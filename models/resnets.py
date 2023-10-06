@@ -1,48 +1,33 @@
 from typing import Any
 
 import torch
-import lightning as L
 import torch.nn as nn
-from lightning.pytorch.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 
 from src.stream import StreamingModule
 from torchvision.models import resnet18, resnet34, resnet50
 
-class StreamingResNet(L.LightningModule):
+class StreamingResNet(StreamingModule):
     model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
 
     def __init__(self, model_name, tile_size, *args, **kwargs):
-        super().__init__()
+
         assert model_name in list(StreamingResNet.model_choices.keys())
-        self.model = StreamingResNet.model_choices[model_name](weights="IMAGENET1K_V1")
-        self.stream_net, self.head = self.split_model()
-        self.stream_net = StreamingModule(self.stream_net, tile_size)
+        network = StreamingResNet.model_choices[model_name](weights="IMAGENET1K_V1")
+        super().__init__(network, tile_size, train_streaming_layers=False)
 
-
-    def split_model(self):
+    def split_model(self, model):
         stream_net = nn.Sequential(
-            self.model.conv1,
-            self.model.bn1,
-            self.model.relu,
-            self.model.maxpool,
-            self.model.layer1,
-            self.model.layer2,
-            self.model.layer3,
-            self.model.layer4,
+            model.conv1,
+            model.bn1,
+            model.relu,
+            model.maxpool,
+            model.layer1,
+            model.layer2,
+            model.layer3,
+            model.layer4,
         )
-        head = nn.Sequential(self.model.avgpool, nn.Flatten(), self.model.fc)
+        head = nn.Sequential(model.avgpool, nn.Flatten(), model.fc)
         return stream_net, head
-
-    def training_step(self, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
-        pass
-
-
-    def forward(self, x, *args, **kwargs):
-        x = self.stream_net(x)
-        return self.head(x)
-
-    def configure_optimizers(self) -> OptimizerLRScheduler:
-        return torch.optim.SGD(self.model.parameters(), lr=0.1)
 
 
 

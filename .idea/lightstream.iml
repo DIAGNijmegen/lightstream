@@ -7,8 +7,12 @@
     <orderEntry type="jdk" jdkName="Remote Python 3.11.3 (sftp://stephandooper@dlc-nidoking:2222/home/stephandooper/.virtualenvs/lightstream/bin/python)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
+  <component name="PackageRequirementsSettings">
+    <option name="requirementsPath" value="" />
+  </component>
   <component name="PyDocumentationSettings">
-    <option name="format" value="PLAIN" />
-    <option name="myDocStringFormat" value="Plain" />
+    <option name="format" value="NUMPY" />
+    <option name="myDocStringFormat" value="NumPy" />
+    <option name="renderExternalDocumentation" value="true" />
   </component>
 </module>
