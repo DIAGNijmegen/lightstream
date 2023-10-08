@@ -1,4 +1,4 @@
-from src.scnn import StreamingCNN
+from streaming.scnn import StreamingCNN
 import numpy as np
 import torch
 import torch.nn as nn

@@ -31,7 +31,7 @@ from tqdm import tqdm
 try:
     from torch.cuda.amp import (
         autocast,
-    )  # pylint: disable=import-error,no-name-in-module
+    )  # pylint: disable=import-error,no-name-in-modules
 
     def forward_amp_decorator(func):
         return torch.cuda.amp.custom_fwd(func)  # type:ignore
@@ -243,7 +243,7 @@ class StreamingConv2dF(torch.autograd.Function):
 
             # Accounting for padding:
             # the kernel locations are relative to the padded input, inpt[0] is not padded
-            # this means that the corresponding input of the grad_loc is module.padding shifted to the left
+            # this means that the corresponding input of the grad_loc is modules.padding shifted to the left
             # we account for this:
             input_y -= padding[1]
             input_x -= padding[2]
@@ -458,7 +458,7 @@ class StreamingCNN(object):
     ):
         """
         Parameters:
-            stream_module (torch.nn.Module): module containing the to be streamed layers
+            stream_module (torch.nn.Module): modules containing the to be streamed layers
             tile_shape (tuple, NCHW): size of the to be streamed tiles
             verbose (bool): will log various debugging relevant information (default is False)
             deterministic (bool): whether to use the deterministic algorithms for cudnn
@@ -541,9 +541,11 @@ class StreamingCNN(object):
         # Remove all hooks and add hooks for correcting gradients
         # during streaming
         self._remove_hooks()
-        self._add_hooks_for_streaming()
+        #
         self._restore_parameters(state_dict)
         self._convert_modules_for_streaming(self.stream_module)
+        self._add_hooks_for_streaming()
+
         if self.replace_non_linearity:
             self.convert_modules_model(self.stream_module, back=True)
 
@@ -1089,8 +1091,6 @@ class StreamingCNN(object):
                         0 : trimmed_output.shape[H_DIM],
                         0 : trimmed_output.shape[W_DIM],
                     ]
-                # Module weight grad update?
-                print(self.stream_module[0].weight.grad)
 
                 trimmed_output.backward(trimmed_grad)
 
@@ -1230,7 +1230,7 @@ class StreamingCNN(object):
                 lost.left : output[0, 0].shape[1] - lost.right,
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride, "module": module}
+            module_stats = {"lost": lost, "stride": stride, "modules": module}
             if self.verbose:
                 print(module, "\n", module_stats["lost"])
 
