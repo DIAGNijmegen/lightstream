@@ -2,7 +2,7 @@ name: Test code and app
 on:
   pull_request:
     paths:
-      - streaming/**
+      - stream/**
       - tests/**
       - .github/workflows/run_test.yaml
 jobs:

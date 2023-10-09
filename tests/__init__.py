@@ -1,8 +1,8 @@
 # Avoid ModuleNotFoundError
 
 import sys
-from streaming.scnn import StreamingCNN
-sys.path.append("./streaming")
+from stream.scnn import StreamingCNN
+sys.path.append("./stream")
 
 
 print("meow")

@@ -1,18 +1,26 @@
-from .streaming import StreamingModule
-from typing import Any
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
+
+from stream.modules.streaming import StreamingModule
+from typing import Any, Tuple
 import torch
 
-# TODO: Write control flow when streaming is turned off
+
+# TODO: Write control flow when stream is turned off
 
 class StandardModule(StreamingModule):
-    def __init__(self, stream_net, head, tile_size, loss_fn: torch.nn.modules.loss, train_streaming_layers=True,
-                 enable_streaming=True, *args, **kwargs):
-        super().__init__(stream_net, tile_size, *args, **kwargs)
+    def __init__(self, stream_net: torch.nn.modules.container.Sequential,
+                 head: torch.nn.modules.container.Sequential,
+                 tile_size: int,
+                 loss_fn: torch.nn.modules.loss,
+                 train_streaming_layers=True,
+                 use_streaming=True,
+                 *args, **kwargs):
+
+        super().__init__(stream_net, tile_size, use_streaming, *args, **kwargs)
 
         self.head = head
-        self.criterion = loss_fn
+        self.loss_fn = loss_fn
         self.train_streaming_layers = train_streaming_layers
-        self.enable_streaming = enable_streaming
 
     def on_train_epoch_start(self) -> None:
 
@@ -35,14 +43,15 @@ class StandardModule(StreamingModule):
         out = self.forward_head(fmap)
         return out
 
-    def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
         image, target = batch
-
         fmap = self.forward_streaming(image)
-        fmap.requires_grad = True
+
+        # Can only be changed when streaming is enabled, otherwise not a lead variable
+        if self.use_streaming:
+            fmap.requires_grad = True
 
         output_head = self.forward_head(fmap)
-
         loss = self.loss_fn(output_head, target)
 
         return fmap, output_head, loss
@@ -62,9 +71,11 @@ class StandardModule(StreamingModule):
         -------
 
         """
-        self.loss.backward()
+
+        # if use_streaming is False, backward through the stream_network is controlled by loss.backward()
+        loss.backward()
         input_image, _ = batch
-        if self.train_streaming_layers and self.enable_streaming:
+        if self.train_streaming_layers and self.use_streaming:
             self.backward_streaming(input_image, fmap.grad)
 
     def get_trainable_params(self):

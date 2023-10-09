@@ -1,4 +1,4 @@
-from streaming.scnn import StreamingCNN
+from stream.scnn import StreamingCNN
 import torch
 import torch.nn as nn
 from torchvision.models import (

@@ -432,8 +432,8 @@ class StreamingCNN(object):
     sCNN.backward(image, str_output.grad)
     ```
 
-    Hooks are used to perform streaming, to use the stream_layers without
-    streaming you can disable StreamingCNN with the disable() function.
+    Hooks are used to perform stream, to use the stream_layers without
+    stream you can disable StreamingCNN with the disable() function.
     Subsequently, enable() enables it again. Streaming gets enabled by default
     after initialization.
     """
@@ -539,7 +539,7 @@ class StreamingCNN(object):
             self.device = torch.device("cuda")  # type:ignore
 
         # Remove all hooks and add hooks for correcting gradients
-        # during streaming
+        # during stream
         self._remove_hooks()
         #
         self._restore_parameters(state_dict)
@@ -733,7 +733,7 @@ class StreamingCNN(object):
         return Lost(int(top), int(left), int(bottom), int(right))
 
     def forward(self, image, result_on_cpu=False):
-        """Perform forward pass with streaming.
+        """Perform forward pass with stream.
 
         Parameters:
             image (torch.Tensor): CHW the image to stream
@@ -866,6 +866,7 @@ class StreamingCNN(object):
 
                     if self.should_normalize:
                         tile = self._normalize_on_gpu(tile)
+
                     tile_output = self.stream_module(tile)
 
                     if torch.backends.cudnn.benchmark:
@@ -916,7 +917,7 @@ class StreamingCNN(object):
         return output
 
     def backward(self, image, grad):
-        """Perform backward pass with streaming.
+        """Perform backward pass with stream.
 
         Parameters:
             image (torch.Tensor): the image (expects NCHW) that was used in the forward pass
@@ -1130,12 +1131,12 @@ class StreamingCNN(object):
         return tile
 
     def disable(self):
-        """Disable the streaming hooks"""
+        """Disable the stream hooks"""
         self._remove_hooks()
         self._reset_converted_modules(self.stream_module)
 
     def enable(self):
-        """Enable the streaming hooks"""
+        """Enable the stream hooks"""
         self._remove_hooks()
         self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
