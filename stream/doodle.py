@@ -1,25 +1,23 @@
-import torch
-import torch.nn as nn
-from stream.scnn import StreamingCNN, StreamingConv2d
-from torchvision.models import resnet18, resnet34, resnet50
+import numpy as np
+import pytest
 
-#%%
-resnet = resnet18(weights="IMAGENET1K_V1")
 
-def split_model(model):
-    stream_net = nn.Sequential(
-        model.conv1,
-        model.bn1,
-        model.relu,
-        model.maxpool,
-        model.layer1,
-        model.layer2,
-        model.layer3,
-        model.layer4,
-    )
-    head = nn.Sequential(model.avgpool, nn.Flatten(), model.fc)
-    return stream_net, head
+@pytest.fixture
+def tuple_params(request):
+    yield sum(request.param)
 
-stream_net, head = split_model(resnet)
 
-print(type(head))
+@pytest.mark.parametrize("tuple_params", [(1, 2, 3)], indirect=True)
+def test_tuple_params(tuple_params):
+    print("meowing here")
+    print(tuple_params)  # 6
+
+
+@pytest.fixture
+def dict_params(request):
+    yield f"{request.param['a']}_{request.param['b']}"
+
+
+@pytest.mark.parametrize("dict_params", [{"a": "foo", "b": "bar"}], indirect=True)
+def test_dict_params(dict_params):
+    print(dict_params)  # foo_bar

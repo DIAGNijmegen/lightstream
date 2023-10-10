@@ -1,73 +1,63 @@
-from stream.scnn import StreamingCNN
 import torch
-import torch.nn as nn
-from torchvision.models import (
-    resnet18,
-    resnet34,
-    resnet50,
-    ResNet18_Weights,
-    ResNet34_Weights,
-    ResNet50_Weights,
-)
+import pytest
+import numpy as np
+from stream.utils.modelcheck import ModelCheck
+from torchvision.models import resnet18, resnet34, resnet50
+from models.resnet import split_resnet
 
 
-class TestResNet:
-    def __init__(self):
-        pass
-
-    def test_resnet18(self):
-        pass
-
-    def test_resnet34(self):
-        pass
-
-    def test_resnet50(self):
-        model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+test_cases = [resnet18, resnet34, resnet50]
 
 
-def test_model_logic():
-    tile_size = 1600
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model.eval()
-    stream_net, net = split_model(model)
-    stream_net = StreamingCNN(
-        stream_net,
-        tile_shape=(1, 3, tile_size, tile_size),
-        deterministic=True,
-        saliency=False,
-        gather_gradients=False,
-        copy_to_gpu=True,
-        verbose=True,
-    )
-
-    model_input = torch.ones(1, 3, 3200, 3200)
-    first_out = stream_net.forward(model_input)
-    out_streaming = net(first_out)
-
-    out_normal = model(model_input)
-
-    print(torch.sum(out_streaming - out_normal))
+@pytest.fixture(scope="module", params=test_cases)
+def streaming_outputs(request):
+    print("model fn", request.param)
+    model = request.param()
+    stream_net, head = split_resnet(model)
+    model_check = ModelCheck(stream_net, verbose=False)
+    model_check.gather_outputs()
+    return [model_check.streaming_outputs, model_check.normal_outputs]
 
 
-# Only stream the conv layers, do not include the heads.
-def split_model(model):
-    stream_net = nn.Sequential(
-        model.conv1,
-        model.bn1,
-        model.relu,
-        model.maxpool,
-        model.layer1,
-        model.layer2,
-        model.layer3,
-        model.layer4,
-    )
-    net = nn.Sequential(model.avgpool, nn.Flatten(), model.fc)
-    return stream_net, net
+def test_forward_output(streaming_outputs):
+    stream_outputs, normal_outputs = streaming_outputs
+    max_error = np.abs(
+        stream_outputs["forward_output"] - normal_outputs["forward_output"]
+    ).max()
+
+    # if max_error < 1e-7:
+    #    print("Equal output to streaming")
+    # else:
+    #    print("NOT equal output to streaming"),
+    #    print("error:", max_error)
+
+    assert max_error < 1e-2
 
 
-def freeze_bn_layers(module):
-    freeze_layers = [l.eval() for l in module.layers if isinstance(l, nn.BatchNorm2D)]
+def test_input_gradients(streaming_outputs):
+    stream_outputs, normal_outputs = streaming_outputs
+
+    diff = np.abs(stream_outputs["input_gradient"] - normal_outputs["input_gradient"])
+    assert diff.max() < 1e-2
 
 
-def test_pytest():
-    assert 1 == 1
+def test_kernel_gradients(streaming_outputs):
+    stream_outputs, normal_outputs = streaming_outputs
+    streaming_kernel_gradients = stream_outputs["kernel_gradients"]
+    conventional_kernel_gradients = normal_outputs["kernel_gradients"]
+
+    for i in range(len(streaming_kernel_gradients)):
+        diff = np.abs(streaming_kernel_gradients[i] - conventional_kernel_gradients[i])
+        max_diff = diff.max()
+        # print(f"Conv layer {i} \t max difference between kernel gradients: {max_diff}")
+        assert max_diff < 1e-2
+
+
+def get_kernel_sizes(kernel_gradients):
+    for i in range(len(kernel_gradients)):
+        print(
+            "Conv layer",
+            i,
+            "\t average gradient size:",
+            float(torch.mean(torch.abs(kernel_gradients[i].cpu().numpy()))),
+        )

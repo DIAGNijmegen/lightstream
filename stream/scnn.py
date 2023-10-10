@@ -146,7 +146,7 @@ class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @backward_amp_decorator
     def backward(ctx, grad_output):
-        inpt, weight, bias = ctx.saved_variables
+        inpt, weight, bias = ctx.saved_tensors
         grad = grad_weight = grad_bias = None
 
         stride = ctx.stride
@@ -1160,7 +1160,7 @@ class StreamingCNN(object):
                 if isinstance(mod, StreamingConv2d):
                     if mod.in_channels == 3:
                         self.saliency_input_module = mod
-                        back_handle = mod.register_backward_hook(back_lambda)
+                        back_handle = mod.register_full_backward_hook(back_lambda)
                         self._hooks.append(back_handle)
 
     def _add_hooks(
@@ -1175,7 +1175,7 @@ class StreamingCNN(object):
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
                 if back_modules and isinstance(mod, back_modules):
-                    back_handle = mod.register_backward_hook(backward_hook)
+                    back_handle = mod.register_full_backward_hook(backward_hook)
                     self._hooks.append(back_handle)
 
     def _remove_hooks(self):
