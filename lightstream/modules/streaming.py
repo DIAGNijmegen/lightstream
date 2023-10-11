@@ -1,7 +1,7 @@
 import torch
 import lightning as L
 
-from stream.scnn import StreamingCNN
+from lightstream.scnn import StreamingCNN
 
 
 class StreamingModule(L.LightningModule):
@@ -24,7 +24,7 @@ class StreamingModule(L.LightningModule):
             self.disable_streaming()
 
     def freeze_streaming_normalization_layers(self):
-        """Do not use normalization layers within stream, only local ops are allowed"""
+        """Do not use normalization layers within lightstream, only local ops are allowed"""
         freeze_layers = [
             l
             for l in self.stream_network.stream_module.modules()

@@ -1,21 +1,25 @@
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
 
-from stream.modules.streaming import StreamingModule
+from lightstream.modules.streaming import StreamingModule
 from typing import Any, Tuple
 import torch
 
 
-# TODO: Write control flow when stream is turned off
+# TODO: Write control flow when lightstream is turned off
 
-class StandardModule(StreamingModule):
-    def __init__(self, stream_net: torch.nn.modules.container.Sequential,
-                 head: torch.nn.modules.container.Sequential,
-                 tile_size: int,
-                 loss_fn: torch.nn.modules.loss,
-                 train_streaming_layers=True,
-                 use_streaming=True,
-                 *args, **kwargs):
 
+class BaseModel(StreamingModule):
+    def __init__(
+        self,
+        stream_net: torch.nn.modules.container.Sequential,
+        head: torch.nn.modules.container.Sequential,
+        tile_size: int,
+        loss_fn: torch.nn.modules.loss,
+        train_streaming_layers=True,
+        use_streaming=True,
+        *args,
+        **kwargs
+    ):
         super().__init__(stream_net, tile_size, use_streaming, *args, **kwargs)
 
         self.head = head
@@ -23,7 +27,6 @@ class StandardModule(StreamingModule):
         self.train_streaming_layers = train_streaming_layers
 
     def on_train_epoch_start(self) -> None:
-
         print("on train epoch start hook")
         print("Printing model weights and their param/training attributes")
         print("Setting batchnorm layers to eval")
@@ -43,7 +46,9 @@ class StandardModule(StreamingModule):
         out = self.forward_head(fmap)
         return out
 
-    def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
+    def training_step(
+        self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any
+    ) -> tuple[Any, Any, Any]:
         image, target = batch
         fmap = self.forward_streaming(image)
 
@@ -56,7 +61,15 @@ class StandardModule(StreamingModule):
 
         return fmap, output_head, loss
 
-    def backward(self, loss: torch.Tensor, batch: Any, fmap: Any, out: Any, *args: Any, **kwargs: Any):
+    def backward(
+        self,
+        loss: torch.Tensor,
+        batch: Any,
+        fmap: Any,
+        out: Any,
+        *args: Any,
+        **kwargs: Any
+    ):
         """
 
         Parameters
@@ -83,5 +96,6 @@ class StandardModule(StreamingModule):
             params = list(self.stream_network) + list(self.head)
         else:
             params = list(self.head)
-            for param in self.stream_network: param.requires_grad = False
+            for param in self.stream_network:
+                param.requires_grad = False
         return params

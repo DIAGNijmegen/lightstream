@@ -15,7 +15,7 @@ However, it should not matter which loss is used.
 """
 
 import torch
-from stream.scnn import StreamingCNN, StreamingConv2d
+from lightstream.scnn import StreamingCNN, StreamingConv2d
 
 
 class ModelCheck:

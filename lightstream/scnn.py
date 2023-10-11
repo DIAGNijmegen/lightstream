@@ -420,7 +420,7 @@ W_DIM = 3
 
 class StreamingCNN(object):
     """Initialize Streaming CNN helper class. After initialization use the
-    forward() and backward() function of this class to stream.
+    forward() and backward() function of this class to lightstream.
     Pseudocode example:
 
     ```python
@@ -432,8 +432,8 @@ class StreamingCNN(object):
     sCNN.backward(image, str_output.grad)
     ```
 
-    Hooks are used to perform stream, to use the stream_layers without
-    stream you can disable StreamingCNN with the disable() function.
+    Hooks are used to perform lightstream, to use the stream_layers without
+    lightstream you can disable StreamingCNN with the disable() function.
     Subsequently, enable() enables it again. Streaming gets enabled by default
     after initialization.
     """
@@ -539,7 +539,7 @@ class StreamingCNN(object):
             self.device = torch.device("cuda")  # type:ignore
 
         # Remove all hooks and add hooks for correcting gradients
-        # during stream
+        # during lightstream
         self._remove_hooks()
         #
         self._restore_parameters(state_dict)
@@ -733,10 +733,10 @@ class StreamingCNN(object):
         return Lost(int(top), int(left), int(bottom), int(right))
 
     def forward(self, image, result_on_cpu=False):
-        """Perform forward pass with stream.
+        """Perform forward pass with lightstream.
 
         Parameters:
-            image (torch.Tensor): CHW the image to stream
+            image (torch.Tensor): CHW the image to lightstream
         """
         # The input image is likely quite small in terms of channels, for
         # performance reasons it is beneficial to copy to the GPU as a whole
@@ -917,7 +917,7 @@ class StreamingCNN(object):
         return output
 
     def backward(self, image, grad):
-        """Perform backward pass with stream.
+        """Perform backward pass with lightstream.
 
         Parameters:
             image (torch.Tensor): the image (expects NCHW) that was used in the forward pass
@@ -1131,12 +1131,12 @@ class StreamingCNN(object):
         return tile
 
     def disable(self):
-        """Disable the stream hooks"""
+        """Disable the lightstream hooks"""
         self._remove_hooks()
         self._reset_converted_modules(self.stream_module)
 
     def enable(self):
-        """Enable the stream hooks"""
+        """Enable the lightstream hooks"""
         self._remove_hooks()
         self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()

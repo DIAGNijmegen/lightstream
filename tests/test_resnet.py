@@ -1,7 +1,7 @@
 import torch
 import pytest
 import numpy as np
-from stream.utils.modelcheck import ModelCheck
+from lightstream.utils.modelcheck import ModelCheck
 from torchvision.models import resnet18, resnet34, resnet50
 from models.resnet import split_resnet
 

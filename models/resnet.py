@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-from stream.scnn import StreamingConv2d
+from lightstream.scnn import StreamingConv2d
 
 
-from modules.standard import StandardModule
+from modules.base import BaseModel
 from torchvision.models import resnet18, resnet34, resnet50
 
 
@@ -22,12 +22,12 @@ def split_resnet(net):
     return stream_net, head
 
 
-class StreamingResNet(StandardModule):
+class StreamingResNet(BaseModel):
     model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
 
     def __init__(
         self,
-        model_name,
+        model_name: str,
         tile_size,
         loss_fn,
         train_streaming_layers=True,
