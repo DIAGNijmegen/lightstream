@@ -36,6 +36,8 @@ RUN wget https://github.com/libvips/libvips/releases/download/v${VIPS_VERSION}/v
     mkdir -p /opt/tests/vips_tests && mv /tmp/vips-${VIPS_VERSION}/test/test-suite /opt/tests/vips_tests &&\
     rm -rf /tmp/vips-${VIPS_VERSION}
 
-RUN pip3 install lightning pyvips
+RUN pip3 install lightning pyvips albumentations
+
+EXPOSE 8888
 
 ENTRYPOINT ["/bin/bash"]
