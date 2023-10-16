@@ -7,6 +7,12 @@ Functional representations of the augmentations. Most will function as functiona
 import pyvips
 import numpy as np
 
+__all__ = [
+    "separate_stains",
+    "combine_stains",
+    "color_aug_hed"
+]
+
 # Needed for stain unmixing
 rgb_from_hed = np.array([[0.65, 0.70, 0.29],
                          [0.07, 0.99, 0.11],
@@ -14,7 +20,7 @@ rgb_from_hed = np.array([[0.65, 0.70, 0.29],
 hed_from_rgb = np.linalg.inv(rgb_from_hed)
 
 
-def separate_stains_pyvips(rgb: pyvips.Image) -> pyvips.Image:
+def separate_stains(rgb: pyvips.Image) -> pyvips.Image:
     """ Separate rgb into HED stain
 
     adapted from https://github.com/scikit-image/scikit-image/blob/v0.22.0/skimage/color/colorconv.py#L1638
@@ -35,7 +41,7 @@ def separate_stains_pyvips(rgb: pyvips.Image) -> pyvips.Image:
 
     # convert uint8 to [0,1] float 32
     if rgb.format == 'uchar':
-        rgb = rgb.cast('float') / 255 # alternatively: hed.colourspace('scrgb') gives darker colours
+        rgb = rgb.cast('float') / 255  # alternatively: hed.colourspace('scrgb') gives darker colours
     elif rgb.format not in ('float', 'double'):
         raise TypeError("format must be one of uchar [0,255], float [0, 1], or double [0,1]")
 
@@ -48,7 +54,7 @@ def separate_stains_pyvips(rgb: pyvips.Image) -> pyvips.Image:
     return stains
 
 
-def combine_stains_pyvips(hed: pyvips.Image):
+def combine_stains(hed: pyvips.Image):
     """  Combine stains from HED to RGB
 
     adapted from https://github.com/scikit-image/scikit-image/blob/v0.22.0/skimage/color/colorconv.py#L1638
@@ -69,7 +75,7 @@ def combine_stains_pyvips(hed: pyvips.Image):
     """
 
     if hed.format == 'uchar':
-        hed = hed.cast('float') / 255 # alternatively: hed.colourspace('scrgb')
+        hed = hed.cast('float') / 255  # alternatively: hed.colourspace('scrgb')
     elif hed.format not in ('float', 'double'):
         raise TypeError("format must be one of uchar [0,255], float [0, 1], or double [0,1]")
 
@@ -86,7 +92,8 @@ def combine_stains_pyvips(hed: pyvips.Image):
 
     return (rgb * 255).cast('uchar')
 
-def color_aug_hed(img: pyvips.Image, bias, sigma):
+
+def color_aug_hed(img: pyvips.Image, shift):
     """ Stain augmentation in HED colourspace
 
     Perform color unmixing from RGB to HED color space.
@@ -96,9 +103,9 @@ def color_aug_hed(img: pyvips.Image, bias, sigma):
     ----------
     img : pyvips.Image
         The image to be augmented in HED colour space
-    bias : list
+    bias : list of floats
+        A list of 3 floats [h_value, e_value, d_value] by which each of the channels should be shifted
 
-    sigma : list
 
     Returns
     -------
@@ -108,12 +115,13 @@ def color_aug_hed(img: pyvips.Image, bias, sigma):
     """
 
     img = img.cast('float') / 255
-    hed = separate_stains_pyvips(img)
+    hed = separate_stains(img)
 
     # Augment the Haematoxylin channel.
-    hed = hed * sigma + bias
+    print(shift)
+    hed = hed + shift
 
     # Back to rgb
-    rgb = combine_stains_pyvips(hed)
+    rgb = combine_stains(hed)
 
     return rgb

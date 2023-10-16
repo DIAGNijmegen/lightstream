@@ -18,7 +18,12 @@ from ...core.transforms_interface import (
     DualTransform,
     KeypointInternalType,
 )
-
+__all__ = [
+    "VerticalFlip",
+    "HorizontalFlip",
+    "Flip",
+    "Transpose"
+]
 
 class VerticalFlip(DualTransform):
     """Flip the input vertically around the x-axis.

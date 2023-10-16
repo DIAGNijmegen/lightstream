@@ -6,6 +6,14 @@ Functional representations of the augmentations. Most will function as functiona
 
 import pyvips
 
+
+__all__ = [
+    "vflip",
+    "hflip",
+    "random_flip",
+    "transpose"
+]
+
 def vflip(img: pyvips.Image) -> pyvips.Image:
     return img.flipver()
 
