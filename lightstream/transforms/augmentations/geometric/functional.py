@@ -69,3 +69,40 @@ def transpose(img: pyvips.Image) -> pyvips.Image:
 
     return img.rot270()
 
+
+def elastic_deformation(image: pyvips.Image, sigma: int=32, alpha:int=4):
+    """ Apply elastic transformation on the image
+
+
+
+    Parameters
+    ----------
+    image
+    sigma
+    alpha
+
+    Returns
+    -------
+
+    """
+    width, height, channels = image.width, image.height, image.bands
+
+    # Create a random displacement field, pyvips does not have uniform
+    # instead, use a Gaussian and convert using Box-Muller inverse
+    z1 = pyvips.Image.gaussnoise(width, height, sigma=1.0, mean=0.0)
+    z2 = pyvips.Image.gaussnoise(width, height, sigma=1.0, mean=0.0)
+
+    # Compute box-muller inverse to get approximate uniform values
+    dx = (-(z1*z1 + z2*z2) / 2).exp()
+    dx = (2 * dx - 1).gaussblur(sigma) * alpha
+
+    dy = (z1 / z2).atan()
+    dy = (2 * dy - 1).gaussblur(sigma) * alpha
+
+    grid = pyvips.Image.xyz(image.width, image.height)
+    new_coords = grid + dx.bandjoin([dy])
+
+    image = image.mapim(new_coords, interpolate=pyvips.Interpolate.new('bilinear'), background=[255, 255, 255])
+
+    return image
+
