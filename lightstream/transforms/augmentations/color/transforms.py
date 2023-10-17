@@ -24,7 +24,19 @@ __all__ = [
 
 
 class HEDShift(ImageOnlyTransform):
-    """ todo: Add masking support"""
+    """ todo: Add masking support
+
+    perhaps use this to add mask as param?
+    https://stackoverflow.com/questions/76125174/custom-mask-dependent-augmentation-in-albumentations
+    mask = (pyvips_image >= 250).bandand()
+    plt.imshow(mask.numpy())
+    plt.show()
+
+    result = (mask).ifthenelse(
+        mask, color_aug_hed(pyvips_image, shift=[0.0, 0.05, 0.0])
+    )
+
+    """
     def __init__(self, h_shift_limit: float = 0.03, e_shift_limit: float = 0.03, d_shift_limit: float = 0.03,
                  always_apply: bool = False, p: float = 0.5, **params):
         super().__init__(always_apply, p, **params)

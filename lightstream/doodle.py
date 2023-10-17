@@ -4,12 +4,14 @@ import pyvips
 import matplotlib.pyplot as plt
 from PIL import Image
 from lightstream.transforms import Compose, HorizontalFlip, VerticalFlip, HEDShift
+from lightstream.transforms import color_aug_hed
 import os
 import cv2
 import random
 
 random.seed(0)
 np.random.seed(0)
+
 
 def draw_grid(image: pyvips.Image, grid_size):
     # Draw grid lines
@@ -20,7 +22,8 @@ def draw_grid(image: pyvips.Image, grid_size):
 
     return image
 
-def elastic_deformation(image: pyvips.Image, sigma: int=32, alpha:int=4):
+
+def elastic_deformation(image: pyvips.Image, sigma: int = 50, alpha: int = 1):
     width, height, channels = image.width, image.height, image.bands
 
     # Create a random displacement field, pyvips does not have uniform
@@ -29,7 +32,7 @@ def elastic_deformation(image: pyvips.Image, sigma: int=32, alpha:int=4):
     z2 = pyvips.Image.gaussnoise(width, height, sigma=1.0, mean=0.0)
 
     # Compute box-muller inverse to get approximate uniform values
-    dx = (-(z1*z1 + z2*z2) / 2).exp()
+    dx = (-(z1 * z1 + z2 * z2) / 2).exp()
     dx = (2 * dx - 1).gaussblur(sigma) * alpha
 
     dy = (z1 / z2).atan()
@@ -38,30 +41,28 @@ def elastic_deformation(image: pyvips.Image, sigma: int=32, alpha:int=4):
     grid = pyvips.Image.xyz(image.width, image.height)
     new_coords = grid + dx.bandjoin([dy])
 
-    image = image.mapim(new_coords, interpolate=pyvips.Interpolate.new('bilinear'), background=[255, 255, 255])
+    image = image.mapim(
+        new_coords,
+        interpolate=pyvips.Interpolate.new("bilinear"),
+        background=[255, 255, 255],
+    )
 
     return image
-
-
-
-
-
-
 
 
 if __name__ == "__main__":
     image = np.array(Image.open("../images/he.jpg"))
     pyvips_image = pyvips.Image.new_from_array(image)
-    print(pyvips_image.width,pyvips_image.height,pyvips_image.bands)
+    print(pyvips_image.width, pyvips_image.height, pyvips_image.bands)
     plt.imshow(pyvips_image.numpy())
     plt.show()
 
-
-    pyvips_image = draw_grid(pyvips_image, 50)
-    plt.imshow(pyvips_image.numpy())
+    mask = (pyvips_image >= 250).bandand()
+    plt.imshow(mask.numpy())
     plt.show()
 
-    out = elastic_deformation(pyvips_image)
-
-    plt.imshow(out.numpy())
+    result = (mask).ifthenelse(
+        mask, color_aug_hed(pyvips_image, shift=[0.0, 0.05, 0.0])
+    )
+    plt.imshow(result.numpy())
     plt.show()
