@@ -120,6 +120,14 @@ def elastic_transform(
     img: pyvips.Image
 
     """
+
+    # Image size: 24448 55293, camelyon16 normal 1
+    # Mine: 340
+    # Mine @ no box-muller: 170, 166
+    # Hans @ grid scale 8: 260
+    # Hans @ grid scale 16: 257
+    # Hans @ grid scale 64: 257
+
     width, height, channels = img.width, img.height, img.bands
 
     # Create a random displacement field, pyvips does not have uniform sampling (yet)

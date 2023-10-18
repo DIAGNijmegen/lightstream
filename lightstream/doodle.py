@@ -1,13 +1,8 @@
-import albumentations as A
 import numpy as np
 import pyvips
-import matplotlib.pyplot as plt
-from PIL import Image
-from lightstream.transforms import Compose, HorizontalFlip, VerticalFlip, HEDShift
-from lightstream.transforms import color_aug_hed
-import os
-import cv2
 import random
+import time
+import cv2
 
 random.seed(0)
 np.random.seed(0)
@@ -23,10 +18,42 @@ def draw_grid(image: pyvips.Image, grid_size):
     return image
 
 
-def elastic_deformation(image: pyvips.Image, sigma: int = 50, alpha: int = 1):
-    width, height, channels = image.width, image.height, image.bands
+def elastic_transform(
+    img: pyvips.Image,
+    alpha: float = 1.0,
+    sigma: float = 50.0,
+    interpolation: pyvips.Interpolate = pyvips.Interpolate.new("bilinear"),
+    background: list = [255, 255, 255],
+    same_dxdy: bool = False,
+) -> pyvips.Image:
+    """Apply elastic transformation on the image
 
-    # Create a random displacement field, pyvips does not have uniform
+    .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
+         Convolutional Neural Networks applied to Visual Document Analysis", in
+         Proc. of the International Conference on Document Analysis and
+         Recognition, 2003.
+
+    Parameters
+    ----------
+    image : Pyvips Image object
+        The image on which to apply elastic deformation
+    sigma : int
+        Elasticity coefficient : standard deviation for Gaussian blur, controls smoothness, higher is smoother
+    alpha : int
+        Scaling  factor that controls the intensity (magnitude) of the displacements
+    interpolation : pyvips.Interpolate
+        The interpolation to use, can be one of bilinear, cubic, linear, nearest
+    same_dx_dy : bool
+        DOES NOTHING FOR NOW Whether to use the same displacement for both x and y directions.
+
+    Returns
+    -------
+    img: pyvips.Image
+
+    """
+    width, height, channels = img.width, img.height, img.bands
+
+    # Create a random displacement field, pyvips does not have uniform sampling (yet)
     # instead, use a Gaussian and convert using Box-Muller inverse
     z1 = pyvips.Image.gaussnoise(width, height, sigma=1.0, mean=0.0)
     z2 = pyvips.Image.gaussnoise(width, height, sigma=1.0, mean=0.0)
@@ -38,31 +65,38 @@ def elastic_deformation(image: pyvips.Image, sigma: int = 50, alpha: int = 1):
     dy = (z1 / z2).atan()
     dy = (2 * dy - 1).gaussblur(sigma) * alpha
 
-    grid = pyvips.Image.xyz(image.width, image.height)
+    grid = pyvips.Image.xyz(img.width, img.height)
     new_coords = grid + dx.bandjoin([dy])
 
-    image = image.mapim(
-        new_coords,
-        interpolate=pyvips.Interpolate.new("bilinear"),
-        background=[255, 255, 255],
-    )
+    image = img.mapim(new_coords, interpolate=interpolation, background=background)
 
     return image
 
 
 if __name__ == "__main__":
-    image = np.array(Image.open("../images/he.jpg"))
-    pyvips_image = pyvips.Image.new_from_array(image)
-    print(pyvips_image.width, pyvips_image.height, pyvips_image.bands)
-    plt.imshow(pyvips_image.numpy())
-    plt.show()
+    # image = np.array(Image.open("../images/he.jpg"))
+    # image = pyvips.Image.new_from_array(image)
 
-    mask = (pyvips_image >= 250).bandand()
-    plt.imshow(mask.numpy())
-    plt.show()
+    image = pyvips.Image.new_from_file(
+        "/data/pathology/archives/breast/camelyon/CAMELYON16/images/normal_001.tif",
+        level=2,
+    ).flatten()
 
-    result = (mask).ifthenelse(
-        mask, color_aug_hed(pyvips_image, shift=[0.0, 0.05, 0.0])
+    print(image.width, image.height, image.bands)
+    start = time.time()
+    image = elastic_transform(image)
+
+    image.write_to_file(
+        "/data/pathology/projects/pathology-bigpicture-streamingclam/test_elastic.tif",
+        pyramid=True,
+        bigtiff=True,
+        compression="jpeg",
+        Q=90,
     )
-    plt.imshow(result.numpy())
-    plt.show()
+    print(f"pyvips: {time.time() - start}s")
+    # Image size: 24448 55293, camelyon16 normal 1
+    # Mine: 340
+    # Mine @ no box-muller: 170, 166
+    # Hans @ grid scale 8: 260
+    # Hans @ grid scale 16: 257
+    # Hans @ grid scale 64: 257
