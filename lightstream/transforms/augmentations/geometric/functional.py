@@ -121,9 +121,11 @@ def elastic_transform(
 
     """
 
+    # TLDR: It's currently slow due to Box-Muller workaround, but will be solved in vips 8.16:
+    # https://github.com/libvips/pyvips/issues/436
     # Image size: 24448 55293, camelyon16 normal 1
     # Mine: 340
-    # Mine @ no box-muller: 170, 166
+    # Mine @ no box-muller: 170, 166 (flawed -> did not take into account gaus blurr)
     # Hans @ grid scale 8: 260
     # Hans @ grid scale 16: 257
     # Hans @ grid scale 64: 257

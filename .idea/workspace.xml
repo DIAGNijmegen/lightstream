@@ -6,12 +6,12 @@
   <component name="BlackConnectSettings" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/lightstream/data/dataset.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/lightstream.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/lightstream.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/data/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/data/dataset.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/doodle.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/doodle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/helpers.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/utils/helpers.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/run_augmentations.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/run_augmentations.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/functional.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/functional.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -68,7 +68,7 @@
       <recent name="C:\Users\Stephan\Desktop\projects\lightstream\images" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.doodle">
+  <component name="RunManager" selected="Python.run_augmentations">
     <configuration name="doodle" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="lightstream" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -201,16 +201,35 @@
       </deployment>
       <method v="2" />
     </configuration>
+    <configuration name="pytest in doodle.py" type="tests" factoryName="py.test" temporary="true" nameIsGenerated="true">
+      <module name="lightstream" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/lightstream" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="_new_keywords" value="&quot;&quot;" />
+      <option name="_new_parameters" value="&quot;&quot;" />
+      <option name="_new_additionalArguments" value="&quot;&quot;" />
+      <option name="_new_target" value="&quot;$PROJECT_DIR$/lightstream/doodle.py&quot;" />
+      <option name="_new_targetType" value="&quot;PATH&quot;" />
+      <method v="2" />
+    </configuration>
     <list>
       <item itemvalue="Docker.docker/Dockerfile" />
       <item itemvalue="Python.run_augmentations" />
       <item itemvalue="Python.doodle" />
       <item itemvalue="Python.resnet" />
+      <item itemvalue="Python tests.pytest in doodle.py" />
     </list>
     <recent_temporary>
       <list>
-        <item itemvalue="Python.doodle" />
         <item itemvalue="Python.run_augmentations" />
+        <item itemvalue="Python.doodle" />
+        <item itemvalue="Python tests.pytest in doodle.py" />
         <item itemvalue="Docker.docker/Dockerfile" />
         <item itemvalue="Python.resnet" />
       </list>
@@ -228,6 +247,7 @@
       <workItem from="1697534468697" duration="16540000" />
       <workItem from="1697564664039" duration="14076000" />
       <workItem from="1697627184405" duration="6458000" />
+      <workItem from="1697651359888" duration="10961000" />
     </task>
     <servers />
   </component>
@@ -246,22 +266,13 @@
           <url>file://$PROJECT_DIR$/lightstream/run_augmentations.py</url>
           <option name="timeStamp" value="2" />
         </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/lightstream/doodle.py</url>
-          <line>79</line>
-          <option name="timeStamp" value="3" />
-        </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/lightstream/doodle.py</url>
-          <line>2</line>
-          <option name="timeStamp" value="4" />
-        </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/lightstream$doodle.coverage" NAME="doodle Coverage Results" MODIFIED="1697631202390" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$doodle.coverage" NAME="doodle Coverage Results" MODIFIED="1697664365838" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697666024554" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$pytest_in_doodle_py.coverage" NAME="pytest in doodle.py Coverage Results" MODIFIED="1697664234018" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
     <SUITE FILE_PATH="coverage/lightstream$resnet.coverage" NAME="resnet Coverage Results" MODIFIED="1697455218358" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models" />
-    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697584407020" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
   </component>
 </project>

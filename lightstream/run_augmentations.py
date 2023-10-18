@@ -31,8 +31,8 @@ if __name__ == "__main__":
     plt.show()
 
     transforms = Compose([RandomRotate90(p=1.0)])
-
-    new_image = transforms(image=pyvips_image, mask=mask)
+    sample = {'image': pyvips_image, 'mask': mask}
+    new_image = transforms(**sample)
 
     plt.imshow(new_image["image"].numpy())
     plt.show()
