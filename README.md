@@ -51,3 +51,40 @@ To auto-generate API document for your project, run:
 ```bash
 make docs
 ```
+
+## LightStream
+
+### Image and tile size
+- Image size: Multiple of output stride
+- Tile size: Multiple of output stride
+
+
+## Data augmentation pipeline
+
+### Albumentations-like pipeline
+- Small differences among pipelines
+
+### Recommended image transformations
+
+#### variable input shapes
+Recommend to use variable input shapes when many images are relatively small
+
+- Start with uint8 (uchar) images
+- for very large images, use a randomcrop at the start of the augmentation pipeline
+- At the end of the augmentation pipeline, some padding or cropping is required to get the correct output in streaming (see above)
+  - Strategy 1: Pad the image to be within a multiple of the network output stride
+  - Strategy 2: Pad the image to be within a multiple of tile stride, called tile delta. 
+  The tile delta is the stride with which the tile moves over the input image during streaming. It is calculated during
+  Streaming and its value can be retrieved from the StreamingModule class under ``` _configure_tile_delta``` and be passed on into a data loader
+- Convert the image to float32
+- Normalize the image
+
+#### Static image sizes
+Depending on the dataset, images can be cropped or padded to fixed image sizes at the start of end of the pipeline
+
+
+- Make sure the images are cropped/padded to an image size that is in a multiple of the network output stride
+- If the images are bigger than the chosen image size, crop them at the beginning, if they are smaller, try to avoid padding until the end of the augmentation pipeline
+- Near the end of the pipeline, apply a crop_or_pad that crops or pads the image to the chosen image size. Some augmentations like random rotations can change the image size, so it is best to apply this at the end of the augmentation pipeline before casting to floats and normalizing
+- Convert the image to float32
+- Normalize the image

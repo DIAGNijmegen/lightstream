@@ -227,6 +227,7 @@ class ElasticTransform(DualTransform):
         p=0.5,
     ):
         super().__init__(always_apply, p)
+        print("Elastic transform is only supported for image-only datasets, do not use with bounding boxes/masks!")
         self.alpha = alpha
         self.sigma = sigma
         self.interpolation = interpolation

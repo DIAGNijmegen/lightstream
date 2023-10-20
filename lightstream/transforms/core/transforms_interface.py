@@ -4,6 +4,7 @@ Adapted from https://github.com/albumentations-team/albumentations/blob/master/a
 
 from __future__ import absolute_import
 
+import pyvips
 import random
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
@@ -170,7 +171,7 @@ class BasicTransform(Serializable):
         target_function = self.targets.get(transform_key, lambda x, **p: x)
         return target_function
 
-    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+    def apply(self, img: pyvips.Image, **params) -> pyvips.Image:
         raise NotImplementedError
 
     def get_params(self) -> Dict:

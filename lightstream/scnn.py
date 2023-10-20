@@ -941,7 +941,6 @@ class StreamingCNN(object):
 
         output_height = self._tile_output_shape[H_DIM]
         output_width = self._tile_output_shape[W_DIM]
-
         valid_grad_height = (
             tile_height - grad_lost.top - grad_lost.bottom
         ) // self.output_stride[1]
@@ -976,7 +975,7 @@ class StreamingCNN(object):
         self._backward_seen_indices = {}
 
         if self.verbose:
-            print("Number of tiles in backprop:", n_rows * n_cols)
+            print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
         if self.verbose:
             iterator = tqdm(range(n_rows))
         else:
@@ -1006,6 +1005,7 @@ class StreamingCNN(object):
                 # If the tile is at the bottom or right side of the input image
                 # than we need to shift back so that the tile fits (does not go
                 # over the border)
+
                 if sides_bottom:
                     output_y = max(grad.shape[H_DIM] - output_height, 0)
                 if sides_right:

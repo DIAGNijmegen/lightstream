@@ -18,6 +18,11 @@ class StreamingModule(L.LightningModule):
             gather_gradients=kwargs.get("gather_gradients", False),
             copy_to_gpu=kwargs.get("copy_to_gpu", True),
             verbose=kwargs.get("verbose", True),
+            statistics_on_cpu=kwargs.get("statistics_on_cpu", False),
+            normalize_on_gpu=kwargs.get("normalize_on_gpu", False),
+            mean=kwargs.get("mean", [0.485, 0.456, 0.406]),
+            std=kwargs.get("std", [0.229, 0.224, 0.225]),
+            state_dict=kwargs.get("state_dict", None),
         )
 
         if not self.use_streaming:
@@ -44,21 +49,6 @@ class StreamingModule(L.LightningModule):
         self.stream_network.enable()
         self.use_streaming = True
 
-    def _configure_tile_delta(self):
-        """Configure tile delta for variable input shapes"""
-
-        delta = self.tile_size - (
-            self.stream_network.tile_gradient_lost.left
-            + self.stream_network.tile_gradient_lost.right
-        )
-        delta = delta // self.stream_network.output_stride[-1]
-        delta *= self.stream_network.output_stride[-1]
-
-        # if delta < 3000:
-        #     delta = (3000 // delta + 1) * delta
-        print("DELTA", delta.item())
-        return delta.item()
-
     def forward_streaming(self, x):
         out = (
             self.stream_network(x)
@@ -71,3 +61,15 @@ class StreamingModule(L.LightningModule):
         """backward only if streaming is turned on. If not, let pytorch do backward via loss.backward()"""
         if self.use_streaming:
             self.stream_network.backward(image, gradient)
+
+    def _configure_tile_delta(self):
+        delta = self.settings.tile_size - (
+            self.stream_network.tile_gradient_lost.left
+            + self.stream_network.tile_gradient_lost.right
+        )
+        delta = delta // self.stream_network.output_stride[-1]
+        delta *= self.stream_network.output_stride[-1]
+        # if delta < 3000:
+        #     delta = (3000 // delta + 1) * delta
+        print("tile delta value:", delta.detach().cpu())
+        return delta.detach().cpu()

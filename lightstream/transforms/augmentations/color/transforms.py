@@ -56,5 +56,5 @@ class HEDShift(ImageOnlyTransform):
         }
 
     def get_transform_init_args_names(self):
-        return ("h_shift_limit", "e_shift_limit", "d_shift_limit")
+        return "h_shift_limit", "e_shift_limit", "d_shift_limit"
 

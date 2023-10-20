@@ -10,6 +10,10 @@ from lightstream.transforms import (
     HEDShift,
     ElasticTransform,
     RandomRotate90,
+    ToTensor,
+    toDtype,
+    Normalize,
+    RandomCrop,
 )
 from lightstream.transforms import color_aug_hed
 
@@ -24,18 +28,23 @@ if __name__ == "__main__":
     pyvips_image = pyvips.Image.new_from_array(image)
     print(pyvips_image.width, pyvips_image.height, pyvips_image.bands)
     plt.imshow(pyvips_image.numpy())
-    plt.show()
 
     mask = (pyvips_image >= 250).bandand()
-    plt.imshow(mask.numpy())
-    plt.show()
 
-    transforms = Compose([RandomRotate90(p=1.0)])
-    sample = {'image': pyvips_image, 'mask': mask}
+    plt.imshow(mask.numpy(), alpha=0.4)
+
+    plt.show()
+    transforms = Compose([RandomCrop(200, 200, p=1.00)], is_check_shapes=False)
+
+    sample = {"image": pyvips_image, "mask": mask}
     new_image = transforms(**sample)
 
-    plt.imshow(new_image["image"].numpy())
-    plt.show()
+    out_image = new_image["image"]
+    out_mask = new_image["mask"]
 
-    plt.imshow(new_image["mask"].numpy())
+    print(out_image.format)
+    print(out_mask.format)
+
+    plt.imshow(out_image.numpy())
+    plt.imshow(out_mask.numpy(), alpha=0.3)
     plt.show()
