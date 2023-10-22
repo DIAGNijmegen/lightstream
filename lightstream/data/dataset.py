@@ -133,23 +133,6 @@ class StreamingClassificationDataset(Dataset):
     def __len__(self):
         return len(self.classification_frame)
 
-    def pad_or_crop_image(self, **kwargs):
-        """
-        TODO: Add this into the albumenations workflow
-        """
-        image = kwargs.get("image")
-        mask = kwargs.get("mask")
-
-        image = image.gravity(
-            "centre", self.img_size, self.img_size, background=[255, 255, 255]
-        )
-        # size of mask should match the size of the image after the encoder + extra downsampling
-        if mask:
-            mask = mask.gravity(
-                "centre", self.img_size, self.img_size, background=[0, 0, 0]
-            )
-
-        return image, mask
 
     def pad_to_tile_delta(self, **kwargs):
         """

@@ -5,8 +5,18 @@ Functional representations of the augmentations. Most will function as functiona
 """
 
 import pyvips
+from ...core.transforms_interface import ImageColorType
 
-__all__ = ["vflip", "hflip", "random_flip", "rot90", "transpose", "elastic_transform"]
+__all__ = [
+    "vflip",
+    "hflip",
+    "random_flip",
+    "rot90",
+    "transpose",
+    "rotate",
+    "elastic_transform",
+    "pad_with_params",
+]
 
 
 def vflip(img: pyvips.Image) -> pyvips.Image:
@@ -87,11 +97,20 @@ def transpose(img: pyvips.Image) -> pyvips.Image:
     return img.rot270()
 
 
+def rotate(
+    img: pyvips.Image,
+    angle: float,
+    interp: pyvips.Interpolate | str,
+    background: list[float, float, float],
+):
+    return img.similarity(angle=angle, interpolate=interp, background=background)
+
+
 def elastic_transform(
     img: pyvips.Image,
     alpha: float = 1.0,
     sigma: float = 50.0,
-    interpolation: pyvips.Interpolate = pyvips.Interpolate.new("bilinear"),
+    interpolation: str | pyvips.Interpolate = pyvips.Interpolate.new("bilinear"),
     background: list = [255, 255, 255],
     same_dxdy: bool = False,
 ) -> pyvips.Image:
@@ -150,3 +169,20 @@ def elastic_transform(
     image = img.mapim(new_coords, interpolate=interpolation, background=background)
 
     return image
+
+
+def pad_with_params(
+    img: pyvips.Image,
+    direction: str,
+    width: int,
+    height: int,
+    border_mode: int = pyvips.enums.Extend.MIRROR,
+    value: ImageColorType | None = None,
+) -> pyvips.Image:
+    print("img", img)
+    print("direction", direction)
+    print("width", width)
+    print("height", height)
+    print("border_mode", border_mode)
+    print("value", value)
+    return img.gravity(direction, width, height, extend=border_mode, background=value)

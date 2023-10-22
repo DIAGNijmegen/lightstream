@@ -12,8 +12,10 @@ import numpy as np
 import cv2
 
 # we need both albumentations functional and our custom one
+from enum import Enum
 from albumentations.augmentations.geometric import functional as F
 from albumentations.augmentations.functional import bbox_from_mask
+from albumentations.core.bbox_utils import denormalize_bbox, normalize_bbox
 
 from . import functional as FT
 
@@ -21,6 +23,7 @@ from ...core.transforms_interface import (
     BoxInternalType,
     DualTransform,
     KeypointInternalType,
+    ImageColorType,
 )
 
 __all__ = [
@@ -30,6 +33,7 @@ __all__ = [
     "Transpose",
     "ElasticTransform",
     "RandomRotate90",
+    "PadIfNeeded",
 ]
 
 
@@ -227,7 +231,9 @@ class ElasticTransform(DualTransform):
         p=0.5,
     ):
         super().__init__(always_apply, p)
-        print("Elastic transform is only supported for image-only datasets, do not use with bounding boxes/masks!")
+        print(
+            "Elastic transform is only supported for image-only datasets, do not use with bounding boxes/masks!"
+        )
         self.alpha = alpha
         self.sigma = sigma
         self.interpolation = interpolation
@@ -281,3 +287,229 @@ class ElasticTransform(DualTransform):
 
     def get_transform_init_args_names(self):
         return ("alpha", "sigma", "interpolation", "value", "mask_value", "same_dxdy")
+
+
+class PadIfNeeded(DualTransform):
+    """Pad side of the image / max if side is less than desired number.
+
+    Args:
+        min_height (int): minimal result image height.
+        min_width (int): minimal result image width.
+        pad_height_divisor (int): if not None, ensures image height is dividable by value of this argument.
+        pad_width_divisor (int): if not None, ensures image width is dividable by value of this argument.
+        position (Union[str, PositionType]): Position of the image. should be PositionType.CENTER or
+            PositionType.TOP_LEFT or PositionType.TOP_RIGHT or PositionType.BOTTOM_LEFT or PositionType.BOTTOM_RIGHT.
+            Default: PositionType.CENTER.
+        border_mode (pyvips enums extend): pyvips border mode.
+        value (int, float, list of int, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
+        mask_value (int, float,
+                    list of int,
+                    list of float): padding value for mask if border_mode is pyvips.enums.Extend.constant.
+        p (float): probability of applying the transform. Default: 1.0.
+
+    Targets:
+        image, mask, bbox, keypoints
+
+    Image types:
+        uint8, float32
+    """
+
+    class PositionType(Enum):
+        CENTER = "centre"
+        TOP_LEFT = "north-west"
+        TOP_RIGHT = "north-east"
+        BOTTOM_LEFT = "south-west"
+        BOTTOM_RIGHT = "south-east"
+
+    def __init__(
+        self,
+        min_height: int | None = 1024,
+        min_width: int | None = 1024,
+        pad_height_divisor: int | None = None,
+        pad_width_divisor: int | None = None,
+        position: PositionType | str = PositionType.CENTER,
+        border_mode: int = pyvips.enums.Extend.BACKGROUND,
+        value: ImageColorType | None = None,
+        mask_value: ImageColorType | None = None,
+        always_apply: bool = False,
+        p: float = 1.0,
+    ):
+        print(min_height, pad_height_divisor)
+        if (min_height is None) == (pad_height_divisor is None):
+            raise ValueError(
+                "Only one of 'min_height' and 'pad_height_divisor' parameters must be set"
+            )
+
+        if (min_width is None) == (pad_width_divisor is None):
+            raise ValueError(
+                "Only one of 'min_width' and 'pad_width_divisor' parameters must be set"
+            )
+
+        super(PadIfNeeded, self).__init__(always_apply, p)
+        self.min_height = min_height
+        self.min_width = min_width
+        self.pad_width_divisor = pad_width_divisor
+        self.pad_height_divisor = pad_height_divisor
+        self.position = PadIfNeeded.PositionType(position)
+        self.border_mode = border_mode
+        self.value = value
+        self.mask_value = mask_value
+
+    def update_params(self, params, **kwargs):
+        params = super(PadIfNeeded, self).update_params(params, **kwargs)
+        rows = params["rows"]
+        cols = params["cols"]
+
+        if self.min_height is not None:
+            if rows < self.min_height:
+                h_pad_top = int((self.min_height - rows) / 2.0)
+                h_pad_bottom = self.min_height - rows - h_pad_top
+            else:
+                h_pad_top = 0
+                h_pad_bottom = 0
+        else:
+            pad_remained = rows % self.pad_height_divisor
+            pad_rows = self.pad_height_divisor - pad_remained if pad_remained > 0 else 0
+
+            h_pad_top = pad_rows // 2
+            h_pad_bottom = pad_rows - h_pad_top
+
+        if self.min_width is not None:
+            if cols < self.min_width:
+                w_pad_left = int((self.min_width - cols) / 2.0)
+                w_pad_right = self.min_width - cols - w_pad_left
+            else:
+                w_pad_left = 0
+                w_pad_right = 0
+        else:
+            pad_remainder = cols % self.pad_width_divisor
+            pad_cols = (
+                self.pad_width_divisor - pad_remainder if pad_remainder > 0 else 0
+            )
+
+            w_pad_left = pad_cols // 2
+            w_pad_right = pad_cols - w_pad_left
+
+        (
+            h_pad_top,
+            h_pad_bottom,
+            w_pad_left,
+            w_pad_right,
+        ) = self.__update_position_params(
+            h_top=h_pad_top,
+            h_bottom=h_pad_bottom,
+            w_left=w_pad_left,
+            w_right=w_pad_right,
+        )
+
+        new_width = cols + w_pad_left + w_pad_right
+        new_height = rows + h_pad_top + h_pad_bottom
+
+        params.update(
+            {
+                "pad_top": h_pad_top,
+                "pad_bottom": h_pad_bottom,
+                "pad_left": w_pad_left,
+                "pad_right": w_pad_right,
+                "new_height": new_height,
+                "new_width": new_width,
+            }
+        )
+        return params
+
+    def apply(
+        self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params
+    ) -> pyvips.Image:
+        print(img.width, img.height)
+        print("new width and height", new_width, new_height)
+        print(self.position, self.position.value)
+        print("")
+        return FT.pad_with_params(
+            img,
+            direction=self.position.value,
+            width=new_width,
+            height=new_height,
+            border_mode=self.border_mode,
+            value=self.value,
+        )
+
+    def apply_to_mask(
+        self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params
+    ) -> pyvips.Image:
+        return FT.pad_with_params(
+            img,
+            direction=self.position.value,
+            width=new_width,
+            height=new_height,
+            border_mode=self.border_mode,
+            value=self.mask_value,
+        )
+
+    def apply_to_bbox(
+        self,
+        bbox: BoxInternalType,
+        pad_top: int = 0,
+        pad_bottom: int = 0,
+        pad_left: int = 0,
+        pad_right: int = 0,
+        rows: int = 0,
+        cols: int = 0,
+        **params
+    ) -> BoxInternalType:
+        x_min, y_min, x_max, y_max = denormalize_bbox(bbox, rows, cols)[:4]
+        bbox = x_min + pad_left, y_min + pad_top, x_max + pad_left, y_max + pad_top
+        return normalize_bbox(
+            bbox, rows + pad_top + pad_bottom, cols + pad_left + pad_right
+        )
+
+    def apply_to_keypoint(
+        self,
+        keypoint: KeypointInternalType,
+        pad_top: int = 0,
+        pad_bottom: int = 0,
+        pad_left: int = 0,
+        pad_right: int = 0,
+        **params
+    ) -> KeypointInternalType:
+        x, y, angle, scale = keypoint[:4]
+        return x + pad_left, y + pad_top, angle, scale
+
+    def get_transform_init_args_names(self):
+        return (
+            "min_height",
+            "min_width",
+            "pad_height_divisor",
+            "pad_width_divisor",
+            "border_mode",
+            "value",
+            "mask_value",
+        )
+
+    def __update_position_params(
+        self, h_top: int, h_bottom: int, w_left: int, w_right: int
+    ) -> tuple[int, int, int, int]:
+        if self.position == PadIfNeeded.PositionType.TOP_LEFT:
+            h_bottom += h_top
+            w_right += w_left
+            h_top = 0
+            w_left = 0
+
+        elif self.position == PadIfNeeded.PositionType.TOP_RIGHT:
+            h_bottom += h_top
+            w_left += w_right
+            h_top = 0
+            w_right = 0
+
+        elif self.position == PadIfNeeded.PositionType.BOTTOM_LEFT:
+            h_top += h_bottom
+            w_right += w_left
+            h_bottom = 0
+            w_left = 0
+
+        elif self.position == PadIfNeeded.PositionType.BOTTOM_RIGHT:
+            h_top += h_bottom
+            w_left += w_right
+            h_bottom = 0
+            w_right = 0
+
+        return h_top, h_bottom, w_left, w_right

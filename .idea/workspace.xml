@@ -6,29 +6,24 @@
   <component name="BlackConnectSettings" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/examples/maauw.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/functional.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/transforms.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/misc/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/misc/functional.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/misc/transforms.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/pytorch/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/pytorch/functional.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/pytorch/transforms.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/blur/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/blur/functional.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/blur/transforms.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/utils.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/data/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/data/dataset.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/doodle.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/doodle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/modules/streaming.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/streaming.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/run_augmentations.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/run_augmentations.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/scnn.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/scnn.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/color/functional.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/color/functional.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/color/transforms.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/color/transforms.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/functional.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/functional.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/transforms.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/crops/transforms.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/functional.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/functional.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/rotate.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/rotate.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/transforms.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/augmentations/geometric/transforms.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/transforms/core/transforms_interface.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/transforms/core/transforms_interface.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/notebooks/scnn_comparison.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/notebooks/scnn_comparison.ipynb" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -70,7 +65,7 @@
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;configurable.group.tools&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;me.lensvol.blackconnect.settings&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
@@ -86,7 +81,7 @@
       <recent name="C:\Users\Stephan\Desktop\projects\lightstream\images" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.maauw">
+  <component name="RunManager" selected="Python.run_augmentations">
     <configuration name="dataset" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="lightstream" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -230,10 +225,10 @@
     </list>
     <recent_temporary>
       <list>
-        <item itemvalue="Python.maauw" />
-        <item itemvalue="Python.doodle" />
-        <item itemvalue="Python.dataset" />
         <item itemvalue="Python.run_augmentations" />
+        <item itemvalue="Python.doodle" />
+        <item itemvalue="Python.maauw" />
+        <item itemvalue="Python.dataset" />
         <item itemvalue="Python tests.pytest in doodle.py" />
       </list>
     </recent_temporary>
@@ -252,6 +247,9 @@
       <workItem from="1697627184405" duration="6458000" />
       <workItem from="1697651359888" duration="10961000" />
       <workItem from="1697781543778" duration="20104000" />
+      <workItem from="1697832199247" duration="9737000" />
+      <workItem from="1697897681821" duration="19504000" />
+      <workItem from="1697965931869" duration="16951000" />
     </task>
     <servers />
   </component>
@@ -267,18 +265,19 @@
           <option name="timeStamp" value="1" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/lightstream/transforms/augmentations/pytorch/__init__.py</url>
-          <option name="timeStamp" value="2" />
+          <url>file://$PROJECT_DIR$/lightstream/transforms/core/composition.py</url>
+          <line>3</line>
+          <option name="timeStamp" value="3" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/lightstream$dataset.coverage" NAME="dataset Coverage Results" MODIFIED="1697814116655" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream/data" />
-    <SUITE FILE_PATH="coverage/lightstream$pytest_in_doodle_py.coverage" NAME="pytest in doodle.py Coverage Results" MODIFIED="1697664234018" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
-    <SUITE FILE_PATH="coverage/lightstream$doodle.coverage" NAME="doodle Coverage Results" MODIFIED="1697814927030" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
-    <SUITE FILE_PATH="coverage/lightstream$resnet.coverage" NAME="resnet Coverage Results" MODIFIED="1697455218358" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models" />
-    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697796651189" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$doodle.coverage" NAME="doodle Coverage Results" MODIFIED="1697987141356" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697989739878" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
     <SUITE FILE_PATH="coverage/lightstream$maauw.coverage" NAME="maauw Coverage Results" MODIFIED="1697818241185" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
+    <SUITE FILE_PATH="coverage/lightstream$pytest_in_doodle_py.coverage" NAME="pytest in doodle.py Coverage Results" MODIFIED="1697664234018" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$resnet.coverage" NAME="resnet Coverage Results" MODIFIED="1697455218358" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models" />
+    <SUITE FILE_PATH="coverage/lightstream$dataset.coverage" NAME="dataset Coverage Results" MODIFIED="1697814116655" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream/data" />
   </component>
 </project>
