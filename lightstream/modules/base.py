@@ -15,28 +15,30 @@ class BaseModel(StreamingModule):
         head: torch.nn.modules.container.Sequential,
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
+        accumulate_grad_batches=32,
         train_streaming_layers=True,
         use_streaming=True,
         *args,
         **kwargs
     ):
-        super().__init__(stream_net, tile_size, use_streaming, *args, **kwargs)
-
+        super().__init__(
+            stream_net,
+            tile_size,
+            use_streaming,
+            train_streaming_layers,
+            *args,
+            **kwargs
+        )
         self.head = head
         self.loss_fn = loss_fn
         self.train_streaming_layers = train_streaming_layers
+        self.params = self.extend_trainable_params()
+        self.accumulate_batches = accumulate_grad_batches
 
     def on_train_epoch_start(self) -> None:
         print("on train epoch start hook")
-        print("Printing model weights and their param/training attributes")
         print("Setting batchnorm layers to eval")
         self.freeze_streaming_normalization_layers()
-
-        for mod in self.stream_network.stream_module:
-            if hasattr(mod, "weight"):
-                print(mod, mod.weight)
-            else:
-                print(mod)
 
     def forward_head(self, x):
         return self.head(x)
@@ -50,18 +52,26 @@ class BaseModel(StreamingModule):
         self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any
     ) -> tuple[Any, Any, Any]:
         image, target = batch
-        fmap = self.forward_streaming(image)
+        opt = self.optimizers()
 
+        fmap = self.forward_streaming(image)
         # Can only be changed when streaming is enabled, otherwise not a lead variable
         if self.use_streaming:
             fmap.requires_grad = True
 
         output_head = self.forward_head(fmap)
-        loss = self.loss_fn(output_head, target)
+        loss = self.loss_fn(output_head, target) / self.accumulate_batches
 
-        return fmap, output_head, loss
+        self.manual_backward(loss, batch, fmap, output_head)
 
-    def backward(
+        # accumulate gradients of N batches
+        if (batch_idx + 1) % self.accumulate_batches == 0:
+            opt.step()
+            opt.zero_grad()
+
+        self.log_dict({"entropy loss": loss}, prog_bar=True)
+
+    def manual_backward(
         self,
         loss: torch.Tensor,
         batch: Any,
@@ -91,11 +101,9 @@ class BaseModel(StreamingModule):
         if self.train_streaming_layers and self.use_streaming:
             self.backward_streaming(input_image, fmap.grad)
 
-    def get_trainable_params(self):
-        if self.train_streaming_layers:
-            params = list(self.stream_network) + list(self.head)
-        else:
-            params = list(self.head)
-            for param in self.stream_network:
-                param.requires_grad = False
-        return params
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(self.params, lr=1e-3)
+        return opt
+
+    def extend_trainable_params(self):
+        return self.params + list(self.head.parameters())

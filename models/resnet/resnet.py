@@ -8,7 +8,6 @@ from torchvision.models import resnet18, resnet34, resnet50
 
 
 def split_resnet(net):
-
     stream_net = nn.Sequential(
         net.conv1,
         net.bn1,
@@ -29,10 +28,10 @@ class StreamingResNet(BaseModel):
     def __init__(
         self,
         model_name: str,
-        tile_size,
-        loss_fn,
-        train_streaming_layers=True,
-        use_streaming=True,
+        tile_size: int,
+        loss_fn: torch.nn.functional,
+        train_streaming_layers: bool = True,
+        use_streaming: bool = True,
         *args,
         **kwargs
     ):
@@ -50,5 +49,6 @@ class StreamingResNet(BaseModel):
             **kwargs
         )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     print(torch.cuda.is_available())

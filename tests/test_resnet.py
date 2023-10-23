@@ -3,7 +3,7 @@ import pytest
 import numpy as np
 from lightstream.utils.modelcheck import ModelCheck
 from torchvision.models import resnet18, resnet34, resnet50
-from models.resnet import split_resnet
+from models.resnet.resnet import split_resnet
 
 
 test_cases = [resnet18, resnet34, resnet50]

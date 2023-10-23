@@ -5,11 +5,15 @@ from lightstream.scnn import StreamingCNN
 
 
 class StreamingModule(L.LightningModule):
-    def __init__(self, stream_network, tile_size, use_streaming=True, *args, **kwargs):
+    def __init__(self, stream_network, tile_size, use_streaming=True, train_streaming_layers=True, *args, **kwargs):
         super().__init__()
-
+        # needed since we need a manual_backward
+        self.automatic_optimization = False
         self.tile_size = tile_size
         self.use_streaming = use_streaming
+        self.train_streaming_layers = train_streaming_layers
+        self._stream_module =  stream_network
+        self.params = self.get_trainable_params()
         self.stream_network = StreamingCNN(
             stream_network,
             tile_shape=(1, 3, tile_size, tile_size),
@@ -73,3 +77,11 @@ class StreamingModule(L.LightningModule):
         #     delta = (3000 // delta + 1) * delta
         print("tile delta value:", delta.detach().cpu())
         return delta.detach().cpu()
+
+    def get_trainable_params(self):
+        if self.train_streaming_layers:
+            params = list(self._stream_module.parameters())
+        else:
+            for param in self._stream_module.parameters():
+                param.requires_grad = False
+        return params
