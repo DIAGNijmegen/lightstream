@@ -1,9 +1,13 @@
 import torch
 
-from models.resnet.resnet import split_resnet
-from torchvision.models import resnet18, resnet34, resnet50
+
 from modules.base import BaseModel
+
+from models.resnet.resnet import split_resnet
 from models.streamingclam.clam import CLAM_MB, CLAM_SB
+
+from torchvision.models import resnet18, resnet34, resnet50
+from torchmetrics.functional import accuracy
 
 
 # Streamingclam works with resnets, can be extended to other encoders if needed
@@ -116,7 +120,7 @@ class StreamingCLAM(BaseModel):
 
         super().__init__(stream_net, head, tile_size, loss_fn, *args, **kwargs)
 
-        if ds_blocks is not None:
+        if self.ds_blocks is not None:
             self.ds_blocks = ds_blocks
 
     def add_maxpool_layers(self, network):
@@ -203,6 +207,32 @@ class StreamingCLAM(BaseModel):
 
         self.log_dict({"entropy loss": loss}, prog_bar=True)
 
+    def validation_step(self, batch, batch_idx):
+        loss, acc = self._shared_eval_step(batch, batch_idx)
+        metrics = {"val_acc": acc, "val_loss": loss}
+        self.log_dict(metrics, on_epoch=True)
+        return metrics
+
+    def test_step(self, batch, batch_idx):
+        loss, acc = self._shared_eval_step(batch, batch_idx)
+        metrics = {"test_acc": acc, "test_loss": loss}
+        self.log_dict(metrics, on_epoch=True)
+        return metrics
+
+    def _shared_eval_step(self, batch, batch_idx):
+        if len(batch) == 3:
+            image, mask, label = batch
+        else:
+            image, label = batch
+            mask = None
+
+        y_hat = self.forward(image)[0]
+        loss = self.loss_fn(y_hat, label)
+        y_hat = torch.argmax(y_hat, dim=1)
+        print(y_hat.shape)
+        acc = accuracy(y_hat, label, task="binary")
+        return loss, acc
+
 
 if __name__ == "__main__":
     model = StreamingCLAM(
@@ -210,7 +240,7 @@ if __name__ == "__main__":
         tile_size=1600,
         loss_fn=torch.nn.functional.cross_entropy,
         branch="sb",
-        n_classes=2,
+        n_classes=4,
         max_pool_kernel=8,
     )
 

@@ -67,7 +67,7 @@ class StreamingModule(L.LightningModule):
             self.stream_network.backward(image, gradient)
 
     def _configure_tile_delta(self):
-        delta = self.settings.tile_size - (
+        delta = self.tile_size - (
             self.stream_network.tile_gradient_lost.left
             + self.stream_network.tile_gradient_lost.right
         )
@@ -79,9 +79,12 @@ class StreamingModule(L.LightningModule):
         return delta.detach().cpu()
 
     def get_trainable_params(self):
+        print("Get trainable params", self.train_streaming_layers)
         if self.train_streaming_layers:
             params = list(self._stream_module.parameters())
+            return params
         else:
             for param in self._stream_module.parameters():
                 param.requires_grad = False
-        return params
+
+

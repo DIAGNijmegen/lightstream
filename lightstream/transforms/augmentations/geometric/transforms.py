@@ -19,22 +19,9 @@ from albumentations.core.bbox_utils import denormalize_bbox, normalize_bbox
 
 from . import functional as FT
 
-from ...core.transforms_interface import (
-    BoxInternalType,
-    DualTransform,
-    KeypointInternalType,
-    ImageColorType,
-)
+from ...core.transforms_interface import BoxInternalType, DualTransform, KeypointInternalType, ImageColorType
 
-__all__ = [
-    "VerticalFlip",
-    "HorizontalFlip",
-    "Flip",
-    "Transpose",
-    "ElasticTransform",
-    "RandomRotate90",
-    "PadIfNeeded",
-]
+__all__ = ["VerticalFlip", "HorizontalFlip", "Flip", "Transpose", "ElasticTransform", "RandomRotate90", "PadIfNeeded"]
 
 
 class VerticalFlip(DualTransform):
@@ -56,9 +43,7 @@ class VerticalFlip(DualTransform):
     def apply_to_bbox(self, bbox: BoxInternalType, **params) -> BoxInternalType:
         return F.bbox_vflip(bbox, **params)
 
-    def apply_to_keypoint(
-        self, keypoint: KeypointInternalType, **params
-    ) -> KeypointInternalType:
+    def apply_to_keypoint(self, keypoint: KeypointInternalType, **params) -> KeypointInternalType:
         return F.keypoint_vflip(keypoint, **params)
 
     def get_transform_init_args_names(self):
@@ -84,9 +69,7 @@ class HorizontalFlip(DualTransform):
     def apply_to_bbox(self, bbox: BoxInternalType, **params) -> BoxInternalType:
         return F.bbox_hflip(bbox, **params)
 
-    def apply_to_keypoint(
-        self, keypoint: KeypointInternalType, **params
-    ) -> KeypointInternalType:
+    def apply_to_keypoint(self, keypoint: KeypointInternalType, **params) -> KeypointInternalType:
         return F.keypoint_hflip(keypoint, **params)
 
     def get_transform_init_args_names(self):
@@ -155,9 +138,7 @@ class Flip(DualTransform):
     def apply_to_bbox(self, bbox: BoxInternalType, **params) -> BoxInternalType:
         return F.bbox_flip(bbox, **params)
 
-    def apply_to_keypoint(
-        self, keypoint: KeypointInternalType, **params
-    ) -> KeypointInternalType:
+    def apply_to_keypoint(self, keypoint: KeypointInternalType, **params) -> KeypointInternalType:
         return F.keypoint_flip(keypoint, **params)
 
     def get_transform_init_args_names(self):
@@ -183,9 +164,7 @@ class Transpose(DualTransform):
     def apply_to_bbox(self, bbox: BoxInternalType, **params) -> BoxInternalType:
         return F.bbox_transpose(bbox, 0, **params)
 
-    def apply_to_keypoint(
-        self, keypoint: KeypointInternalType, **params
-    ) -> KeypointInternalType:
+    def apply_to_keypoint(self, keypoint: KeypointInternalType, **params) -> KeypointInternalType:
         return F.keypoint_transpose(keypoint)
 
     def get_transform_init_args_names(self):
@@ -231,9 +210,7 @@ class ElasticTransform(DualTransform):
         p=0.5,
     ):
         super().__init__(always_apply, p)
-        print(
-            "Elastic transform is only supported for image-only datasets, do not use with bounding boxes/masks!"
-        )
+        print("Elastic transform is only supported for image-only datasets, do not use with bounding boxes/masks!")
         self.alpha = alpha
         self.sigma = sigma
         self.interpolation = interpolation
@@ -241,25 +218,12 @@ class ElasticTransform(DualTransform):
         self.mask_value = [0, 0, 0] if mask_value is None else mask_value
         self.same_dxdy = same_dxdy
 
-    def apply(
-        self,
-        img,
-        random_state=None,
-        interpolation=pyvips.Interpolate.new("bilinear"),
-        **params
-    ):
-        return FT.elastic_transform(
-            img, self.alpha, self.sigma, interpolation, self.value, self.same_dxdy
-        )
+    def apply(self, img, random_state=None, interpolation=pyvips.Interpolate.new("bilinear"), **params):
+        return FT.elastic_transform(img, self.alpha, self.sigma, interpolation, self.value, self.same_dxdy)
 
     def apply_to_mask(self, img, random_state=None, **params):
         return FT.elastic_transform(
-            img,
-            self.alpha,
-            self.sigma,
-            pyvips.Interpolate.new("nearest"),
-            self.mask_value,
-            self.same_dxdy,
+            img, self.alpha, self.sigma, pyvips.Interpolate.new("nearest"), self.mask_value, self.same_dxdy
         )
 
     def apply_to_bbox(self, bbox, random_state=None, **params):
@@ -271,12 +235,7 @@ class ElasticTransform(DualTransform):
         x_min, y_min, x_max, y_max = int(x_min), int(y_min), int(x_max), int(y_max)
         mask[y_min:y_max, x_min:x_max] = 1
         mask = F.elastic_transform(
-            mask,
-            self.alpha,
-            self.sigma,
-            pyvips.Interpolate.new("nearest"),
-            self.mask_value,
-            self.same_dxdy,
+            mask, self.alpha, self.sigma, pyvips.Interpolate.new("nearest"), self.mask_value, self.same_dxdy
         )
         bbox_returned = bbox_from_mask(mask)
         bbox_returned = F.normalize_bbox(bbox_returned, rows, cols)
@@ -334,16 +293,11 @@ class PadIfNeeded(DualTransform):
         always_apply: bool = False,
         p: float = 1.0,
     ):
-        print(min_height, pad_height_divisor)
         if (min_height is None) == (pad_height_divisor is None):
-            raise ValueError(
-                "Only one of 'min_height' and 'pad_height_divisor' parameters must be set"
-            )
+            raise ValueError("Only one of 'min_height' and 'pad_height_divisor' parameters must be set")
 
         if (min_width is None) == (pad_width_divisor is None):
-            raise ValueError(
-                "Only one of 'min_width' and 'pad_width_divisor' parameters must be set"
-            )
+            raise ValueError("Only one of 'min_width' and 'pad_width_divisor' parameters must be set")
 
         super(PadIfNeeded, self).__init__(always_apply, p)
         self.min_height = min_height
@@ -383,23 +337,13 @@ class PadIfNeeded(DualTransform):
                 w_pad_right = 0
         else:
             pad_remainder = cols % self.pad_width_divisor
-            pad_cols = (
-                self.pad_width_divisor - pad_remainder if pad_remainder > 0 else 0
-            )
+            pad_cols = self.pad_width_divisor - pad_remainder if pad_remainder > 0 else 0
 
             w_pad_left = pad_cols // 2
             w_pad_right = pad_cols - w_pad_left
 
-        (
-            h_pad_top,
-            h_pad_bottom,
-            w_pad_left,
-            w_pad_right,
-        ) = self.__update_position_params(
-            h_top=h_pad_top,
-            h_bottom=h_pad_bottom,
-            w_left=w_pad_left,
-            w_right=w_pad_right,
+        (h_pad_top, h_pad_bottom, w_pad_left, w_pad_right) = self.__update_position_params(
+            h_top=h_pad_top, h_bottom=h_pad_bottom, w_left=w_pad_left, w_right=w_pad_right
         )
 
         new_width = cols + w_pad_left + w_pad_right
@@ -417,13 +361,7 @@ class PadIfNeeded(DualTransform):
         )
         return params
 
-    def apply(
-        self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params
-    ) -> pyvips.Image:
-        print(img.width, img.height)
-        print("new width and height", new_width, new_height)
-        print(self.position, self.position.value)
-        print("")
+    def apply(self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params) -> pyvips.Image:
         return FT.pad_with_params(
             img,
             direction=self.position.value,
@@ -433,9 +371,7 @@ class PadIfNeeded(DualTransform):
             value=self.value,
         )
 
-    def apply_to_mask(
-        self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params
-    ) -> pyvips.Image:
+    def apply_to_mask(self, img: pyvips.Image, new_width: int = 0, new_height: int = 0, **params) -> pyvips.Image:
         return FT.pad_with_params(
             img,
             direction=self.position.value,
@@ -458,9 +394,7 @@ class PadIfNeeded(DualTransform):
     ) -> BoxInternalType:
         x_min, y_min, x_max, y_max = denormalize_bbox(bbox, rows, cols)[:4]
         bbox = x_min + pad_left, y_min + pad_top, x_max + pad_left, y_max + pad_top
-        return normalize_bbox(
-            bbox, rows + pad_top + pad_bottom, cols + pad_left + pad_right
-        )
+        return normalize_bbox(bbox, rows + pad_top + pad_bottom, cols + pad_left + pad_right)
 
     def apply_to_keypoint(
         self,

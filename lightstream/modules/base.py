@@ -97,7 +97,7 @@ class BaseModel(StreamingModule):
 
         # if use_streaming is False, backward through the stream_network is controlled by loss.backward()
         loss.backward()
-        input_image, _ = batch
+        input_image = batch[0]
         if self.train_streaming_layers and self.use_streaming:
             self.backward_streaming(input_image, fmap.grad)
 
@@ -106,4 +106,6 @@ class BaseModel(StreamingModule):
         return opt
 
     def extend_trainable_params(self):
-        return self.params + list(self.head.parameters())
+        if self.params:
+            return self.params + list(self.head.parameters())
+        return list(self.head.parameters())

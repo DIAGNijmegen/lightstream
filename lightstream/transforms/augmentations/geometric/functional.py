@@ -7,16 +7,7 @@ Functional representations of the augmentations. Most will function as functiona
 import pyvips
 from ...core.transforms_interface import ImageColorType
 
-__all__ = [
-    "vflip",
-    "hflip",
-    "random_flip",
-    "rot90",
-    "transpose",
-    "rotate",
-    "elastic_transform",
-    "pad_with_params",
-]
+__all__ = ["vflip", "hflip", "random_flip", "rot90", "transpose", "rotate", "elastic_transform", "pad_with_params"]
 
 
 def vflip(img: pyvips.Image) -> pyvips.Image:
@@ -97,12 +88,7 @@ def transpose(img: pyvips.Image) -> pyvips.Image:
     return img.rot270()
 
 
-def rotate(
-    img: pyvips.Image,
-    angle: float,
-    interp: pyvips.Interpolate | str,
-    background: list[float, float, float],
-):
+def rotate(img: pyvips.Image, angle: float, interp: pyvips.Interpolate | str, background: list[float, float, float]):
     return img.similarity(angle=angle, interpolate=interp, background=background)
 
 
@@ -179,10 +165,4 @@ def pad_with_params(
     border_mode: int = pyvips.enums.Extend.MIRROR,
     value: ImageColorType | None = None,
 ) -> pyvips.Image:
-    print("img", img)
-    print("direction", direction)
-    print("width", width)
-    print("height", height)
-    print("border_mode", border_mode)
-    print("value", value)
     return img.gravity(direction, width, height, extend=border_mode, background=value)

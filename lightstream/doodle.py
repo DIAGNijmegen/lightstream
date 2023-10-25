@@ -1,12 +1,4 @@
-def meowFunc(**kwargs):
-    options = {"option1": "default_value1", "option2": "default_value2", "option3": "default_value3"}
-
-    options = kwargs.pop("option21")
-    print("opts", options)
-    print("kw", kwargs)
+from torch.utils.data.sampler import WeightedRandomSampler
 
 
-meowFunc(option1="new_value1", option3="new_value3")
-
-
-# testFunc(option2="new_value2")
+print(list(WeightedRandomSampler([0.1, 0.5, 0.1, 0.1, 0.1, 0.1], 50, replacement=True)))
