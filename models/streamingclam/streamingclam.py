@@ -1,13 +1,13 @@
 import torch
 
-
 from modules.base import BaseModel
 
 from models.resnet.resnet import split_resnet
 from models.streamingclam.clam import CLAM_MB, CLAM_SB
 
 from torchvision.models import resnet18, resnet34, resnet50
-from torchmetrics.functional import accuracy
+from torchmetrics.classification import Accuracy, AUROC
+import torchmetrics
 
 
 # Streamingclam works with resnets, can be extended to other encoders if needed
@@ -97,6 +97,8 @@ class StreamingCLAM(BaseModel):
         self.instance_eval = instance_eval
         self.return_features = return_features
         self.attention_only = attention_only
+        self.check_val_auc = []
+        self.val_labels = []
 
         if self.max_pool_kernel < 0:
             raise ValueError(f"max_pool_kernel must be non-negative, found {max_pool_kernel}")
@@ -122,6 +124,16 @@ class StreamingCLAM(BaseModel):
 
         if self.ds_blocks is not None:
             self.ds_blocks = ds_blocks
+
+        # Define metrics
+        self.train_acc = Accuracy(task="binary", num_classes=n_classes)
+        self.train_auc = AUROC(task="binary", num_classes=n_classes)
+
+        self.val_acc = Accuracy(task="binary", num_classes=n_classes)
+        self.val_auc = AUROC(task="binary", num_classes=n_classes)
+
+        self.test_acc = Accuracy(task="binary", num_classes=n_classes)
+        self.test_auc = AUROC(task="binary", num_classes=n_classes)
 
     def add_maxpool_layers(self, network):
         ds_blocks = torch.nn.Sequential(torch.nn.MaxPool2d((self.max_pool_kernel, self.max_pool_kernel)))
@@ -205,18 +217,35 @@ class StreamingCLAM(BaseModel):
             opt.step()
             opt.zero_grad()
 
-        self.log_dict({"entropy loss": loss}, prog_bar=True)
+        self.train_acc(torch.argmax(logits, dim=1), label)
+        self.train_auc(torch.sigmoid(logits)[:, 1], label)
+
+        self.log_dict({"entropy loss": loss, "train_acc": self.train_acc, "train_auc": self.train_auc})
 
     def validation_step(self, batch, batch_idx):
-        loss, acc = self._shared_eval_step(batch, batch_idx)
-        metrics = {"val_acc": acc, "val_loss": loss}
-        self.log_dict(metrics, on_epoch=True)
+        loss, y_hat, label = self._shared_eval_step(batch, batch_idx)
+
+        self.val_labels.append(label.detach().cpu().numpy())
+        self.check_val_auc.append(y_hat.detach().cpu().numpy())
+
+        self.val_acc(torch.argmax(y_hat, dim=1), label)
+        self.val_auc(torch.sigmoid(y_hat)[:, 1], label)
+
+        # Should update and clear automatically, as per
+        # https://torchmetrics.readthedocs.io/en/stable/pages/lightning.html
+        # https: // lightning.ai / docs / pytorch / stable / extensions / logging.html
+        metrics = {"val_acc": self.val_acc, "val_auc": self.val_auc, "val_loss": loss}
+        self.log_dict(metrics, prog_bar=True)
         return metrics
 
     def test_step(self, batch, batch_idx):
-        loss, acc = self._shared_eval_step(batch, batch_idx)
-        metrics = {"test_acc": acc, "test_loss": loss}
-        self.log_dict(metrics, on_epoch=True)
+        loss, y_hat, label = self._shared_eval_step(batch, batch_idx)
+
+        self.test_acc(torch.argmax(y_hat, dim=1), label)
+        self.test_auc(torch.sigmoid(y_hat)[:, 1], label)
+
+        metrics = {"test_acc": self.test_acc, "test_auc": self.test_auc, "test_loss": loss}
+        self.log_dict(metrics, prog_bar=True)
         return metrics
 
     def _shared_eval_step(self, batch, batch_idx):
@@ -228,10 +257,8 @@ class StreamingCLAM(BaseModel):
 
         y_hat = self.forward(image)[0]
         loss = self.loss_fn(y_hat, label)
-        y_hat = torch.argmax(y_hat, dim=1)
-        print(y_hat.shape)
-        acc = accuracy(y_hat, label, task="binary")
-        return loss, acc
+
+        return loss, y_hat, label
 
 
 if __name__ == "__main__":
@@ -243,5 +270,3 @@ if __name__ == "__main__":
         n_classes=4,
         max_pool_kernel=8,
     )
-
-    print(model.head)

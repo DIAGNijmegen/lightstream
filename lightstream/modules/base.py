@@ -15,20 +15,13 @@ class BaseModel(StreamingModule):
         head: torch.nn.modules.container.Sequential,
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
-        accumulate_grad_batches=32,
+        accumulate_grad_batches=1,
         train_streaming_layers=True,
         use_streaming=True,
         *args,
         **kwargs
     ):
-        super().__init__(
-            stream_net,
-            tile_size,
-            use_streaming,
-            train_streaming_layers,
-            *args,
-            **kwargs
-        )
+        super().__init__(stream_net, tile_size, use_streaming, train_streaming_layers, *args, **kwargs)
         self.head = head
         self.loss_fn = loss_fn
         self.train_streaming_layers = train_streaming_layers
@@ -36,8 +29,6 @@ class BaseModel(StreamingModule):
         self.accumulate_batches = accumulate_grad_batches
 
     def on_train_epoch_start(self) -> None:
-        print("on train epoch start hook")
-        print("Setting batchnorm layers to eval")
         self.freeze_streaming_normalization_layers()
 
     def forward_head(self, x):
@@ -48,9 +39,7 @@ class BaseModel(StreamingModule):
         out = self.forward_head(fmap)
         return out
 
-    def training_step(
-        self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any
-    ) -> tuple[Any, Any, Any]:
+    def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
         image, target = batch
         opt = self.optimizers()
 
@@ -71,15 +60,7 @@ class BaseModel(StreamingModule):
 
         self.log_dict({"entropy loss": loss}, prog_bar=True)
 
-    def manual_backward(
-        self,
-        loss: torch.Tensor,
-        batch: Any,
-        fmap: Any,
-        out: Any,
-        *args: Any,
-        **kwargs: Any
-    ):
+    def manual_backward(self, loss: torch.Tensor, batch: Any, fmap: Any, out: Any, *args: Any, **kwargs: Any):
         """
 
         Parameters

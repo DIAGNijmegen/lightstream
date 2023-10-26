@@ -2,6 +2,7 @@ import torch
 
 import numpy as np
 import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 from pathlib import Path
 
@@ -32,17 +33,16 @@ def weighted_sampler(dataset):
 
 
 if __name__ == "__main__":
-    transforms = transforms.Compose([transforms.Resize((1600, 1600)), transforms.ToTensor()])
-    root = Path("/data/pathology/projects/pathology-bigpicture-streamingclam")
-    data_path = root / Path("data/breast/camelyon_packed_0.25mpp_tif/images")
-    mask_path = root / Path("data/breast/camelyon_packed_0.25mpp_tif/images_tissue_masks")
-    train_csv = root / Path("streaming_experiments/camelyon/data_splits/train_debug.csv")
-    val_csv = root / Path("streaming_experiments/camelyon/data_splits/val_debug.csv")
-    test_csv = root / Path("streaming_experiments/camelyon/data_splits/test.csv")
+    root = Path("/opt/ml")
+    data_path = root / Path("/input/data/images")
+    mask_path = root / Path("/input/data/tissue_masks")
+    train_csv = root / Path("/input/data/train.csv")
+    val_csv = root / Path("/input/data/val.csv")
+    test_csv = root / Path("/input/data/test.csv")
 
     model = StreamingCLAM(
         "resnet18",
-        tile_size=1600,
+        tile_size=9984,
         loss_fn=torch.nn.functional.cross_entropy,
         branch="sb",
         n_classes=2,
@@ -60,52 +60,70 @@ if __name__ == "__main__":
     train_dataset = StreamingClassificationDataset(
         img_dir=str(data_path),
         csv_file=str(train_csv),
-        tile_size=1600,
-        img_size=3200,
+        tile_size=9984,
+        img_size=32768,
         transform=[],
         mask_dir=mask_path,
-        mask_suffix="_tissue",
+        mask_suffix="",
         variable_input_shapes=True,
         tile_delta=tile_delta,
         network_output_stride=network_output_stride,
         filetype=".tif",
-        read_level=4,
+        read_level=1,
     )
 
     val_dataset = StreamingClassificationDataset(
         img_dir=str(data_path),
         csv_file=str(val_csv),
-        tile_size=1600,
-        img_size=3200,
+        tile_size=9984,
+        img_size=32768,
         transform=[],
         mask_dir=mask_path,
-        mask_suffix="_tissue",
+        mask_suffix="",
         variable_input_shapes=True,
         tile_delta=tile_delta,
         network_output_stride=network_output_stride,
         filetype=".tif",
-        read_level=4,
+        read_level=1,
     )
 
     test_dataset = StreamingClassificationDataset(
         img_dir=str(data_path),
         csv_file=str(test_csv),
-        tile_size=1600,
-        img_size=3200,
+        tile_size=9984,
+        img_size=32768,
         transform=[],
         mask_dir=mask_path,
-        mask_suffix="_tissue",
+        mask_suffix="",
         variable_input_shapes=True,
         tile_delta=tile_delta,
         network_output_stride=network_output_stride,
         filetype=".tif",
-        read_level=4,
+        read_level=1,
     )
 
     sampler = weighted_sampler(train_dataset)
-    train_loader = DataLoader(train_dataset, num_workers=1, sampler=sampler, shuffle=False)
-    val_loader = DataLoader(val_dataset, num_workers=1, shuffle=False)
+    train_loader = DataLoader(train_dataset, num_workers=3, sampler=sampler, shuffle=False)
+    val_loader = DataLoader(val_dataset, num_workers=3, shuffle=False)
+
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        filename="streamingclam-derma-{epoch:02d}-{val_loss:.2f}",
+        save_top_k=3,
+        save_last=False,
+        mode="min",
+        every_n_epochs=1,
+        verbose=True,
+    )
 
     # train model
-    trainer = pl.Trainer(accelerator="gpu")
+    trainer = pl.Trainer(
+        default_root_dir="/opt/ml/checkpoints",
+        accelerator="gpu",
+        max_epochs=2,
+        check_val_every_n_epoch=1,
+        devices=8,
+        strategy="ddp",
+        callbacks=[checkpoint_callback],
+    )
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)

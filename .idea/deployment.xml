@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="stephandooper@dlc-tornadus:2222 agent" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="stephandooper@dlc-tornadus:2222 agent" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+    <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="stephandooper@dlc-tornadus:2222 agent">
         <serverdata>
           <mappings>
-            <mapping deploy="/tmp/pycharm_project_471" local="$PROJECT_DIR$" />
+            <mapping deploy="/tmp/pycharm_project_805" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
