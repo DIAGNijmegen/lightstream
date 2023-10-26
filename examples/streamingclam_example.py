@@ -1,4 +1,6 @@
 import torch
+import json
+
 
 import numpy as np
 import lightning.pytorch as pl
@@ -13,7 +15,7 @@ from torch.utils.data import DataLoader
 # My own edits here
 from models.streamingclam.streamingclam import StreamingCLAM
 from data.dataset import StreamingClassificationDataset
-
+from examples.options import TrainConfig
 
 def weighted_sampler(dataset):
     labels = np.array([int(label) for label in dataset.labels])
@@ -32,24 +34,40 @@ def weighted_sampler(dataset):
     return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
 
 
+def prepare_dataset(csv_file, options):
+    return  StreamingClassificationDataset(
+        img_dir=options.image_path,
+        csv_file=csv_file,
+        tile_size=options.tile_size,
+        img_size=options.img_size,
+        transform=[],
+        mask_dir=options.mask_path,
+        mask_suffix=options.mask_suffix,
+        variable_input_shapes=options.variable_input_shapes,
+        tile_delta=tile_delta,
+        network_output_stride=network_output_stride,
+        filetype=options.filetype,
+        read_level=options.read_level,
+    )
+
+
 if __name__ == "__main__":
-    root = Path("/opt/ml")
-    data_path = root / Path("/input/data/images")
-    mask_path = root / Path("/input/data/tissue_masks")
-    train_csv = root / Path("/input/data/train.csv")
-    val_csv = root / Path("/input/data/val.csv")
-    test_csv = root / Path("/input/data/test.csv")
+    # Read json config from file
+    options = TrainConfig()
+    parser = options.configure_parser_with_options()
+    args = parser.parse_args()
+    options.parser_to_options(vars(args))
 
     model = StreamingCLAM(
-        "resnet18",
-        tile_size=9984,
+        options.encoder,
+        tile_size=options.tile_size,
         loss_fn=torch.nn.functional.cross_entropy,
-        branch="sb",
-        n_classes=2,
-        max_pool_kernel=0,
-        statistics_on_cpu=True,
-        verbose=False,
-        train_streaming_layers=False,
+        branch=options.branch,
+        n_classes=options.num_classes,
+        max_pool_kernel=options.max_pool_kernel,
+        statistics_on_cpu=options.statistics_on_cpu,
+        verbose=options.verbose,
+        train_streaming_layers=options.train_streaming_layers,
     )
 
     tile_delta = model._configure_tile_delta()
@@ -57,54 +75,13 @@ if __name__ == "__main__":
         model.stream_network.output_stride[1] * model.max_pool_kernel, model.stream_network.output_stride[1]
     )
 
-    train_dataset = StreamingClassificationDataset(
-        img_dir=str(data_path),
-        csv_file=str(train_csv),
-        tile_size=9984,
-        img_size=32768,
-        transform=[],
-        mask_dir=mask_path,
-        mask_suffix="",
-        variable_input_shapes=True,
-        tile_delta=tile_delta,
-        network_output_stride=network_output_stride,
-        filetype=".tif",
-        read_level=1,
-    )
-
-    val_dataset = StreamingClassificationDataset(
-        img_dir=str(data_path),
-        csv_file=str(val_csv),
-        tile_size=9984,
-        img_size=32768,
-        transform=[],
-        mask_dir=mask_path,
-        mask_suffix="",
-        variable_input_shapes=True,
-        tile_delta=tile_delta,
-        network_output_stride=network_output_stride,
-        filetype=".tif",
-        read_level=1,
-    )
-
-    test_dataset = StreamingClassificationDataset(
-        img_dir=str(data_path),
-        csv_file=str(test_csv),
-        tile_size=9984,
-        img_size=32768,
-        transform=[],
-        mask_dir=mask_path,
-        mask_suffix="",
-        variable_input_shapes=True,
-        tile_delta=tile_delta,
-        network_output_stride=network_output_stride,
-        filetype=".tif",
-        read_level=1,
-    )
+    train_dataset = prepare_dataset(options.train_csv, options)
+    val_dataset = prepare_dataset(options.val_csv, options)
+    test_dataset = prepare_dataset(options.test_csv, options)
 
     sampler = weighted_sampler(train_dataset)
-    train_loader = DataLoader(train_dataset, num_workers=3, sampler=sampler, shuffle=False)
-    val_loader = DataLoader(val_dataset, num_workers=3, shuffle=False)
+    train_loader = DataLoader(train_dataset, num_workers=options.num_workers, sampler=sampler, shuffle=False)
+    val_loader = DataLoader(val_dataset, num_workers=options.num_workers, shuffle=False)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
@@ -112,7 +89,6 @@ if __name__ == "__main__":
         save_top_k=3,
         save_last=False,
         mode="min",
-        every_n_epochs=1,
         verbose=True,
     )
 
@@ -120,10 +96,9 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         default_root_dir="/opt/ml/checkpoints",
         accelerator="gpu",
-        max_epochs=2,
-        check_val_every_n_epoch=1,
-        devices=8,
-        strategy="ddp",
+        max_epochs=options.num_epochs,
+        devices=options.num_gpus,
+        strategy=options.strategy,
         callbacks=[checkpoint_callback],
     )
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)

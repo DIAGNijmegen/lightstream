@@ -15,7 +15,7 @@ class BaseModel(StreamingModule):
         head: torch.nn.modules.container.Sequential,
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
-        accumulate_grad_batches=1,
+        accumulate_grad_batches=32,
         train_streaming_layers=True,
         use_streaming=True,
         *args,
