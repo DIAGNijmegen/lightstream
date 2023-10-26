@@ -17,6 +17,7 @@ class TrainConfig:
     num_gpus: int = 8
     strategy: str = "ddp"
     grad_batches: int = 32  # Gradient accumulation: the amount of batches before optimzier step
+    resume: bool = True # Whether to resume training from the last epochs
 
     # StreamingClam options
     num_epochs: int = 100  # The number of epochs to train (max)

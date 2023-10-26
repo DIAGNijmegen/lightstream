@@ -96,10 +96,9 @@ if __name__ == "__main__":
         verbose=True,
     )
 
-    last_checkpoint = Path(options.default_save_dir + "/checkpoints").glob("*last.ckp")
-    last_checkpoint_path = list(last_checkpoint)
-    print("last checkpoint file found?", last_checkpoint_path)
-    print("")
+    last_checkpoint = Path(options.default_save_dir + "/checkpoints").glob("*last.ckpt")
+    last_checkpoint_path = str(list(last_checkpoint)[0])
+
 
     # train model
     trainer = pl.Trainer(
@@ -110,4 +109,7 @@ if __name__ == "__main__":
         strategy=options.strategy,
         callbacks=[checkpoint_callback],
     )
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(model=model,
+                train_dataloaders=train_loader,
+                val_dataloaders=val_loader,
+                ckpt_path=last_checkpoint_path if options.resume else None)
