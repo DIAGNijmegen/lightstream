@@ -1,22 +1,3 @@
-"""
-                                 _
-                                | \
-                                | |
-                                | |
-           |\                   | |
-          /, ~\                / /
-         X     `-.....-------./ /
-          ~-. ~  ~              |
-             \             /    |
-              \  /_     ___\   /
-              | /\ ~~~~~   \ |
-              | | \        || |
-              | |\ \       || )
-             (_/ (_/      ((_/
-"""
-
-
-import torch
 import dataclasses
 from dataclasses_json import dataclass_json
 import argparse
@@ -35,6 +16,7 @@ class TrainConfig:
     default_save_dir: str =  "/opt/ml/checkpoints"
     num_gpus: int = 8
     strategy: str = "ddp"
+    grad_batches: int = 32  # Gradient accumulation: the amount of batches before optimzier step
 
     # StreamingClam options
     num_epochs: int = 100  # The number of epochs to train (max)
@@ -46,13 +28,13 @@ class TrainConfig:
     # Streaming options
     tile_size: int = 3200
     statistics_on_cpu: bool = True,
-    verbose: bool = False,
-    train_streaming_layers: bool = True,
+    verbose: bool = False
+    train_streaming_layers: bool = True
 
     # Dataloader options
     img_size: int = 32768 # represents image size if variable_input_shape=False, else the maximum image size
     variable_input_shapes: bool = True
-    filetype: str = ".tif",
+    filetype: str = ".tif"
     read_level: int = 1 # the level of the tif file (0 is highest resolution)
     num_workers: int= 3
 

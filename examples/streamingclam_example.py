@@ -1,7 +1,6 @@
 import torch
 import json
 
-
 import numpy as np
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -56,7 +55,10 @@ if __name__ == "__main__":
     options = TrainConfig()
     parser = options.configure_parser_with_options()
     args = parser.parse_args()
+    print(args)
     options.parser_to_options(vars(args))
+
+    print(options)
 
     model = StreamingCLAM(
         options.encoder,
@@ -68,6 +70,7 @@ if __name__ == "__main__":
         statistics_on_cpu=options.statistics_on_cpu,
         verbose=options.verbose,
         train_streaming_layers=options.train_streaming_layers,
+        accumulate_grad_batches=options.grad_batches
     )
 
     tile_delta = model._configure_tile_delta()
@@ -84,17 +87,23 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, num_workers=options.num_workers, shuffle=False)
 
     checkpoint_callback = ModelCheckpoint(
+        dirpath=options.default_save_dir + "/checkpoints",
         monitor="val_loss",
         filename="streamingclam-derma-{epoch:02d}-{val_loss:.2f}",
         save_top_k=3,
-        save_last=False,
+        save_last=True,
         mode="min",
         verbose=True,
     )
 
+    last_checkpoint = Path(options.default_save_dir + "/checkpoints").glob("*last.ckp")
+    last_checkpoint_path = list(last_checkpoint)
+    print("last checkpoint file found?", last_checkpoint_path)
+    print("")
+
     # train model
     trainer = pl.Trainer(
-        default_root_dir="/opt/ml/checkpoints",
+        default_root_dir=options.default_save_dir,
         accelerator="gpu",
         max_epochs=options.num_epochs,
         devices=options.num_gpus,
