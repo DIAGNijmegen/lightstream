@@ -16,6 +16,7 @@ from models.streamingclam.streamingclam import StreamingCLAM
 from data.dataset import StreamingClassificationDataset
 from examples.options import TrainConfig
 
+
 def weighted_sampler(dataset):
     labels = np.array([int(label) for label in dataset.labels])
 
@@ -34,7 +35,7 @@ def weighted_sampler(dataset):
 
 
 def prepare_dataset(csv_file, options):
-    return  StreamingClassificationDataset(
+    return StreamingClassificationDataset(
         img_dir=options.image_path,
         csv_file=csv_file,
         tile_size=options.tile_size,
@@ -70,7 +71,8 @@ if __name__ == "__main__":
         statistics_on_cpu=options.statistics_on_cpu,
         verbose=options.verbose,
         train_streaming_layers=options.train_streaming_layers,
-        accumulate_grad_batches=options.grad_batches
+        accumulate_grad_batches=options.grad_batches,
+        dtype=torch.float16,
     )
 
     tile_delta = model._configure_tile_delta()
@@ -99,7 +101,6 @@ if __name__ == "__main__":
     last_checkpoint = Path(options.default_save_dir + "/checkpoints").glob("*last.ckpt")
     last_checkpoint_path = str(list(last_checkpoint)[0])
 
-
     # train model
     trainer = pl.Trainer(
         default_root_dir=options.default_save_dir,
@@ -108,8 +109,11 @@ if __name__ == "__main__":
         devices=options.num_gpus,
         strategy=options.strategy,
         callbacks=[checkpoint_callback],
+        precision="16-mixed",
     )
-    trainer.fit(model=model,
-                train_dataloaders=train_loader,
-                val_dataloaders=val_loader,
-                ckpt_path=last_checkpoint_path if options.resume else None)
+    trainer.fit(
+        model=model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=last_checkpoint_path if options.resume else None,
+    )

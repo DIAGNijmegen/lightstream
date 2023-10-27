@@ -12,7 +12,7 @@ class StreamingModule(L.LightningModule):
         self.tile_size = tile_size
         self.use_streaming = use_streaming
         self.train_streaming_layers = train_streaming_layers
-        self._stream_module =  stream_network
+        self._stream_module = stream_network
         self.params = self.get_trainable_params()
         self.stream_network = StreamingCNN(
             stream_network,
@@ -32,13 +32,14 @@ class StreamingModule(L.LightningModule):
         if not self.use_streaming:
             self.disable_streaming()
 
+        # set dtype to float16 after initialization, becuase half is not implemented for cpu
+        print("dtype in streaming:", kwargs.get("dtype"))
+        if kwargs.get("dtype") == torch.half:
+            self.stream_network.dtype = torch.half
+
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
-        freeze_layers = [
-            l
-            for l in self.stream_network.stream_module.modules()
-            if isinstance(l, torch.nn.BatchNorm2d)
-        ]
+        freeze_layers = [l for l in self.stream_network.stream_module.modules() if isinstance(l, torch.nn.BatchNorm2d)]
 
         for mod in freeze_layers:
             mod.eval()
@@ -54,11 +55,7 @@ class StreamingModule(L.LightningModule):
         self.use_streaming = True
 
     def forward_streaming(self, x):
-        out = (
-            self.stream_network(x)
-            if self.use_streaming
-            else self.stream_network.stream_module(x)
-        )
+        out = self.stream_network(x) if self.use_streaming else self.stream_network.stream_module(x)
         return out
 
     def backward_streaming(self, image, gradient):
@@ -68,8 +65,7 @@ class StreamingModule(L.LightningModule):
 
     def _configure_tile_delta(self):
         delta = self.tile_size - (
-            self.stream_network.tile_gradient_lost.left
-            + self.stream_network.tile_gradient_lost.right
+            self.stream_network.tile_gradient_lost.left + self.stream_network.tile_gradient_lost.right
         )
         delta = delta // self.stream_network.output_stride[-1]
         delta *= self.stream_network.output_stride[-1]
@@ -86,5 +82,3 @@ class StreamingModule(L.LightningModule):
         else:
             for param in self._stream_module.parameters():
                 param.requires_grad = False
-
-

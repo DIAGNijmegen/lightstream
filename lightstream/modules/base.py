@@ -41,46 +41,16 @@ class BaseModel(StreamingModule):
 
     def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
         image, target = batch
-        opt = self.optimizers()
+        self.image = image
 
-        fmap = self.forward_streaming(image)
-        # Can only be changed when streaming is enabled, otherwise not a lead variable
-        if self.use_streaming:
-            fmap.requires_grad = True
+        self.str_output = self.forward_streaming(image)
+        self.str_output.requires_grad = self.training
 
-        output_head = self.forward_head(fmap)
-        loss = self.loss_fn(output_head, target) / self.accumulate_batches
-
-        self.manual_backward(loss, batch, fmap, output_head)
-
-        # accumulate gradients of N batches
-        if (batch_idx + 1) % self.accumulate_batches == 0:
-            opt.step()
-            opt.zero_grad()
+        out = self.forward_head(self.str_output[0])
+        loss = self.loss_fn(out, target)
 
         self.log_dict({"entropy loss": loss}, prog_bar=True)
-
-    def manual_backward(self, loss: torch.Tensor, batch: Any, fmap: Any, out: Any, *args: Any, **kwargs: Any):
-        """
-
-        Parameters
-        ----------
-        loss : torch.Tensor, the loss of the model
-        batch : The NHWC input image to the model
-        out: The (fmap, out) output tuple from the training step. Needed for fmap.grad
-        args
-        kwargs
-
-        Returns
-        -------
-
-        """
-
-        # if use_streaming is False, backward through the stream_network is controlled by loss.backward()
-        loss.backward()
-        input_image = batch[0]
-        if self.train_streaming_layers and self.use_streaming:
-            self.backward_streaming(input_image, fmap.grad)
+        return loss
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.params, lr=1e-3)
@@ -90,3 +60,14 @@ class BaseModel(StreamingModule):
         if self.params:
             return self.params + list(self.head.parameters())
         return list(self.head.parameters())
+
+    def backward(self, loss):
+        loss.backward()
+        del loss
+
+        # Don't call this>? https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#things-to-avoid
+        torch.cuda.empty_cache()
+        if self.train_streaming_layers and self.use_streaming:
+            with torch.set_grad_enabled(True):
+                self.backward_streaming(self.image[None], self.str_output.grad)
+        del self.str_output

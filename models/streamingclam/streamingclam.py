@@ -192,15 +192,16 @@ class StreamingCLAM(BaseModel):
             image, label = batch
             mask = None
 
-        opt = self.optimizers()
+        self.image = image
+        self.str_output = self.forward_streaming(image)
+        self.str_output.requires_grad = self.training
 
-        fmap = self.forward_streaming(image)
-        # Can only be changed when streaming is enabled, otherwise not a lead variable
-        if self.use_streaming:
-            fmap.requires_grad = True
+        # Can only be changed when streaming is enabled, otherwise not a leaf variable
+        # if self.use_streaming:
+        #    self.str_output.requires_grad = True
 
         logits, Y_prob, Y_hat, A_raw, instance_dict = self.forward_head(
-            fmap,
+            self.str_output,
             mask=mask,
             instance_eval=self.instance_eval,
             label=label if self.instance_eval else None,
@@ -208,14 +209,7 @@ class StreamingCLAM(BaseModel):
             attention_only=self.attention_only,
         )
 
-        loss = self.loss_fn(logits, label) / self.accumulate_batches
-
-        self.manual_backward(loss, batch, fmap, logits)
-
-        # accumulate gradients of N batches
-        if (batch_idx + 1) % self.accumulate_batches == 0:
-            opt.step()
-            opt.zero_grad()
+        loss = self.loss_fn(logits, label)
 
         self.train_acc(torch.argmax(logits, dim=1), label)
         self.train_auc(torch.sigmoid(logits)[:, 1], label)
