@@ -15,7 +15,7 @@ class TrainConfig:
     default_save_dir: str = "/opt/ml/checkpoints"
     num_gpus: int = 8
     strategy: str = "ddp"
-    grad_batches: int = 1  # Gradient accumulation: the amount of batches before optimzier step
+    grad_batches: int = 8  # Gradient accumulation: the amount of batches before optimzier step
     resume: bool = True  # Whether to resume training from the last epochs
 
     # StreamingClam options

@@ -11,8 +11,6 @@
       <change beforePath="$PROJECT_DIR$/examples/streamingclam_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/streamingclam_example.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/modules/base.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/base.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lightstream/modules/streaming.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/streaming.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/scnn.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/scnn.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/streamingclam.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/streamingclam/streamingclam.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -248,7 +246,7 @@
       <workItem from="1698314947601" duration="14066000" />
       <workItem from="1698333317230" duration="185000" />
       <workItem from="1698394748608" duration="8480000" />
-      <workItem from="1698415303039" duration="4576000" />
+      <workItem from="1698415303039" duration="5141000" />
     </task>
     <servers />
   </component>
@@ -276,6 +274,6 @@
     <SUITE FILE_PATH="coverage/lightstream$streamingclam.coverage" NAME="streamingclam Coverage Results" MODIFIED="1698017104776" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models/streamingclam" />
     <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697989739878" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
     <SUITE FILE_PATH="coverage/lightstream$maauw.coverage" NAME="maauw Coverage Results" MODIFIED="1697818241185" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
-    <SUITE FILE_PATH="coverage/lightstream$streamingclam_example.coverage" NAME="streamingclam_example Coverage Results" MODIFIED="1698420669288" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
+    <SUITE FILE_PATH="coverage/lightstream$streamingclam_example.coverage" NAME="streamingclam_example Coverage Results" MODIFIED="1698421221582" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
   </component>
 </project>

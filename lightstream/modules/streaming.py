@@ -8,7 +8,6 @@ class StreamingModule(L.LightningModule):
     def __init__(self, stream_network, tile_size, use_streaming=True, train_streaming_layers=True, *args, **kwargs):
         super().__init__()
         # needed since we need a manual_backward
-        self.automatic_optimization = False
         self.tile_size = tile_size
         self.use_streaming = use_streaming
         self.train_streaming_layers = train_streaming_layers

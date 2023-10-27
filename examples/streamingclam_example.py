@@ -71,7 +71,6 @@ if __name__ == "__main__":
         statistics_on_cpu=options.statistics_on_cpu,
         verbose=options.verbose,
         train_streaming_layers=options.train_streaming_layers,
-        accumulate_grad_batches=options.grad_batches,
         dtype=torch.float16,
     )
 
@@ -102,6 +101,7 @@ if __name__ == "__main__":
     last_checkpoint_path = str(list(last_checkpoint)[0])
 
     # train model
+    # for gradient checkpointing: https: // lightning.ai / docs / pytorch / stable / advanced / training_tricks.html
     trainer = pl.Trainer(
         default_root_dir=options.default_save_dir,
         accelerator="gpu",
@@ -110,6 +110,7 @@ if __name__ == "__main__":
         strategy=options.strategy,
         callbacks=[checkpoint_callback],
         precision="16-mixed",
+        accumulate_grad_batches=options.grad_batches,
     )
     trainer.fit(
         model=model,

@@ -15,7 +15,6 @@ class BaseModel(StreamingModule):
         head: torch.nn.modules.container.Sequential,
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
-        accumulate_grad_batches=32,
         train_streaming_layers=True,
         use_streaming=True,
         *args,
@@ -26,7 +25,6 @@ class BaseModel(StreamingModule):
         self.loss_fn = loss_fn
         self.train_streaming_layers = train_streaming_layers
         self.params = self.extend_trainable_params()
-        self.accumulate_batches = accumulate_grad_batches
 
     def on_train_epoch_start(self) -> None:
         self.freeze_streaming_normalization_layers()
