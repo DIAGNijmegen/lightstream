@@ -1,5 +1,6 @@
 import torch
 import json
+import warnings
 
 import numpy as np
 import lightning.pytorch as pl
@@ -97,10 +98,16 @@ if __name__ == "__main__":
         verbose=True,
     )
 
-    last_checkpoint = Path(options.default_save_dir + "/checkpoints").glob("*last.ckpt")
-    last_checkpoint_path = str(list(last_checkpoint)[0])
+    try:
+        # Check for last checkpoint
+        last_checkpoint = list(Path(options.default_save_dir + "/checkpoints").glob("*last.ckpt"))
+        last_checkpoint_path = str(last_checkpoint[0])
+    except IndexError:
+        if options.resume:
+            warnings.warn("Resume option enabled, but no checkpoint files found. Training will start from scratch.")
+        last_checkpoint_path = None
 
-    # train model
+    # Train model
     # for gradient checkpointing: https: // lightning.ai / docs / pytorch / stable / advanced / training_tricks.html
     trainer = pl.Trainer(
         default_root_dir=options.default_save_dir,
@@ -116,5 +123,5 @@ if __name__ == "__main__":
         model=model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        ckpt_path=last_checkpoint_path if options.resume else None,
+        ckpt_path=last_checkpoint_path if (options.resume and last_checkpoint_path) else None,
     )
