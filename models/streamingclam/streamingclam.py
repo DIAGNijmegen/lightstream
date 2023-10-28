@@ -97,8 +97,6 @@ class StreamingCLAM(BaseModel):
         self.instance_eval = instance_eval
         self.return_features = return_features
         self.attention_only = attention_only
-        self.check_val_auc = []
-        self.val_labels = []
 
         if self.max_pool_kernel < 0:
             raise ValueError(f"max_pool_kernel must be non-negative, found {max_pool_kernel}")
@@ -211,16 +209,15 @@ class StreamingCLAM(BaseModel):
 
         loss = self.loss_fn(logits, label)
 
-        self.train_acc(torch.argmax(logits, dim=1), label)
-        self.train_auc(torch.sigmoid(logits)[:, 1], label)
+        self.train_acc(torch.argmax(logits, dim=1).detach(), label)
+        self.train_auc(torch.sigmoid(logits)[:, 1].detach(), label)
 
-        self.log_dict({"entropy loss": loss, "train_acc": self.train_acc, "train_auc": self.train_auc})
+        self.log_dict({"entropy loss": loss.detach(), "train_acc": self.train_acc, "train_auc": self.train_auc})
+
+        return loss
 
     def validation_step(self, batch, batch_idx):
         loss, y_hat, label = self._shared_eval_step(batch, batch_idx)
-
-        self.val_labels.append(label.detach().cpu().numpy())
-        self.check_val_auc.append(y_hat.detach().cpu().numpy())
 
         self.val_acc(torch.argmax(y_hat, dim=1), label)
         self.val_auc(torch.sigmoid(y_hat)[:, 1], label)
@@ -235,8 +232,8 @@ class StreamingCLAM(BaseModel):
     def test_step(self, batch, batch_idx):
         loss, y_hat, label = self._shared_eval_step(batch, batch_idx)
 
-        self.test_acc(torch.argmax(y_hat, dim=1), label)
-        self.test_auc(torch.sigmoid(y_hat)[:, 1], label)
+        self.test_acc(torch.argmax(y_hat, dim=1))
+        self.test_auc(torch.sigmoid(y_hat)[:, 1])
 
         metrics = {"test_acc": self.test_acc, "test_auc": self.test_auc, "test_loss": loss}
         self.log_dict(metrics, prog_bar=True)
@@ -249,10 +246,10 @@ class StreamingCLAM(BaseModel):
             image, label = batch
             mask = None
 
-        y_hat = self.forward(image)[0]
-        loss = self.loss_fn(y_hat, label)
+        y_hat = self.forward(image)[0].detach()
+        loss = self.loss_fn(y_hat, label).detach()
 
-        return loss, y_hat, label
+        return loss, y_hat, label.detach()
 
 
 if __name__ == "__main__":

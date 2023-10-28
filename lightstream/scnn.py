@@ -916,13 +916,10 @@ class StreamingCNN(object):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                print("dtype during streaming", self.dtype)
                 if self.dtype == torch.float16:
-                    print("using autocast")
                     with autocast():
                         tile_output = self.stream_module(tile)
                 else:
-                    print("using normal")
                     tile_output = self.stream_module(tile)
 
                 del tile  # memory management

@@ -75,7 +75,8 @@ class StreamingClassificationDataset(Dataset):
 
     def get_img_path(self, idx):
         img_fname = self.classification_frame.iloc[idx, 0]
-        label = self.classification_frame.iloc[idx, 1]
+        label = self.classification_frame.iloc[idx, 3]
+
         img_path = self.img_dir / Path(img_fname).with_suffix(self.filetype)
 
         if self.mask_dir:

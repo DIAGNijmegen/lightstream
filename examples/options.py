@@ -14,7 +14,7 @@ class TrainConfig:
     mask_suffix: str = ""  # the suffix for mask tissues e.g. tumor_069_<mask_suffix>.tif
     default_save_dir: str = "/opt/ml/checkpoints"
     num_gpus: int = 8
-    strategy: str = "ddp"
+    strategy: str = "auto"
     grad_batches: int = 8  # Gradient accumulation: the amount of batches before optimzier step
     resume: bool = True  # Whether to resume training from the last epochs
 

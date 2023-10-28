@@ -47,7 +47,7 @@ class BaseModel(StreamingModule):
         out = self.forward_head(self.str_output[0])
         loss = self.loss_fn(out, target)
 
-        self.log_dict({"entropy loss": loss}, prog_bar=True)
+        self.log_dict({"entropy loss": loss.detach()}, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -61,11 +61,9 @@ class BaseModel(StreamingModule):
 
     def backward(self, loss):
         loss.backward()
-        del loss
-
+        # del loss
         # Don't call this>? https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#things-to-avoid
         torch.cuda.empty_cache()
         if self.train_streaming_layers and self.use_streaming:
-            with torch.set_grad_enabled(True):
-                self.backward_streaming(self.image[None], self.str_output.grad)
+            self.backward_streaming(self.image, self.str_output.grad)
         del self.str_output

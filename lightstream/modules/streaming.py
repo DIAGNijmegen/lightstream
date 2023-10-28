@@ -7,7 +7,6 @@ from lightstream.scnn import StreamingCNN
 class StreamingModule(L.LightningModule):
     def __init__(self, stream_network, tile_size, use_streaming=True, train_streaming_layers=True, *args, **kwargs):
         super().__init__()
-        # needed since we need a manual_backward
         self.tile_size = tile_size
         self.use_streaming = use_streaming
         self.train_streaming_layers = train_streaming_layers
@@ -71,7 +70,7 @@ class StreamingModule(L.LightningModule):
         # if delta < 3000:
         #     delta = (3000 // delta + 1) * delta
         print("tile delta value:", delta.detach().cpu())
-        return delta.detach().cpu()
+        return delta.detach().cpu().numpy()
 
     def get_trainable_params(self):
         print("Get trainable params", self.train_streaming_layers)

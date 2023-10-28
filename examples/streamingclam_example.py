@@ -5,6 +5,7 @@ import numpy as np
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 
+
 from pathlib import Path
 
 from torch.utils.data.sampler import WeightedRandomSampler
@@ -109,12 +110,7 @@ if __name__ == "__main__":
         devices=options.num_gpus,
         strategy=options.strategy,
         callbacks=[checkpoint_callback],
-        precision="16-mixed",
         accumulate_grad_batches=options.grad_batches,
+        precision="16-mixed",
     )
-    trainer.fit(
-        model=model,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-        ckpt_path=last_checkpoint_path if options.resume else None,
-    )
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
