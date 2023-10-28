@@ -6,7 +6,6 @@
   <component name="BlackConnectSettings" lineLength="120" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/Dockerfile" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/examples/streamingclam_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/streamingclam_example.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -42,7 +41,7 @@
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
     "WebServerToolWindowFactoryState": "true",
-    "git-widget-placeholder": "Merging new__template",
+    "git-widget-placeholder": "new__template",
     "last_opened_file_path": "C:/Users/Stephan/Desktop/projects/lightstream/examples",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -246,7 +245,7 @@
       <workItem from="1698415303039" duration="6046000" />
       <workItem from="1698423122286" duration="81000" />
       <workItem from="1698495998618" duration="12641000" />
-      <workItem from="1698512695346" duration="4520000" />
+      <workItem from="1698512695346" duration="4555000" />
     </task>
     <servers />
   </component>
