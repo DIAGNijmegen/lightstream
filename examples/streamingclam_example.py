@@ -86,8 +86,10 @@ if __name__ == "__main__":
     test_dataset = prepare_dataset(options.test_csv, options)
 
     sampler = weighted_sampler(train_dataset)
-    train_loader = DataLoader(train_dataset, num_workers=options.num_workers, sampler=sampler, shuffle=False)
-    val_loader = DataLoader(val_dataset, num_workers=options.num_workers, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset, num_workers=options.num_workers, sampler=sampler, shuffle=False, prefetch_factor=1
+    )
+    val_loader = DataLoader(val_dataset, num_workers=options.num_workers, shuffle=False, prefetch_factor=1)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=options.default_save_dir + "/checkpoints",

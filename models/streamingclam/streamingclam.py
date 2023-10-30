@@ -7,7 +7,6 @@ from models.streamingclam.clam import CLAM_MB, CLAM_SB
 
 from torchvision.models import resnet18, resnet34, resnet50
 from torchmetrics.classification import Accuracy, AUROC
-import torchmetrics
 
 
 # Streamingclam works with resnets, can be extended to other encoders if needed
@@ -212,13 +211,21 @@ class StreamingCLAM(BaseModel):
         self.train_acc(torch.argmax(logits, dim=1).detach(), label)
         self.train_auc(torch.sigmoid(logits)[:, 1].detach(), label)
 
-        self.log_dict({"entropy loss": loss.detach(), "train_acc": self.train_acc, "train_auc": self.train_auc})
-
+        self.log_dict(
+            {
+                "train_acc": self.train_acc.compute(),
+                "train_auc": self.train_auc.compute(),
+                "entropy loss": loss.detach(),
+            },
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, y_hat, label = self._shared_eval_step(batch, batch_idx)
-
+        print(y_hat, label)
         self.val_acc(torch.argmax(y_hat, dim=1), label)
         self.val_auc(torch.sigmoid(y_hat)[:, 1], label)
 
