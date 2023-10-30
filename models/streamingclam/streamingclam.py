@@ -114,13 +114,11 @@ class StreamingCLAM(BaseModel):
         if self.max_pool_kernel > 0:
             if self.stream_maxpool_kernel:
                 stream_net = self.add_maxpool_layers(stream_net)
+                super().__init__(stream_net, head, tile_size, loss_fn, *args, **kwargs)
             else:
                 ds_blocks, head = self.add_maxpool_layers(head)
-
-        super().__init__(stream_net, head, tile_size, loss_fn, *args, **kwargs)
-
-        if self.ds_blocks is not None:
-            self.ds_blocks = ds_blocks
+                super().__init__(stream_net, head, tile_size, loss_fn, *args, **kwargs)
+                self.ds_blocks = ds_blocks
 
         # Define metrics
         self.train_acc = Accuracy(task="binary", num_classes=n_classes)

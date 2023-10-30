@@ -14,7 +14,7 @@ class TrainConfig:
     mask_suffix: str = ""  # the suffix for mask tissues e.g. tumor_069_<mask_suffix>.tif
     default_save_dir: str = "/opt/ml/checkpoints"
     num_gpus: int = 8
-    strategy: str = "auto" # "ddp_find_unused_parameters_true"
+    strategy: str = "ddp_find_unused_parameters_true"
     grad_batches: int = 8  # Gradient accumulation: the amount of batches before optimzier step
     resume: bool = True  # Whether to resume training from the last epochs
 
@@ -22,11 +22,11 @@ class TrainConfig:
     num_epochs: int = 100  # The number of epochs to train (max)
     encoder: str = "resnet34"  # Resnet 18, ResNet34, Resnet50
     branch: str = "sb"  # sb or mb
-    max_pool_kernel: int = 4
+    max_pool_kernel: int = 2
     num_classes: int = 2
 
     # Streaming options
-    tile_size: int = 3200
+    tile_size: int = 6400
     statistics_on_cpu: bool = True
     verbose: bool = False
     train_streaming_layers: bool = True

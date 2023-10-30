@@ -46,7 +46,7 @@ def prepare_dataset(csv_file, options):
         mask_dir=options.mask_path,
         mask_suffix=options.mask_suffix,
         variable_input_shapes=options.variable_input_shapes,
-        tile_delta=tile_delta,
+        tile_delta=tile_delta * model.max_pool_kernel,
         network_output_stride=network_output_stride,
         filetype=options.filetype,
         read_level=options.read_level,
@@ -80,6 +80,8 @@ if __name__ == "__main__":
     network_output_stride = max(
         model.stream_network.output_stride[1] * model.max_pool_kernel, model.stream_network.output_stride[1]
     )
+
+    print("network output stride calc", network_output_stride)
 
     train_dataset = prepare_dataset(options.train_csv, options)
     val_dataset = prepare_dataset(options.val_csv, options)
