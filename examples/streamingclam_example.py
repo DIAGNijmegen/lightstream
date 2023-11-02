@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 
 
 from pathlib import Path
@@ -14,9 +15,11 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 
 # My own edits here
-from models.streamingclam.streamingclam import StreamingCLAM
-from data.dataset import StreamingClassificationDataset
+from models.streamingclam.streamingclam_regression import StreamingCLAM
+from data.dataset_regression import StreamingSurvivalDataset
 from examples.options import TrainConfig
+
+wandb_logger = WandbLogger(project="Bladder")
 
 
 def weighted_sampler(dataset):
@@ -37,7 +40,7 @@ def weighted_sampler(dataset):
 
 
 def prepare_dataset(csv_file, options):
-    return StreamingClassificationDataset(
+    return StreamingSurvivalDataset(
         img_dir=options.image_path,
         csv_file=csv_file,
         tile_size=options.tile_size,
@@ -46,7 +49,7 @@ def prepare_dataset(csv_file, options):
         mask_dir=options.mask_path,
         mask_suffix=options.mask_suffix,
         variable_input_shapes=options.variable_input_shapes,
-        tile_delta=tile_delta * model.max_pool_kernel,
+        tile_delta=tile_delta,
         network_output_stride=network_output_stride,
         filetype=options.filetype,
         read_level=options.read_level,
@@ -66,7 +69,7 @@ if __name__ == "__main__":
     model = StreamingCLAM(
         options.encoder,
         tile_size=options.tile_size,
-        loss_fn=torch.nn.functional.cross_entropy,
+        loss_fn=torch.nn.SmoothL1Loss(),
         branch=options.branch,
         n_classes=options.num_classes,
         max_pool_kernel=options.max_pool_kernel,
@@ -80,7 +83,7 @@ if __name__ == "__main__":
     network_output_stride = max(
         model.stream_network.output_stride[1] * model.max_pool_kernel, model.stream_network.output_stride[1]
     )
-
+    print("tile delta", tile_delta)
     print("network output stride calc", network_output_stride)
 
     train_dataset = prepare_dataset(options.train_csv, options)
@@ -123,6 +126,7 @@ if __name__ == "__main__":
         callbacks=[checkpoint_callback],
         accumulate_grad_batches=options.grad_batches,
         precision="16-mixed",
+        logger=wandb_logger,
     )
 
     trainer.fit(
