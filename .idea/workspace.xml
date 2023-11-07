@@ -6,16 +6,8 @@
   <component name="BlackConnectSettings" lineLength="120" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/lightstream/data/dataset_regression.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/models/streamingclam/streamingclam_regression.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/deployment.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/deployment.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/lightstream.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/lightstream.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/options.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/options.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/streamingclam_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/streamingclam_example.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/doodle.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/doodle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/streamingclam.py" beforeDir="false" afterPath="$PROJECT_DIR$/models/streamingclam/streamingclam.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/run_augmentations.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/run_augmentations.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -44,23 +36,23 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
-    &quot;WebServerToolWindowFactoryState&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;new__template&quot;,
-    &quot;last_opened_file_path&quot;: &quot;C:/Users/Stephan/Desktop/projects/lightstream/examples&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
+    "WebServerToolWindowFactoryState": "true",
+    "git-widget-placeholder": "new__template",
+    "last_opened_file_path": "C:/Users/Stephan/Desktop/Projects/albumentationsxl",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="C:\Users\Stephan\Desktop\projects\lightstream\examples" />
@@ -76,7 +68,7 @@
       <recent name="C:\Users\Stephan\Desktop\projects\lightstream\images" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.streamingclam_example">
+  <component name="RunManager" selected="Python.run_augmentations">
     <configuration name="dataset" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="lightstream" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -143,6 +135,28 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="run_augmentations" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="lightstream" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/lightstream" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/lightstream/run_augmentations.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <configuration name="streamingclam_example" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="lightstream" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -196,37 +210,20 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
-    <configuration name="pytest in doodle.py" type="tests" factoryName="py.test" temporary="true" nameIsGenerated="true">
-      <module name="lightstream" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/lightstream" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="_new_keywords" value="&quot;&quot;" />
-      <option name="_new_parameters" value="&quot;&quot;" />
-      <option name="_new_additionalArguments" value="&quot;&quot;" />
-      <option name="_new_target" value="&quot;$PROJECT_DIR$/lightstream/doodle.py&quot;" />
-      <option name="_new_targetType" value="&quot;PATH&quot;" />
-      <method v="2" />
-    </configuration>
     <list>
+      <item itemvalue="Python.run_augmentations" />
       <item itemvalue="Python.doodle2" />
       <item itemvalue="Python.dataset" />
       <item itemvalue="Python.streamingclam_example" />
       <item itemvalue="Python.doodle" />
-      <item itemvalue="Python tests.pytest in doodle.py" />
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.run_augmentations" />
         <item itemvalue="Python.streamingclam_example" />
         <item itemvalue="Python.doodle" />
         <item itemvalue="Python.doodle2" />
         <item itemvalue="Python.dataset" />
-        <item itemvalue="Python tests.pytest in doodle.py" />
       </list>
     </recent_temporary>
   </component>
@@ -262,6 +259,10 @@
       <workItem from="1698746611967" duration="12095000" />
       <workItem from="1698789808097" duration="11916000" />
       <workItem from="1698846490361" duration="1307000" />
+      <workItem from="1699020377869" duration="5265000" />
+      <workItem from="1699276738397" duration="903000" />
+      <workItem from="1699352859229" duration="91000" />
+      <workItem from="1699352961011" duration="728000" />
     </task>
     <servers />
   </component>
@@ -307,11 +308,6 @@
           <line>256</line>
           <option name="timeStamp" value="8" />
         </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/models/streamingclam/streamingclam_regression.py</url>
-          <line>36</line>
-          <option name="timeStamp" value="20" />
-        </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
   </component>
@@ -323,8 +319,8 @@
     <SUITE FILE_PATH="coverage/lightstream$doodle2.coverage" NAME="doodle2 Coverage Results" MODIFIED="1698322581460" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream/utils" />
     <SUITE FILE_PATH="coverage/lightstream$resnet.coverage" NAME="resnet Coverage Results" MODIFIED="1697455218358" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models" />
     <SUITE FILE_PATH="coverage/lightstream$streamingclam.coverage" NAME="streamingclam Coverage Results" MODIFIED="1698017104776" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/models/streamingclam" />
-    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1697989739878" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
+    <SUITE FILE_PATH="coverage/lightstream$run_augmentations.coverage" NAME="run_augmentations Coverage Results" MODIFIED="1699277036790" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lightstream" />
     <SUITE FILE_PATH="coverage/lightstream$maauw.coverage" NAME="maauw Coverage Results" MODIFIED="1697818241185" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
-    <SUITE FILE_PATH="coverage/lightstream$streamingclam_example.coverage" NAME="streamingclam_example Coverage Results" MODIFIED="1698802447901" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
+    <SUITE FILE_PATH="coverage/lightstream$streamingclam_example.coverage" NAME="streamingclam_example Coverage Results" MODIFIED="1699276798623" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/examples" />
   </component>
 </project>
