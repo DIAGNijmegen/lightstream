@@ -1,5 +1,4 @@
 import torch
-import json
 import warnings
 
 import numpy as np
@@ -11,12 +10,11 @@ from lightning.pytorch.loggers import WandbLogger
 from pathlib import Path
 
 from torch.utils.data.sampler import WeightedRandomSampler
-from torchvision import transforms
 from torch.utils.data import DataLoader
 
 # My own edits here
 from models.streamingclam.streamingclam_regression import StreamingCLAM
-from data.dataset_regression import StreamingSurvivalDataset
+from examples.data.dataset_regression import StreamingSurvivalDataset
 from examples.options import TrainConfig
 
 wandb_logger = WandbLogger(project="Bladder")

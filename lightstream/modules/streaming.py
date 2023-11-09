@@ -12,6 +12,9 @@ class StreamingModule(L.LightningModule):
         self.train_streaming_layers = train_streaming_layers
         self._stream_module = stream_network
         self.params = self.get_trainable_params()
+        self.mean = kwargs.get("mean", [0.485, 0.456, 0.406])
+        self.std = kwargs.get("std", [0.229, 0.224, 0.225])
+
         self.stream_network = StreamingCNN(
             stream_network,
             tile_shape=(1, 3, tile_size, tile_size),
@@ -22,18 +25,13 @@ class StreamingModule(L.LightningModule):
             verbose=kwargs.get("verbose", True),
             statistics_on_cpu=kwargs.get("statistics_on_cpu", False),
             normalize_on_gpu=kwargs.get("normalize_on_gpu", False),
-            mean=kwargs.get("mean", [0.485, 0.456, 0.406]),
-            std=kwargs.get("std", [0.229, 0.224, 0.225]),
+            mean=self.mean,
+            std=self.std,
             state_dict=kwargs.get("state_dict", None),
         )
 
         if not self.use_streaming:
             self.disable_streaming()
-
-        # set dtype to float16 after initialization, becuase half is not implemented for cpu
-        print("dtype in streaming:", kwargs.get("dtype"))
-        if kwargs.get("dtype") == torch.half:
-            self.stream_network.dtype = torch.half
 
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
@@ -41,6 +39,23 @@ class StreamingModule(L.LightningModule):
 
         for mod in freeze_layers:
             mod.eval()
+
+    def on_train_epoch_start(self) -> None:
+        self.freeze_streaming_normalization_layers()
+
+    def on_validation_start(self):
+        # Update streaming to put all the inputs/tensors on the right device
+        self.stream_network.device = self.device
+        self.stream_network.mean = self.mean
+        self.stream_network.std = self.std
+        self.stream_network.dtype = self.dtype
+
+    def on_train_start(self):
+        # Update streaming to put all the inputs/tensors on the right device
+        self.stream_network.device = self.device
+        self.stream_network.mean = self.mean
+        self.stream_network.std = self.std
+        self.stream_network.dtype = self.dtype
 
     def disable_streaming(self):
         """Disable streaming hooks and replace streamingconv2d  with conv2d modules"""
@@ -62,14 +77,12 @@ class StreamingModule(L.LightningModule):
             self.stream_network.backward(image, gradient)
 
     def _configure_tile_delta(self):
+        """Configure the tile delta for dataloaders"""
         delta = self.tile_size - (
             self.stream_network.tile_gradient_lost.left + self.stream_network.tile_gradient_lost.right
         )
         delta = delta // self.stream_network.output_stride[-1]
         delta *= self.stream_network.output_stride[-1]
-        # if delta < 3000:
-        #     delta = (3000 // delta + 1) * delta
-        print("tile delta value:", delta.detach().cpu())
         return delta.detach().cpu().numpy()
 
     def get_trainable_params(self):

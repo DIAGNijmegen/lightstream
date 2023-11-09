@@ -42,9 +42,11 @@ class BaseModel(StreamingModule):
         self.image = image
 
         self.str_output = self.forward_streaming(image)
-        self.str_output.requires_grad = self.training
 
-        out = self.forward_head(self.str_output[0])
+        if self.use_streaming:
+            self.str_output.requires_grad = self.training
+
+        out = self.forward_head(self.str_output)
         loss = self.loss_fn(out, target)
 
         self.log_dict({"entropy loss": loss.detach()}, prog_bar=True)

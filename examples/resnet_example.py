@@ -9,14 +9,18 @@ import lightning.pytorch as pl
 
 from models.resnet.resnet import StreamingResNet
 
-
-
-
 dataset = CIFAR10(os.getcwd(), download=True, transform=transforms.ToTensor())
-train_loader = DataLoader(dataset, num_workers=7)
+train_loader = DataLoader(dataset, num_workers=3)
 
-autoencoder= StreamingResNet('resnet18', 1600, torch.nn.functional.cross_entropy, statistics_on_cpu=True, verbose=False)
-
+autoencoder = StreamingResNet(
+    "resnet18",
+    1600,
+    torch.nn.functional.cross_entropy,
+    statistics_on_cpu=False,
+    verbose=True,
+    use_streaming=True,
+    num_classes=10,
+)
 
 # train model
 trainer = pl.Trainer(accelerator="gpu")

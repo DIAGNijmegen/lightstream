@@ -1,4 +1,4 @@
-from lightstream.data.dataset import StreamingClassificationDataset
+from examples.data.dataset import StreamingClassificationDataset
 from pathlib import Path
 from lightstream import transforms as T
 
