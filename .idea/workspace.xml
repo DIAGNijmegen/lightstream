@@ -6,17 +6,7 @@
   <component name="BlackConnectSettings" lineLength="120" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/docs/getting_started/installation.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/docs/how_to/customization" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/docs/tutorials/classification.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/docs/tutorials/dataloading.md" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lightstream/modules/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/docs/about.md" beforeDir="false" afterPath="$PROJECT_DIR$/docs/getting_started/requirements.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/docs/index.md" beforeDir="false" afterPath="$PROJECT_DIR$/docs/index.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/modules/streaming.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/streaming.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/mkdocs.yml" beforeDir="false" afterPath="$PROJECT_DIR$/mkdocs.yml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -57,7 +47,7 @@
     "WebServerToolWindowPanel.toolwindow.show.permissions": "false",
     "WebServerToolWindowPanel.toolwindow.show.size": "false",
     "git-widget-placeholder": "new__template",
-    "last_opened_file_path": "C:/Users/Stephan/Desktop/projects/albumentationsxl",
+    "last_opened_file_path": "C:/Users/Stephan/Desktop/projects/lightstream",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
@@ -83,7 +73,7 @@
       <recent name="C:\Users\Stephan\Desktop\Projects\lightstream\docs\docs" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.resnet_example">
+  <component name="RunManager" selected="Docker.docker/Dockerfile">
     <configuration name="doodle" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="lightstream" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -98,28 +88,6 @@
       <option name="ADD_SOURCE_ROOTS" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/lightstream/doodle.py" />
-      <option name="PARAMETERS" value="" />
-      <option name="SHOW_COMMAND_LINE" value="false" />
-      <option name="EMULATE_TERMINAL" value="false" />
-      <option name="MODULE_MODE" value="false" />
-      <option name="REDIRECT_INPUT" value="false" />
-      <option name="INPUT_FILE" value="" />
-      <method v="2" />
-    </configuration>
-    <configuration name="doodle2" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
-      <module name="lightstream" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/lightstream/utils" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/lightstream/utils/doodle2.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
@@ -225,20 +193,28 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="docker/Dockerfile" type="docker-deploy" factoryName="dockerfile" temporary="true" server-name="Docker">
+      <deployment type="dockerfile">
+        <settings>
+          <option name="sourceFilePath" value="docker/Dockerfile" />
+        </settings>
+      </deployment>
+      <method v="2" />
+    </configuration>
     <list>
+      <item itemvalue="Docker.docker/Dockerfile" />
       <item itemvalue="Python.resnet_example" />
       <item itemvalue="Python.run_augmentations" />
-      <item itemvalue="Python.doodle2" />
       <item itemvalue="Python.streamingclam_example" />
       <item itemvalue="Python.doodle" />
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Docker.docker/Dockerfile" />
         <item itemvalue="Python.resnet_example" />
         <item itemvalue="Python.run_augmentations" />
         <item itemvalue="Python.streamingclam_example" />
         <item itemvalue="Python.doodle" />
-        <item itemvalue="Python.doodle2" />
       </list>
     </recent_temporary>
   </component>
@@ -284,6 +260,7 @@
       <workItem from="1699619719524" duration="3060000" />
       <workItem from="1699720863366" duration="7280000" />
       <workItem from="1699795308131" duration="6209000" />
+      <workItem from="1699803324602" duration="1729000" />
     </task>
     <servers />
   </component>
