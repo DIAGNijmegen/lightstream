@@ -77,7 +77,17 @@ class StreamingModule(L.LightningModule):
             self.stream_network.backward(image, gradient)
 
     def _configure_tile_delta(self):
-        """Configure the tile delta for dataloaders"""
+        """
+
+        Examples:
+
+        test
+
+
+        Returns
+        -------
+
+        """
         delta = self.tile_size - (
             self.stream_network.tile_gradient_lost.left + self.stream_network.tile_gradient_lost.right
         )
