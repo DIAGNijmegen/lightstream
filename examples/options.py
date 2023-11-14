@@ -29,7 +29,7 @@ class TrainConfig:
     tile_size: int = 3200
     statistics_on_cpu: bool = True
     verbose: bool = False
-    train_streaming_layers: bool = True
+    train_streaming_layers: bool = False
 
     # Dataloader options
     img_size: int = 32768  # represents image size if variable_input_shape=False, else the maximum image size

@@ -6,26 +6,9 @@
   <component name="BlackConnectSettings" lineLength="120" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/deployment.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/deployment.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/lightstream.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/lightstream.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Dockerfile" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/docker/Dockerfile" beforeDir="false" afterPath="$PROJECT_DIR$/docker/Dockerfile" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/data/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/data/dataset.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/data/dataset_regression.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/data/dataset_regression.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/streamingclam_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/streamingclam_example.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/doodle.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/doodle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/modules/base.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/base.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/modules/streaming.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/streaming.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/.gitkeep" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/.gitkeep" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/resnet/resnet.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/resnet/resnet.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/clam.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/streamingclam/clam.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/model.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/streamingclam.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/streamingclam/streamingclam_regression.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam_regression.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/poetry.lock" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/options.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/options.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam_regression.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam_regression.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -282,7 +265,8 @@
       <workItem from="1699803324602" duration="1729000" />
       <workItem from="1699912482148" duration="4025000" />
       <workItem from="1699953178697" duration="2151000" />
-      <workItem from="1699962812800" duration="6406000" />
+      <workItem from="1699962812800" duration="7742000" />
+      <workItem from="1699979952288" duration="596000" />
     </task>
     <servers />
   </component>
@@ -327,7 +311,7 @@
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam_regression.py</url>
-          <line>279</line>
+          <line>278</line>
           <option name="timeStamp" value="10" />
         </line-breakpoint>
       </breakpoints>

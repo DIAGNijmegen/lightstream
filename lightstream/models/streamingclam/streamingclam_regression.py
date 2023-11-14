@@ -4,14 +4,13 @@ import pandas as pd
 
 from modules.base import BaseModel
 
-from models.resnet.resnet import split_resnet
-from models.streamingclam.clam import CLAM_MB, CLAM_SB
+from lightstream.models.resnet.resnet import split_resnet
+from lightstream.models.streamingclam.clam import CLAM_MB, CLAM_SB
 
 from torch import Tensor
 from torchvision.models import resnet18, resnet34, resnet50
 
 from torchmetrics import Metric
-from torchmetrics.classification import Accuracy, AUROC
 
 from lifelines import CoxPHFitter
 from sksurv.metrics import concordance_index_censored
