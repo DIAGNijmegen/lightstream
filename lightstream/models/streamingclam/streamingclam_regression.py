@@ -14,6 +14,7 @@ from torchmetrics import Metric
 from torchmetrics.classification import Accuracy, AUROC
 
 from lifelines import CoxPHFitter
+from sksurv.metrics import concordance_index_censored
 
 
 class HazardRatio(Metric):
@@ -45,13 +46,12 @@ class HazardRatio(Metric):
             return torch.as_tensor(0)
 
 
-class HazardRatio(Metric):
+class Concordance(Metric):
     def __init__(self):
         super().__init__()
         self.add_state("event", default=[], dist_reduce_fx="cat")
         self.add_state("output", default=[], dist_reduce_fx="cat")
         self.add_state("time", default=[], dist_reduce_fx="cat")
-        self.cph_model = CoxPHFitter()
 
     def update(self, output: Tensor, event: Tensor, time: Tensor):
         self.event.append(event)
@@ -59,19 +59,17 @@ class HazardRatio(Metric):
         self.time.append(time)
 
     def compute(self):
-        output = np.array([x.cpu().numpy() for x in self.output]).flatten()
-        event = np.array([x.cpu().numpy() for x in self.event]).flatten()
-        time = np.array([x.cpu().numpy() for x in self.time]).flatten()
+        self.event = np.array([x.cpu().numpy() for x in self.event]).flatten()
+        self.output = np.array([x.cpu().numpy() for x in self.output]).flatten()
+        self.time = np.array([x.cpu().numpy() for x in self.time]).flatten()
 
-        df = pd.DataFrame({"output": output, "event": event, "time": time})
-
-        # documentation on lightning is all over the place
-        # but no docs on how to call sanity check compute when more than 2 batches have been processed
-        if len(df) > 2:
-            self.cph_model.fit(df=df, duration_col="time", event_col="event")
-            return torch.as_tensor(self.cph_model.hazard_ratios_["output"])
+        if len(self.event) > 2:
+            c_index, concordant, disconcordant, tied_risk, tied_time = concordance_index_censored(
+                self.event, self.time, self.output
+            )
         else:
             return torch.as_tensor(0)
+        return torch.as_tensor(c_index)
 
 
 # Streamingclam works with resnets, can be extended to other encoders if needed
@@ -190,6 +188,9 @@ class StreamingCLAM(BaseModel):
         self.train_hazard_ratio = HazardRatio()
         self.val_hazard_ratio = HazardRatio()
 
+        self.train_index = Concordance()
+        self.val_index = Concordance()
+
     def add_maxpool_layers(self, network):
         ds_blocks = torch.nn.Sequential(torch.nn.MaxPool2d((self.max_pool_kernel, self.max_pool_kernel)))
 
@@ -241,10 +242,10 @@ class StreamingCLAM(BaseModel):
         return out
 
     def training_step(self, batch, batch_idx: int, *args, **kwargs):
-        if len(batch) == 4:
-            image, mask, label, follow_up = batch
+        if len(batch) == 5:
+            image, mask, label, follow_up, event = batch
         else:
-            image, label, follow_up = batch
+            image, label, follow_up, event = batch
             mask = None
 
         self.image = image
@@ -268,11 +269,15 @@ class StreamingCLAM(BaseModel):
 
         self.train_hazard_ratio(logits.flatten().detach(), label.detach(), follow_up.detach())
         self.log("train_hazard_ratio", self.train_hazard_ratio, on_epoch=True)
+
+        self.train_index(logits.flatten().detach(), event.detach(), label.detach())
+        self.log("train_index", self.train_index, on_epoch=True)
+
         self.log_dict({"entropy loss": loss.detach()}, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, y_hat, label, follow_up = self._shared_eval_step(batch, batch_idx)
+        loss, y_hat, label, follow_up, event = self._shared_eval_step(batch, batch_idx)
 
         # Should update and clear automatically, as per
         # https://torchmetrics.readthedocs.io/en/stable/pages/lightning.html
@@ -281,10 +286,14 @@ class StreamingCLAM(BaseModel):
         self.log_dict(metrics, prog_bar=True)
         self.val_hazard_ratio(y_hat.flatten(), label.detach(), follow_up.detach())
         self.log("val_hazard_ratio", self.val_hazard_ratio, on_epoch=True)
+
+        self.val_index(y_hat.flatten(), event.detach(), label.detach())
+        self.log("val_index", self.val_index, on_epoch=True)
+
         return metrics
 
     def test_step(self, batch, batch_idx):
-        loss, y_hat, label, follow_up = self._shared_eval_step(batch, batch_idx)
+        loss, y_hat, label, follow_up, event = self._shared_eval_step(batch, batch_idx)
 
         self.test_acc(torch.argmax(y_hat, dim=1))
         self.test_auc(torch.sigmoid(y_hat)[:, 1])
@@ -294,16 +303,16 @@ class StreamingCLAM(BaseModel):
         return metrics
 
     def _shared_eval_step(self, batch, batch_idx):
-        if len(batch) == 4:
-            image, mask, label, follow_up = batch
+        if len(batch) == 5:
+            image, mask, label, follow_up, event = batch
         else:
-            image, label, follow_up = batch
+            image, label, follow_up, event = batch
             mask = None
 
         y_hat = self.forward(image)[0].detach()
         loss = self.loss_fn(y_hat.flatten(), label).detach()
 
-        return loss, y_hat, label.detach(), follow_up.detach()
+        return loss, y_hat, label.detach(), follow_up.detach(), event.detach()
 
 
 if __name__ == "__main__":

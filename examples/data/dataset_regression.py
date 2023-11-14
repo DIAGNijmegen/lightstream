@@ -1,9 +1,10 @@
 from examples.data.dataset import StreamingClassificationDataset
 from pathlib import Path
-from lightstream import transforms as T
 
 import pyvips
 import torch
+
+import albumentationsxl as T
 
 
 class StreamingSurvivalDataset(StreamingClassificationDataset):
@@ -11,25 +12,26 @@ class StreamingSurvivalDataset(StreamingClassificationDataset):
         img_fname = self.classification_frame.iloc[idx, 0]
         label = self.classification_frame.iloc[idx, 1]
         follow_up = self.classification_frame.iloc[idx, 2]
+        event = self.classification_frame.iloc[idx, 3]
 
         img_path = self.img_dir / Path(img_fname).with_suffix(self.filetype)
 
         if self.mask_dir:
             mask_path = self.mask_dir / Path(img_fname + self.mask_suffix).with_suffix(self.filetype)
-            return [img_path, mask_path], label, follow_up
+            return [img_path, mask_path], label, follow_up, event
 
-        return [img_path], label, follow_up
+        return [img_path], label, follow_up, event
 
     def check_csv(self):
         """Check if entries in csv file exist"""
         included = (
-            {"images": [], "masks": [], "labels": [], "follow_up": []}
+            {"images": [], "masks": [], "labels": [], "follow_up": [], "event": []}
             if self.mask_dir
-            else {"images": [], "labels": [], "follow_up": []}
+            else {"images": [], "labels": [], "follow_up": [], "event": []}
         )
 
         for i in range(len(self)):
-            images, label, follow_up = self.get_img_path(i)  #
+            images, label, follow_up, event = self.get_img_path(i)  #
 
             # Files can be just images, but also image, mask
             for file in images:
@@ -40,6 +42,7 @@ class StreamingSurvivalDataset(StreamingClassificationDataset):
             included["images"].append(images[0])
             included["labels"].append(label)
             included["follow_up"].append(follow_up)
+            included["event"].append(event)
 
             if self.mask_dir:
                 included["masks"].append(images[1])
@@ -50,6 +53,7 @@ class StreamingSurvivalDataset(StreamingClassificationDataset):
         img_fname = str(self.data_paths["images"][idx])
         label = int(self.data_paths["labels"][idx])
         follow_up = int(self.data_paths["follow_up"][idx])
+        event = bool(self.data_paths["event"][idx])
 
         image = pyvips.Image.new_from_file(img_fname, page=self.read_level)
         sample = {"image": image}
@@ -93,6 +97,6 @@ class StreamingSurvivalDataset(StreamingClassificationDataset):
 
         if self.mask_dir:
             sample["mask"] = sample["mask"] >= 1
-            return sample["image"], sample["mask"], torch.tensor(label), torch.tensor(follow_up)
+            return sample["image"], sample["mask"], torch.tensor(label), torch.tensor(follow_up), torch.tensor(event)
 
-        return sample["image"], torch.tensor(label), torch.tensor(follow_up)
+        return sample["image"], torch.tensor(label), torch.tensor(follow_up), torch.tensor(event)

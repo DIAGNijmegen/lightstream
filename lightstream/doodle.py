@@ -2,8 +2,9 @@ from torchmetrics import Metric
 from torch import Tensor
 import torch
 import pandas as pd
-from lifelines import CoxPHFitter
 import numpy as np
+from sksurv.metrics import concordance_index_censored
+
 
 class HazardRatio(Metric):
     def __init__(self):
@@ -11,29 +12,29 @@ class HazardRatio(Metric):
         self.add_state("event", default=[], dist_reduce_fx="cat")
         self.add_state("output", default=[], dist_reduce_fx="cat")
         self.add_state("time", default=[], dist_reduce_fx="cat")
-        self.cph_model = CoxPHFitter()
 
     def update(self, output: Tensor, event: Tensor, time: Tensor):
-
         self.event.append(event)
         self.output.append(output)
         self.time.append(time)
 
     def compute(self):
+        self.event = np.array(self.event).flatten()
+        self.output = np.array(self.output).flatten()
+        self.time = np.array(self.time).flatten()
 
-        df = pd.DataFrame({"output": np.array(self.output).flatten(),
-                           "event": np.array(self.event).flatten(),
-                           "time": np.array(self.time).flatten()})
+        print(self.event, self.output, self.time)
+        c_index, concordant, disconcordant, tied_risk, tied_time = concordance_index_censored(
+            self.event, self.time, self.output
+        )
+        return torch.as_tensor(c_index)
 
-        self.cph_model.fit(df=df, duration_col="time", event_col="event")
-        return torch.as_tensor(self.cph_model.hazard_ratios_["output"])
 
 if __name__ == "__main__":
-    label = [0,1,2,3]
-    event = [0, 1,3,3]
-    time = [6, 13, 25, 37 ]
+    label = [0, 1, 2, 2, 1, 0]
+    event = [True, True, True, False, True, True]
+    time = [0.1, 0.9, 2.4, 1.9, 1, 0.1]
 
     metric = HazardRatio()
-    metric.update(event, label, time)
+    metric.update(time, event, label)
     print(metric.compute())
-    print(torch.as_tensor(0))

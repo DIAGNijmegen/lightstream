@@ -6,7 +6,6 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
-
 from pathlib import Path
 
 from torch.utils.data.sampler import WeightedRandomSampler

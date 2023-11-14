@@ -8,6 +8,8 @@ LABEL maintainer="Stephan"
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 ENV DEBIAN_FRONTEND noninteractive
 
+WORKDIR /app
+COPY . .
 
 RUN apt-get update --fix-missing && \
     apt-get install -y --no-install-recommends \
@@ -36,10 +38,8 @@ RUN wget https://github.com/libvips/libvips/releases/download/v${VIPS_VERSION}/v
     mkdir -p /opt/tests/vips_tests && mv /tmp/vips-${VIPS_VERSION}/test/test-suite /opt/tests/vips_tests &&\
     rm -rf /tmp/vips-${VIPS_VERSION}
 
-RUN pip3  install lightning pyvips albumentations
+RUN pip3  install lightning pyvips albumentations dataclasses-json
 RUN pip3 uninstall opencv-python opencv-contrib-python opencv-python-headless -y
 RUN pip3 install opencv-contrib-python==4.8.0.74
 
-EXPOSE 8888
-
-ENTRYPOINT ["/bin/bash"]
+ENV PYTHONPATH=$PYTHONPATH:/app/lightstream

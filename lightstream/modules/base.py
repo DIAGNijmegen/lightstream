@@ -6,6 +6,7 @@ import torch
 
 
 # TODO: Write control flow when lightstream is turned off
+# TODO: Add torchmetric collections as parameters (dependency injections)
 
 
 class BaseModel(StreamingModule):
@@ -27,7 +28,7 @@ class BaseModel(StreamingModule):
         self.params = self.extend_trainable_params()
 
     def on_train_epoch_start(self) -> None:
-        self.freeze_streaming_normalization_layers()
+        super().on_train_epoch_start()
 
     def forward_head(self, x):
         return self.head(x)

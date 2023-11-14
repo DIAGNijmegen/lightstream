@@ -96,10 +96,10 @@ class StreamingModule(L.LightningModule):
         return delta.detach().cpu().numpy()
 
     def get_trainable_params(self):
-        print("Get trainable params", self.train_streaming_layers)
         if self.train_streaming_layers:
             params = list(self._stream_module.parameters())
             return params
         else:
+            print("WARNING: Streaming network will not be trained")
             for param in self._stream_module.parameters():
                 param.requires_grad = False

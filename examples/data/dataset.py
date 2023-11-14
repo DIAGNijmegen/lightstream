@@ -7,7 +7,6 @@ import numpy as np
 
 from pathlib import Path
 from torch.utils.data import Dataset
-from lightstream import transforms as T
 
 
 class StreamingClassificationDataset(Dataset):
