@@ -58,7 +58,11 @@ class StreamingModule(L.LightningModule):
         self.stream_network.dtype = self.dtype
 
     def disable_streaming(self):
-        """Disable streaming hooks and replace streamingconv2d  with conv2d modules"""
+        """Disable streaming hooks and replace streamingconv2d  with conv2d modules
+
+        This will still use the StreamingCNN backward and forward functions, but the memory gains from gradient
+        checkpointing will be turned off.
+        """
         self.stream_network.disable()
         self.use_streaming = False
 
@@ -103,3 +107,18 @@ class StreamingModule(L.LightningModule):
             print("WARNING: Streaming network will not be trained")
             for param in self._stream_module.parameters():
                 param.requires_grad = False
+
+    def _remove_streaming_network(self):
+        """Converts the streaming network into a non-streaming network
+
+        The former streaming encoder can be addressed as self.stream_network
+
+        """
+
+        # Convert streamingConv2D into regular Conv2D and turn off streaming hooks
+        self.disable_streaming()
+        temp = self.stream_network.stream_module
+
+        # torch modules cannot be overridden normally, so delete and reassign
+        del self.stream_network
+        self.stream_network = temp
