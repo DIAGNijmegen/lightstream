@@ -6,13 +6,7 @@
   <component name="BlackConnectSettings" lineLength="120" skipMagicTrailingComma="true" triggerOnEachSave="true" triggerOnReformat="true" />
   <component name="ChangeListManager">
     <list default="true" id="d583ca00-0b9a-4028-b271-fda8a653c172" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/tests/modelcheck.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/lightstream.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/lightstream.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/modules/streaming.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/modules/streaming.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/notebooks/scnn_comparison.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/notebooks/scnn_comparison.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_resnet.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_resnet.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/utils/modelcheck.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -285,7 +279,7 @@
       <workItem from="1700042719973" duration="4148000" />
       <workItem from="1700058273112" duration="597000" />
       <workItem from="1700129931982" duration="9753000" />
-      <workItem from="1700148105278" duration="3794000" />
+      <workItem from="1700148105278" duration="3861000" />
     </task>
     <servers />
   </component>
