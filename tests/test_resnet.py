@@ -1,7 +1,7 @@
 import torch
 import pytest
 import numpy as np
-from lightstream.utils.modelcheck import ModelCheck
+from tests.modelcheck import ModelCheck
 from torchvision.models import resnet18, resnet34, resnet50
 from models.resnet.resnet import split_resnet
 
@@ -9,21 +9,44 @@ from models.resnet.resnet import split_resnet
 test_cases = [resnet18, resnet34, resnet50]
 
 
+def make_dummy_data():
+    img_size = 1600 + 320
+    dtype = torch.float64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    image = torch.FloatTensor(3, img_size, img_size).normal_(0, 1)
+    image = image.type(dtype).to(device)
+
+    target = torch.tensor(50.0)  # large value so we get larger gradients
+    target = target.type(dtype).to(device)
+
+    batch = (image[None], target)
+    return batch
+
+
 @pytest.fixture(scope="module", params=test_cases)
 def streaming_outputs(request):
     print("model fn", request.param)
     model = request.param()
+
+    tile_size = 1600
+
+    dtype = torch.float64
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch = make_dummy_data()
+
     stream_net, head = split_resnet(model)
-    model_check = ModelCheck(stream_net, verbose=False)
-    model_check.gather_outputs()
-    return [model_check.streaming_outputs, model_check.normal_outputs]
+    model_check = ModelCheck(stream_net, tile_size, loss_fn=torch.nn.MSELoss(), verbose=False, saliency=True)
+    model_check.to(device)
+    model_check.to(dtype)
+    streaming, normal = model_check.run(batch)
+
+    return [streaming, normal]
 
 
 def test_forward_output(streaming_outputs):
     stream_outputs, normal_outputs = streaming_outputs
-    max_error = np.abs(
-        stream_outputs["forward_output"] - normal_outputs["forward_output"]
-    ).max()
+    max_error = np.abs(stream_outputs["forward_output"] - normal_outputs["forward_output"]).max()
 
     # if max_error < 1e-7:
     #    print("Equal output to streaming")
