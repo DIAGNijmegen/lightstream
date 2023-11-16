@@ -3,7 +3,7 @@ name = "lightstream"
 version = "0.0.1"
 description = "A Pytorch lightning framework for streaming CNN's"
 authors = [
-  { name = "Stephan Dooper", email = "stephan.dooper@radboudumc.nl" },
+    { name = "Stephan Dooper", email = "stephan.dooper@radboudumc.nl" },
 ]
 readme = "README.md"
 classifiers = [
@@ -12,12 +12,21 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  "torch>=2.0.0",
+    "torch>=2.0.0",
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/DIAGNijmegen/lightstream"
 "Bug Tracker" = "https://github.com/DIAGNijmegen/lightstream/issues"
+
+
+[project.optional-dependencies]
+docs = [
+    "mkdocs",
+    "mkdocstrings",
+    "mkdocs-material",
+    "mkdocs-caption"
+]
 
 [build-system]
 requires = ["hatchling"]

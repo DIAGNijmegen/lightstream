@@ -1,36 +1,23 @@
-# Lightstream
+# Installation
 
-Lightstream is a Pytorch-Lightning library for training CNN-based models with large input data using streaming. 
-This approach allows you to parse huge (image) inputs through a CNN without running into memory bottlenecks, i.e. getting GPU out of memory (OOM) errors.
+## Installing lightstream
+Installing the lightstream package can be done via pip:
+``` py
+pip install lightstream
+```
 
-The underlying algorithm is based on the `streaming` paper described in [[1]](#1). During training/inferencing, 
-a huge input image that would normally cause GPU OOM is split into tiles and processed sequentially until a pre-defined part of the network. 
-There, the individual tiles are stitched back together, and the forward/backward is finished normally. Due to gradient 
-checkpointing, intermediate features are deleted to save memory, and are re-computed tile-wise during backpropagation (see figure below)
-[^1] The exact method 
+Alternative, the project can be cloned using `git` from the [lightstream git repo](https://github.com/DIAGNijmegen/lightstream). 
+From there, the package can again be installed using `pip install .` within the directory. Otherwise, you can use the repository as-is, but
+you will have to add it to your `PYTHONPATH` if you want to access it from other repositories.
 
-By doing so, the result is mathematically the same as if the large input was parsed directly through a GPU without memory restrictions.
+## Installing (Py)vips
+Before pyvips can be installed, libvips must be present on the system, as pyvips is a Python wrapper around the libvips library.
+Libvips can be installed either using the binaries on the [libvips website](https://www.libvips.org/install.html), or it can be built from source with or without Docker.
+After libvips is properly installed, pyvips can be installed via pip:
+``` py
+pip install pyvips
+```
 
-
-
-## Commands
-
-* `mkdocs new [dir-name]` - Create a new project.
-* `mkdocs serve` - Start the live-reloading docs server.
-* `mkdocs build` - Build the documentation site.
-* `mkdocs -h` - Print help message and exit.
-
-## Project layout
-
-    mkdocs.yml    # The configuration file.
-    docs/
-        index.md  # The documentation homepage.
-        ...       # Other markdown pages, images and other files.
-
-## References
-<a id="1">[1]</a> 
-H. Pinckaers, B. van Ginneken and G. Litjens,
-"Streaming convolutional neural networks for end-to-end learning with multi-megapixel images,"
-in IEEE Transactions on Pattern Analysis and Machine Intelligence, 
-[doi: 10.1109/TPAMI.2020.3019563](https://ieeexplore.ieee.org/abstract/document/9178453)
-
+## Installing torch-related libraries
+Installing torch and its related libraries (lightning, torchvision) can be done via pip installs. We recommend looking at their respective websites
+for further help to install these packages.

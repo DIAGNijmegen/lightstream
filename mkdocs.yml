@@ -6,8 +6,14 @@ nav:
       Requirements: getting_started/requirements.md
       Installation: getting_started/installation.md
   - Tutorials:
-      Image processing: tutorials/dataloading.md
       Image classification: tutorials/classification.md
+      Custom models: tutorials/custom_models.md
+      Image processing: tutorials/dataloading.md
+  - Models:
+      ResNet: models/resnet.md
+  - Modules:
+      streamingmodule: modules/streamingmodule.md
+      basemodule: modules/basemodule.md
 
 theme:
   features:
@@ -15,6 +21,7 @@ theme:
     - header.autohide
     - navigation.instant
     - navigation.instant.prefetch
+    - content.code.copy
   logo: images/lightning_icon.png
   name: material
   palette:
@@ -44,7 +51,14 @@ repo_name: diagnijmegen/lightstream
 
 plugins:
   - search
-  - mkdocstrings
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [lightstream]
+  - caption:
+      table:
+        position: top
 
 markdown_extensions:
   - admonition

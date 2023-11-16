@@ -1,0 +1,3 @@
+# StreamingModule
+
+::: modules.streaming.StreamingModule

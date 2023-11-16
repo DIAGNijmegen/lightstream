@@ -3,7 +3,6 @@ import torch.nn as nn
 from modules.base import BaseModel
 from torchvision.models import resnet18, resnet34, resnet50
 
-
 def split_resnet(net, **kwargs):
     num_classes = kwargs.get("num_classes", 1000)
     stream_net = nn.Sequential(

@@ -1,0 +1,3 @@
+# BaseModule
+
+::: modules.base.BaseModel
