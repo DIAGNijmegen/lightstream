@@ -1,4 +1,4 @@
-from examples.data.dataset import StreamingClassificationDataset
+from applications.data.dataset import StreamingClassificationDataset
 from pathlib import Path
 
 import pyvips
