@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 
 # My own edits here
 from models.streamingclam.streamingclam_regression import StreamingCLAM
-from examples.data.dataset_regression import StreamingSurvivalDataset
-from examples.options import TrainConfig
+from applications.data.dataset_regression import StreamingSurvivalDataset
+from applications.options import TrainConfig
 
 wandb_logger = WandbLogger(project="Bladder")
 
