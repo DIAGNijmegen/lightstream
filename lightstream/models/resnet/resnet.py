@@ -4,12 +4,34 @@ from modules.base import BaseModel
 from torchvision.models import resnet18, resnet34, resnet50
 
 def split_resnet(net, **kwargs):
+    """ Split resnet architectures into backbone and fc modules
+
+    The stream_net will contain the CNN backbone that is capable for streaming.
+    The fc model is not streamable and will be a separate module
+    If num_classes are specified as a kwarg, then a new fc model will be created with the desired classes
+
+    Parameters
+    ----------
+    net: torch model
+        A ResNet model in the format provided by torchvision
+    kwargs
+
+    Returns
+    -------
+    stream_net : torch.nn.Sequential
+        The CNN backbone of the ResNet
+    head : torch.nn.Sequential
+        The head of the model, defaults to the fc model provided by torchvision.
+
+    """
+
+
     num_classes = kwargs.get("num_classes", 1000)
     stream_net = nn.Sequential(
         net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4
     )
 
-    # 1000 is the default
+    # 1000 classes is the default from ImageNet classification
     if num_classes != 1000:
         net.fc = torch.nn.Linear(512, num_classes)
         torch.nn.init.xavier_normal_(net.fc.weight)
