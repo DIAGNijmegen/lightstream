@@ -405,6 +405,8 @@ class StreamingCNN(object):
         self.dtype = next(stream_module.parameters()).dtype
         if dtype is not None:
             self.dtype = dtype
+        print("scnn dtype", self.dtype)
+        print("scnn device", self.device)
         self.tile_shape = tile_shape
         self.gather_input_gradient = saliency
         self.gather_gradient = gather_gradients

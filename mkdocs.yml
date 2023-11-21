@@ -57,6 +57,9 @@ plugins:
       handlers:
         python:
           paths: [lightstream]
+          options:
+            docstring_section_style: table
+            docstring_style: numpy
   - caption:
       table:
         position: top
