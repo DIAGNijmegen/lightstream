@@ -1,12 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-<<<<<<< HEAD
-  <component name="ProjectRootManager" version="2" project-jdk-name="lightstream" project-jdk-type="Python SDK" />
-=======
   <component name="Black">
-    <option name="pathToExecutable" value="C:\Users\Stephan\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\Roaming\pypoetry\venv\Scripts\black.exe" />
     <option name="sdkName" value="Remote Python 3.11.3 (sftp://stephandooper@dlc-tornadus:2222/home/stephandooper/.virtualenvs/lightstream/bin/python)" />
   </component>
   <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.11.3 (sftp://stephandooper@dlc-tornadus:2222/home/stephandooper/.virtualenvs/lightstream/bin/python)" project-jdk-type="Python SDK" />
->>>>>>> 1c921377c62aab9bcf1b4170c981c7d8ebde2efc
 </project>

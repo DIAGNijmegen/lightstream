@@ -1,25 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="stephandooper@dlc-tornadus:2222 agent (3)" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="stephandooper@dlc-tornadus:2222 agent" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
       <paths name="stephandooper@dlc-tornadus:2222 agent">
         <serverdata>
           <mappings>
-            <mapping deploy="/tmp/pycharm_project_997" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="stephandooper@dlc-tornadus:2222 agent (2)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/pycharm_project_787" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="stephandooper@dlc-tornadus:2222 agent (3)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/pycharm_project_464" local="$PROJECT_DIR$" />
+            <mapping deploy="/tmp/pycharm_project_786" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

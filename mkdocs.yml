@@ -9,6 +9,7 @@ nav:
       Image classification: tutorials/classification.md
       Custom models: tutorials/custom_models.md
       Image processing: tutorials/dataloading.md
+      Trainer options: tutorials/trainer_options.md
   - Models:
       ResNet: models/resnet.md
   - Modules:
