@@ -15,8 +15,6 @@ The lightstream repository can be installed using pip, or you can alternatively 
 pip install lightstream
 ```
 
-
-
 We also recommend to install the albumentationsxl package, which is an albumentations fork with a pyvips backend to preprocess large images
 
 ```python
@@ -24,10 +22,14 @@ pip install albumentationsxl
 ```
 
 ## Documentation
-The documentation can be generated using 
+The documentation can be found at https://diagnijmegen.github.io/lightstream/
+
+Alternatively the documentation can be generated locally using 
 
 ```
 make docs
 ```
+
+
 
 ## 
