@@ -10,8 +10,8 @@ test_cases = [resnet18, resnet34, resnet50]
 
 
 def make_dummy_data():
-    img_size = 1600 + 320
-    dtype = torch.float64
+    img_size = 1600 + 640
+    dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     image = torch.FloatTensor(3, img_size, img_size).normal_(0, 1)
@@ -29,9 +29,9 @@ def streaming_outputs(request):
     print("model fn", request.param)
     model = request.param()
 
-    tile_size = 1600
+    tile_size = 1920
 
-    dtype = torch.float64
+    dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch = make_dummy_data()
 
@@ -53,7 +53,6 @@ def test_forward_output(streaming_outputs):
     # else:
     #    print("NOT equal output to streaming"),
     #    print("error:", max_error)
-
     assert max_error < 1e-2
 
 

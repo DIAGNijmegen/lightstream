@@ -20,7 +20,8 @@ from models.resnet.resnet import split_resnet
 
 
 def create_dummy_data(self):
-    image = torch.FloatTensor(3, self.img_size, self.img_size).normal_(0, 1)
+    img_size = 1600
+    image = torch.FloatTensor(3, img_size, img_size).normal_(0, 1)
     image = image.type(self.dtype)
     image = image.to(self.device)
 

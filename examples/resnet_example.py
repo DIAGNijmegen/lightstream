@@ -13,10 +13,10 @@ dataset = CIFAR10(os.getcwd(), download=True, transform=transforms.ToTensor())
 train_loader = DataLoader(dataset, num_workers=3)
 
 autoencoder = StreamingResNet(
-    "resnet18",
-    1600,
+    "resnet34",
+    1920,
     torch.nn.functional.cross_entropy,
-    statistics_on_cpu=False,
+    statistics_on_cpu=True,
     verbose=True,
     use_streaming=True,
     num_classes=10,

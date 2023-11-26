@@ -507,6 +507,7 @@ class StreamingCNN(object):
 
         # Calculate the output stride of the whole stream_module
         p_stats = self._prev_stats(output)
+
         if p_stats:
             self.output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
         else:
@@ -616,10 +617,6 @@ class StreamingCNN(object):
             if isinstance(m, torch.nn.BatchNorm2d):
                 # Perhaps change to torch.nn.init.ones_(m.weight) and zeros?
                 m.weight.data.fill_(1)
-                m.bias.data.zero_()
-                m.eval()
-            elif isinstance(m, torch.nn.LayerNorm):
-                m.weight.data.fill(1)
                 m.bias.data.zero_()
                 m.eval()
 
@@ -986,12 +983,12 @@ class StreamingCNN(object):
         return tile
 
     def disable(self):
-        """Disable the lightstream hooks"""
+        """Disable the streaming hooks"""
         self._remove_hooks()
         self._reset_converted_modules(self.stream_module)
 
     def enable(self):
-        """Enable the lightstream hooks"""
+        """Enable the streaming hooks"""
         self._remove_hooks()
         self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
@@ -1091,7 +1088,6 @@ class StreamingCNN(object):
                 output_stride = torch.tensor([1, 1, 1])
 
             module_stats["output_stride"] = output_stride.clone().detach()
-
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
@@ -1280,17 +1276,32 @@ class StreamingCNN(object):
 
         return new_value_indices, old_value_indices
 
-    def _prev_stats(self, tensor):
-        prev = tensor.grad_fn
+    def _prev_stats(self, grad_fn):
+        """ DAG traversal, finds the first grad_fn that is in self._stats_per_grad_fn
+
+        Finds the first grad_fn that is in self._stats_per_grad_fn, which is needed for output stride calculations
+
+        Parameters
+        ----------
+        grad_fn: the grad function of the current output tensor
+
+        """
+        if hasattr(grad_fn, "grad_fn"):
+            grad_fn = grad_fn.grad_fn
+
         prev_stats = None
-        while True:
-            if prev in self._stats_per_grad_fn:
-                prev_stats = self._stats_per_grad_fn[prev]
-                break
-            if hasattr(prev, "next_functions") and len(prev.next_functions) > 0:
-                prev = prev.next_functions[0][0]
-            else:
-                break
+
+        if grad_fn in self._stats_per_grad_fn:
+            prev_stats = self._stats_per_grad_fn[grad_fn]
+            return prev_stats
+        elif hasattr(grad_fn, "next_functions") and len(grad_fn.next_functions) > 0:
+            children = [x[0] for x in grad_fn.next_functions]
+
+            for x in children:
+                prev_stats = self._prev_stats(x)
+                if prev_stats is not None:
+                    break
+            return prev_stats
         return prev_stats
 
     def state_dict(self):

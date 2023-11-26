@@ -1,6 +1,12 @@
 import torch
+from sys import getsizeof
+import numpy as np
+
 from torchvision.models import convnext_tiny
+from torchvision.models import resnet18
+from lightstream.models.resnet.resnet import split_resnet
 import torchvision
+from torchvision.ops.misc import Permute
 from scnn import StreamingCNN
 from torchviz import make_dot
 
@@ -15,43 +21,12 @@ def create_dummy_data(img_size):
 
     return image, target
 
+def freeze_streaming_normalization_layers(model):
+    """Do not use normalization layers within lightstream, only local ops are allowed"""
+    freeze_layers = [l for l in model.modules() if isinstance(l, torch.nn.BatchNorm2d)]
 
-def _reset_parameters_to_constant(model):
-    for mod in model.modules():
-        if isinstance(mod, (torch.nn.Conv2d)):
-            # to counter floating precision errors, we assign 1 to the weights and
-            # normalize the output after the conv.
-            torch.nn.init.constant_(mod.weight, 1)
-            if mod.bias is not None:
-                torch.nn.init.constant_(mod.bias, 0)
-    return model
-
-
-def freeze_stochastic_depth(model):
-    for m in model.modules():
-        if isinstance(m, torchvision.ops.StochasticDepth):
-            m.training = False
-    return model
-
-
-def replace_layers(model, old, new):
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            ## compound module, go inside it
-            replace_layers(module, old, new)
-
-        if isinstance(module, old):
-            ## simple module
-            try:
-                n = int(n)
-                model[n] = new
-            except:
-                setattr(model, n, new)
-
-def set_layer_scale(model, val):
-    for x in model.modules():
-        if hasattr(x, "layer_scale"):
-            x.layer_scale.data.fill_(val)
+    for mod in freeze_layers:
+        mod.eval()
 
 if __name__ == "__main__":
     tile_size = 1920
@@ -59,27 +34,20 @@ if __name__ == "__main__":
 
     # print(getsizeof(np.random.randint(256, size=(8192, 8192,3), dtype=np.uint8).astype(np.float64)) / 1000000000, "GB")
 
-    model = convnext_tiny().features
+    model = resnet18()
+    model, head = split_resnet(model)
     model = torch.nn.Sequential(
-        model
+        model[0:4], model[4]
     )
 
-    replace_layers(model, torch.nn.LayerNorm, torch.nn.Identity())
-    replace_layers(model, torch.nn.Linear, torch.nn.Identity())
-    replace_layers(model, torch.nn.GELU, torch.nn.Identity())
-
-    model = freeze_stochastic_depth(model)
-    model = _reset_parameters_to_constant(model)
+    freeze_streaming_normalization_layers(model)
 
     # temp = model[0](image)
     # out = model[1](temp)
-
     check_1 = model(image)
     make_dot(check_1, params=dict(list(model.named_parameters()))).render("rnn_torchviz", format="png")
-    set_layer_scale(model, 1.0)
 
     sCNN = StreamingCNN(model, tile_shape=(1, 3, tile_size, tile_size), verbose=True)
-    set_layer_scale(sCNN.stream_module, 1e-6)
     check_2 = sCNN(image)
 
     print(check_1.shape)

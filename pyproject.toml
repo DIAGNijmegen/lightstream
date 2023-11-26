@@ -24,7 +24,7 @@ dependencies = [
 docs = [
     "mkdocs",
     "mkdocstrings",
-    "mkdocstrings[python]"
+    "mkdocstrings[python]",
     "mkdocs-material",
     "mkdocs-caption"
 ]
