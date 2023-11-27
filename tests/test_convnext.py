@@ -1,15 +1,15 @@
 import torch
 import pytest
 import numpy as np
-from tests.modelcheck import ModelCheck
-from torchvision.models import resnet18, resnet34, resnet50
+from tests.modelcheck import ModelCheck, ModelCheckConvNext
 from models.resnet.resnet import split_resnet
+from torchvision.models import convnext_tiny
 
-test_cases = [resnet18, resnet34, resnet50]
+test_cases = [convnext_tiny]
 
 
 def make_dummy_data():
-    img_size = 1600 + 640
+    img_size = 3840
     dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,17 +25,16 @@ def make_dummy_data():
 
 @pytest.fixture(scope="module", params=test_cases)
 def streaming_outputs(request):
-    print("model fn", request.param)
+    #print("model fn", request.param)
     model = request.param()
 
-    tile_size = 1920
+    tile_size = 3520
 
     dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch = make_dummy_data()
 
-    stream_net, head = split_resnet(model)
-    model_check = ModelCheck(stream_net, tile_size, loss_fn=torch.nn.MSELoss(), verbose=False, saliency=True)
+    model_check = ModelCheckConvNext('convnext_tiny', tile_size, loss_fn=torch.nn.MSELoss(), verbose=False, saliency=True)
     model_check.to(device)
     model_check.to(dtype)
     streaming, normal = model_check.run(batch)

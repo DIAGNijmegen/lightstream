@@ -405,8 +405,6 @@ class StreamingCNN(object):
         self.dtype = next(stream_module.parameters()).dtype
         if dtype is not None:
             self.dtype = dtype
-        print("scnn dtype", self.dtype)
-        print("scnn device", self.device)
         self.tile_shape = tile_shape
         self.gather_input_gradient = saliency
         self.gather_gradient = gather_gradients
@@ -832,6 +830,7 @@ class StreamingCNN(object):
 
         output_height = self._tile_output_shape[H_DIM]
         output_width = self._tile_output_shape[W_DIM]
+
         valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // self.output_stride[1]
         valid_grad_height *= self.output_stride[1]
         valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // self.output_stride[2]

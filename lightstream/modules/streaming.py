@@ -47,13 +47,17 @@ class StreamingModule(L.LightningModule):
 
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
-        freeze_layers = [l for l in self.stream_network.stream_module.modules() if isinstance(l, torch.nn.BatchNorm2d)]
+        freeze_layers = [
+            l
+            for l in self.stream_network.stream_module.modules()
+            if isinstance(l, (torch.nn.BatchNorm2d, torch.nn.LayerNorm))
+        ]
 
         for mod in freeze_layers:
             mod.eval()
 
     def on_train_epoch_start(self) -> None:
-        """ on_train_epoch_start hook
+        """on_train_epoch_start hook
 
         Do not override this method. Instead, call the parent class using super().on_train_start if you want
         to add this hook into your pipelines
@@ -62,7 +66,7 @@ class StreamingModule(L.LightningModule):
         self.freeze_streaming_normalization_layers()
 
     def on_validation_start(self):
-        """ on_validation_start hook
+        """on_validation_start hook
 
         Do not override this method. Instead, call the parent class using super().on_train_start if you want
         to add this hook into your pipelines
@@ -75,7 +79,7 @@ class StreamingModule(L.LightningModule):
         self.stream_network.dtype = self.dtype
 
     def on_train_start(self):
-        """ on_train_start hook
+        """on_train_start hook
 
         Do not override this method. Instead, call the parent class using super().on_train_start if you want
         to add this hook into your pipelines
@@ -119,7 +123,7 @@ class StreamingModule(L.LightningModule):
         return out
 
     def backward_streaming(self, image, gradient):
-        """ Perform the backward pass using the streaming network
+        """Perform the backward pass using the streaming network
 
         Backward only if streaming is turned on.
         This method is primarily a convenience function
@@ -164,7 +168,7 @@ class StreamingModule(L.LightningModule):
         return delta.detach().cpu().numpy()
 
     def get_trainable_params(self):
-        """ Get trainable parameters for the entire model
+        """Get trainable parameters for the entire model
 
         If self.streaming_layers is True, then the parameters of the streaming network will be trained.
         Otherwise, the parameters will be left untrained (no gradients will be collected)
@@ -198,7 +202,7 @@ class StreamingModule(L.LightningModule):
 
     def _build_streaming_network(self, **kwargs):
         """
-            (re)-build the streaming network
+        (re)-build the streaming network
         """
 
         stream_network = self.stream_network

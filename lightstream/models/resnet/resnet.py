@@ -55,9 +55,9 @@ class StreamingResNet(BaseModel):
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
         network = StreamingResNet.model_choices[model_name](weights="IMAGENET1K_V1")
-        stream_net, head = split_resnet(network, num_classes=kwargs.get("num_classes", 1000))
+        stream_network, head = split_resnet(network, num_classes=kwargs.get("num_classes", 1000))
         super().__init__(
-            stream_net,
+            stream_network,
             head,
             tile_size,
             loss_fn,
