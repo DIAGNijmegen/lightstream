@@ -6,23 +6,13 @@
   <component name="BlackConnectSettings" lineLength="120" />
   <component name="ChangeListManager">
     <list default="true" id="f7ceb1fb-d685-449f-8b7e-5e41c7fbc908" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/lightstream/doodle_resnet.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/deployment.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/deployment.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/lightstream.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/lightstream.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/applications/streamingclam_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/applications/streamingclam_example.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/resnet_example.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/resnet_example.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/doodle.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/doodle.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/models/convnext/convnext.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/models/convnext/convnext.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/models/streamingclam/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/models/streamingclam/clam.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/models/streamingclam/streamingclam_regression.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/lightstream/scnn.py" beforeDir="false" afterPath="$PROJECT_DIR$/lightstream/scnn.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/modelcheck.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/modelcheck.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tests/test_resnet.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_resnet.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/resnet_block.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/rnn_torchviz" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/rnn_torchviz_block.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lightstream/rnn_torchviz_cnblock.png" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -209,7 +199,8 @@
       <workItem from="1700822842781" duration="35425000" />
       <workItem from="1700905299566" duration="14377000" />
       <workItem from="1701008729207" duration="7991000" />
-      <workItem from="1701022772662" duration="8989000" />
+      <workItem from="1701022772662" duration="9034000" />
+      <workItem from="1701079415786" duration="435000" />
     </task>
     <servers />
   </component>
