@@ -133,3 +133,4 @@ class StreamingConvnext(BaseModel):
 if __name__ == "__main__":
     print(torch.cuda.is_available())
     model = StreamingConvnext("convnext_tiny", 1600, nn.MSELoss)
+    print(model)
