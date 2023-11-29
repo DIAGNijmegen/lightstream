@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from copy import deepcopy
-from modules.base import BaseModel
+from lightstream.modules.base import BaseModel
 from torchvision.models import convnext_tiny, convnext_small
 from torchvision.ops.misc import Permute
 import torchvision

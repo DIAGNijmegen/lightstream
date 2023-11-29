@@ -382,8 +382,8 @@ class StreamingCNN(object):
         dtype=None,
         statistics_on_cpu=False,
         normalize_on_gpu=False,
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
+        mean=None,
+        std=None,
         state_dict=None,
     ):
         """
@@ -412,8 +412,15 @@ class StreamingCNN(object):
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
 
-        self.mean = torch.tensor(mean).cuda()[:, None, None]
-        self.std = torch.tensor(std).cuda()[:, None, None]
+        if mean is not None and not isinstance(mean, torch.Tensor):
+            mean = torch.Tensor(mean)[:, None, None]
+
+        if std is not None and not isinstance(torch.Tensor):
+            std = torch.Tensor(std)[:, None, None]
+
+        self.mean = mean if mean is not None else torch.tensor([0.485, 0.456, 0.406]).cuda()[:, None, None]
+        self.std = std if std is not None else torch.tensor([0.229, 0.224, 0.225]).cuda()[:, None, None]
+
         self.should_normalize = normalize_on_gpu
 
         self._tile_output_shape = None

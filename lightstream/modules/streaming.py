@@ -18,8 +18,8 @@ class StreamingModule(L.LightningModule):
         self.saliency = kwargs.get("saliency", False)
         self.copy_to_gpu = kwargs.get("copy_to_gpu", False)
         self.verbose = kwargs.get("verbose", True)
-        self.mean = kwargs.get("mean", [0.485, 0.456, 0.406])
-        self.std = kwargs.get("std", [0.229, 0.224, 0.225])
+        self.mean = torch.Tensor(kwargs.get("mean", [0.485, 0.456, 0.406]))
+        self.std = torch.Tensor(kwargs.get("std", [0.229, 0.224, 0.225]))
         self.statistics_on_cpu = kwargs.get("statistics_on_cpu", True)
         self.normalize_on_gpu = kwargs.get("normalize_on_gpu", False)
 
@@ -37,8 +37,8 @@ class StreamingModule(L.LightningModule):
             verbose=self.verbose,
             statistics_on_cpu=self.statistics_on_cpu,
             normalize_on_gpu=self.normalize_on_gpu,
-            mean=self.mean,
-            std=self.std,
+            mean=torch.Tensor(self.mean),
+            std=torch.Tensor(self.std),
             state_dict=kwargs.get("state_dict", None),
         )
 
@@ -74,8 +74,8 @@ class StreamingModule(L.LightningModule):
         """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
-        self.stream_network.mean = self.mean
-        self.stream_network.std = self.std
+        self.stream_network.mean = self.mean.to(self.device)
+        self.stream_network.std = self.std.to(self.device)
         self.stream_network.dtype = self.dtype
 
     def on_train_start(self):
@@ -87,8 +87,21 @@ class StreamingModule(L.LightningModule):
         """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
-        self.stream_network.mean = self.mean
-        self.stream_network.std = self.std
+        self.stream_network.mean = self.mean.to(self.device)
+        self.stream_network.std = self.std.to(self.device)
+        self.stream_network.dtype = self.dtype
+    
+    def on_test_start(self):
+        """on_train_start hook
+
+        Do not override this method. Instead, call the parent class using super().on_train_start if you want
+        to add this hook into your pipelines
+
+        """
+        # Update streaming to put all the inputs/tensors on the right device
+        self.stream_network.device = self.device
+        self.stream_network.mean = self.mean.to(self.device)
+        self.stream_network.std = self.std.to(self.device)
         self.stream_network.dtype = self.dtype
 
     def disable_streaming(self):
