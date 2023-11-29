@@ -415,11 +415,11 @@ class StreamingCNN(object):
         if mean is not None and not isinstance(mean, torch.Tensor):
             mean = torch.Tensor(mean)[:, None, None]
 
-        if std is not None and not isinstance(torch.Tensor):
+        if std is not None and not isinstance(std, torch.Tensor):
             std = torch.Tensor(std)[:, None, None]
 
-        self.mean = mean if mean is not None else torch.tensor([0.485, 0.456, 0.406]).cuda()[:, None, None]
-        self.std = std if std is not None else torch.tensor([0.229, 0.224, 0.225]).cuda()[:, None, None]
+        self.mean = mean if mean is not None else torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+        self.std = std if std is not None else torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
         self.should_normalize = normalize_on_gpu
 
