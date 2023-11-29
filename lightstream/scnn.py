@@ -709,12 +709,12 @@ class StreamingCNN(object):
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
-        if self.verbose:
-            print("Number of tiles in forward:", n_rows * n_cols)
-        if self.verbose:
-            iterator = tqdm(range(n_rows))
-        else:
-            iterator = range(n_rows)
+        #if self.verbose:
+        #    print("Number of tiles in forward:", n_rows * n_cols)
+        #if self.verbose:
+        #    iterator = tqdm(range(n_rows))
+        #else:
+        iterator = range(n_rows)
 
         with torch.no_grad():
             for row in iterator:
@@ -846,10 +846,10 @@ class StreamingCNN(object):
         n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
 
-        if self.verbose:
-            ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
-            next_ideal_tile_size = height / float(n_rows - 1) + grad_lost.top + grad_lost.bottom
-            print(ideal_tile_size, n_rows * n_cols, next_ideal_tile_size)
+        #if self.verbose:
+        #    ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
+        #    next_ideal_tile_size = height / float(n_rows - 1) + grad_lost.top + grad_lost.bottom
+        #    print(ideal_tile_size, n_rows * n_cols, next_ideal_tile_size)
 
         if image.shape[W_DIM] <= tile_width:
             n_cols = 1
@@ -861,12 +861,12 @@ class StreamingCNN(object):
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        if self.verbose:
-            print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
-        if self.verbose:
-            iterator = tqdm(range(n_rows))
-        else:
-            iterator = range(n_rows)
+        #if self.verbose:
+        #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
+        #if self.verbose:
+        #    iterator = tqdm(range(n_rows))
+        #else:
+        iterator = range(n_rows)
 
         for row in iterator:
             for col in range(n_cols):
