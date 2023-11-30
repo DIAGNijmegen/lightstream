@@ -348,7 +348,7 @@ H_DIM = 2
 W_DIM = 3
 
 
-class StreamingCNN(object):
+class StreamingCNN(torch.nn.Module):
     """Initialize Streaming CNN helper class. After initialization use the
     forward() and backward() function of this class to lightstream.
     Pseudocode example:
@@ -396,6 +396,7 @@ class StreamingCNN(object):
             gather_gradients (bool): will gather the gradients of the feature maps
             eps (float): epsilon error to compare floating values
         """
+        super().__init__()
         global H_DIM, W_DIM
         self.stream_module = stream_module
         self.verbose = verbose
@@ -668,6 +669,7 @@ class StreamingCNN(object):
         # performance reasons it is beneficial to copy to the GPU as a whole
         # instead of tile-by-tile.
         image = image
+
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
 
@@ -1310,7 +1312,7 @@ class StreamingCNN(object):
             return prev_stats
         return prev_stats
 
-    def state_dict(self):
+    def get_tile_cache(self):
         named_stats = {"net_stats": {}}
         for name, module in self.stream_module.named_modules():
             if module in self._module_stats:

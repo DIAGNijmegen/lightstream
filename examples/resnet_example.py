@@ -14,10 +14,10 @@ dataset = CIFAR10(os.getcwd(), download=True, transform=transforms.ToTensor())
 train_loader = DataLoader(dataset, num_workers=3)
 
 
-"""
+
 autoencoder = StreamingResNet(
     "resnet34",
-    1600,
+    1920,
     torch.nn.functional.cross_entropy,
     statistics_on_cpu=True,
     verbose=True,
@@ -35,7 +35,7 @@ autoencoder = StreamingConvnext(
     num_classes=10,
     use_stochastic_depth=False,
 )
-
+"""
 # train model
 trainer = pl.Trainer(accelerator="gpu")
 trainer.fit(model=autoencoder, train_dataloaders=train_loader)

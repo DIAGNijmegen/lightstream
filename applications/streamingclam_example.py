@@ -126,9 +126,16 @@ if __name__ == "__main__":
         logger=wandb_logger,
     )
 
-    trainer.fit(
-        model=model,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-        ckpt_path=last_checkpoint_path if (options.resume and last_checkpoint_path) else None,
-    )
+    if options.mode == "train":
+        trainer.fit(
+            model=model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+            ckpt_path=last_checkpoint_path if (options.resume and last_checkpoint_path) else None,
+        )
+
+    elif options.mode == "validation":
+
+        print("trainer arg precision", trainer.precision)
+
+        trainer.validate(model, dataloaders=val_loader)

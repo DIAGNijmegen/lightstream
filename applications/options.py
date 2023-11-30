@@ -13,16 +13,17 @@ class TrainConfig:
     test_csv: str = ""
     mask_suffix: str = "_tissue"  # the suffix for mask tissues e.g. tumor_069_<mask_suffix>.tif
     default_save_dir: str = "/opt/ml/checkpoints"
-    num_gpus: int = 8
+    num_gpus: int = 1
     strategy: str = "ddp_find_unused_parameters_true"
     grad_batches: int = 8  # Gradient accumulation: the amount of batches before optimzier step
     resume: bool = True  # Whether to resume training from the last epochs
+    mode: str = "validation"
 
     # StreamingClam options
     num_epochs: int = 100  # The number of epochs to train (max)
     encoder: str = "resnet34"  # Resnet 18, ResNet34, Resnet50
     branch: str = "sb"  # sb or mb
-    max_pool_kernel: int = 0
+    max_pool_kernel: int = 8
     num_classes: int = 2
 
     # Streaming options
@@ -32,11 +33,11 @@ class TrainConfig:
     train_streaming_layers: bool = False
 
     # Dataloader options
-    img_size: int = 32768  # represents image size if variable_input_shape=False, else the maximum image size
-    variable_input_shapes: bool = True
+    img_size: int = 4096  # represents image size if variable_input_shape=False, else the maximum image size
+    variable_input_shapes: bool = False
     filetype: str = ".tif"
-    read_level: int = 3  # the level of the tif file (0 is highest resolution)
-    num_workers: int = 3
+    read_level: int = 4  # the level of the tif file (0 is highest resolution)
+    num_workers: int = 4
 
     def configure_parser_with_options(self):
         """Create an argparser based on the attributes"""

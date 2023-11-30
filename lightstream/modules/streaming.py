@@ -9,8 +9,7 @@ class StreamingModule(L.LightningModule):
         super().__init__()
         self.use_streaming = use_streaming
         self.train_streaming_layers = train_streaming_layers
-        self._stream_module = stream_network
-        self.params = self.get_trainable_params()
+        #self._stream_module = stream_network
 
         # StreamingCNN options
         self.tile_size = tile_size
@@ -18,8 +17,8 @@ class StreamingModule(L.LightningModule):
         self.saliency = kwargs.get("saliency", False)
         self.copy_to_gpu = kwargs.get("copy_to_gpu", False)
         self.verbose = kwargs.get("verbose", True)
-        self.mean = torch.Tensor(kwargs.get("mean", [0.485, 0.456, 0.406]))
-        self.std = torch.Tensor(kwargs.get("std", [0.229, 0.224, 0.225]))
+        self.mean = torch.Tensor(kwargs.get("mean", [0.485, 0.456, 0.406]))[:,None, None]
+        self.std = torch.Tensor(kwargs.get("std", [0.229, 0.224, 0.225]))[:,None, None]
         self.statistics_on_cpu = kwargs.get("statistics_on_cpu", True)
         self.normalize_on_gpu = kwargs.get("normalize_on_gpu", False)
 
@@ -41,6 +40,8 @@ class StreamingModule(L.LightningModule):
             std=torch.Tensor(self.std),
             state_dict=kwargs.get("state_dict", None),
         )
+
+        self.params = self.get_trainable_params()
 
         if not self.use_streaming:
             self.disable_streaming()
@@ -188,11 +189,11 @@ class StreamingModule(L.LightningModule):
 
         """
         if self.train_streaming_layers:
-            params = list(self._stream_module.parameters())
+            params = list(self.stream_network.stream_module.parameters())
             return params
         else:
             print("WARNING: Streaming network will not be trained")
-            for param in self._stream_module.parameters():
+            for param in self.stream_network.stream_module.parameters():
                 param.requires_grad = False
 
     def _remove_streaming_network(self):
