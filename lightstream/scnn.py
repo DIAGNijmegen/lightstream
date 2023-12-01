@@ -559,7 +559,7 @@ class StreamingCNN(torch.nn.Module):
                     module.groups,
                     module.bias is not None,
                 )
-                mod = mod.to(module.weight.device)
+                mod = mod.to(module.weight.device, non_blocking=True)
                 mod = mod.to(module.weight.dtype)
 
                 mod.weight.requires_grad = module.weight.requires_grad
@@ -589,7 +589,7 @@ class StreamingCNN(torch.nn.Module):
                 module.groups,
                 module.bias is not None,
             )
-            mod = mod.to(module.weight.device)
+            mod = mod.to(module.weight.device, non_blocking=True)
             mod = mod.to(module.weight.dtype)
 
             mod.weight.requires_grad = module.weight.requires_grad
