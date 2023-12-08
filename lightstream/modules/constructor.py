@@ -120,5 +120,5 @@ class StreamingConstructor:
                     setattr(model_rep, n_rep, model_ref[int(n_ref)])
 
 
-if __name__=='__main__':
-    print("Starting constructor checks")
+if __name__ == "__main__":
+    print("Starting constructor checks 2")
