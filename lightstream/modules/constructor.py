@@ -118,3 +118,7 @@ class StreamingConstructor:
                     model_rep[n_rep] = model_ref[n_ref]
                 except:
                     setattr(model_rep, n_rep, model_ref[int(n_ref)])
+
+
+if __name__=='__main__':
+    print("Starting constructor checks")
