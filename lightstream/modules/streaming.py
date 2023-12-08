@@ -30,7 +30,7 @@ class StreamingModule(L.LightningModule):
             stream_network.to(device)
 
         # Load the tile cache state dict if present
-        self.load_tile_cache_if_needed()
+        state_dict = self.load_tile_cache_if_needed()
 
         self.stream_network = StreamingCNN(
             stream_network,
@@ -43,7 +43,7 @@ class StreamingModule(L.LightningModule):
             normalize_on_gpu=self.normalize_on_gpu,
             mean=torch.Tensor(self.mean),
             std=torch.Tensor(self.std),
-            state_dict=kwargs.get("state_dict", None),
+            state_dict=state_dict,
         )
 
         self.save_tile_cache_if_needed()

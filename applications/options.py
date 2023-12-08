@@ -29,7 +29,7 @@ class TrainConfig:
     # Streaming options
     tile_size: int = 3200
     statistics_on_cpu: bool = True
-    verbose: bool = False
+    verbose: bool = True
     train_streaming_layers: bool = False
 
     # Dataloader options
