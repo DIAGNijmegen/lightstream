@@ -2,7 +2,6 @@ import torch
 import lightning as L
 
 from pathlib import Path
-from lightstream.scnn import StreamingCNN
 from lightstream.modules.constructor import StreamingConstructor
 
 

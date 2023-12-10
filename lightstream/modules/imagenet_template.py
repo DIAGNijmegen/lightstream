@@ -7,7 +7,7 @@ import torch
 # TODO: Add torchmetric collections as parameters (dependency injections)
 
 
-class BaseModel(StreamingModule):
+class ImageNetClassifier(StreamingModule):
     def __init__(
         self,
         stream_net: torch.nn.modules.container.Sequential,

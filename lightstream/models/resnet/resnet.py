@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from lightstream.modules.base import BaseModel
+from lightstream.modules.imagenet_template import ImageNetClassifier
 from torchvision.models import resnet18, resnet34, resnet50
 
 
@@ -41,7 +41,7 @@ def split_resnet(net, num_classes=1000):
     return stream_net, head
 
 
-class StreamingResNet(BaseModel):
+class StreamingResNet(ImageNetClassifier):
     # Resnet  minimal tile size based on tile statistics calculations:
     # resnet18 : 960
 

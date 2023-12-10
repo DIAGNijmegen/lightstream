@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from lightstream.modules.base import BaseModel
+from lightstream.modules.imagenet_template import ImageNetClassifier
 from torchvision.models import convnext_tiny, convnext_small
 
 
@@ -18,7 +18,7 @@ def _set_layer_scale(model, val=1.0):
             x.layer_scale.data.fill_(val)
 
 
-class StreamingConvnext(BaseModel):
+class StreamingConvnext(ImageNetClassifier):
     model_choices = {"convnext_tiny": convnext_tiny, "convnext_small": convnext_small}
 
     def __init__(

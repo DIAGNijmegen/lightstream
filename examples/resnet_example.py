@@ -5,14 +5,11 @@ from torchvision.datasets import CIFAR10
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 
-# My own edits here
-
 from models.resnet.resnet import StreamingResNet
 from models.convnext.convnext import StreamingConvnext
 
 dataset = CIFAR10(os.getcwd(), download=True, transform=transforms.ToTensor())
 train_loader = DataLoader(dataset, num_workers=3)
-
 
 
 autoencoder = StreamingResNet(
@@ -23,6 +20,7 @@ autoencoder = StreamingResNet(
     verbose=True,
     num_classes=10,
 )
+
 """
 autoencoder = StreamingConvnext(
     "convnext_tiny",

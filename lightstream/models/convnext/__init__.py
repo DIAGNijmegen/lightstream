@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from modules.base import BaseModel
+from modules.imagenet_template import BaseModel
 from torchvision.models import resnet18, resnet34, resnet50
 
 def split_resnet(net, num_classes=1000):
