@@ -56,8 +56,8 @@ class StreamingModule(L.LightningModule):
         """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
-        self.stream_network.mean = self.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.std.to(self.device, non_blocking=True)
+        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
+        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
         self.stream_network.dtype = self.dtype
 
     def on_train_start(self):
@@ -69,8 +69,8 @@ class StreamingModule(L.LightningModule):
         """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
-        self.stream_network.mean = self.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.std.to(self.device, non_blocking=True)
+        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
+        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
         self.stream_network.dtype = self.dtype
 
     def on_test_start(self):
@@ -82,8 +82,8 @@ class StreamingModule(L.LightningModule):
         """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
-        self.stream_network.mean = self.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.std.to(self.device, non_blocking=True)
+        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
+        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
         self.stream_network.dtype = self.dtype
 
     def disable_streaming_hooks(self):

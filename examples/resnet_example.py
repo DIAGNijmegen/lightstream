@@ -21,7 +21,6 @@ autoencoder = StreamingResNet(
     torch.nn.functional.cross_entropy,
     statistics_on_cpu=True,
     verbose=True,
-    use_streaming=True,
     num_classes=10,
 )
 """

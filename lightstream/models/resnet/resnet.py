@@ -57,7 +57,7 @@ class StreamingResNet(BaseModel):
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
         network = StreamingResNet.model_choices[model_name](weights="DEFAULT")
-        stream_network, head = split_resnet(network, num_classes=kwargs.get("num_classes", 1000))
+        stream_network, head = split_resnet(network, num_classes=kwargs.pop("num_classes", 1000))
 
         self._get_streaming_options(**kwargs)
 
@@ -73,6 +73,8 @@ class StreamingResNet(BaseModel):
     def _get_streaming_options(self, **kwargs):
         """Set streaming defaults, but overwrite them with values of kwargs if present."""
 
+        # We need to add torch.nn.Batchnorm to the keep modules, because of some in-place ops error if we don't
+        # https://discuss.pytorch.org/t/register-full-backward-hook-for-residual-connection/146850
         streaming_options = {
             "verbose": True,
             "copy_to_gpu": False,

@@ -255,15 +255,6 @@ class StreamingConv2dF(torch.autograd.Function):
                 groups,
             )
 
-            # grad_weight = cpp_functions.backward(weight.shape,
-            #                                      relevant_grad.to(weight.dtype),
-            #                                      relevant_input.to(weight.dtype),
-            #                                      (0, 0),  # padding
-            #                                      stride[1:3], dilation, groups,
-            #                                      torch.backends.cudnn.benchmark,  # benchmark
-            #                                      torch.backends.cudnn.deterministic,
-            #                                      True)  # deterministic
-
             if bias is not None:
                 grad_bias = relevant_grad[0].sum((1, 2))
 
@@ -375,8 +366,6 @@ class StreamingCNN(torch.nn.Module):
         verbose=False,
         deterministic=False,
         saliency=False,
-        gather_gradients=False,
-        replace_non_linearity=True,
         eps=1e-5,
         copy_to_gpu=True,
         dtype=None,
@@ -393,7 +382,6 @@ class StreamingCNN(torch.nn.Module):
             verbose (bool): will log various debugging relevant information (default is False)
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
-            gather_gradients (bool): will gather the gradients of the feature maps
             eps (float): epsilon error to compare floating values
         """
         super().__init__()
@@ -408,8 +396,6 @@ class StreamingCNN(torch.nn.Module):
             self.dtype = dtype
         self.tile_shape = tile_shape
         self.gather_input_gradient = saliency
-        self.gather_gradient = gather_gradients
-        self.replace_non_linearity = replace_non_linearity
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
 
@@ -437,9 +423,6 @@ class StreamingCNN(torch.nn.Module):
             self.load_state_dict(state_dict)
 
     def _configure(self):
-        if self.replace_non_linearity:
-            self.convert_modules_model(self.stream_module)
-
         # Save current model and cudnn flags, since we need to change them and restore later
         state_dict = self._save_parameters()
         (old_deterministic_flag, old_benchmark_flag) = self._set_cudnn_flags_to_determistic()
@@ -478,9 +461,6 @@ class StreamingCNN(torch.nn.Module):
         self._restore_parameters(state_dict)
         self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
-
-        if self.replace_non_linearity:
-            self.convert_modules_model(self.stream_module, back=True)
 
         # Remove temporary data
         self._saved_tensors = {}
@@ -532,18 +512,6 @@ class StreamingCNN(torch.nn.Module):
         self.tile_output_lost = self._non_max_border_amount(output)
         if self.verbose:
             print("\n", "Output lost", self.tile_output_lost)
-
-    def convert_modules_model(self, module, from_mod=torch.nn.ReLU6, to_mod=torch.nn.ReLU, back=False):
-        mod = module
-        if not back and isinstance(module, from_mod):
-            mod = to_mod()
-            mod.previous_mod = module
-        if back and isinstance(module, to_mod):
-            mod = module.previous_mod
-        for name, child in module.named_children():
-            mod.add_module(name, self.convert_modules_model(child, from_mod, to_mod))
-        del module
-        return mod
 
     def _convert_modules_for_streaming(self, module):
         mod = module
@@ -711,11 +679,11 @@ class StreamingCNN(torch.nn.Module):
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
-        #if self.verbose:
+        # if self.verbose:
         #    print("Number of tiles in forward:", n_rows * n_cols)
-        #if self.verbose:
+        # if self.verbose:
         #    iterator = tqdm(range(n_rows))
-        #else:
+        # else:
         iterator = range(n_rows)
 
         with torch.no_grad():
@@ -848,7 +816,7 @@ class StreamingCNN(torch.nn.Module):
         n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
 
-        #if self.verbose:
+        # if self.verbose:
         #    ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
         #    next_ideal_tile_size = height / float(n_rows - 1) + grad_lost.top + grad_lost.bottom
         #    print(ideal_tile_size, n_rows * n_cols, next_ideal_tile_size)
@@ -858,16 +826,14 @@ class StreamingCNN(torch.nn.Module):
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
 
-        if self.gather_gradient:
-            self.gradients = {}
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        #if self.verbose:
+        # if self.verbose:
         #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
-        #if self.verbose:
+        # if self.verbose:
         #    iterator = tqdm(range(n_rows))
-        #else:
+        # else:
         iterator = range(n_rows)
 
         for row in iterator:
@@ -1285,7 +1251,7 @@ class StreamingCNN(torch.nn.Module):
         return new_value_indices, old_value_indices
 
     def _prev_stats(self, grad_fn):
-        """ DAG traversal, finds the first grad_fn that is in self._stats_per_grad_fn
+        """DAG traversal, finds the first grad_fn that is in self._stats_per_grad_fn
 
         Finds the first grad_fn that is in self._stats_per_grad_fn, which is needed for output stride calculations
 

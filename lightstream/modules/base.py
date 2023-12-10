@@ -40,8 +40,8 @@ class BaseModel(StreamingModule):
 
         self.str_output = self.forward_streaming(image)
 
-        if self.use_streaming:
-            self.str_output.requires_grad = self.training
+        # let leaf tensor require grad when training with streaming
+        self.str_output.requires_grad = self.training
 
         out = self.forward_head(self.str_output)
         loss = self.loss_fn(out, target)
@@ -63,6 +63,6 @@ class BaseModel(StreamingModule):
         # del loss
         # Don't call this>? https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#things-to-avoid
         torch.cuda.empty_cache()
-        if self.train_streaming_layers and self.use_streaming:
+        if self.train_streaming_layers:
             self.backward_streaming(self.image, self.str_output.grad)
         del self.str_output
