@@ -1,57 +1,31 @@
 import torch
 import lightning as L
-from lightstream.scnn import StreamingCNN
+
 from pathlib import Path
+from lightstream.scnn import StreamingCNN
+from lightstream.modules.constructor import StreamingConstructor
 
 
 class StreamingModule(L.LightningModule):
-    def __init__(self, stream_network, tile_size, use_streaming=True, train_streaming_layers=True, *args, **kwargs):
+    def __init__(self, stream_network, tile_size, train_streaming_layers=True, **kwargs):
         super().__init__()
-        self.use_streaming = use_streaming
         self.train_streaming_layers = train_streaming_layers
         # self._stream_module = stream_network
 
         # StreamingCNN options
         self.tile_size = tile_size
-        self.deterministic = kwargs.get("deterministic", True)
-        self.saliency = kwargs.get("saliency", False)
-        self.copy_to_gpu = kwargs.get("copy_to_gpu", False)
-        self.verbose = kwargs.get("verbose", True)
-        self.mean = torch.Tensor(kwargs.get("mean", [0.485, 0.456, 0.406]))[:, None, None]
-        self.std = torch.Tensor(kwargs.get("std", [0.229, 0.224, 0.225]))[:, None, None]
-        self.statistics_on_cpu = kwargs.get("statistics_on_cpu", True)
-        self.normalize_on_gpu = kwargs.get("normalize_on_gpu", False)
         self.tile_cache_dir = kwargs.get("tile_cache_dir", Path.cwd())
         self.tile_cache_fname = kwargs.get("tile_cache_fname", None)
 
-        if not self.statistics_on_cpu:
-            # Move to cuda manually if statistics are computed on gpu
-            device = torch.device("cuda")
-            stream_network.to(device)
-
         # Load the tile cache state dict if present
-        state_dict = self.load_tile_cache_if_needed()
+        tile_cache = self.load_tile_cache_if_needed()
 
-        self.stream_network = StreamingCNN(
-            stream_network,
-            tile_shape=(1, 3, tile_size, tile_size),
-            deterministic=self.deterministic,
-            saliency=self.saliency,
-            copy_to_gpu=self.copy_to_gpu,
-            verbose=self.verbose,
-            statistics_on_cpu=self.statistics_on_cpu,
-            normalize_on_gpu=self.normalize_on_gpu,
-            mean=torch.Tensor(self.mean),
-            std=torch.Tensor(self.std),
-            state_dict=state_dict,
-        )
+        # Initialize the streaming network
+        constructor = StreamingConstructor(stream_network, tile_size, tile_cache=tile_cache, **kwargs)
+        self.stream_network = constructor.prepare_streaming_model()
 
         self.save_tile_cache_if_needed()
-
         self.params = self.get_trainable_params()
-
-        if not self.use_streaming:
-            self.disable_streaming_hooks()
 
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
@@ -119,12 +93,10 @@ class StreamingModule(L.LightningModule):
         checkpointing will be turned off.
         """
         self.stream_network.disable()
-        self.use_streaming = False
 
     def enable_streaming_hooks(self):
         """Enable streaming hooks and use streamingconv2d modules"""
         self.stream_network.enable()
-        self.use_streaming = True
 
     def forward_streaming(self, x):
         """
@@ -140,8 +112,7 @@ class StreamingModule(L.LightningModule):
         The output of the streaming model
 
         """
-        out = self.stream_network(x) if self.use_streaming else self.stream_network.stream_module(x)
-        return out
+        return self.stream_network(x)
 
     def backward_streaming(self, image, gradient):
         """Perform the backward pass using the streaming network
@@ -161,7 +132,7 @@ class StreamingModule(L.LightningModule):
 
         """
 
-        if self.use_streaming and self.train_streaming_layers:
+        if self.train_streaming_layers:
             self.stream_network.backward(image, gradient)
 
     def configure_tile_delta(self):
@@ -214,39 +185,15 @@ class StreamingModule(L.LightningModule):
 
         # Convert streamingConv2D into regular Conv2D and turn off streaming hooks
         self.disable_streaming_hooks()
-        self.use_streaming = False
         temp = self.stream_network.stream_module
 
         # torch modules cannot be overridden normally, so delete and reassign
         del self.stream_network
         self.stream_network = temp
 
-    def _build_streaming_network(self, **kwargs):
-        """
-        (re)-build the streaming network
-        """
-
-        stream_network = self.stream_network
-        del self.stream_network
-
-        self.stream_network = StreamingCNN(
-            stream_network,
-            tile_shape=(1, 3, self.tile_size, self.tile_size),
-            deterministic=kwargs.get("deterministic", True),
-            saliency=kwargs.get("saliency", False),
-            gather_gradients=kwargs.get("gather_gradients", False),
-            copy_to_gpu=kwargs.get("copy_to_gpu", True),
-            verbose=kwargs.get("verbose", True),
-            statistics_on_cpu=kwargs.get("statistics_on_cpu", False),
-            normalize_on_gpu=kwargs.get("normalize_on_gpu", False),
-            mean=self.mean,
-            std=self.std,
-            state_dict=kwargs.get("state_dict", None),
-        )
-
     def save_tile_cache_if_needed(self, overwrite=False):
         """
-        Writes the tile cache to a file so it does not have to be recomputed
+        Writes the tile cache to a file, so it does not have to be recomputed
 
         The tile cache is normally calculated for each run.
         However, this can take a long time. By writing it to a file it can be reloaded without the need

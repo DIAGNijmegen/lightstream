@@ -15,11 +15,9 @@ class BaseModel(StreamingModule):
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
         train_streaming_layers=True,
-        use_streaming=True,
-        *args,
         **kwargs
     ):
-        super().__init__(stream_net, tile_size, use_streaming, train_streaming_layers, *args, **kwargs)
+        super().__init__(stream_net, tile_size, train_streaming_layers, **kwargs)
         self.head = head
         self.loss_fn = loss_fn
         self.train_streaming_layers = train_streaming_layers

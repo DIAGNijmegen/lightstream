@@ -3,8 +3,9 @@ import torch.nn as nn
 from lightstream.modules.base import BaseModel
 from torchvision.models import resnet18, resnet34, resnet50
 
+
 def split_resnet(net, num_classes=1000):
-    """ Split resnet architectures into backbone and fc modules
+    """Split resnet architectures into backbone and fc modules
 
     The stream_net will contain the CNN backbone that is capable for streaming.
     The fc model is not streamable and will be a separate module
@@ -41,6 +42,9 @@ def split_resnet(net, num_classes=1000):
 
 
 class StreamingResNet(BaseModel):
+    # Resnet  minimal tile size based on tile statistics calculations:
+    # resnet18 : 960
+
     model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
 
     def __init__(
@@ -49,25 +53,38 @@ class StreamingResNet(BaseModel):
         tile_size: int,
         loss_fn: torch.nn.functional,
         train_streaming_layers: bool = True,
-        use_streaming: bool = True,
-        *args,
         **kwargs
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
-        network = StreamingResNet.model_choices[model_name](weights="IMAGENET1K_V1")
+        network = StreamingResNet.model_choices[model_name](weights="DEFAULT")
         stream_network, head = split_resnet(network, num_classes=kwargs.get("num_classes", 1000))
+
+        self._get_streaming_options(**kwargs)
+
         super().__init__(
             stream_network,
             head,
             tile_size,
             loss_fn,
             train_streaming_layers=train_streaming_layers,
-            use_streaming=use_streaming,
-            *args,
-            **kwargs
+            **self.streaming_options,
         )
+
+    def _get_streaming_options(self, **kwargs):
+        """Set streaming defaults, but overwrite them with values of kwargs if present."""
+
+        streaming_options = {
+            "verbose": True,
+            "copy_to_gpu": False,
+            "statistics_on_cpu": True,
+            "normalize_on_gpu": True,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+            "add_keep_modules": [torch.nn.BatchNorm2d],
+        }
+        self.streaming_options = {**streaming_options, **kwargs}
 
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
+    print("is cuda available?", torch.cuda.is_available())
     model = StreamingResNet("resnet18", 1600, nn.MSELoss)

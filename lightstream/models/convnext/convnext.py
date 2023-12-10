@@ -1,79 +1,21 @@
 import torch
 import torch.nn as nn
-
-from copy import deepcopy
-from lightstream.modules.base import BaseModel
-from torchvision.models import convnext_tiny, convnext_small
-from torchvision.ops.misc import Permute
 import torchvision
 
+from lightstream.modules.base import BaseModel
+from torchvision.models import convnext_tiny, convnext_small
 
-# TODO: Integrate this into a basic streaming constructor class
+
 def _toggle_stochastic_depth(model, training=False):
     for m in model.modules():
         if isinstance(m, torchvision.ops.StochasticDepth):
             m.training = training
 
-def _convert_to_identity(model, old):
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            ## compound module, go inside it
-            _convert_to_identity(module, old)
 
-        # if new module is assigned to a variable, e.g. new = nn.Identity(), then it's considered a duplicate in
-        # module.named_children used later. Instead, we use in-place assignment, so each new module is unique
-        if isinstance(module, old):
-            ## simple module
-            try:
-                n = int(n)
-                model[n] = torch.nn.Identity()
-            except:
-                setattr(model, str(n), torch.nn.Identity())
-
-def _set_layer_scale(model, val):
+def _set_layer_scale(model, val=1.0):
     for x in model.modules():
         if hasattr(x, "layer_scale"):
             x.layer_scale.data.fill_(val)
-
-def _restore_layers(model_ref, model_rep):
-    for ref, rep in zip(
-        model_ref.named_children(), model_rep.named_children()
-    ):
-
-        n_ref, module_ref = ref
-        n_rep, module_rep = rep
-
-        if len(list(module_ref.children())) > 0:
-            ## compound module, go inside it
-            _restore_layers(module_ref, module_rep)
-
-        if isinstance(module_rep, torch.nn.Identity):
-            ## simple module
-            try:
-                n_ref = int(n_ref)
-                model_rep[n_rep] = model_ref[n_ref]
-            except:
-                setattr(model_rep, n_rep, model_ref[int(n_ref)])
-
-def _save_parameters(model):
-    state_dict = model.state_dict()
-    state_dict = deepcopy(state_dict)
-    return state_dict
-
-
-def _prepare_for_streaming_statistics(stream_network):
-    # Temporarily replace layernorm, linear, and gelu to not meddle with statistics calculations in streaming
-    _convert_to_identity(stream_network, torch.nn.LayerNorm)
-    _convert_to_identity(stream_network, torch.nn.Linear)
-    _convert_to_identity(stream_network, torch.nn.GELU)
-    _convert_to_identity(stream_network, Permute)
-
-
-    # Do not use stochastic depth when initializing streaming
-    _toggle_stochastic_depth(stream_network)
-
-    # Set layer scale parameters to one to not meddle with streaming statistics calculations
-    _set_layer_scale(stream_network, 1.0)
 
 
 class StreamingConvnext(BaseModel):
@@ -85,9 +27,7 @@ class StreamingConvnext(BaseModel):
         tile_size: int,
         loss_fn: torch.nn.functional,
         train_streaming_layers: bool = True,
-        use_streaming: bool = True,
         use_stochastic_depth: bool = False,
-        *args,
         **kwargs,
     ):
         assert model_name in list(StreamingConvnext.model_choices.keys())
@@ -95,14 +35,9 @@ class StreamingConvnext(BaseModel):
         self.model_name = model_name
         self.use_stochastic_depth = use_stochastic_depth
 
-        network = StreamingConvnext.model_choices[model_name](weights="IMAGENET1K_V1")
+        network = StreamingConvnext.model_choices[model_name](weights="DEFAULT")
         stream_network, head = network.features, torch.nn.Sequential(network.avgpool, network.classifier)
-
-        # Save parameters for easy recovery of module parameters later
-        state_dict = _save_parameters(stream_network)
-
-        # Prepare for streaming tile statistics calculations
-        _prepare_for_streaming_statistics(stream_network)
+        self._get_streaming_options(**kwargs)
 
         super().__init__(
             stream_network,
@@ -110,27 +45,51 @@ class StreamingConvnext(BaseModel):
             tile_size,
             loss_fn,
             train_streaming_layers=train_streaming_layers,
-            use_streaming=use_streaming,
-            *args,
-            **kwargs,
+            **self.streaming_options,
         )
 
-        # check self.stream_network, and reload the proper weights
-        self._restore_model_layers()
+        # By default, the after_streaming_init callback turns sd off
+        _toggle_stochastic_depth(self.stream_network.stream_module, training=self.use_stochastic_depth)
 
-        # re apply layer scale weights and stochastic depth settings
-        self.stream_network.stream_module.load_state_dict(state_dict)
+    def _get_streaming_options(self, **kwargs):
+        """Set streaming defaults, but overwrite them with values of kwargs if present."""
 
-        if use_stochastic_depth:
-            _toggle_stochastic_depth(stream_network, training=True)
-
-
-    def _restore_model_layers(self):
-        temp_model = StreamingConvnext.model_choices[self.model_name](weights="IMAGENET1K_V1").features
-        _restore_layers(temp_model, self.stream_network.stream_module)
+        streaming_options = {
+            "verbose": True,
+            "copy_to_gpu": False,
+            "statistics_on_cpu": True,
+            "normalize_on_gpu": True,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+            "before_streaming_init_callbacks": [_set_layer_scale],
+            "after_streaming_init_callbacks": [_toggle_stochastic_depth]
+        }
+        self.streaming_options = {**streaming_options, **kwargs}
 
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
-    model = StreamingConvnext("convnext_tiny", 1600, nn.MSELoss)
-    print(model)
+    print(" is cuda available? ", torch.cuda.is_available())
+    img = torch.rand((1, 3, 4160, 4160)).to("cuda")
+    network = StreamingConvnext(
+        "convnext_tiny",
+        3520,
+        nn.MSELoss,
+        use_stochastic_depth=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        normalize_on_gpu=False,
+    )
+    network.to("cuda")
+    network.stream_network.device = torch.device("cuda")
+
+    network.stream_network.mean = network.stream_network.mean.to("cuda")
+    network.stream_network.std = network.stream_network.std.to("cuda")
+
+    out_streaming = network(img)
+
+    network.disable_streaming_hooks()
+    normal_net = network.stream_network.stream_module
+    out_normal = normal_net(img)
+    out_final = network.head(out_normal)
+    diff = out_streaming - out_final
+    print(diff.max())
