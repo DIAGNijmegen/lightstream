@@ -131,6 +131,7 @@ class StreamingModule(L.LightningModule):
 
         """
 
+        # Even if requires_grad is set to false, .backward() in streaming causes a lot of overhead, so use a bool
         if self.train_streaming_layers:
             self.stream_network.backward(image, gradient)
 
@@ -165,6 +166,7 @@ class StreamingModule(L.LightningModule):
         Otherwise, the parameters will be left untrained (no gradients will be collected)
 
         """
+
         if self.train_streaming_layers:
             params = list(self.stream_network.stream_module.parameters())
             return params

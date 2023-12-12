@@ -44,6 +44,7 @@ class ImageNetClassifier(StreamingModule):
         self.str_output.requires_grad = self.training
 
         out = self.forward_head(self.str_output)
+
         loss = self.loss_fn(out, target)
 
         self.log_dict({"entropy loss": loss.detach()}, prog_bar=True)
