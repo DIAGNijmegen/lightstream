@@ -25,7 +25,7 @@ class StreamingConstructor:
         verbose: bool = False,
         deterministic: bool = False,
         saliency: bool = False,
-        copy_to_gpu: bool = True,
+        copy_to_gpu: bool = False,
         statistics_on_cpu: bool = False,
         normalize_on_gpu: bool = False,
         mean: list[float, float, float] | None = None,

@@ -21,6 +21,7 @@ class StreamingModule(L.LightningModule):
 
         # Initialize the streaming network
         constructor = StreamingConstructor(stream_network, tile_size, tile_cache=tile_cache, **kwargs)
+        self.copy_to_gpu = constructor.copy_to_gpu
         self.stream_network = constructor.prepare_streaming_model()
 
         self.save_tile_cache_if_needed()
@@ -36,6 +37,20 @@ class StreamingModule(L.LightningModule):
 
         for mod in freeze_layers:
             mod.eval()
+
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        """ Transfer image to gpu only if copy_to_gpu is True"""
+        image, label = batch
+
+        label = label.to(device)
+
+        image = image.to("cpu")
+        if self.copy_to_gpu:
+            image = image.to(device)
+
+        return image, label
+
 
     def on_train_epoch_start(self) -> None:
         """on_train_epoch_start hook
