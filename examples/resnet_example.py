@@ -34,5 +34,6 @@ autoencoder = StreamingConvnext(
 )
 """
 # train model
-trainer = pl.Trainer(accelerator="gpu")
+trainer = pl.Trainer(accelerator="gpu", strategy='auto')
+print("the trainer strategy is", trainer.strategy)
 trainer.fit(model=autoencoder, train_dataloaders=train_loader)

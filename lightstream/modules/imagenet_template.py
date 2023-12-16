@@ -30,11 +30,13 @@ class ImageNetClassifier(StreamingModule):
         return self.head(x)
 
     def forward(self, x):
+        print("x during forward", x)
         fmap = self.forward_streaming(x)
         out = self.forward_head(fmap)
         return out
 
     def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
+        print("image during training step", batch)
         image, target = batch
         self.image = image
 

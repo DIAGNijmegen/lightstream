@@ -38,19 +38,15 @@ class StreamingModule(L.LightningModule):
         for mod in freeze_layers:
             mod.eval()
 
-
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        """ Transfer image to gpu only if copy_to_gpu is True"""
-        image, label = batch
+        """Transfer image to gpu only if copy_to_gpu is True"""
+        batch[0] = batch[0].to("cpu")
 
-        label = label.to(device)
+        return batch
 
-        image = image.to("cpu")
-        if self.copy_to_gpu:
-            image = image.to(device)
-
-        return image, label
-
+    def on_after_batch_transfer(self, batch, dataloader_idx):
+        print("batch after batch transfer", batch)
+        return batch
 
     def on_train_epoch_start(self) -> None:
         """on_train_epoch_start hook
@@ -126,7 +122,7 @@ class StreamingModule(L.LightningModule):
         The output of the streaming model
 
         """
-        return self.stream_network(x)
+        return self.stream_network.forward(x)
 
     def backward_streaming(self, image, gradient):
         """Perform the backward pass using the streaming network
