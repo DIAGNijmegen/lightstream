@@ -21,18 +21,19 @@ class StreamingModule(L.LightningModule):
 
         # Initialize the streaming network
         self._constructor_opts = kwargs
-        self.constructor = StreamingConstructor(stream_network, self.tile_size, tile_cache=tile_cache, **self._constructor_opts)
+        self.constructor = StreamingConstructor(
+            stream_network, self.tile_size, tile_cache=tile_cache, **self._constructor_opts
+        )
         self.copy_to_gpu = self.constructor.copy_to_gpu
-        self.stream_network = constructor.prepare_streaming_model()
+        self.stream_network = self.constructor.prepare_streaming_model()
 
         self.save_tile_cache_if_needed()
         self.params = self.get_trainable_params()
-    
-    
+
     @property
     def tile_size(self):
         return self._tile_size
-    
+
     @tile_size.setter
     def tile_size(self, new_tile_size):
         self._tile_size = new_tile_size
