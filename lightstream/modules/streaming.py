@@ -37,8 +37,6 @@ class StreamingModule(L.LightningModule):
     def tile_size(self, new_tile_size):
         self._tile_size = new_tile_size
 
-        
-        
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
         freeze_layers = [
@@ -158,7 +156,7 @@ class StreamingModule(L.LightningModule):
         if self.train_streaming_layers:
             self.stream_network.backward(image, gradient)
 
-    def configure_tile_delta(self):
+    def configure_tile_stride(self):
         """
         Helper function that returns the tile stride during streaming.
 
@@ -170,17 +168,17 @@ class StreamingModule(L.LightningModule):
 
         Returns
         -------
-        tile_delta: numpy.ndarray
+        tile_stride: numpy.ndarray
             the tile stride.
 
 
         """
-        delta = self.tile_size - (
+        stride = self.tile_size - (
             self.stream_network.tile_gradient_lost.left + self.stream_network.tile_gradient_lost.right
         )
-        delta = delta // self.stream_network.output_stride[-1]
-        delta *= self.stream_network.output_stride[-1]
-        return delta.detach().cpu().numpy()
+        stride = stride // self.stream_network.output_stride[-1]
+        stride *= self.stream_network.output_stride[-1]
+        return stride.detach().cpu().numpy()
 
     def get_trainable_params(self):
         """Get trainable parameters for the entire model
@@ -273,18 +271,3 @@ class StreamingModule(L.LightningModule):
             state_dict = None
 
         return state_dict
-
-    def reconfigure_streaming_network(self, **kwargs):
-        """ Reconfigure the streaming network without changing weights
-
-        Rebuilds the streaming network with the same weights, but different parameters e.g. tile sizes.
-        This can be useful for finetuning strategies, where the streaming network is frozen for several epochs,
-        and later unfrozen.
-
-        Within such a finetuning strategy, a higher tile size can be used when only the non-streaming network is
-        trained, as it saves GPU memory. When all layers are unfrozen and trained, the memory usage will go up, and
-        the tile size must be adjusted.
-
-        """
-
-        self.constructor.
