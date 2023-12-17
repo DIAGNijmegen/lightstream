@@ -12,7 +12,7 @@ class StreamingModule(L.LightningModule):
         # self._stream_module = stream_network
 
         # StreamingCNN options
-        self.tile_size = tile_size
+        self._tile_size = tile_size
         self.tile_cache_dir = kwargs.get("tile_cache_dir", Path.cwd())
         self.tile_cache_fname = kwargs.get("tile_cache_fname", None)
 
@@ -20,13 +20,25 @@ class StreamingModule(L.LightningModule):
         tile_cache = self.load_tile_cache_if_needed()
 
         # Initialize the streaming network
-        constructor = StreamingConstructor(stream_network, tile_size, tile_cache=tile_cache, **kwargs)
-        self.copy_to_gpu = constructor.copy_to_gpu
+        self._constructor_opts = kwargs
+        self.constructor = StreamingConstructor(stream_network, self.tile_size, tile_cache=tile_cache, **self._constructor_opts)
+        self.copy_to_gpu = self.constructor.copy_to_gpu
         self.stream_network = constructor.prepare_streaming_model()
 
         self.save_tile_cache_if_needed()
         self.params = self.get_trainable_params()
+    
+    
+    @property
+    def tile_size(self):
+        return self._tile_size
+    
+    @tile_size.setter
+    def tile_size(self, new_tile_size):
+        self._tile_size = new_tile_size
 
+        
+        
     def freeze_streaming_normalization_layers(self):
         """Do not use normalization layers within lightstream, only local ops are allowed"""
         freeze_layers = [
@@ -261,3 +273,18 @@ class StreamingModule(L.LightningModule):
             state_dict = None
 
         return state_dict
+
+    def reconfigure_streaming_network(self, **kwargs):
+        """ Reconfigure the streaming network without changing weights
+
+        Rebuilds the streaming network with the same weights, but different parameters e.g. tile sizes.
+        This can be useful for finetuning strategies, where the streaming network is frozen for several epochs,
+        and later unfrozen.
+
+        Within such a finetuning strategy, a higher tile size can be used when only the non-streaming network is
+        trained, as it saves GPU memory. When all layers are unfrozen and trained, the memory usage will go up, and
+        the tile size must be adjusted.
+
+        """
+
+        self.constructor.
