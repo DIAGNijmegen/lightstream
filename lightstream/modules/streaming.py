@@ -55,9 +55,6 @@ class StreamingModule(L.LightningModule):
 
         return batch
 
-    def on_after_batch_transfer(self, batch, dataloader_idx):
-        print("batch after batch transfer", batch)
-        return batch
 
     def on_train_epoch_start(self) -> None:
         """on_train_epoch_start hook
