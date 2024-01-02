@@ -92,7 +92,20 @@ class StreamingModule(L.LightningModule):
         self.stream_network.dtype = self.dtype
 
     def on_test_start(self):
-        """on_train_start hook
+        """on_test_start hook
+
+        Do not override this method. Instead, call the parent class using super().on_train_start if you want
+        to add this hook into your pipelines
+
+        """
+        # Update streaming to put all the inputs/tensors on the right device
+        self.stream_network.device = self.device
+        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
+        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
+        self.stream_network.dtype = self.dtype
+
+    def on_predict_start(self):
+        """on_predict_start hook
 
         Do not override this method. Instead, call the parent class using super().on_train_start if you want
         to add this hook into your pipelines
