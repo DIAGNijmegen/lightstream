@@ -13,8 +13,8 @@ class StreamingModule(L.LightningModule):
 
         # StreamingCNN options
         self._tile_size = tile_size
-        self.tile_cache_dir = kwargs.get("tile_cache_dir", Path.cwd())
-        self.tile_cache_fname = kwargs.get("tile_cache_fname", None)
+        self.tile_cache_dir = kwargs.pop("tile_cache_dir", Path.cwd())
+        self.tile_cache_fname = kwargs.pop("tile_cache_fname", None)
 
         # Load the tile cache state dict if present
         tile_cache = self.load_tile_cache_if_needed()
