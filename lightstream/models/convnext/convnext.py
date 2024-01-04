@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
+from torchmetrics import MetricCollection
 from lightstream.modules.imagenet_template import ImageNetClassifier
 from torchvision.models import convnext_tiny, convnext_small
 
@@ -28,6 +29,7 @@ class StreamingConvnext(ImageNetClassifier):
         loss_fn: torch.nn.functional,
         train_streaming_layers: bool = True,
         use_stochastic_depth: bool = False,
+        metrics: MetricCollection | None = None,
         **kwargs,
     ):
         assert model_name in list(StreamingConvnext.model_choices.keys())
@@ -45,6 +47,7 @@ class StreamingConvnext(ImageNetClassifier):
             tile_size,
             loss_fn,
             train_streaming_layers=train_streaming_layers,
+            metrics=metrics
             **self.streaming_options,
         )
 

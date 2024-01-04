@@ -1,4 +1,5 @@
 from lightstream.modules.streaming import StreamingModule
+from torchmetrics import MetricCollection
 from typing import Any
 import torch
 
@@ -15,6 +16,7 @@ class ImageNetClassifier(StreamingModule):
         tile_size: int,
         loss_fn: torch.nn.modules.loss,
         train_streaming_layers=True,
+        metrics: MetricCollection | None = None,
         **kwargs
     ):
         super().__init__(stream_net, tile_size, train_streaming_layers, **kwargs)
@@ -23,6 +25,10 @@ class ImageNetClassifier(StreamingModule):
         self.train_streaming_layers = train_streaming_layers
         self.params = self.extend_trainable_params()
 
+        self.train_metrics = metrics.clone(prefix='train_') if metrics else None
+        self.val_metrics = metrics.clone(prefix='val_') if metrics else None
+        self.test_metrics = metrics.clone(prefix='test_') if metrics else None
+
     def on_train_epoch_start(self) -> None:
         super().on_train_epoch_start()
 
@@ -30,13 +36,11 @@ class ImageNetClassifier(StreamingModule):
         return self.head(x)
 
     def forward(self, x):
-        print("x during forward", x)
         fmap = self.forward_streaming(x)
         out = self.forward_head(fmap)
         return out
 
     def training_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> tuple[Any, Any, Any]:
-        print("image during training step", batch)
         image, target = batch
         self.image = image
 
@@ -45,11 +49,17 @@ class ImageNetClassifier(StreamingModule):
         # let leaf tensor require grad when training with streaming
         self.str_output.requires_grad = self.training
 
-        out = self.forward_head(self.str_output)
+        logits = self.forward_head(self.str_output)
 
-        loss = self.loss_fn(out, target)
+        loss = self.loss_fn(logits, target)
 
-        self.log_dict({"entropy loss": loss.detach()}, prog_bar=True)
+        output = {}
+        if self.train_metrics:
+            output = self.train_metrics(logits, target)
+
+        output["train_loss"] = loss.detach()
+
+        self.log_dict(output, prog_bar=True, on_step=True,  on_epoch=True, sync_dist=True,)
         return loss
 
     def configure_optimizers(self):

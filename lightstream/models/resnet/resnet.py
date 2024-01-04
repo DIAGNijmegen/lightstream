@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 from lightstream.modules.imagenet_template import ImageNetClassifier
 from torchvision.models import resnet18, resnet34, resnet50
-
-
+from torchmetrics import MetricCollection
 def split_resnet(net, num_classes=1000):
     """Split resnet architectures into backbone and fc modules
 
@@ -53,6 +52,7 @@ class StreamingResNet(ImageNetClassifier):
         tile_size: int,
         loss_fn: torch.nn.functional,
         train_streaming_layers: bool = True,
+        metrics: MetricCollection | None = None,
         **kwargs
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
@@ -60,13 +60,14 @@ class StreamingResNet(ImageNetClassifier):
         stream_network, head = split_resnet(network, num_classes=kwargs.pop("num_classes", 1000))
 
         self._get_streaming_options(**kwargs)
-
+        print("metrics", metrics)
         super().__init__(
             stream_network,
             head,
             tile_size,
             loss_fn,
             train_streaming_layers=train_streaming_layers,
+            metrics=metrics,
             **self.streaming_options,
         )
 

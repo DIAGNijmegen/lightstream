@@ -49,13 +49,6 @@ class StreamingModule(L.LightningModule):
         for mod in freeze_layers:
             mod.eval()
 
-    def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        """Transfer image to gpu only if copy_to_gpu is True"""
-        batch[0] = batch[0].to("cpu")
-
-        return batch
-
-
     def on_train_epoch_start(self) -> None:
         """on_train_epoch_start hook
 
