@@ -57,7 +57,7 @@ class ImageNetClassifier(StreamingModule):
         if self.train_metrics:
             output = self.train_metrics(logits, target)
 
-        output["train_loss"] = loss.detach()
+        output["train_loss"] = loss
 
         self.log_dict(output, prog_bar=True, on_step=True,  on_epoch=True, sync_dist=True,)
         return loss

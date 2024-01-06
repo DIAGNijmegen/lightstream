@@ -69,7 +69,12 @@ class StreamingModule(L.LightningModule):
         self.stream_network.device = self.device
         self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
         self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        self.stream_network.dtype = self.dtype
+        if self.trainer.precision == "16-mixed":
+            self.stream_network.dtype = torch.float16
+        elif self.trainer.precision == "bf16-mixed":
+            self.stream_network.dtype = torch.float16
+        else:
+            self.stream_network.dtype = self.dtype
 
     def on_train_start(self):
         """on_train_start hook
@@ -82,7 +87,12 @@ class StreamingModule(L.LightningModule):
         self.stream_network.device = self.device
         self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
         self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        self.stream_network.dtype = self.dtype
+        if self.trainer.precision == "16-mixed":
+            self.stream_network.dtype = torch.float16
+        elif self.trainer.precision == "bf16-mixed":
+            self.stream_network.dtype = torch.float16
+        else:
+            self.stream_network.dtype = self.dtype
 
     def on_test_start(self):
         """on_test_start hook
@@ -95,7 +105,12 @@ class StreamingModule(L.LightningModule):
         self.stream_network.device = self.device
         self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
         self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        self.stream_network.dtype = self.dtype
+        if self.trainer.precision == "16-mixed":
+            self.stream_network.dtype = torch.float16
+        elif self.trainer.precision == "bf16-mixed":
+            self.stream_network.dtype = torch.float16
+        else:
+            self.stream_network.dtype = self.dtype
 
     def on_predict_start(self):
         """on_predict_start hook
@@ -108,7 +123,12 @@ class StreamingModule(L.LightningModule):
         self.stream_network.device = self.device
         self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
         self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        self.stream_network.dtype = self.dtype
+        if self.trainer.precision == "16-mixed":
+            self.stream_network.dtype = torch.float16
+        elif self.trainer.precision == "bf16-mixed":
+            self.stream_network.dtype = torch.float16
+        else:
+            self.stream_network.dtype = self.dtype
 
     def disable_streaming_hooks(self):
         """Disable streaming hooks and replace streamingconv2d  with conv2d modules
