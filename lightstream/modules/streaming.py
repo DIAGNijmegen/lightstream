@@ -176,7 +176,7 @@ class StreamingModule(L.LightningModule):
 
         """
 
-        # Even if requires_grad is set to false, .backward() in streaming causes a lot of overhead, so use a bool
+        # If requires_grad is set to false, .backward() in streaming causes errors or overhead, so use a bool
         if self.train_streaming_layers:
             self.stream_network.backward(image, gradient)
 
