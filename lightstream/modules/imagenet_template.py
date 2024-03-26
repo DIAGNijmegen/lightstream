@@ -1,8 +1,10 @@
+from lightning.pytorch.utilities.types import STEP_OUTPUT
+
 from lightstream.modules.streaming import StreamingModule
 from torchmetrics import MetricCollection
 from typing import Any
 import torch
-
+from torch import Tensor
 
 # TODO: Write control flow when lightstream is turned off
 # TODO: Add torchmetric collections as parameters (dependency injections)
@@ -59,8 +61,29 @@ class ImageNetClassifier(StreamingModule):
 
         output["train_loss"] = loss
 
-        self.log_dict(output, prog_bar=True, on_step=True,  on_epoch=True, sync_dist=True,)
+        self.log_dict(output, prog_bar=True, on_step=False,  on_epoch=True, sync_dist=True,)
         return loss
+
+    def validation_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
+        image, target = batch
+        self.image = image
+
+        self.str_output = self.forward_streaming(image)
+
+        # let leaf tensor require grad when training with streaming
+        self.str_output.requires_grad = self.training
+
+        logits = self.forward_head(self.str_output)
+
+        loss = self.loss_fn(logits, target)
+
+        output = {}
+        if self.val_metrics:
+            output = self.train_metrics(logits, target)
+
+        output["val_loss"] = loss
+
+        self.log_dict(output, prog_bar=True, on_step=False,  on_epoch=True, sync_dist=True,)
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.params, lr=1e-3)
@@ -71,7 +94,7 @@ class ImageNetClassifier(StreamingModule):
             return self.params + list(self.head.parameters())
         return list(self.head.parameters())
 
-    def backward(self, loss):
+    def backward(self, loss: Tensor, **kwargs) -> None:
         loss.backward()
         # del loss
         # Don't call this>? https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#things-to-avoid

@@ -1,7 +1,13 @@
+from typing import Any
+
 import torch
 import lightning as L
 
 from pathlib import Path
+
+from lightning.pytorch.utilities.types import STEP_OUTPUT
+from torch import Tensor
+
 from lightstream.modules.constructor import StreamingConstructor
 
 
@@ -58,13 +64,8 @@ class StreamingModule(L.LightningModule):
         """
         self.freeze_streaming_normalization_layers()
 
-    def on_validation_start(self):
-        """on_validation_start hook
+    def prepare_start_for_streaming(self):
 
-        Do not override this method. Instead, call the parent class using super().on_train_start if you want
-        to add this hook into your pipelines
-
-        """
         # Update streaming to put all the inputs/tensors on the right device
         self.stream_network.device = self.device
         self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
@@ -75,6 +76,15 @@ class StreamingModule(L.LightningModule):
             self.stream_network.dtype = torch.float16
         else:
             self.stream_network.dtype = self.dtype
+
+    def on_validation_start(self):
+        """on_validation_start hook
+
+        Do not override this method. Instead, call the parent class using super().on_train_start if you want
+        to add this hook into your pipelines
+
+        """
+        self.prepare_start_for_streaming()
 
     def on_train_start(self):
         """on_train_start hook
@@ -83,16 +93,8 @@ class StreamingModule(L.LightningModule):
         to add this hook into your pipelines
 
         """
-        # Update streaming to put all the inputs/tensors on the right device
-        self.stream_network.device = self.device
-        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        if self.trainer.precision == "16-mixed":
-            self.stream_network.dtype = torch.float16
-        elif self.trainer.precision == "bf16-mixed":
-            self.stream_network.dtype = torch.float16
-        else:
-            self.stream_network.dtype = self.dtype
+        self.prepare_start_for_streaming()
+
 
     def on_test_start(self):
         """on_test_start hook
@@ -101,16 +103,8 @@ class StreamingModule(L.LightningModule):
         to add this hook into your pipelines
 
         """
-        # Update streaming to put all the inputs/tensors on the right device
-        self.stream_network.device = self.device
-        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        if self.trainer.precision == "16-mixed":
-            self.stream_network.dtype = torch.float16
-        elif self.trainer.precision == "bf16-mixed":
-            self.stream_network.dtype = torch.float16
-        else:
-            self.stream_network.dtype = self.dtype
+        self.prepare_start_for_streaming()
+
 
     def on_predict_start(self):
         """on_predict_start hook
@@ -119,16 +113,8 @@ class StreamingModule(L.LightningModule):
         to add this hook into your pipelines
 
         """
-        # Update streaming to put all the inputs/tensors on the right device
-        self.stream_network.device = self.device
-        self.stream_network.mean = self.stream_network.mean.to(self.device, non_blocking=True)
-        self.stream_network.std = self.stream_network.std.to(self.device, non_blocking=True)
-        if self.trainer.precision == "16-mixed":
-            self.stream_network.dtype = torch.float16
-        elif self.trainer.precision == "bf16-mixed":
-            self.stream_network.dtype = torch.float16
-        else:
-            self.stream_network.dtype = self.dtype
+        self.prepare_start_for_streaming()
+
 
     def disable_streaming_hooks(self):
         """Disable streaming hooks and replace streamingconv2d  with conv2d modules
@@ -180,6 +166,12 @@ class StreamingModule(L.LightningModule):
         if self.train_streaming_layers:
             self.stream_network.backward(image, gradient)
 
+    def training_step(self, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
+        raise NotImplementedError
+
+    def backward(self, loss: Tensor, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError
+
     def configure_tile_stride(self):
         """
         Helper function that returns the tile stride during streaming.
@@ -219,6 +211,7 @@ class StreamingModule(L.LightningModule):
             print("WARNING: Streaming network will not be trained")
             for param in self.stream_network.stream_module.parameters():
                 param.requires_grad = False
+
 
     def _remove_streaming_network(self):
         """Converts the streaming network into a non-streaming network
