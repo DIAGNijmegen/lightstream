@@ -12,9 +12,12 @@ nav:
       Trainer options: tutorials/trainer_options.md
   - Models:
       ResNet: models/resnet.md
+      ConvNext: models/convnext.md
   - Modules:
-      streamingmodule: modules/streamingmodule.md
-      basemodule: modules/basemodule.md
+      streaming: modules/streamingmodule.md
+      imagenet: modules/imagenettemplate.md
+      constructor: modules/constructor.md
+
 
 theme:
   features:

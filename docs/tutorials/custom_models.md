@@ -2,10 +2,10 @@
 Custom models can be created in one of three ways:
 
 * Using the `StreamingModule` (recommended)
-* Using the `BaseModel` (a subclass of `StreamingModule`)
+* Using the `ImageNetClassifier` (a subclass of `StreamingModule`)
 * Creating your own class (not recommended)
 
-The `StreamingModule` and `BaseModel` classes are both regular `LightningModule` objects and should be treated as such.
+The `StreamingModule` and `ImageNetClassifier` classes are both regular `LightningModule` objects and should be treated as such.
 Both classes have several helper functions and a custom initialization that create the streaming model instance. Secondly, 
 the helper functions make sure that several settings, such as freezing normalization layers and setting them to `eval()` mode, both during training and inference.
 This is necessary since streaming does not work with layers that are not locally defined, but rather need the entire input image.
@@ -83,24 +83,44 @@ class StreamingResNet(StreamingModule):
         tile_size: int,
         loss_fn: torch.nn.functional,
         train_streaming_layers: bool = True,
-        use_streaming: bool = True,
-        *args,
+        metrics: MetricCollection | None = None,
         **kwargs
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
-        network = StreamingResNet.model_choices[model_name](weights="IMAGENET1K_V1")
-        stream_net, head = split_resnet(network, num_classes=kwargs.get("num_classes"))
+        network = StreamingResNet.model_choices[model_name](weights="DEFAULT")
+        stream_network, head = split_resnet(network, num_classes=kwargs.pop("num_classes", 1000))
+
+        self._get_streaming_options(**kwargs)
+        print("metrics", metrics)
         super().__init__(
-            stream_net,
+            stream_network,
             head,
             tile_size,
+            loss_fn,
             train_streaming_layers=train_streaming_layers,
-            use_streaming=use_streaming,
-            *args,
-            **kwargs
+            metrics=metrics,
+            **self.streaming_options,
         )
+        
+    def _get_streaming_options(self, **kwargs):
+        """Set streaming defaults, but overwrite them with values of kwargs if present."""
+
+        # We need to add torch.nn.Batchnorm to the keep modules, because of some in-place ops error if we don't
+        # https://discuss.pytorch.org/t/register-full-backward-hook-for-residual-connection/146850
+        streaming_options = {
+            "verbose": True,
+            "copy_to_gpu": False,
+            "statistics_on_cpu": True,
+            "normalize_on_gpu": True,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+            "add_keep_modules": [torch.nn.BatchNorm2d],
+        }
+        self.streaming_options = {**streaming_options, **kwargs}
 
 ```
+The actual streaming module can be configured with varying settings. These can be passed as a kwarg dictionary within the `super().__init__()` call of the parent class. Under the hood, this dictionary with options is passed to a constructor which takes care of properly building the streaming module.
+A more detailed explanation about the constructor can be found below.
 
 
 ## Custom forward/backward logic
@@ -150,10 +170,44 @@ def backward(self, loss):
 ```
 
 
-- Hooks: Several hooks in pytorch lightning are used to set the normalization layers to `eval()` and set the inputs/models to the right device (this is not how it should be done, but we are working on a solution for this).
+- Hooks: Several hooks in pytorch lightning are used to set the normalization layers to `eval()` and set the inputs/models to the right device.
     - on_training_start: Allocates the input and models to the correct device at training time.
     - on_validation_start: Allocates the input and models to the correct device at validation time.
     - on_test_start: Allocates the input and models to the correct device at test time.
     - on_train_epoch_start(self): sets all the normalization layers to eval() during training
 
 **Warning: do not override these hooks with your own code. If you need these hooks for any reason, then call the parent method first using e.g.  `super().on_training_start`**
+
+
+## Streaming using the constructor
+Under the hood of the `StreamingModule` class, we have an additional `Constructor` class that actually builds and defines the streaming module. The following arguments can be passed to it:
+At the very least, a torch model and a tile size must be provided.
+```python
+model: torch.nn.modules,
+tile_size: int,
+verbose: bool = False,
+deterministic: bool = False,
+saliency: bool = False,
+copy_to_gpu: bool = False,
+statistics_on_cpu: bool = False,
+normalize_on_gpu: bool = False,
+mean: list[float, float, float] | None = None,
+std: list[float, float, float] | None = None,
+tile_cache: dict | None = None,
+add_keep_modules: list[torch.nn.modules] | None = None,
+before_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] | None = None,
+after_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] | None = None,
+```
+
+### Constructor default behaviour
+By default, the constructor will perform the following steps:   
+1. All layers except convolution, local max pooling, and local average pooling layers are set to `nn.Identity`   
+2. `before_streaming_init_callbacks` are executed. These are user-specified, and by default, no callbacks are executed.   
+3. The streaming module is constructed from the convolution/local pooling layers. Within this step, the model's weights are altered to calculate tile statistics.   
+4. The streaming module's `nn.Identity` layers from step 1 are restored back to their old layers, and the correct model weights are reloaded   
+5. `after_streaming_init_callbacks` are executed. These are user-specified, and by default, no callbacks are executed.   
+6. The streaming module is returned
+
+The before and after streaming initialization callbacks are added for flexibility, since we cannot take all possible variations for model creation into account. 
+An example of where these callbacks come in handy is given in the code for the streaming convnext model. Within this model, we need to additionally turn off the stochastic depth operation, as well as the layer scale, which are not normal layers.
+For a more detailed example, we invite the reader to look at the code for either the [Resnet](/models/resnet) or [Convnext](/models/convnext) models within the repository.
