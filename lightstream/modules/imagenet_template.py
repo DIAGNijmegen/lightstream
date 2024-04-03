@@ -61,7 +61,7 @@ class ImageNetClassifier(StreamingModule):
 
         output["train_loss"] = loss
 
-        self.log_dict(output, prog_bar=True, on_step=False,  on_epoch=True, sync_dist=True,)
+        self.log_dict(output, prog_bar=True, on_step=True,  on_epoch=True, sync_dist=True,)
         return loss
 
     def validation_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
