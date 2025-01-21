@@ -32,10 +32,10 @@ try:
     from torch.cuda.amp import autocast  # pylint: disable=import-error,no-name-in-modules
 
     def forward_amp_decorator(func):
-        return torch.cuda.amp.custom_fwd(func)  # type:ignore
+        return torch.amp.custom_fwd(func, device_type='cuda')  # type:ignore
 
     def backward_amp_decorator(func):
-        return torch.cuda.amp.custom_bwd(func)  # type:ignore
+        return torch.amp.custom_fwd(func, device_type='cuda')  # type:ignore
 
 except ModuleNotFoundError:
 
