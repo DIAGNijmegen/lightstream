@@ -282,7 +282,7 @@ class StreamingModule(L.LightningModule):
 
         if tile_cache_loc.exists() and use_tile_cache:
             print("Loading tile cache from", tile_cache_loc)
-            state_dict = torch.load(str(tile_cache_loc), map_location=lambda storage, loc: storage)
+            state_dict = torch.load(str(tile_cache_loc), map_location=lambda storage, loc: storage, weights_only=False)
         else:
             print("No tile cache found, calculating it now")
             state_dict = None
