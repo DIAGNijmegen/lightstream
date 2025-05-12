@@ -29,13 +29,13 @@ from tqdm import tqdm
 # from torch.nn.grad import _grad_input_padding
 
 try:
-    from torch.cuda.amp import autocast  # pylint: disable=import-error,no-name-in-modules
+    from torch.amp import autocast  # pylint: disable=import-error,no-name-in-modules
 
     def forward_amp_decorator(func):
         return torch.amp.custom_fwd(func, device_type='cuda')  # type:ignore
 
     def backward_amp_decorator(func):
-        return torch.amp.custom_fwd(func, device_type='cuda')  # type:ignore
+        return torch.amp.custom_bwd(func, device_type='cuda')  # type:ignore
 
 except ModuleNotFoundError:
 
@@ -895,7 +895,7 @@ class StreamingCNN(torch.nn.Module):
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
                 if self.dtype == torch.float16:
-                    with autocast():
+                    with autocast(device_type="cuda"):
                         tile_output = self.stream_module(tile)
                 else:
                     tile_output = self.stream_module(tile)
