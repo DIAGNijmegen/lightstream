@@ -420,7 +420,7 @@ class StreamingCNN(torch.nn.Module):
         if state_dict is None:
             self._configure()
         else:
-            self.load_state_dict(state_dict)
+            self.load_tile_cache(state_dict)
 
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
@@ -1289,7 +1289,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         return named_stats
 
-    def load_state_dict(self, state):
+    def load_tile_cache(self, state):
         self.disable()
 
         self.output_stride = state["output_stride"]
