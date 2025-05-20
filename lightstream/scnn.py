@@ -1046,7 +1046,7 @@ class StreamingCNN(torch.nn.Module):
                 :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride, "modules": module}
+            module_stats = {"lost": lost, "stride": stride, "module": module}
             if self.verbose:
                 print(module, "\n", module_stats["lost"])
 
