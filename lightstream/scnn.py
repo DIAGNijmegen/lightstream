@@ -20,9 +20,10 @@ import collections.abc as container_abcs
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.utils import _pair
 from torch.nn.grad import conv2d_input, conv2d_weight
+from torch.amp import custom_fwd, custom_bwd
 
 # from torch.utils.cpp_extension import load
-
+import pydevd
 
 from tqdm import tqdm
 
@@ -108,10 +109,11 @@ class Lost:
 
 class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
-    @forward_amp_decorator
+    @custom_fwd(device_type="cuda", cast_inputs=None)
     def forward(
         ctx, inpt, weight, bias, stride, padding, dilation, groups, grad_lost, seen_indices, output_stride, input_loc
     ):
+        print("inpt dtype", inpt.dtype)
         ctx.save_for_backward(inpt, weight, bias)
         ctx.stride = stride
         ctx.padding = padding
@@ -124,8 +126,9 @@ class StreamingConv2dF(torch.autograd.Function):
         return torch.nn.functional.conv2d(inpt, weight, bias, stride, padding, dilation, groups)
 
     @staticmethod
-    @backward_amp_decorator
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
+        pydevd.settrace(suspend=False, trace_only_current_thread=True)
         inpt, weight, bias = ctx.saved_tensors
         grad = grad_weight = grad_bias = None
 
@@ -894,7 +897,7 @@ class StreamingCNN(torch.nn.Module):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                if self.dtype == torch.float16:
+                if self.dtype == torch.float16 or self.dtype == torch.bfloat16:
                     with autocast(device_type="cuda"):
                         tile_output = self.stream_module(tile)
                 else:

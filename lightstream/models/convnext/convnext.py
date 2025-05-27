@@ -47,7 +47,7 @@ class StreamingConvnext(ImageNetClassifier):
             tile_size,
             loss_fn,
             train_streaming_layers=train_streaming_layers,
-            metrics=metrics
+            metrics=metrics,
             **self.streaming_options,
         )
 
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     img = torch.rand((1, 3, 4160, 4160)).to("cuda")
     network = StreamingConvnext(
         "convnext_tiny",
-        3520,
+        4800,
         nn.MSELoss,
         use_stochastic_depth=False,
         mean=[0, 0, 0],
