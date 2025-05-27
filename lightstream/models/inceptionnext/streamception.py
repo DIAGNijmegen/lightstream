@@ -16,11 +16,10 @@ from torchmetrics import MetricCollection
 # inception atto: Forward/backward pass size (MB): 1194.36
 # inception tiny: Forward/backward pass size (MB): 3907.07
 
-def _set_layer_scale(model, val=1.0):
+def _set_layer_gamma(model, val=1.0):
     for x in model.modules():
         if hasattr(x, "gamma"):
             x.gamma.data.fill_(val)
-
 
 
 def split_net(net, num_classes=1000):
@@ -93,7 +92,7 @@ class StreamingInceptionNext(ImageNetClassifier):
             "normalize_on_gpu": False,
             "mean": [0.485, 0.456, 0.406],
             "std": [0.229, 0.224, 0.225],
-            "before_streaming_init_callbacks": [_set_layer_scale],
+            "before_streaming_init_callbacks": [_set_layer_gamma],
         }
         self.streaming_options = {**streaming_options, **kwargs}
 

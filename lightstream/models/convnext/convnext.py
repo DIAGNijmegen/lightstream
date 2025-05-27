@@ -12,11 +12,15 @@ def _toggle_stochastic_depth(model, training=False):
         if isinstance(m, torchvision.ops.StochasticDepth):
             m.training = training
 
-
 def _set_layer_scale(model, val=1.0):
     for x in model.modules():
         if hasattr(x, "layer_scale"):
             x.layer_scale.data.fill_(val)
+            
+def _set_layer_gamma(model, val=1.0):
+    for x in model.modules():
+        if hasattr(x, "gamma"):
+            x.gamma.data.fill_(val)
 
 
 class StreamingConvnext(ImageNetClassifier):

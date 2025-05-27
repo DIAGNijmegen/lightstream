@@ -73,7 +73,7 @@ class StreamingModule(L.LightningModule):
         if self.trainer.precision == "16-mixed":
             self.stream_network.dtype = torch.float16
         elif self.trainer.precision == "bf16-mixed":
-            self.stream_network.dtype = torch.float16
+            self.stream_network.dtype = torch.bfloat16
         else:
             self.stream_network.dtype = self.dtype
 
