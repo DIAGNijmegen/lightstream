@@ -22,36 +22,7 @@ from torch.nn.modules.utils import _pair
 from torch.nn.grad import conv2d_input, conv2d_weight
 from torch.amp import custom_fwd, custom_bwd
 
-# from torch.utils.cpp_extension import load
-import pydevd
-
 from tqdm import tqdm
-
-# from torch.nn.grad import _grad_input_padding
-
-try:
-    from torch.amp import autocast  # pylint: disable=import-error,no-name-in-modules
-
-    def forward_amp_decorator(func):
-        return torch.amp.custom_fwd(func, device_type='cuda')  # type:ignore
-
-    def backward_amp_decorator(func):
-        return torch.amp.custom_bwd(func, device_type='cuda')  # type:ignore
-
-except ModuleNotFoundError:
-
-    def forward_amp_decorator(func):
-        return func
-
-    def backward_amp_decorator(func):
-        return func
-
-
-# Load and compile cpp code to call cudnn conv2d backward function
-# dirname = os.path.dirname(__file__)
-
-# filename = os.path.join(dirname, "cpp_functions.cpp")
-# cpp_functions = load(name="cpp_functions", sources=[filename], verbose=False)
 
 
 # inspired by torch/nn/modules/utils.py
@@ -109,11 +80,10 @@ class Lost:
 
 class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
-    @custom_fwd(device_type="cuda", cast_inputs=None)
+    @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
     def forward(
         ctx, inpt, weight, bias, stride, padding, dilation, groups, grad_lost, seen_indices, output_stride, input_loc
     ):
-        print("inpt dtype", inpt.dtype)
         ctx.save_for_backward(inpt, weight, bias)
         ctx.stride = stride
         ctx.padding = padding
@@ -128,7 +98,6 @@ class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        pydevd.settrace(suspend=False, trace_only_current_thread=True)
         inpt, weight, bias = ctx.saved_tensors
         grad = grad_weight = grad_bias = None
 
@@ -897,10 +866,7 @@ class StreamingCNN(torch.nn.Module):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                if self.dtype == torch.float16 or self.dtype == torch.bfloat16:
-                    with autocast(device_type="cuda"):
-                        tile_output = self.stream_module(tile)
-                else:
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
                     tile_output = self.stream_module(tile)
 
                 del tile  # memory management
