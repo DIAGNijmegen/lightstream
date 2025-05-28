@@ -11,29 +11,30 @@ with streaming or will be kept on module.eval() during both training and inferen
 """
 
 import torch
+import torch.nn as nn
 
 from copy import deepcopy
-from lightstream.scnn import StreamingCNN
-from collections.abc import Callable
+from lightstream.core.scnn import StreamingCNN
+from typing import Callable, Optional, Any
 
 
 class StreamingConstructor:
     def __init__(
         self,
-        model: torch.nn.modules,
+        model: nn.Module,
         tile_size: int,
-        verbose: bool = False,
+        verbose: bool = True,
         deterministic: bool = False,
         saliency: bool = False,
         copy_to_gpu: bool = False,
-        statistics_on_cpu: bool = False,
-        normalize_on_gpu: bool = False,
-        mean: list[float, float, float] | None = None,
-        std: list[float, float, float] | None = None,
-        tile_cache: dict | None = None,
-        add_keep_modules: list[torch.nn.modules] | None = None,
-        before_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] | None = None,
-        after_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] | None = None,
+        statistics_on_cpu: bool = True,
+        normalize_on_gpu: bool = True,
+        mean: Optional[tuple[float, float, float]] = None,
+        std: Optional[tuple[float, float, float]] = None,
+        tile_cache: Optional[dict] = None,
+        add_keep_modules: Optional[list[nn.Module]] = None,
+        before_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
+        after_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
     ):
         self.model = model
         self.model_copy = deepcopy(self.model)
@@ -73,7 +74,7 @@ class StreamingConstructor:
             device = torch.device("cuda")
             self.model.to(device)
 
-    def add_modules_to_keep(self, module_list: list):
+    def add_modules_to_keep(self, module_list: list) -> None:
         """Add extra layers to keep during streaming tile calculations
 
         Modules in the keep_modules list will not be set to nn.Identity() during streaming initialization
@@ -85,7 +86,7 @@ class StreamingConstructor:
 
         self.keep_modules.extend(module_list)
 
-    def prepare_streaming_model(self):
+    def prepare_streaming_model(self) -> nn.Module:
         """Run pre and postprocessing for tile lost calculations
         Returns
         -------
@@ -117,7 +118,7 @@ class StreamingConstructor:
         self._execute_after_callbacks()
         return sCNN
 
-    def _execute_before_callbacks(self):
+    def _execute_before_callbacks(self) -> None:
         for cb_func in self.before_streaming_init_callbacks:
             print(f"Executing callback function {cb_func}")
             cb_func(self.model)
@@ -129,7 +130,7 @@ class StreamingConstructor:
             cb_func(self.model)
         print("")
 
-    def create_streaming_model(self):
+    def create_streaming_model(self) -> nn.Module:
         return StreamingCNN(
             self.model,
             tile_shape=(1, 3, self.tile_size, self.tile_size),
@@ -144,12 +145,12 @@ class StreamingConstructor:
             state_dict=self.tile_cache,
         )
 
-    def save_parameters(self):
+    def save_parameters(self) -> dict:
         state_dict = self.model.state_dict()
         state_dict = deepcopy(state_dict)
         return state_dict
 
-    def convert_to_identity(self, model: torch.nn.modules):
+    def convert_to_identity(self, model: torch.nn.modules) -> None:
         """Convert non-conv and non-local pooling layers to identity
 
         Parameters
@@ -173,7 +174,7 @@ class StreamingConstructor:
                 except ValueError:
                     setattr(model, str(n), torch.nn.Identity())
 
-    def restore_model_layers(self, model_ref, model_rep):
+    def restore_model_layers(self, model_ref: nn.Module, model_rep: nn.Module) -> None:
         """Restore model layers from Identity to what they were before
 
         This function requires an exact copy of the model (model_ref) before its layers were set to nn.Identity()
@@ -210,7 +211,7 @@ class StreamingConstructor:
 
 
 if __name__ == "__main__":
-    from lightstream.models.resnet.resnet import resnet18, split_resnet
+    from lightstream.models.resnet.resnet import resnet18
     from lightstream.models.convnext.convnext import convnext_tiny
     import torchvision
 
