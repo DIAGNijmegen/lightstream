@@ -25,6 +25,10 @@ def freeze_normalization_layers(model: nn.Module, norm_types: tuple[type, ...] =
     Args:
         model: The PyTorch model to modify.
         norm_types: A tuple of normalization layer classes to freeze.
+
+    Returns
+    -------
+    object
     """
     for module in model.modules():
         if isinstance(module, norm_types):

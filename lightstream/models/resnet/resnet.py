@@ -1,73 +1,59 @@
 import torch
 import torch.nn as nn
-from lightstream.modules.imagenet_template import ImageNetClassifier
+from pathlib import Path
+from lightstream.modules.streaming import StreamingModule
 from torchvision.models import resnet18, resnet34, resnet50
-from torchmetrics import MetricCollection
-def split_resnet(net, num_classes=1000):
-    """Split resnet architectures into backbone and fc modules
 
-    The stream_net will contain the CNN backbone that is capable for streaming.
-    The fc model is not streamable and will be a separate module
-    If num_classes are specified as a kwarg, then a new fc model will be created with the desired classes
+def split_resnet(net, encoder: str):
+    """Split resnet architectures into streamable models
 
     Parameters
     ----------
     net: torch model
         A ResNet model in the format provided by torchvision
-    kwargs
 
     Returns
     -------
     stream_net : torch.nn.Sequential
-        The CNN backbone of the ResNet
-    head : torch.nn.Sequential
-        The head of the model, defaults to the fc model provided by torchvision.
+        The CNN core of the ResNet
 
     """
 
-    stream_net = nn.Sequential(
-        net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4
-    )
+    if encoder == "resnet39":
+        stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3)
+    else:
+        stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4)
 
-    # 1000 classes is the default from ImageNet classification
-    if num_classes != 1000:
-        net.fc = torch.nn.Linear(512, num_classes)
-        torch.nn.init.xavier_normal_(net.fc.weight)
-        net.fc.bias.data.fill_(0)  # type:ignore
-
-    head = nn.Sequential(net.avgpool, nn.Flatten(), net.fc)
-
-    return stream_net, head
+    return stream_net
 
 
-class StreamingResNet(ImageNetClassifier):
+class StreamingResNet(StreamingModule):
     # Resnet  minimal tile size based on tile statistics calculations:
     # resnet18 : 960
 
-    model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
+    model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet39": resnet50, "resnet50": resnet50}
 
     def __init__(
         self,
         model_name: str,
         tile_size: int,
-        loss_fn: torch.nn.functional,
-        train_streaming_layers: bool = True,
-        metrics: MetricCollection | None = None,
+        tile_cache_path: Path | None = None,
         **kwargs
     ):
         assert model_name in list(StreamingResNet.model_choices.keys())
         network = StreamingResNet.model_choices[model_name](weights="DEFAULT")
-        stream_network, head = split_resnet(network, num_classes=kwargs.pop("num_classes", 1000))
+        stream_network = split_resnet(network, encoder=model_name)
 
         self._get_streaming_options(**kwargs)
-        print("metrics", metrics)
+        self.streaming_options["add_keep_modules"] = [torch.nn.BatchNorm2d]
+
+        if tile_cache_path is None:
+            tile_cache_path = Path.cwd() / Path(f"{model_name}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+
         super().__init__(
             stream_network,
-            head,
             tile_size,
-            loss_fn,
-            train_streaming_layers=train_streaming_layers,
-            metrics=metrics,
+            tile_cache_path=tile_cache_path,
             **self.streaming_options,
         )
 
@@ -83,11 +69,31 @@ class StreamingResNet(ImageNetClassifier):
             "normalize_on_gpu": True,
             "mean": [0.485, 0.456, 0.406],
             "std": [0.229, 0.224, 0.225],
-            "add_keep_modules": [torch.nn.BatchNorm2d],
         }
         self.streaming_options = {**streaming_options, **kwargs}
 
 
+
 if __name__ == "__main__":
-    print("is cuda available?", torch.cuda.is_available())
-    model = StreamingResNet("resnet18", 1600, nn.MSELoss)
+    print(" is cuda available? ", torch.cuda.is_available())
+    img = torch.rand((1, 3, 4160, 4160)).to("cuda")
+    network = StreamingResNet(
+        "resnet39",
+        4800,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        normalize_on_gpu=False,
+    )
+    network.to("cuda")
+    network.stream_network.device = torch.device("cuda")
+
+    network.stream_network.mean = network.stream_network.mean.to("cuda")
+    network.stream_network.std = network.stream_network.std.to("cuda")
+
+    out_streaming = network(img)
+
+    network.disable_streaming_hooks()
+    normal_net = network.stream_network.stream_module
+    out_normal = normal_net(img)
+    diff = out_streaming - out_normal
+    print(diff.max())

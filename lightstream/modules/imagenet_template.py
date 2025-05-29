@@ -1,35 +1,30 @@
 from lightning.pytorch.utilities.types import STEP_OUTPUT
-
-from lightstream.modules.streaming import StreamingModule
-from torchmetrics import MetricCollection
+from lightning.pytorch import LightningModule
 from typing import Any
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 # TODO: Write control flow when lightstream is turned off
 # TODO: Add torchmetric collections as parameters (dependency injections)
 
 
-class ImageNetClassifier(StreamingModule):
+class ImageNetClassifier(LightningModule):
     def __init__(
         self,
-        stream_net: torch.nn.modules.container.Sequential,
+        stream_net: LightningModule,
         head: torch.nn.modules.container.Sequential,
-        tile_size: int,
         loss_fn: torch.nn.modules.loss,
-        train_streaming_layers=True,
-        metrics: MetricCollection | None = None,
-        **kwargs
+        accumulate_grad_batches: int = 1
     ):
-        super().__init__(stream_net, tile_size, train_streaming_layers, **kwargs)
+        super().__init__()
+        self.stream_network = stream_net
         self.head = head
         self.loss_fn = loss_fn
-        self.train_streaming_layers = train_streaming_layers
-        self.params = self.extend_trainable_params()
+        self.accumulate_grad_batches = accumulate_grad_batches # manual optimization, so do gradient accumulation here
 
-        self.train_metrics = metrics.clone(prefix='train_') if metrics else None
-        self.val_metrics = metrics.clone(prefix='val_') if metrics else None
-        self.test_metrics = metrics.clone(prefix='test_') if metrics else None
+        self.manual_optimization=True
+
 
     def on_train_epoch_start(self) -> None:
         super().on_train_epoch_start()
@@ -46,23 +41,50 @@ class ImageNetClassifier(StreamingModule):
         image, target = batch
         self.image = image
 
-        self.str_output = self.forward_streaming(image)
+        str_output = self.forward_streaming(image)
 
         # let leaf tensor require grad when training with streaming
-        self.str_output.requires_grad = self.training
+        str_output.requires_grad = self.training
 
         logits = self.forward_head(self.str_output)
 
         loss = self.loss_fn(logits, target)
+        loss = loss / self.accumulate_grad_batches
+
+        self.backward_streaming(loss, image, str_output)
+
+        self.distribute_gradients()
+
+        self.optimizer_step_if_needed(batch_idx)
 
         output = {}
-        if self.train_metrics:
-            output = self.train_metrics(logits, target)
-
         output["train_loss"] = loss
 
         self.log_dict(output, prog_bar=True, on_step=True,  on_epoch=True, sync_dist=True,)
         return loss
+
+    def backward_streaming(self, loss: Tensor, image: Tensor, str_output: Tensor) -> None:
+        with self.trainer.strategy.model.no_sync():
+            self.manual_backward(loss)
+        self.stream_network.backward(image, str_output.grad)
+
+
+    def distribute_gradients(self):
+        for p in self.parameters():
+            if p.requires_grad and p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad.div_(dist.get_world_size())
+
+    def optimizer_step_if_needed(self, batch_idx: int):
+        opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+
+        for opt in opts:
+            # accumulate gradients of N batches
+            if (batch_idx + 1) % self.accumulate_grad_batches == 0:
+                opt.step()
+                opt.zero_grad()
 
     def validation_step(self, batch: Any, batch_idx: int, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
         image, target = batch
@@ -78,27 +100,19 @@ class ImageNetClassifier(StreamingModule):
         loss = self.loss_fn(logits, target)
 
         output = {}
-        if self.val_metrics:
-            output = self.train_metrics(logits, target)
 
         output["val_loss"] = loss
 
         self.log_dict(output, prog_bar=True, on_step=False,  on_epoch=True, sync_dist=True,)
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(self.params, lr=1e-3)
+        opt = torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-5)
         return opt
 
-    def extend_trainable_params(self):
-        if self.params:
-            return self.params + list(self.head.parameters())
-        return list(self.head.parameters())
+    def manual_backward(self, loss: Tensor, *args: Any, **kwargs: Any) -> None:
+        loss.backward()
 
     def backward(self, loss: Tensor, **kwargs) -> None:
         loss.backward()
-        # del loss
-        # Don't call this>? https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#things-to-avoid
-        torch.cuda.empty_cache()
-        if self.train_streaming_layers:
-            self.backward_streaming(self.image, self.str_output.grad)
-        del self.str_output
+
+

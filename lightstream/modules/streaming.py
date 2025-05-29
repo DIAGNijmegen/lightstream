@@ -15,16 +15,16 @@ class StreamingModule(L.LightningModule):
         self,
         stream_network: torch.nn.Module,
         tile_size,
-        tile_cache_dir: str | Path = None,
-        tile_cache_fname: str | None = None,
+        tile_cache_path: str | Path = None,
         **kwargs,
     ):
         super().__init__()
 
         # StreamingCNN options
         self._tile_size = tile_size
-        self.tile_cache_dir = Path.cwd() if tile_cache_dir is None else Path(tile_cache_dir)
-        self.tile_cache_fname = f"tile_cache_{tile_size}" if tile_cache_fname is None else Path(tile_cache_fname)
+        self.tile_cache_path = Path(tile_cache_path) if tile_cache_path else None
+        self.tile_cache_dir = Path.cwd() if tile_cache_path is None else self.tile_cache_path.parent
+        self.tile_cache_fname = None if tile_cache_path is None else self.tile_cache_path.stem
         tile_cache = self.load_tile_cache_if_needed()  # Load tile cache if present
 
         # Initialize the streaming network
