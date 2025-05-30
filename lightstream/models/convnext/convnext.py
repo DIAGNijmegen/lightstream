@@ -1,4 +1,4 @@
-from lightstream.modules.streaming import StreamingModule
+from lightstream.modules.lightningstreaming import StreamingModule
 from torchvision.ops import StochasticDepth
 from torchvision.models.convnext import convnext_tiny, convnext_small
 from pathlib import Path

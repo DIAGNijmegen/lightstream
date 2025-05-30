@@ -1,3 +1,3 @@
-from .modules.streaming import StreamingModule
+from .modules.lightningstreaming import LightningStreamingModule
 
-__all__ = ["StreamingModule"]
+__all__ = ["LightningStreamingModule"]

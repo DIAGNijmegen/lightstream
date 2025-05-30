@@ -2,7 +2,7 @@ import torch
 
 from pathlib import Path
 
-from lightstream.modules.streaming import StreamingModule
+from lightstream.modules.lightningstreaming import StreamingModule
 from lightstream.models.inceptionnext.model import inceptionnext_atto, inceptionnext_tiny
 
 # input 320x320x3 on float32, torchinfo

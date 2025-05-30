@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 from pathlib import Path
-from lightstream.modules.streaming import StreamingModule
 from torchvision.models import resnet18, resnet34, resnet50
+from lightstream.modules.streaming import StreamingModule
+
 
 def split_resnet(net, encoder: str):
     """Split resnet architectures into streamable models
@@ -22,55 +23,58 @@ def split_resnet(net, encoder: str):
     if encoder == "resnet39":
         stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3)
     else:
-        stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4)
+        stream_net = nn.Sequential(
+            net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4
+        )
 
     return stream_net
 
 
 class StreamingResNet(StreamingModule):
-    # Resnet  minimal tile size based on tile statistics calculations:
-    # resnet18 : 960
-
-    model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet39": resnet50, "resnet50": resnet50}
-
     def __init__(
         self,
-        model_name: str,
+        encoder: str,
         tile_size: int,
-        tile_cache_path: Path | None = None,
-        **kwargs
+        verbose: bool = True,
+        deterministic: bool = True,
+        saliency: bool = False,
+        copy_to_gpu: bool = False,
+        statistics_on_cpu: bool = True,
+        normalize_on_gpu: bool = True,
+        mean: list | None = None,
+        std: list | None = None,
+        tile_cache_path=None,
     ):
-        assert model_name in list(StreamingResNet.model_choices.keys())
-        network = StreamingResNet.model_choices[model_name](weights="DEFAULT")
-        stream_network = split_resnet(network, encoder=model_name)
+        model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet39": resnet50, "resnet50": resnet50}
 
-        self._get_streaming_options(**kwargs)
-        self.streaming_options["add_keep_modules"] = [torch.nn.BatchNorm2d]
+        if encoder not in model_choices:
+            raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
+
+        resnet = model_choices[encoder](weights="DEFAULT")
+        stream_network = split_resnet(resnet, encoder=encoder)
+
+        if mean is None:
+            mean = [0.485, 0.456, 0.406]
+        if std is None:
+            std = [0.229, 0.224, 0.225]
 
         if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"{model_name}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+            tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
 
         super().__init__(
             stream_network,
             tile_size,
-            tile_cache_path=tile_cache_path,
-            **self.streaming_options,
+            tile_cache_path,
+            verbose=verbose,
+            deterministic=deterministic,
+            saliency=saliency,
+            copy_to_gpu=copy_to_gpu,
+            statistics_on_cpu=statistics_on_cpu,
+            normalize_on_gpu=normalize_on_gpu,
+            mean=mean,
+            std=std,
+            add_keep_modules=[nn.BatchNorm2d]
         )
-
-    def _get_streaming_options(self, **kwargs):
-        """Set streaming defaults, but overwrite them with values of kwargs if present."""
-
-        # We need to add torch.nn.Batchnorm to the keep modules, because of some in-place ops error if we don't
-        # https://discuss.pytorch.org/t/register-full-backward-hook-for-residual-connection/146850
-        streaming_options = {
-            "verbose": True,
-            "copy_to_gpu": False,
-            "statistics_on_cpu": True,
-            "normalize_on_gpu": True,
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-        }
-        self.streaming_options = {**streaming_options, **kwargs}
 
 
 
@@ -91,8 +95,7 @@ if __name__ == "__main__":
     network.stream_network.std = network.stream_network.std.to("cuda")
 
     out_streaming = network(img)
-
-    network.disable_streaming_hooks()
+    network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
     diff = out_streaming - out_normal
