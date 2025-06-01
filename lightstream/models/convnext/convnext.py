@@ -16,7 +16,7 @@ def _set_layer_scale(model, val=1.0):
 
 
 
-class StreamingConvnext(StreamingModule):
+class StreamingConvnext_(StreamingModule):
     model_choices = {"convnext-tiny": convnext_tiny, "convnext-small": convnext_small}
 
     def __init__(
@@ -27,12 +27,12 @@ class StreamingConvnext(StreamingModule):
             tile_cache_path: str = None,
             **kwargs,
     ):
-        assert model_name in list(StreamingConvnext.model_choices.keys())
+        assert model_name in list(StreamingConvnext_.model_choices.keys())
 
         self.model_name = model_name
         self.use_stochastic_depth = use_stochastic_depth
 
-        network = StreamingConvnext.model_choices[model_name](weights="DEFAULT")
+        network = StreamingConvnext_.model_choices[model_name](weights="DEFAULT")
         self._get_streaming_options(**kwargs)
 
         # Set these here so that they are no accidentally overwritten by the user
@@ -67,12 +67,61 @@ class StreamingConvnext(StreamingModule):
         }
         self.streaming_options = {**streaming_options, **kwargs}
 
+class StreamingConvNext(StreamingModule):
+    def __init__(
+        self,
+        encoder: str,
+        tile_size: int,
+        use_stochastic_depth: bool = False,
+        verbose: bool = True,
+        deterministic: bool = True,
+        saliency: bool = False,
+        copy_to_gpu: bool = False,
+        statistics_on_cpu: bool = True,
+        normalize_on_gpu: bool = True,
+        mean: list | None = None,
+        std: list | None = None,
+        tile_cache_path=None,
+    ):
+        model_choices = {"convnext-tiny": convnext_tiny, "convnext-small": convnext_small}
+        self.use_stochastic_depth = use_stochastic_depth
+
+        if encoder not in model_choices:
+            raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
+
+        stream_network = model_choices[encoder](weights="DEFAULT").features
+
+        if mean is None:
+            mean = [0.485, 0.456, 0.406]
+        if std is None:
+            std = [0.229, 0.224, 0.225]
+
+        if tile_cache_path is None:
+            tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+
+        super().__init__(
+            stream_network,
+            tile_size,
+            tile_cache_path,
+            verbose=verbose,
+            deterministic=deterministic,
+            saliency=saliency,
+            copy_to_gpu=copy_to_gpu,
+            statistics_on_cpu=statistics_on_cpu,
+            normalize_on_gpu=normalize_on_gpu,
+            mean=mean,
+            std=std,
+            before_streaming_init_callback=[_set_layer_scale],
+            after_streaming_init_callback=[_toggle_stochastic_depth]
+        )
+        _toggle_stochastic_depth(self.stream_network.stream_module, training=self.use_stochastic_depth)
+
 
 if __name__ == "__main__":
     import torch
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 4160, 4160)).to("cuda")
-    network = StreamingConvnext(
+    network = StreamingConvNext(
         "convnext-tiny",
         4800,
         use_stochastic_depth=False,
