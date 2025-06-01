@@ -111,8 +111,8 @@ class StreamingConvNext(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            before_streaming_init_callback=[_set_layer_scale],
-            after_streaming_init_callback=[_toggle_stochastic_depth]
+            before_streaming_init_callbacks=[_set_layer_scale],
+            after_streaming_init_callbacks=[_toggle_stochastic_depth]
         )
         _toggle_stochastic_depth(self.stream_network.stream_module, training=self.use_stochastic_depth)
 
@@ -137,7 +137,7 @@ if __name__ == "__main__":
 
     out_streaming = network(img)
 
-    network.disable_streaming_hooks()
+    network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
     diff = out_streaming - out_normal
