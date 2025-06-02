@@ -15,58 +15,6 @@ def _set_layer_scale(model, val=1.0):
             x.layer_scale.data.fill_(val)
 
 
-
-class StreamingConvnext_(StreamingModule):
-    model_choices = {"convnext-tiny": convnext_tiny, "convnext-small": convnext_small}
-
-    def __init__(
-            self,
-            model_name: str,
-            tile_size: int,
-            use_stochastic_depth: bool = False,
-            tile_cache_path: str = None,
-            **kwargs,
-    ):
-        assert model_name in list(StreamingConvnext_.model_choices.keys())
-
-        self.model_name = model_name
-        self.use_stochastic_depth = use_stochastic_depth
-
-        network = StreamingConvnext_.model_choices[model_name](weights="DEFAULT")
-        self._get_streaming_options(**kwargs)
-
-        # Set these here so that they are no accidentally overwritten by the user
-        # These functions are necessary to calculate tile statistics correctly
-        self.streaming_options["before_streaming_init_callbacks"] = [_set_layer_scale]
-        self.streaming_options["after_streaming_init_callbacks"] = [_toggle_stochastic_depth]
-
-        if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"{model_name}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
-
-
-        super().__init__(
-            network.features,
-            tile_size,
-            tile_cache_path=tile_cache_path,
-            **self.streaming_options,
-        )
-
-        # By default, the after_streaming_init callback turns sd off
-        _toggle_stochastic_depth(self.stream_network.stream_module, training=self.use_stochastic_depth)
-
-    def _get_streaming_options(self, **kwargs):
-        """Set streaming defaults, but overwrite them with values of kwargs if present."""
-
-        streaming_options = {
-            "verbose": True,
-            "copy_to_gpu": False,
-            "statistics_on_cpu": True,
-            "normalize_on_gpu": True,
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-        }
-        self.streaming_options = {**streaming_options, **kwargs}
-
 class StreamingConvNext(StreamingModule):
     def __init__(
         self,

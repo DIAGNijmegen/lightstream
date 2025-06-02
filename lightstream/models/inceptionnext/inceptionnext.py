@@ -17,48 +17,54 @@ def _set_layer_gamma(model, val=1.0):
         if hasattr(x, "gamma"):
             x.gamma.data.fill_(val)
 
+
 class StreamingInceptionNext(StreamingModule):
-
-    model_choices = {"inceptionnext-atto": inceptionnext_atto, "inceptionnext-tiny": inceptionnext_tiny}
-
     def __init__(
         self,
-        model_name: str,
+        encoder: str,
         tile_size: int,
-        tile_cache_path: Path | None = None,
-        **kwargs
+        use_stochastic_depth: bool = False,
+        verbose: bool = True,
+        deterministic: bool = True,
+        saliency: bool = False,
+        copy_to_gpu: bool = False,
+        statistics_on_cpu: bool = True,
+        normalize_on_gpu: bool = True,
+        mean: list | None = None,
+        std: list | None = None,
+        tile_cache_path=None,
     ):
-        assert model_name in list(StreamingInceptionNext.model_choices.keys())
-        network = StreamingInceptionNext.model_choices[model_name](pretrained=True)
+        model_choices = {"inceptionnext-atto": inceptionnext_atto, "inceptionnext-tiny": inceptionnext_tiny}
+        self.use_stochastic_depth = use_stochastic_depth
+
+        if encoder not in model_choices:
+            raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
+
+        network = model_choices[encoder](weights="DEFAULT")
         stream_network = torch.nn.Sequential(network.stem, network.stages)
 
-        self._get_streaming_options(**kwargs)
-        self.streaming_options["before_streaming_init_callbacks"] = [_set_layer_gamma]
+        if mean is None:
+            mean = [0.485, 0.456, 0.406]
+        if std is None:
+            std = [0.229, 0.224, 0.225]
 
         if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"{model_name}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+            tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
 
         super().__init__(
             stream_network,
             tile_size,
-            tile_cache_path=tile_cache_path,
-            **self.streaming_options,
+            tile_cache_path,
+            verbose=verbose,
+            deterministic=deterministic,
+            saliency=saliency,
+            copy_to_gpu=copy_to_gpu,
+            statistics_on_cpu=statistics_on_cpu,
+            normalize_on_gpu=normalize_on_gpu,
+            mean=mean,
+            std=std,
+            before_streaming_init_callbacks=[_set_layer_gamma],
         )
-
-    def _get_streaming_options(self, **kwargs):
-        """Set streaming defaults, but overwrite them with values of kwargs if present."""
-
-        # We need to add torch.nn.Batchnorm to the keep modules, because of some in-place ops error if we don't
-        # https://discuss.pytorch.org/t/register-full-backward-hook-for-residual-connection/146850
-        streaming_options = {
-            "verbose": True,
-            "copy_to_gpu": False,
-            "statistics_on_cpu": True,
-            "normalize_on_gpu": False,
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-        }
-        self.streaming_options = {**streaming_options, **kwargs}
 
 
 if __name__ == "__main__":
@@ -80,10 +86,8 @@ if __name__ == "__main__":
 
     out_streaming = network(img)
 
-    network.disable_streaming_hooks()
+    network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
     diff = out_streaming - out_normal
     print(diff.max())
-
-
