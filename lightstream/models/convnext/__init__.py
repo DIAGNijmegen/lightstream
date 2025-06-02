@@ -1,2 +1,2 @@
-from .convnext import StreamingConvnext
-__all__ = ["StreamingConvnext"]
+from .convnext import StreamingConvNext
+__all__ = ["StreamingConvNext"]
