@@ -36,7 +36,7 @@ class StreamingResNet(StreamingModule):
         self,
         encoder: str,
         tile_size: int,
-        additional_modules: nn.Module=None,
+        additional_modules: nn.Module | None = None,
         remove_last_block=False,
         verbose: bool = True,
         deterministic: bool = True,
@@ -48,7 +48,11 @@ class StreamingResNet(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-        model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
+        model_choices = {
+            "resnet18": resnet18,
+            "resnet34": resnet34,
+            "resnet50": resnet50,
+        }
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
@@ -56,7 +60,10 @@ class StreamingResNet(StreamingModule):
         resnet = model_choices[encoder](weights="DEFAULT")
 
         if additional_modules is not None:
-            stream_network = Sequential(split_resnet(resnet, remove_last_block=remove_last_block), additional_modules)
+            stream_network = Sequential(
+                split_resnet(resnet, remove_last_block=remove_last_block),
+                additional_modules,
+            )
         else:
             stream_network = split_resnet(resnet, remove_last_block=remove_last_block)
 
@@ -80,7 +87,7 @@ class StreamingResNet(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            add_keep_modules=[nn.BatchNorm2d]
+            add_keep_modules=[nn.BatchNorm2d],
         )
 
 
@@ -90,7 +97,7 @@ if __name__ == "__main__":
     network = StreamingResNet(
         "resnet18",
         4800,
-        additional_modules=torch.nn.MaxPool2d((2,2)),
+        additional_modules=torch.nn.MaxPool2d((2, 2)),
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,

@@ -22,7 +22,7 @@ class StreamingConvNext(StreamingModule):
         self,
         encoder: str,
         tile_size: int,
-        additional_modules: nn.Module=None,
+        additional_modules: nn.Module | None = None,
         remove_last_block = False,
         use_stochastic_depth: bool = False,
         verbose: bool = True,
