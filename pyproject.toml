@@ -1,6 +1,6 @@
 [project]
 name = "lightstream"
-version = "1.0.0"
+version = "1.0.1"
 description = "A Pytorch lightning framework for streaming CNN's"
 authors = [
     { name = "Stephan Dooper", email = "stephan.dooper@radboudumc.nl" },

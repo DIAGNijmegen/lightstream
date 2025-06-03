@@ -1,5 +1,6 @@
 import torch
-
+import torch.nn as nn
+from torch.nn import Sequential
 from pathlib import Path
 
 from lightstream.modules.lightningstreaming import StreamingModule
@@ -23,6 +24,8 @@ class StreamingInceptionNext(StreamingModule):
         self,
         encoder: str,
         tile_size: int,
+        additional_modules: nn.Module=None,
+        remove_last_block: bool = False,
         use_stochastic_depth: bool = False,
         verbose: bool = True,
         deterministic: bool = True,
@@ -41,7 +44,16 @@ class StreamingInceptionNext(StreamingModule):
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
         network = model_choices[encoder](weights="DEFAULT")
-        stream_network = torch.nn.Sequential(network.stem, network.stages)
+
+        end = 4
+        if remove_last_block:
+            end = 3
+
+        if additional_modules is not None:
+            stream_network = Sequential(network.stem, network.stages[0:end], additional_modules)
+        else:
+            stream_network = Sequential(network.stem, network.stages[0:end])
+
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -72,8 +84,10 @@ if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 4160, 4160)).to("cuda")
     network = StreamingInceptionNext(
-        "inceptionnext-atto",
-        4800,
+        "inceptionnext-tiny",
+        6400,
+        remove_last_block=False,
+        additional_modules=torch.nn.MaxPool2d(2,2),
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,

@@ -1,3 +1,5 @@
+import torch.nn as nn
+from torch.nn import Sequential
 from lightstream.modules.lightningstreaming import StreamingModule
 from torchvision.ops import StochasticDepth
 from torchvision.models.convnext import convnext_tiny, convnext_small
@@ -20,6 +22,8 @@ class StreamingConvNext(StreamingModule):
         self,
         encoder: str,
         tile_size: int,
+        additional_modules: nn.Module=None,
+        remove_last_block = False,
         use_stochastic_depth: bool = False,
         verbose: bool = True,
         deterministic: bool = True,
@@ -38,6 +42,12 @@ class StreamingConvNext(StreamingModule):
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
         stream_network = model_choices[encoder](weights="DEFAULT").features
+
+        if remove_last_block:
+            stream_network = stream_network[0:6]
+
+        if additional_modules is not None:
+            stream_network = Sequential(stream_network, additional_modules)
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -68,10 +78,12 @@ class StreamingConvNext(StreamingModule):
 if __name__ == "__main__":
     import torch
     print(" is cuda available? ", torch.cuda.is_available())
-    img = torch.rand((1, 3, 4160, 4160)).to("cuda")
+    img = torch.rand((1, 3, 6400, 6400)).to("cuda")
     network = StreamingConvNext(
         "convnext-tiny",
-        4800,
+        6400,
+        additional_modules=torch.nn.MaxPool2d(8, 8),
+        remove_last_block=False,
         use_stochastic_depth=False,
         mean=[0, 0, 0],
         std=[1, 1, 1],

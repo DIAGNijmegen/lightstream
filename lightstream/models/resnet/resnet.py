@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
+from torch.nn import Sequential
 from pathlib import Path
 from torchvision.models import resnet18, resnet34, resnet50
 from lightstream.modules.streaming import StreamingModule
 
 
-def split_resnet(net, encoder: str):
+def split_resnet(net, remove_last_block: bool = False):
     """Split resnet architectures into streamable models
 
     Parameters
@@ -20,7 +21,7 @@ def split_resnet(net, encoder: str):
 
     """
 
-    if encoder == "resnet39":
+    if remove_last_block:
         stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3)
     else:
         stream_net = nn.Sequential(
@@ -35,6 +36,8 @@ class StreamingResNet(StreamingModule):
         self,
         encoder: str,
         tile_size: int,
+        additional_modules: nn.Module=None,
+        remove_last_block=False,
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
@@ -45,13 +48,17 @@ class StreamingResNet(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-        model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet39": resnet50, "resnet50": resnet50}
+        model_choices = {"resnet18": resnet18, "resnet34": resnet34, "resnet50": resnet50}
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
         resnet = model_choices[encoder](weights="DEFAULT")
-        stream_network = split_resnet(resnet, encoder=encoder)
+
+        if additional_modules is not None:
+            stream_network = Sequential(split_resnet(resnet, remove_last_block=remove_last_block), additional_modules)
+        else:
+            stream_network = split_resnet(resnet, remove_last_block=remove_last_block)
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -77,13 +84,13 @@ class StreamingResNet(StreamingModule):
         )
 
 
-
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 4160, 4160)).to("cuda")
     network = StreamingResNet(
-        "resnet39",
+        "resnet18",
         4800,
+        additional_modules=torch.nn.MaxPool2d((2,2)),
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
