@@ -17,14 +17,12 @@ class LightningStreamingModule(L.LightningModule):
         super().__init__()
 
         self.stream_network = stream_network.stream_network
+        self._tile_size = self.stream_network.tile_shape[2]
 
     @property
     def tile_size(self):
         return self._tile_size
 
-    @tile_size.setter
-    def tile_size(self, new_tile_size: int):
-        self._tile_size = new_tile_size
 
     def _prepare_start_for_streaming(self) -> None:
         # Update streaming to put all the inputs/tensors on the right device

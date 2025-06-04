@@ -96,6 +96,7 @@ if __name__ == "__main__":
     network.stream_network.std = network.stream_network.std.to("cuda")
 
     out_streaming = network(img)
+    print(network.tile_size)
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
