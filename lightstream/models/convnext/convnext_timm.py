@@ -1,37 +1,29 @@
-import torch
+from pathlib import Path
+
 import torch.nn as nn
 from torch.nn import Sequential
-from pathlib import Path
-from torchvision.models import resnet18, resnet34, resnet50
-from lightstream.modules.streaming import StreamingModule
+
+from timm.models.convnext import (
+    convnext_atto,
+    convnext_atto_ols,
+    convnext_femto,
+    convnext_femto_ols,
+    convnext_pico,
+    convnext_pico_ols,
+    convnext_nano,
+    convnext_nano_ols,
+    convnext_tiny_hnf,
+)
+from lightstream.modules.lightningstreaming import StreamingModule
 
 
-def split_resnet(net, remove_last_block: bool = False):
-    """Split resnet architectures into streamable models
-
-    Parameters
-    ----------
-    net: torch model
-        A ResNet model in the format provided by torchvision
-
-    Returns
-    -------
-    stream_net : torch.nn.Sequential
-        The CNN core of the ResNet
-
-    """
-
-    if remove_last_block:
-        stream_net = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3)
-    else:
-        stream_net = nn.Sequential(
-            net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2, net.layer3, net.layer4
-        )
-
-    return stream_net
+def _set_layer_gamma(model, val=1.0):
+    for x in model.modules():
+        if hasattr(x, "gamma"):
+            x.gamma.data.fill_(val)
 
 
-class StreamingResNet(StreamingModule):
+class StreamingConvNextTIMM(StreamingModule):
     def __init__(
         self,
         encoder: str,
@@ -49,23 +41,28 @@ class StreamingResNet(StreamingModule):
         tile_cache_path=None,
     ):
         model_choices = {
-            "resnet18": resnet18,
-            "resnet34": resnet34,
-            "resnet50": resnet50,
+            "convnext_atto": convnext_atto,
+            "convnext_atto_ols": convnext_atto_ols,
+            "convnext_femto": convnext_femto,
+            "convnext_femto_ols": convnext_femto_ols,
+            "convnext_pico": convnext_pico,
+            "convnext_pico_ols": convnext_pico_ols,
+            "convnext_nano": convnext_nano,
+            "convnext_nano_ols": convnext_nano_ols,
+            "convnext-tiny_hnf": convnext_tiny_hnf,
         }
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
-        resnet = model_choices[encoder](weights="DEFAULT")
+        network = model_choices[encoder](pretrained=True)
+
+        end = 3 if remove_last_block else 4
 
         if additional_modules is not None:
-            stream_network = Sequential(
-                split_resnet(resnet, remove_last_block=remove_last_block),
-                additional_modules,
-            )
+            stream_network = Sequential(network.stem, network.stages[0:end], additional_modules)
         else:
-            stream_network = split_resnet(resnet, remove_last_block=remove_last_block)
+            stream_network = Sequential(network.stem, network.stages[0:end])
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -87,17 +84,20 @@ class StreamingResNet(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            add_keep_modules=[nn.BatchNorm2d],
+            before_streaming_init_callbacks=[_set_layer_gamma],
         )
 
 
 if __name__ == "__main__":
+    import torch
+
     print(" is cuda available? ", torch.cuda.is_available())
-    img = torch.rand((1, 3, 4160, 4160)).to("cuda")
-    network = StreamingResNet(
-        "resnet34",
-        4800,
-        additional_modules=torch.nn.MaxPool2d((2, 2)),
+    img = torch.rand((1, 3, 5440, 5440)).to("cuda")
+    network = StreamingConvNextTIMM(
+        "convnext-tiny_hnf",
+        5440,
+        additional_modules=None,
+        remove_last_block=False,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
@@ -109,6 +109,8 @@ if __name__ == "__main__":
     network.stream_network.std = network.stream_network.std.to("cuda")
 
     out_streaming = network(img)
+    print(network.tile_size)
+
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)

@@ -1,2 +1,3 @@
 from .convnext import StreamingConvNext
-__all__ = ["StreamingConvNext"]
+from .convnext_timm import StreamingConvNextTIMM
+__all__ = ["StreamingConvNext", "StreamingConvNextTIMM"]
