@@ -1,7 +1,10 @@
+from pathlib import Path
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from torch.nn import Sequential
-from pathlib import Path
+
 from torchvision.models import resnet18, resnet34, resnet50
 from lightstream.modules.streaming import StreamingModule
 
@@ -48,11 +51,7 @@ class StreamingResNet(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-        model_choices = {
-            "resnet18": resnet18,
-            "resnet34": resnet34,
-            "resnet50": resnet50,
-        }
+        model_choices = self.get_model_choices()
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
@@ -89,6 +88,18 @@ class StreamingResNet(StreamingModule):
             std=std,
             add_keep_modules=[nn.BatchNorm2d],
         )
+
+    @staticmethod
+    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
+        return {
+            "resnet18": resnet18,
+            "resnet34": resnet34,
+            "resnet50": resnet50,
+        }
+
+    @classmethod
+    def get_model_names(cls) -> list[str]:
+        return list(cls.get_model_choices().keys())
 
 
 if __name__ == "__main__":

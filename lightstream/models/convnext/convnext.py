@@ -1,9 +1,14 @@
+from pathlib import Path
+from typing import Callable
+
 import torch.nn as nn
 from torch.nn import Sequential
+
 from lightstream.modules.lightningstreaming import StreamingModule
+
 from torchvision.ops import StochasticDepth
 from torchvision.models.convnext import convnext_tiny, convnext_small
-from pathlib import Path
+
 
 def _toggle_stochastic_depth(model, training=False):
     for m in model.modules():
@@ -23,7 +28,7 @@ class StreamingConvNext(StreamingModule):
         encoder: str,
         tile_size: int,
         additional_modules: nn.Module | None = None,
-        remove_last_block = False,
+        remove_last_block=False,
         use_stochastic_depth: bool = False,
         verbose: bool = True,
         deterministic: bool = True,
@@ -70,13 +75,22 @@ class StreamingConvNext(StreamingModule):
             mean=mean,
             std=std,
             before_streaming_init_callbacks=[_set_layer_scale],
-            after_streaming_init_callbacks=[_toggle_stochastic_depth]
+            after_streaming_init_callbacks=[_toggle_stochastic_depth],
         )
         _toggle_stochastic_depth(self.stream_network.stream_module, training=self.use_stochastic_depth)
+
+    @staticmethod
+    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
+        return {"convnext-tiny": convnext_tiny, "convnext-small": convnext_small}
+
+    @classmethod
+    def get_model_names(cls) -> list[str]:
+        return list(cls.get_model_choices().keys())
 
 
 if __name__ == "__main__":
     import torch
+
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 6400, 6400)).to("cuda")
     network = StreamingConvNext(

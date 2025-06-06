@@ -1,7 +1,9 @@
+from pathlib import Path
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from torch.nn import Sequential
-from pathlib import Path
 
 from lightstream.modules.lightningstreaming import StreamingModule
 from lightstream.models.inceptionnext.model import inceptionnext_atto, inceptionnext_tiny
@@ -26,7 +28,6 @@ class StreamingInceptionNext(StreamingModule):
         tile_size: int,
         additional_modules: nn.Module | None = None,
         remove_last_block: bool = False,
-        use_stochastic_depth: bool = False,
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
@@ -37,8 +38,7 @@ class StreamingInceptionNext(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-        model_choices = {"inceptionnext-atto": inceptionnext_atto, "inceptionnext-tiny": inceptionnext_tiny}
-        self.use_stochastic_depth = use_stochastic_depth
+        model_choices = self.get_model_choices()
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
@@ -78,6 +78,13 @@ class StreamingInceptionNext(StreamingModule):
             before_streaming_init_callbacks=[_set_layer_gamma],
         )
 
+    @staticmethod
+    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
+        return {"inceptionnext-atto": inceptionnext_atto, "inceptionnext-tiny": inceptionnext_tiny}
+
+    @classmethod
+    def get_model_names(cls) -> list[str]:
+        return list(cls.get_model_choices().keys())
 
 if __name__ == "__main__":
 

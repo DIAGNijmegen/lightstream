@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch.nn as nn
 from torch.nn import Sequential
+from typing import Callable
 
 from timm.models.convnext import (
     convnext_atto,
@@ -40,17 +41,7 @@ class StreamingConvNextTIMM(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-        model_choices = {
-            "convnext_atto": convnext_atto,
-            "convnext_atto_ols": convnext_atto_ols,
-            "convnext_femto": convnext_femto,
-            "convnext_femto_ols": convnext_femto_ols,
-            "convnext_pico": convnext_pico,
-            "convnext_pico_ols": convnext_pico_ols,
-            "convnext_nano": convnext_nano,
-            "convnext_nano_ols": convnext_nano_ols,
-            "convnext-tiny_hnf": convnext_tiny_hnf,
-        }
+        model_choices = self.get_model_choices()
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
@@ -87,6 +78,24 @@ class StreamingConvNextTIMM(StreamingModule):
             before_streaming_init_callbacks=[_set_layer_gamma],
         )
 
+    @staticmethod
+    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
+        return {
+            "convnext_atto": convnext_atto,
+            "convnext_atto_ols": convnext_atto_ols,
+            "convnext_femto": convnext_femto,
+            "convnext_femto_ols": convnext_femto_ols,
+            "convnext_pico": convnext_pico,
+            "convnext_pico_ols": convnext_pico_ols,
+            "convnext_nano": convnext_nano,
+            "convnext_nano_ols": convnext_nano_ols,
+            "convnext-tiny_hnf": convnext_tiny_hnf,
+        }
+
+    @classmethod
+    def get_model_names(cls) -> list[str]:
+        return list(cls.get_model_choices().keys())
+
 
 if __name__ == "__main__":
     import torch
@@ -95,7 +104,7 @@ if __name__ == "__main__":
     img = torch.rand((1, 3, 5440, 5440)).to("cuda")
     network = StreamingConvNextTIMM(
         "convnext-tiny_hnf",
-        5440,
+        4800,
         additional_modules=None,
         remove_last_block=False,
         mean=[0, 0, 0],
