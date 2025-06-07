@@ -89,7 +89,7 @@ class StreamingConvNextTIMM(StreamingModule):
             "convnext_pico_ols": convnext_pico_ols,
             "convnext_nano": convnext_nano,
             "convnext_nano_ols": convnext_nano_ols,
-            "convnext-tiny_hnf": convnext_tiny_hnf,
+            "convnext_tiny_hnf": convnext_tiny_hnf,
         }
 
     @classmethod
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 5440, 5440)).to("cuda")
     network = StreamingConvNextTIMM(
-        "convnext-tiny_hnf",
+        "convnext_tiny_hnf",
         4800,
         additional_modules=None,
         remove_last_block=False,
