@@ -14,6 +14,8 @@ from timm.models.convnext import (
     convnext_nano,
     convnext_nano_ols,
     convnext_tiny_hnf,
+    convnext_tiny,
+    convnext_small
 )
 from lightstream.modules.lightningstreaming import StreamingModule
 
@@ -90,6 +92,8 @@ class StreamingConvNextTIMM(StreamingModule):
             "convnext_nano": convnext_nano,
             "convnext_nano_ols": convnext_nano_ols,
             "convnext_tiny_hnf": convnext_tiny_hnf,
+            "convnext_tiny": convnext_tiny,
+            "convnext_small": convnext_small
         }
 
     @classmethod
