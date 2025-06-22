@@ -26,7 +26,7 @@ def _set_layer_gamma(model, val=1.0):
             x.gamma.data.fill_(val)
 
 
-class StreamingConvNextTIMM(StreamingModule):
+class StreamingConvNext(StreamingModule):
     def __init__(
         self,
         encoder: str,
@@ -106,7 +106,7 @@ if __name__ == "__main__":
 
     print(" is cuda available? ", torch.cuda.is_available())
     img = torch.rand((1, 3, 5440, 5440)).to("cuda")
-    network = StreamingConvNextTIMM(
+    network = StreamingConvNext(
         "convnext_tiny_hnf",
         4800,
         additional_modules=None,

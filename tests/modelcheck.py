@@ -18,16 +18,6 @@ from lightstream.core.scnn import StreamingConv2d
 from torchvision.models import resnet18, resnet34, resnet50
 from models.resnet.resnet import split_resnet
 
-from models.convnext.convnext import (
-    _save_parameters,
-    _prepare_for_streaming_statistics,
-    _toggle_stochastic_depth,
-    _restore_layers,
-    _set_layer_scale,
-    _convert_to_identity,
-)
-from torchvision.models import convnext_tiny
-
 
 def create_dummy_data(self):
     img_size = 1600

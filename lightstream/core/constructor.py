@@ -212,7 +212,6 @@ class StreamingConstructor:
 
 if __name__ == "__main__":
     from lightstream.models.resnet.resnet import resnet18
-    from lightstream.models.convnext.convnext import convnext_tiny
     import torchvision
 
     print("Starting constructor checks:")
