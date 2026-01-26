@@ -3,6 +3,7 @@ Author: Hans Pinckaers
 MIT License
 """
 import copy
+import warnings
 import math
 import os
 import copy
@@ -136,6 +137,13 @@ class StreamingConv2dF(torch.autograd.Function):
         lost_right = grad_lost.right if not sides.right else 0
 
         valid_grad = grad[:, :, lost_top : grad.shape[H_DIM] - lost_bottom, lost_left : grad.shape[W_DIM] - lost_right]
+
+        if valid_grad.numel() == 0:
+            grad_in = torch.zeros_like(inpt) if ctx.needs_input_grad[0] else None
+            grad_weight = torch.zeros_like(weight)
+            if bias is not None:
+                grad_bias = torch.zeros_like(bias)
+            return grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
         stride, kernel_size, padding = (_triple(stride), _triple(kernel_size), _triple(padding))
 
@@ -338,6 +346,7 @@ class StreamingCNN(torch.nn.Module):
         verbose=False,
         deterministic=False,
         saliency=False,
+        tiling_gradient_lost_source="penultimate_layer",
         eps=1e-5,
         copy_to_gpu=True,
         dtype=None,
@@ -354,6 +363,9 @@ class StreamingCNN(torch.nn.Module):
             verbose (bool): will log various debugging relevant information (default is False)
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
+            tiling_gradient_lost_source (str): which gradient lost stats to use for backward tiling.
+                Using anything other than "input" can change parameter gradients because it alters
+                the number of streamed tiles during backprop.
             eps (float): epsilon error to compare floating values
         """
         super().__init__()
@@ -368,8 +380,19 @@ class StreamingCNN(torch.nn.Module):
             self.dtype = dtype
         self.tile_shape = tile_shape
         self.gather_input_gradient = saliency
+        self.tiling_gradient_lost_source = tiling_gradient_lost_source
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
+
+        valid_sources = {"input", "penultimate_layer"}
+        if self.tiling_gradient_lost_source not in valid_sources:
+            raise ValueError(f"tiling_gradient_lost_source must be one of {valid_sources}")
+        if self.tiling_gradient_lost_source != "input":
+            warnings.warn(
+                "tiling_gradient_lost_source is not 'input'; this can change parameter gradients "
+                "by altering backward tile coverage.",
+                RuntimeWarning,
+            )
 
         if mean is not None and not isinstance(mean, torch.Tensor):
             mean = torch.Tensor(mean)[:, None, None]
@@ -387,6 +410,7 @@ class StreamingCNN(torch.nn.Module):
         self._backward_seen_indices = {}
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self.tile_gradient_lost_for_tiling = None
         self._hooks = []
 
         if state_dict is None:
@@ -473,10 +497,26 @@ class StreamingCNN(torch.nn.Module):
 
         # tiles can have -1, see backward_statistics_hook
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
+        self.tile_gradient_lost_for_tiling = self._resolve_tiling_gradient_lost()
 
         # lost statistics assume you're always in the middle of an image, so left,bottom,top,right lost can always happen
         if self.verbose:
             print("\n", "Input gradient lost", self.tile_gradient_lost)
+            print("\n", "Tiling gradient lost", self.tile_gradient_lost_for_tiling)
+
+    def _resolve_tiling_gradient_lost(self):
+        if self.tiling_gradient_lost_source == "input":
+            return self.tile_gradient_lost
+
+        if self.tiling_gradient_lost_source == "penultimate_layer":
+            # Use the first layer with gradient stats as a proxy for the
+            # penultimate gradient loss (relative to the input image).
+            for module in self.stream_module.modules():
+                stats = self._module_stats.get(module)
+                if stats and "grad_lost" in stats:
+                    return stats["grad_lost"]
+
+        return self.tile_gradient_lost
 
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
@@ -775,7 +815,7 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self.tile_gradient_lost
+        grad_lost = self.tile_gradient_lost_for_tiling or self.tile_gradient_lost
 
         output_height = self._tile_output_shape[H_DIM]
         output_width = self._tile_output_shape[W_DIM]
@@ -849,6 +889,9 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_grad = gradient[
                     :, :, lost.top : gradient.shape[H_DIM] - lost.bottom, lost.left : gradient.shape[W_DIM] - lost.right
                 ]
+
+                if trimmed_grad.shape[H_DIM] == 0 or trimmed_grad.shape[W_DIM] == 0:
+                    continue
 
                 if not self.copy_to_gpu:
                     tile = tile.to(self.device, non_blocking=True)
@@ -1255,6 +1298,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["output_stride"] = self.output_stride
         named_stats["tile_output_lost"] = self.tile_output_lost  # type:ignore
         named_stats["tile_gradient_lost"] = self.tile_gradient_lost  # type:ignore
+        named_stats["tile_gradient_lost_for_tiling"] = self.tile_gradient_lost_for_tiling  # type:ignore
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         return named_stats
 
@@ -1264,6 +1308,7 @@ class StreamingCNN(torch.nn.Module):
         self.output_stride = state["output_stride"]
         self.tile_output_lost = state["tile_output_lost"]
         self.tile_gradient_lost = state["tile_gradient_lost"]
+        self.tile_gradient_lost_for_tiling = state.get("tile_gradient_lost_for_tiling", self.tile_gradient_lost)
         self._tile_output_shape = state["tile_output_shape"]
 
         for name, module in self.stream_module.named_modules():
