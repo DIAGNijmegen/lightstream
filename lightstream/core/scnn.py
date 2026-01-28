@@ -476,7 +476,7 @@ class StreamingCNN(torch.nn.Module):
                     lost.left : out.shape[W_DIM] - lost.right,
                 ] = 1
                 gradients.append(gradient)
-            torch.autograd.backward(outputs, gradients=gradients)
+            torch.autograd.backward(outputs, grad_tensors=gradients)
 
         # Calculate the output stride of the whole stream_module
         if len(outputs) == 1:
@@ -652,7 +652,6 @@ class StreamingCNN(torch.nn.Module):
         return outputs
 
     def _output_count(self):
-        print("MAAAUYW")
         return len(self._tile_output_shape) if isinstance(self._tile_output_shape, list) else 1
 
     def _get_output_stride(self, index):
@@ -1218,7 +1217,7 @@ class StreamingCNN(torch.nn.Module):
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
 
-                torch.autograd.backward(trimmed_outputs, gradients=trimmed_grads)
+                torch.autograd.backward(trimmed_outputs, grad_tensors=trimmed_grads)
 
                 del tile_output
                 del trimmed_grads
@@ -1277,6 +1276,22 @@ class StreamingCNN(torch.nn.Module):
         tile = tile_norm
         return tile
 
+    def _normalize_stream_input(self, inpt):
+        if not inpt:
+            return inpt
+        data = inpt[0]
+        if isinstance(data, dict):
+            if not data:
+                return inpt
+            data = next(iter(data.values()))
+        elif isinstance(data, (list, tuple)):
+            if not data:
+                return inpt
+            data = data[0]
+        if data is inpt[0]:
+            return inpt
+        return (data,)
+
     def disable(self):
         """Disable the streaming hooks"""
         self._remove_hooks()
@@ -1289,13 +1304,16 @@ class StreamingCNN(torch.nn.Module):
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
+        def pre_lambda(module, inpt):
+            return self._normalize_stream_input(inpt)
+
         def forw_lambda(module, inpt, outpt):
             self._forward_gather_statistics_hook(module, inpt, outpt)
 
         def back_lambda(module, grad_in, grad_out):
             return self._backward_gather_statistics_hook(module, grad_in, grad_out)
 
-        self._add_hooks(forward_hook=forw_lambda, backward_hook=back_lambda)
+        self._add_hooks(forward_pre_hook=pre_lambda, forward_hook=forw_lambda, backward_hook=back_lambda)
 
     def _add_hooks_for_streaming(self):
         if self.gather_input_gradient:
@@ -1314,11 +1332,15 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
+        forward_pre_hook=None,
         forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d),
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
+                if forward_pre_hook:
+                    pre_handle = mod.register_forward_pre_hook(forward_pre_hook)
+                    self._hooks.append(pre_handle)
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
                 if back_modules and isinstance(mod, back_modules):
