@@ -82,8 +82,8 @@ def _parse_dtype(value: str) -> torch.dtype:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for ResNet18.")
     parser.add_argument("--dtype", default="float32", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=2560)
-    parser.add_argument("--input-size", type=int, default=4160)
+    parser.add_argument("--tile-size", type=int, default=3200)
+    parser.add_argument("--input-size", type=int, default=4800)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -102,7 +102,7 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        tile_cache_path="/data/temporary/stephan/lightstream/examples/resnet18_vanilla_tile_cache_1_3_2560_2560"
+        tile_cache_path="/data/temporary/stephan/lightstream/examples/resnet18_vanilla_tile_cache_1_3_3200_3200"
     )
     network.to(device)
     network.stream_network.device = device
