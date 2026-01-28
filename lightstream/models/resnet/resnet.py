@@ -107,7 +107,7 @@ if __name__ == "__main__":
     dtype=torch.float32
     img = torch.rand((1, 3, 4800, 4800)).to("cuda", dtype=dtype)
     network = StreamingResNet(
-        "resnet34",
+        "resnet18",
         3200,
         additional_modules=torch.nn.MaxPool2d((2, 2)),
         mean=[0, 0, 0],
@@ -115,6 +115,7 @@ if __name__ == "__main__":
         normalize_on_gpu=False,
     )
     network.to("cuda", dtype=dtype)
+    netowrk.eval()
     network.stream_network.device = torch.device("cuda")
 
     network.stream_network.mean = network.stream_network.mean.to("cuda", dtype=dtype)
@@ -124,5 +125,7 @@ if __name__ == "__main__":
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
-    diff = out_streaming - out_normal
+    diff = (out_streaming - out_normal).abs()
     print(diff.max())
+
+    print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
