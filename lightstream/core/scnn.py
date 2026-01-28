@@ -1333,6 +1333,7 @@ class StreamingCNN(torch.nn.Module):
         forward_pre_hook=None,
         forward_hook,
         backward_hook,
+        forward_pre_hook=None,
         forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d),
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d),
     ):
