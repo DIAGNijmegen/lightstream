@@ -388,6 +388,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
         self._current_tile_input_loc = None
         self._hooks = []
+        self._output_structure = None
 
         if state_dict is None:
             self._configure()
@@ -450,26 +451,50 @@ class StreamingCNN(torch.nn.Module):
         # Forward pass with grads enabled
         torch.set_grad_enabled(True)
         output = self.stream_module(tile)
+        outputs, _ = self._split_outputs(output)
 
         # Gather backward statistics
-        self._tile_output_shape = output.shape
-        gradient = torch.zeros(*output.shape, dtype=self.dtype, device=self.device)
-        gradient[
-            :,
-            :,
-            self.tile_output_lost.top : output.shape[H_DIM] - self.tile_output_lost.bottom,
-            self.tile_output_lost.left : output.shape[W_DIM] - self.tile_output_lost.right,
-        ] = 1
-
-        output.backward(gradient=gradient)
+        if len(outputs) == 1:
+            self._tile_output_shape = outputs[0].shape
+            gradient = torch.zeros(*outputs[0].shape, dtype=self.dtype, device=self.device)
+            gradient[
+                :,
+                :,
+                self.tile_output_lost.top : outputs[0].shape[H_DIM] - self.tile_output_lost.bottom,
+                self.tile_output_lost.left : outputs[0].shape[W_DIM] - self.tile_output_lost.right,
+            ] = 1
+            outputs[0].backward(gradient=gradient)
+        else:
+            self._tile_output_shape = [out.shape for out in outputs]
+            gradients = []
+            for out, lost in zip(outputs, self.tile_output_lost):
+                gradient = torch.zeros(*out.shape, dtype=self.dtype, device=self.device)
+                gradient[
+                    :,
+                    :,
+                    lost.top : out.shape[H_DIM] - lost.bottom,
+                    lost.left : out.shape[W_DIM] - lost.right,
+                ] = 1
+                gradients.append(gradient)
+            torch.autograd.backward(outputs, grad_tensors=gradients)
 
         # Calculate the output stride of the whole stream_module
-        p_stats = self._prev_stats(output)
-
-        if p_stats:
-            self.output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+        if len(outputs) == 1:
+            p_stats = self._prev_stats(outputs[0])
+            if p_stats:
+                self.output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+            else:
+                self.output_stride = torch.tensor([1, 1, 1])
         else:
-            self.output_stride = torch.tensor([1, 1, 1])
+            output_strides = []
+            for out in outputs:
+                p_stats = self._prev_stats(out)
+                if p_stats:
+                    output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                else:
+                    output_stride = torch.tensor([1, 1, 1])
+                output_strides.append(output_stride)
+            self.output_stride = output_strides
 
         # tiles can have -1, see backward_statistics_hook
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
@@ -481,7 +506,12 @@ class StreamingCNN(torch.nn.Module):
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
-        self.tile_output_lost = self._non_max_border_amount(output)
+        outputs, structure = self._split_outputs(output)
+        self._output_structure = structure
+        if len(outputs) == 1:
+            self.tile_output_lost = self._non_max_border_amount(outputs[0])
+        else:
+            self.tile_output_lost = [self._non_max_border_amount(out) for out in outputs]
         if self.verbose:
             print("\n", "Output lost", self.tile_output_lost)
 
@@ -599,25 +629,70 @@ class StreamingCNN(torch.nn.Module):
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
-    def forward(self, image, result_on_cpu=False):
-        """Perform forward pass with lightstream.
+    def _split_outputs(self, output):
+        if isinstance(output, dict):
+            keys = list(output.keys())
+            return [output[key] for key in keys], ("dict", keys)
+        if isinstance(output, (list, tuple)):
+            return list(output), ("sequence", type(output))
+        return [output], None
 
-        Parameters:
-            image (torch.Tensor): CHW the image to lightstream
-        """
-        # The input image is likely quite small in terms of channels, for
-        # performance reasons it is beneficial to copy to the GPU as a whole
-        # instead of tile-by-tile.
-        image = image
+    def _restore_outputs(self, outputs, structure):
+        if structure is None:
+            return outputs[0]
+        kind, meta = structure
+        if kind == "dict":
+            return {key: value for key, value in zip(meta, outputs)}
+        if kind == "sequence":
+            if meta is tuple:
+                return tuple(outputs)
+            if isinstance(meta, type) and issubclass(meta, tuple):
+                return meta(*outputs)
+            return list(outputs)
+        return outputs
 
-        if self.copy_to_gpu:
-            image = image.to(self.device, non_blocking=True)
+    def _output_count(self):
+        return len(self._tile_output_shape) if isinstance(self._tile_output_shape, list) else 1
 
+    def _get_output_stride(self, index):
+        if isinstance(self.output_stride, list):
+            return self.output_stride[index]
+        return self.output_stride
+
+    def _get_tile_output_shape(self, index):
+        if isinstance(self._tile_output_shape, list):
+            return self._tile_output_shape[index]
+        return self._tile_output_shape
+
+    def _get_tile_output_lost(self, index):
+        if isinstance(self.tile_output_lost, list):
+            return self.tile_output_lost[index]
+        return self.tile_output_lost
+
+    def _outputs_share_tiling(self):
+        if self._output_count() == 1:
+            return True
+        shapes = self._tile_output_shape
+        losts = self.tile_output_lost
+        strides = self.output_stride
+        for idx in range(1, self._output_count()):
+            if shapes[idx] != shapes[0]:
+                return False
+            if losts[idx] != losts[0]:
+                return False
+            if not torch.equal(strides[idx], strides[0]):
+                return False
+        return True
+
+    def _forward_single_output(self, image, result_on_cpu, output_index=0, initialize_saliency=True):
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
+        tile_output_shape = self._get_tile_output_shape(output_index)
+        tile_output_lost = self._get_tile_output_lost(output_index)
+        output_stride = self._get_output_stride(output_index)
 
         # Size of valid output of a tile
-        valid_output_height = self._tile_output_shape[H_DIM] - self.tile_output_lost.top - self.tile_output_lost.bottom
-        valid_output_width = self._tile_output_shape[W_DIM] - self.tile_output_lost.left - self.tile_output_lost.right
+        valid_output_height = tile_output_shape[H_DIM] - tile_output_lost.top - tile_output_lost.bottom
+        valid_output_width = tile_output_shape[W_DIM] - tile_output_lost.left - tile_output_lost.right
 
         # We will keep track which part of the output of the whole image we
         # already filled with valid values from tile output.
@@ -625,19 +700,15 @@ class StreamingCNN(torch.nn.Module):
 
         # Calculate size of output that we would get by inferencing the
         # whole image.
-        output_height = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // self.output_stride[
-            1
-        ] + self._tile_output_shape[H_DIM]
-        output_width = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // self.output_stride[2] + self._tile_output_shape[
-            W_DIM
-        ]
+        output_height = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // output_stride[1] + tile_output_shape[H_DIM]
+        output_width = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // output_stride[2] + tile_output_shape[W_DIM]
 
         if result_on_cpu:
             device = torch.device("cpu")
         else:
             device = self.device
         output = torch.empty(
-            (image.shape[0], self._tile_output_shape[1], output_height, output_width), dtype=self.dtype, device=device
+            (image.shape[0], tile_output_shape[1], output_height, output_width), dtype=self.dtype, device=device
         ).fill_(999)
 
         n_rows = math.ceil(float(output_height) / float(valid_output_height))
@@ -648,7 +719,7 @@ class StreamingCNN(torch.nn.Module):
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
 
-        if self.gather_input_gradient:
+        if self.gather_input_gradient and initialize_saliency:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         # if self.verbose:
@@ -672,34 +743,34 @@ class StreamingCNN(torch.nn.Module):
 
                     sides_bottom = (
                         True
-                        if output_y * self.output_stride[1] + self.tile_shape[H_DIM] >= image.shape[H_DIM]
+                        if output_y * output_stride[1] + self.tile_shape[H_DIM] >= image.shape[H_DIM]
                         else False
                     )
                     sides_right = (
                         True
-                        if output_x * self.output_stride[2] + self.tile_shape[W_DIM] >= image.shape[W_DIM]
+                        if output_x * output_stride[2] + self.tile_shape[W_DIM] >= image.shape[W_DIM]
                         else False
                     )
                     sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                     # These values are used to crop invalid output values
-                    lost = self._get_tile_lost_for_sides(sides)
+                    lost = self._get_tile_lost_for_sides(sides, output_index)
 
                     # Since we need to stay at multiples of output stride we
                     # need to keep that into account when we are at the bottom
                     # and right side of the output.
                     if sides_bottom:
-                        output_y = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // self.output_stride[1]
+                        output_y = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // output_stride[1]
                     if sides_right:
-                        output_x = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // self.output_stride[2]
+                        output_x = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // output_stride[2]
 
                     output_y = output_y if not sides.top else 0
                     output_x = output_x if not sides.left else 0
                     output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
 
                     # Coordinates of the input w.r.t. the output of full image
-                    tile_y = output_y * self.output_stride[1]
-                    tile_x = output_x * self.output_stride[2]
+                    tile_y = output_y * output_stride[1]
+                    tile_x = output_x * output_stride[2]
 
                     # Extract tile and perform forward pass
                     tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
@@ -713,6 +784,10 @@ class StreamingCNN(torch.nn.Module):
                         tile = self._normalize_on_gpu(tile)
 
                     tile_output = self.stream_module(tile)
+                    outputs, _ = self._split_outputs(tile_output)
+                    if output_index >= len(outputs):
+                        raise ValueError("Streaming output index is out of range for the model outputs.")
+                    tile_output = outputs[output_index]
 
                     if torch.backends.cudnn.benchmark:
                         torch.cuda.empty_cache()
@@ -749,25 +824,169 @@ class StreamingCNN(torch.nn.Module):
 
         # mem management
         del relevant_output  # type:ignore
-        del image
         self._saved_tensors = {}
 
         return output
 
-    def backward(self, image, grad):
-        """Perform backward pass with lightstream.
+    def _forward_multi_output_shared(self, image, result_on_cpu):
+        outputs = []
+        already_filled = []
+        tile_output_shape = self._get_tile_output_shape(0)
+        tile_output_lost = self._get_tile_output_lost(0)
+        output_stride = self._get_output_stride(0)
+
+        tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
+
+        valid_output_height = tile_output_shape[H_DIM] - tile_output_lost.top - tile_output_lost.bottom
+        valid_output_width = tile_output_shape[W_DIM] - tile_output_lost.left - tile_output_lost.right
+
+        output_height = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // output_stride[1] + tile_output_shape[H_DIM]
+        output_width = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // output_stride[2] + tile_output_shape[W_DIM]
+
+        if result_on_cpu:
+            device = torch.device("cpu")
+        else:
+            device = self.device
+
+        for _ in range(self._output_count()):
+            output = torch.empty(
+                (image.shape[0], tile_output_shape[1], output_height, output_width), dtype=self.dtype, device=device
+            ).fill_(999)
+            outputs.append(output)
+            already_filled.append(Box(0, 0, 0, 0, None))
+
+        n_rows = math.ceil(float(output_height) / float(valid_output_height))
+        n_cols = math.ceil(float(output_width) / float(valid_output_width))
+
+        if image.shape[W_DIM] <= tile_width:
+            n_cols = 1
+        if image.shape[H_DIM] <= tile_height:
+            n_rows = 1
+
+        if self.gather_input_gradient:
+            self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+
+        iterator = range(n_rows)
+
+        with torch.no_grad():
+            for row in iterator:
+                for col in range(n_cols):
+                    output_y = row * valid_output_height
+                    output_x = col * valid_output_width
+
+                    sides_top = True if row == 0 else False
+                    sides_left = True if col == 0 else False
+
+                    sides_bottom = (
+                        True
+                        if output_y * output_stride[1] + self.tile_shape[H_DIM] >= image.shape[H_DIM]
+                        else False
+                    )
+                    sides_right = (
+                        True
+                        if output_x * output_stride[2] + self.tile_shape[W_DIM] >= image.shape[W_DIM]
+                        else False
+                    )
+                    sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
+
+                    lost = self._get_tile_lost_for_sides(sides, 0)
+
+                    if sides_bottom:
+                        output_y = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // output_stride[1]
+                    if sides_right:
+                        output_x = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // output_stride[2]
+
+                    output_y = output_y if not sides.top else 0
+                    output_x = output_x if not sides.left else 0
+                    output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
+
+                    tile_y = output_y * output_stride[1]
+                    tile_x = output_x * output_stride[2]
+
+                    tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
+
+                    if not self.copy_to_gpu:
+                        tile = tile.to(self.device, non_blocking=True)
+
+                    if self.should_normalize:
+                        tile = self._normalize_on_gpu(tile)
+
+                    tile_output = self.stream_module(tile)
+                    tile_outputs, _ = self._split_outputs(tile_output)
+                    if len(tile_outputs) != self._output_count():
+                        raise ValueError("Streaming output count does not match model outputs.")
+
+                    if torch.backends.cudnn.benchmark:
+                        torch.cuda.empty_cache()
+
+                    for output_index, output_tensor in enumerate(outputs):
+                        tile_output = tile_outputs[output_index]
+                        trimmed_output = tile_output[
+                            :,
+                            :,
+                            lost.top : tile_output.shape[H_DIM] - lost.bottom,
+                            lost.left : tile_output.shape[W_DIM] - lost.right,
+                        ]
+
+                        new_output_box, updated_total_indices = self._new_value_indices(
+                            trimmed_output.shape, output_loc, already_filled[output_index]
+                        )
+                        already_filled[output_index] = updated_total_indices
+
+                        relevant_output = trimmed_output[
+                            :,
+                            :,
+                            new_output_box.y : updated_total_indices.y + new_output_box.height,
+                            new_output_box.x : new_output_box.x + new_output_box.width,
+                        ]
+
+                        output_tensor[
+                            :,
+                            :,
+                            int(updated_total_indices.y) : int(updated_total_indices.height),
+                            int(updated_total_indices.x - new_output_box.width) : int(updated_total_indices.x),
+                        ] = relevant_output
+
+                    del tile
+
+            assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
+
+        del relevant_output  # type:ignore
+        self._saved_tensors = {}
+
+        return outputs
+
+    def forward(self, image, result_on_cpu=False):
+        """Perform forward pass with lightstream.
 
         Parameters:
-            image (torch.Tensor): the image (expects NCHW) that was used in the forward pass
-            grad (torch.Tensor): this should be the gradient of the output of
-                the stream_layers.
+            image (torch.Tensor): CHW the image to lightstream
         """
-        # The input image is likely quite small in terms of channels, for
-        # performance reasons it is beneficial to copy to the GPU as a whole
-        # instead of tile-by-tile.
         image = image
+
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
+
+        if self._output_count() == 1:
+            output = self._forward_single_output(image, result_on_cpu)
+            del image
+            return output
+
+        if self._outputs_share_tiling():
+            outputs = self._forward_multi_output_shared(image, result_on_cpu)
+        else:
+            outputs = []
+            for idx in range(self._output_count()):
+                outputs.append(
+                    self._forward_single_output(
+                        image, result_on_cpu, output_index=idx, initialize_saliency=(idx == 0)
+                    )
+                )
+
+        del image
+        return self._restore_outputs(outputs, self._output_structure)
+
+    def _backward_single_output(self, image, grad, output_index=0):
         grad = grad
 
         height = image.shape[H_DIM]
@@ -777,21 +996,19 @@ class StreamingCNN(torch.nn.Module):
         tile_width = self.tile_shape[W_DIM]
         grad_lost = self.tile_gradient_lost
 
-        output_height = self._tile_output_shape[H_DIM]
-        output_width = self._tile_output_shape[W_DIM]
+        output_stride = self._get_output_stride(output_index)
+        output_shape = self._get_tile_output_shape(output_index)
 
-        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // self.output_stride[1]
-        valid_grad_height *= self.output_stride[1]
-        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // self.output_stride[2]
-        valid_grad_width *= self.output_stride[2]
+        output_height = output_shape[H_DIM]
+        output_width = output_shape[W_DIM]
+
+        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // output_stride[1]
+        valid_grad_height *= output_stride[1]
+        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // output_stride[2]
+        valid_grad_width *= output_stride[2]
 
         n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
-
-        # if self.verbose:
-        #    ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
-        #    next_ideal_tile_size = height / float(n_rows - 1) + grad_lost.top + grad_lost.bottom
-        #    print(ideal_tile_size, n_rows * n_cols, next_ideal_tile_size)
 
         if image.shape[W_DIM] <= tile_width:
             n_cols = 1
@@ -801,19 +1018,12 @@ class StreamingCNN(torch.nn.Module):
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        # if self.verbose:
-        #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
-        # if self.verbose:
-        #    iterator = tqdm(range(n_rows))
-        # else:
         iterator = range(n_rows)
 
         for row in iterator:
             for col in range(n_cols):
-                # Since we determine output (gradient) coordinates based on input
-                # coordinates. We need to divide by output stride.
-                output_y = row * valid_grad_height // self.output_stride[1]
-                output_x = col * valid_grad_width // self.output_stride[2]
+                output_y = row * valid_grad_height // output_stride[1]
+                output_x = col * valid_grad_width // output_stride[2]
 
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
@@ -822,20 +1032,15 @@ class StreamingCNN(torch.nn.Module):
                 sides_right = True if output_x + output_width >= grad.shape[W_DIM] else False
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
-                # We are doing a forward pass
-                lost = self._get_tile_lost_for_sides(sides)
-
-                # If the tile is at the bottom or right side of the input image
-                # than we need to shift back so that the tile fits (does not go
-                # over the border)
+                lost = self._get_tile_lost_for_sides(sides, output_index)
 
                 if sides_bottom:
                     output_y = max(grad.shape[H_DIM] - output_height, 0)
                 if sides_right:
                     output_x = max(grad.shape[W_DIM] - output_width, 0)
 
-                input_y = output_y * self.output_stride[1]
-                input_x = output_x * self.output_stride[2]
+                input_y = output_y * output_stride[1]
+                input_x = output_x * output_stride[2]
 
                 input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
 
@@ -845,7 +1050,6 @@ class StreamingCNN(torch.nn.Module):
 
                 self._saved_tensors = {}
 
-                # Trim output and gradient
                 trimmed_grad = gradient[
                     :, :, lost.top : gradient.shape[H_DIM] - lost.bottom, lost.left : gradient.shape[W_DIM] - lost.right
                 ]
@@ -857,8 +1061,6 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingConv2d):
                         mod.input_loc = input_loc
 
-                # normalize on gpu for speed in dataloader
-                # does this reduce speed significantly?
                 if self.should_normalize:
                     tile = self._normalize_on_gpu(tile)
 
@@ -869,7 +1071,12 @@ class StreamingCNN(torch.nn.Module):
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     tile_output = self.stream_module(tile)
 
-                del tile  # memory management
+                del tile
+
+                outputs, _ = self._split_outputs(tile_output)
+                if output_index >= len(outputs):
+                    raise ValueError("Streaming output index is out of range for the model outputs.")
+                tile_output = outputs[output_index]
 
                 trimmed_output = tile_output[
                     :,
@@ -878,11 +1085,8 @@ class StreamingCNN(torch.nn.Module):
                     lost.left : tile_output.shape[W_DIM] - lost.right,
                 ]
 
-                # Do backward pass, fix gradient in hooks
                 trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
-                # Sometimes when training with variable input shapes,
-                # the gradient size is a bit too big
                 if (
                     trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
                     or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
@@ -892,12 +1096,158 @@ class StreamingCNN(torch.nn.Module):
 
                 trimmed_output.backward(trimmed_grad)
 
-                # Memory management
                 del tile_output
                 del trimmed_grad
                 del trimmed_output
 
-        # Memory management
+    def _backward_multi_output_shared(self, image, grads):
+        height = image.shape[H_DIM]
+        width = image.shape[W_DIM]
+
+        tile_height = self.tile_shape[H_DIM]
+        tile_width = self.tile_shape[W_DIM]
+        grad_lost = self.tile_gradient_lost
+
+        output_stride = self._get_output_stride(0)
+        output_shape = self._get_tile_output_shape(0)
+
+        output_height = output_shape[H_DIM]
+        output_width = output_shape[W_DIM]
+
+        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // output_stride[1]
+        valid_grad_height *= output_stride[1]
+        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // output_stride[2]
+        valid_grad_width *= output_stride[2]
+
+        n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
+        n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
+
+        if image.shape[W_DIM] <= tile_width:
+            n_cols = 1
+        if image.shape[H_DIM] <= tile_height:
+            n_rows = 1
+
+        self._inputs = {}
+        self._backward_seen_indices = {}
+
+        iterator = range(n_rows)
+
+        for row in iterator:
+            for col in range(n_cols):
+                output_y = row * valid_grad_height // output_stride[1]
+                output_x = col * valid_grad_width // output_stride[2]
+
+                sides_top = True if row == 0 else False
+                sides_left = True if col == 0 else False
+
+                sides_bottom = True if output_y + output_height >= grads[0].shape[H_DIM] else False
+                sides_right = True if output_x + output_width >= grads[0].shape[W_DIM] else False
+                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
+
+                lost = self._get_tile_lost_for_sides(sides, 0)
+
+                if sides_bottom:
+                    output_y = max(grads[0].shape[H_DIM] - output_height, 0)
+                if sides_right:
+                    output_x = max(grads[0].shape[W_DIM] - output_width, 0)
+
+                input_y = output_y * output_stride[1]
+                input_x = output_x * output_stride[2]
+
+                input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
+
+                tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
+
+                self._saved_tensors = {}
+
+                if not self.copy_to_gpu:
+                    tile = tile.to(self.device, non_blocking=True)
+
+                for mod in self.stream_module.modules():
+                    if isinstance(mod, StreamingConv2d):
+                        mod.input_loc = input_loc
+
+                if self.should_normalize:
+                    tile = self._normalize_on_gpu(tile)
+
+                if self.gather_input_gradient:
+                    tile.requires_grad = True
+                    self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    tile_output = self.stream_module(tile)
+
+                del tile
+
+                outputs, _ = self._split_outputs(tile_output)
+                if len(outputs) != self._output_count():
+                    raise ValueError("Streaming output count does not match model outputs.")
+
+                trimmed_outputs = []
+                trimmed_grads = []
+                for output_index, gradient in enumerate(grads):
+                    grad_tile = gradient[
+                        :, :, output_y : output_y + output_height, output_x : output_x + output_width
+                    ]
+                    trimmed_grad = grad_tile[
+                        :,
+                        :,
+                        lost.top : grad_tile.shape[H_DIM] - lost.bottom,
+                        lost.left : grad_tile.shape[W_DIM] - lost.right,
+                    ]
+
+                    tile_out = outputs[output_index]
+                    trimmed_output = tile_out[
+                        :,
+                        :,
+                        lost.top : tile_out.shape[H_DIM] - lost.bottom,
+                        lost.left : tile_out.shape[W_DIM] - lost.right,
+                    ]
+                    trimmed_output = trimmed_output.to(self.device, non_blocking=True)
+
+                    if (
+                        trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
+                        or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
+                    ):
+                        assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
+                        trimmed_grad = trimmed_grad[
+                            :, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]
+                        ]
+
+                    trimmed_outputs.append(trimmed_output)
+                    trimmed_grads.append(trimmed_grad)
+
+                torch.autograd.backward(trimmed_outputs, grad_tensors=trimmed_grads)
+
+                del tile_output
+                del trimmed_grads
+                del trimmed_outputs
+
+    def backward(self, image, grad):
+        """Perform backward pass with lightstream.
+
+        Parameters:
+            image (torch.Tensor): the image (expects NCHW) that was used in the forward pass
+            grad (torch.Tensor): this should be the gradient of the output of
+                the stream_layers, or a structure matching the forward outputs.
+        """
+        image = image
+        if self.copy_to_gpu:
+            image = image.to(self.device, non_blocking=True)
+
+        grads, grad_structure = self._split_outputs(grad)
+
+        if len(grads) != self._output_count():
+            raise ValueError("Gradient outputs do not match the number of model outputs.")
+
+        if self._output_count() == 1:
+            self._backward_single_output(image, grads[0])
+        elif self._outputs_share_tiling() and grad_structure == self._output_structure:
+            self._backward_multi_output_shared(image, grads)
+        else:
+            for idx, grad_tensor in enumerate(grads):
+                self._backward_single_output(image, grad_tensor, output_index=idx)
+
         self._saved_tensors = {}
         self._current_tile_input_loc = None
 
@@ -906,13 +1256,14 @@ class StreamingCNN(torch.nn.Module):
                 mod.input_loc = None
                 mod.reset()
 
-        assert sides_right and sides_bottom, "It seems like we could not reconstruct all output"  # type:ignore
+        del image
 
-    def _get_tile_lost_for_sides(self, sides):
-        lost_top = self.tile_output_lost.top if not sides.top else 0
-        lost_bottom = self.tile_output_lost.bottom if not sides.bottom else 0
-        lost_left = self.tile_output_lost.left if not sides.left else 0
-        lost_right = self.tile_output_lost.right if not sides.right else 0
+    def _get_tile_lost_for_sides(self, sides, output_index=0):
+        tile_output_lost = self._get_tile_output_lost(output_index)
+        lost_top = tile_output_lost.top if not sides.top else 0
+        lost_bottom = tile_output_lost.bottom if not sides.bottom else 0
+        lost_left = tile_output_lost.left if not sides.left else 0
+        lost_right = tile_output_lost.right if not sides.right else 0
         lost = Lost(lost_top, lost_left, lost_bottom, lost_right)
         return lost
 
@@ -924,6 +1275,22 @@ class StreamingCNN(torch.nn.Module):
         tile_norm.div_(self.std)
         tile = tile_norm
         return tile
+
+    def _normalize_stream_input(self, inpt):
+        if not inpt:
+            return inpt
+        data = inpt[0]
+        if isinstance(data, dict):
+            if not data:
+                return inpt
+            data = next(iter(data.values()))
+        elif isinstance(data, (list, tuple)):
+            if not data:
+                return inpt
+            data = data[0]
+        if data is inpt[0]:
+            return inpt
+        return (data,)
 
     def disable(self):
         """Disable the streaming hooks"""
@@ -937,13 +1304,16 @@ class StreamingCNN(torch.nn.Module):
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
+        def pre_lambda(module, inpt):
+            return self._normalize_stream_input(inpt)
+
         def forw_lambda(module, inpt, outpt):
             self._forward_gather_statistics_hook(module, inpt, outpt)
 
         def back_lambda(module, grad_in, grad_out):
             return self._backward_gather_statistics_hook(module, grad_in, grad_out)
 
-        self._add_hooks(forward_hook=forw_lambda, backward_hook=back_lambda)
+        self._add_hooks(forward_pre_hook=pre_lambda, forward_hook=forw_lambda, backward_hook=back_lambda)
 
     def _add_hooks_for_streaming(self):
         if self.gather_input_gradient:
@@ -962,11 +1332,15 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
+        forward_pre_hook=None,
         forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d),
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
+                if forward_pre_hook:
+                    pre_handle = mod.register_forward_pre_hook(forward_pre_hook)
+                    self._hooks.append(pre_handle)
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
                 if back_modules and isinstance(mod, back_modules):
@@ -1256,6 +1630,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_lost"] = self.tile_output_lost  # type:ignore
         named_stats["tile_gradient_lost"] = self.tile_gradient_lost  # type:ignore
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
+        named_stats["output_structure"] = self._output_structure
         return named_stats
 
     def load_tile_cache(self, state):
@@ -1265,6 +1640,9 @@ class StreamingCNN(torch.nn.Module):
         self.tile_output_lost = state["tile_output_lost"]
         self.tile_gradient_lost = state["tile_gradient_lost"]
         self._tile_output_shape = state["tile_output_shape"]
+        self._output_structure = state.get("output_structure", self._output_structure)
+        if self._output_structure is None and isinstance(self._tile_output_shape, list):
+            self._output_structure = ("sequence", list)
 
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
