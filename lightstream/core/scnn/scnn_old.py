@@ -724,7 +724,7 @@ class StreamingCNN(torch.nn.Module):
                         lost.left : tile_output.shape[W_DIM] - lost.right,
                     ]
 
-                    new_output_box, updated_total_indices = self._new_value_indices(
+                    new_output_box, updated_total_indices = _new_value_indices(
                         trimmed_output.shape, output_loc, already_filled
                     )
                     already_filled = updated_total_indices

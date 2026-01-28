@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from copy import deepcopy
-from lightstream.core.scnn import StreamingCNN
+from core.scnn.scnn import StreamingCNN
 from typing import Callable, Optional, Any
 
 
@@ -211,9 +211,6 @@ class StreamingConstructor:
 
 
 if __name__ == "__main__":
-    from lightstream.models.resnet.resnet import resnet18
-    import torchvision
-
     print("Starting constructor checks:")
     """
     print("Test 1: ResNet18")

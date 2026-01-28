@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable, Iterable
+import argparse
 
 import torch
 import torch.nn as nn
@@ -93,10 +94,13 @@ def _zero_grads(parameters: Iterable[torch.nn.Parameter]) -> None:
             param.grad.zero_()
 
 
-def _loss_grads_from_outputs(outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+def _loss_grads_from_outputs(
+    outputs: tuple[torch.Tensor, ...], target_value: float
+) -> tuple[torch.Tensor, ...]:
     grads = []
     for out in outputs:
-        grads.append(torch.ones_like(out) / out.numel())
+        target = torch.full_like(out, fill_value=target_value)
+        grads.append(2 * (out - target) / out.numel())
     return tuple(grads)
 
 
@@ -109,19 +113,67 @@ def _compare_grads(stream_grads: dict[str, torch.Tensor], normal_grads: dict[str
     print(f"Comparing {len(shared)} parameter gradients:")
     for name in shared:
         diff = (stream_grads[name] - normal_grads[name]).abs()
+        denom = normal_grads[name].abs().clamp_min(1e-12)
+        rel = diff / denom
         print(
-            f"{name}: mean abs diff={diff.mean().item():.6e}, max abs diff={diff.max().item():.6e}"
+            f"{name}: "
+            f"mean abs diff={diff.mean().item():.6e}, max abs diff={diff.max().item():.6e}, "
+            f"mean rel diff={rel.mean().item():.6e}, max rel diff={rel.max().item():.6e}"
         )
 
 
+def _compare_conv_weight_grads(
+    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor]
+) -> None:
+    conv_names = sorted(
+        name
+        for name, grad in stream_grads.items()
+        if name in normal_grads and grad.ndim == 4 and "conv" in name
+    )
+    if not conv_names:
+        print("No convolution weight gradients found to compare.")
+        return
+
+    print("\nConvolution kernel gradient stats:")
+    for name in conv_names:
+        stream_grad = stream_grads[name]
+        normal_grad = normal_grads[name]
+        diff = (stream_grad - normal_grad).abs()
+        print(
+            f"{name}: "
+            f"stream mean abs={stream_grad.abs().mean().item():.6e}, "
+            f"normal mean abs={normal_grad.abs().mean().item():.6e}, "
+            f"max abs diff={diff.max().item():.6e}"
+        )
+
+
+def _parse_dtype(value: str) -> torch.dtype:
+    mapping = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    key = value.lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dtype '{value}'. Choose from: {', '.join(mapping.keys())}")
+    return mapping[key]
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
+    parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
+    parser.add_argument("--tile-size", type=int, default=2560)
+    parser.add_argument("--input-size", type=int, default=3200)
+    args = parser.parse_args()
+
     torch.manual_seed(0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tile_size = 2560
-    input_size = 3200
+    dtype = _parse_dtype(args.dtype)
+    tile_size = args.tile_size
+    input_size = args.input_size
 
-    img = torch.rand((1, 3, input_size, input_size), device=device)
+    img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
 
     network = StreamingWSS(
         "resnet18",
@@ -130,26 +182,39 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-    ).to(device)
+        saliency=True,
+    ).to(device=device, dtype=dtype)
     network.stream_network.device = device
-    network.stream_network.mean = network.stream_network.mean.to(device)
-    network.stream_network.std = network.stream_network.std.to(device)
+    network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
+    network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
 
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_outputs = network(img)
-    stream_grads = _loss_grads_from_outputs(stream_outputs)
+    target_value = 50.0
+    stream_grads = _loss_grads_from_outputs(stream_outputs, target_value)
     network.stream_network.backward(img, stream_grads)
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     _zero_grads(normal_net.parameters())
-    normal_outputs = normal_net(img)
-    normal_loss = sum(out.mean() for out in normal_outputs)
+    img_normal = img.detach().clone().requires_grad_(True)
+    normal_outputs = normal_net(img_normal)
+    forward_diffs = []
+    for stream_out, normal_out in zip(stream_outputs, normal_outputs):
+        forward_diffs.append((stream_out - normal_out).sum().item())
+    print(f"Forward output sum diffs: {forward_diffs}")
+
+    normal_loss = sum(torch.nn.functional.mse_loss(out, torch.full_like(out, target_value)) for out in normal_outputs)
     normal_loss.backward()
     normal_param_grads = _gather_param_grads(normal_net)
 
+    if img_normal.grad is not None:
+        input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
+        print(f"Input gradient max diff: {input_grad_diff.max()}")
+
     _compare_grads(streaming_param_grads, normal_param_grads)
+    _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
 
 
 if __name__ == "__main__":
