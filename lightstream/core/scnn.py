@@ -476,7 +476,7 @@ class StreamingCNN(torch.nn.Module):
                     lost.left : out.shape[W_DIM] - lost.right,
                 ] = 1
                 gradients.append(gradient)
-            torch.autograd.backward(outputs, gradients=gradients)
+            torch.autograd.backward(outputs, grad_tensors=gradients)
 
         # Calculate the output stride of the whole stream_module
         if len(outputs) == 1:
@@ -1217,7 +1217,7 @@ class StreamingCNN(torch.nn.Module):
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
 
-                torch.autograd.backward(trimmed_outputs, gradients=trimmed_grads)
+                torch.autograd.backward(trimmed_outputs, grad_tensors=trimmed_grads)
 
                 del tile_output
                 del trimmed_grads
