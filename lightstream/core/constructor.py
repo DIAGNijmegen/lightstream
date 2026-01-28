@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from copy import deepcopy
-from core.scnn.scnn import StreamingCNN
+from .scnn.scnn import StreamingCNN
 from typing import Callable, Optional, Any
 
 

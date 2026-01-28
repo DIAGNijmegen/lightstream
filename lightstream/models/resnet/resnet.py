@@ -104,10 +104,10 @@ class StreamingResNet(StreamingModule):
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
-    img = torch.rand((1, 3, 4160, 4160)).to("cuda")
+    img = torch.rand((1, 3, 4800, 4800)).to("cuda")
     network = StreamingResNet(
-        "resnet34",
-        4800,
+        "resnet18",
+        3200,
         additional_modules=torch.nn.MaxPool2d((2, 2)),
         mean=[0, 0, 0],
         std=[1, 1, 1],
@@ -115,7 +115,6 @@ if __name__ == "__main__":
     )
     network.to("cuda")
     network.stream_network.device = torch.device("cuda")
-
     network.stream_network.mean = network.stream_network.mean.to("cuda")
     network.stream_network.std = network.stream_network.std.to("cuda")
 
@@ -124,4 +123,4 @@ if __name__ == "__main__":
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
     diff = out_streaming - out_normal
-    print(diff.max())
+    print(diff.sum())
