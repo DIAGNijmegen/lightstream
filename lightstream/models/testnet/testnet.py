@@ -83,5 +83,7 @@ if __name__ == "__main__":
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     out_normal = normal_net(img)
-    diff = out_streaming - out_normal
+    diff = (out_streaming - out_normal).abs()
     print(diff.max())
+
+    print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
