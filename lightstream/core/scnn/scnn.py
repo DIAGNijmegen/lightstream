@@ -185,6 +185,20 @@ class StreamingCNN(torch.nn.Module):
                     lost.left : out.shape[W_DIM] - lost.right,
                 ] = 1
                 gradients.append(gradient)
+
+            self.tile_gradient_lost = []
+            for idx, (out, gradient) in enumerate(zip(outputs, gradients)):
+                tile_grad = torch.autograd.grad(
+                    out,
+                    tile,
+                    grad_outputs=gradient,
+                    retain_graph=idx < len(outputs) - 1,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                self.tile_gradient_lost.append(self._non_max_border_amount(tile_grad))
+
+            tile.grad = None
             torch.autograd.backward(outputs, grad_tensors=gradients)
 
         # Calculate the output stride of the whole stream_module
@@ -206,7 +220,8 @@ class StreamingCNN(torch.nn.Module):
             self.output_stride = output_strides
 
         # tiles can have -1, see backward_statistics_hook
-        self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
+        if len(outputs) == 1:
+            self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
 
         # lost statistics assume you're always in the middle of an image, so left,bottom,top,right lost can always happen
         if self.verbose:
@@ -462,6 +477,11 @@ class StreamingCNN(torch.nn.Module):
         if isinstance(self.tile_output_lost, list):
             return self.tile_output_lost[index]
         return self.tile_output_lost
+
+    def _get_tile_gradient_lost(self, index):
+        if isinstance(self.tile_gradient_lost, list):
+            return self.tile_gradient_lost[index]
+        return self.tile_gradient_lost
 
     def _outputs_share_tiling(self):
         if self._output_count() == 1:
@@ -774,7 +794,7 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self.tile_gradient_lost
+        grad_lost = self._get_tile_gradient_lost(output_index)
 
         output_stride = self._get_output_stride(output_index)
         stride_y = self._stride_value(output_stride, 1)
@@ -885,7 +905,7 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self.tile_gradient_lost
+        grad_lost = self._get_tile_gradient_lost(0)
 
         output_stride = self._get_output_stride(0)
         stride_y = self._stride_value(output_stride, 1)
@@ -1020,6 +1040,8 @@ class StreamingCNN(torch.nn.Module):
             self._backward_multi_output_shared(image, grads)
         else:
             for idx, grad_tensor in enumerate(grads):
+                if grad_tensor is None:
+                    continue
                 self._backward_single_output(image, grad_tensor, output_index=idx)
 
         self._saved_tensors = {}
