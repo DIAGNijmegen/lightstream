@@ -66,21 +66,38 @@ class StreamingUpsampleF(torch.autograd.Function):
             ctx.seen_indices.sides = updated_total_indices.sides
 
             masked_grad = torch.zeros_like(grad_output)
-            masked_grad[
-                :,
-                :,
-                lost_top : grad_output.shape[H_DIM] - lost_bottom,
-                lost_left : grad_output.shape[W_DIM] - lost_right,
-            ] = valid_grad
+            if new_output_box.height > 0 and new_output_box.width > 0:
+                src_y0 = new_output_box.y
+                src_y1 = new_output_box.y + new_output_box.height
+                src_x0 = new_output_box.x
+                src_x1 = new_output_box.x + new_output_box.width
 
-            grad_in = torch.nn.functional.interpolate(
-                masked_grad,
-                size=inpt.shape[-2:],
-                mode=ctx.mode,
-                align_corners=ctx.align_corners,
-            )
+                dst_y0 = lost_top + src_y0
+                dst_y1 = lost_top + src_y1
+                dst_x0 = lost_left + src_x0
+                dst_x1 = lost_left + src_x1
 
-            del new_output_box
+                masked_grad[:, :, dst_y0:dst_y1, dst_x0:dst_x1] = valid_grad[:, :, src_y0:src_y1, src_x0:src_x1]
+
+            # interpolate backward is not equivalent to interpolate downsample,
+            # so compute grad_input through autograd on interpolate directly.
+            with torch.enable_grad():
+                proxy_input = inpt.detach().requires_grad_(True)
+                proxy_output = torch.nn.functional.interpolate(
+                    proxy_input,
+                    size=ctx.size,
+                    scale_factor=ctx.scale_factor,
+                    mode=ctx.mode,
+                    align_corners=ctx.align_corners,
+                )
+                grad_in = torch.autograd.grad(
+                    outputs=proxy_output,
+                    inputs=proxy_input,
+                    grad_outputs=masked_grad,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
 
         return (grad_in, None, None, None, None, None, None, None, None)
 
