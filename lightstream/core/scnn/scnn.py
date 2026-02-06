@@ -420,6 +420,39 @@ class StreamingCNN(torch.nn.Module):
             return float(scale_factor[0]), float(scale_factor[1])
         return float(scale_factor), float(scale_factor)
 
+
+    def _crop_spatial_for_sides(self, tensor, target_h, target_w, sides):
+        h, w = tensor.shape[H_DIM], tensor.shape[W_DIM]
+
+        if h > target_h:
+            if sides.top and not sides.bottom:
+                tensor = tensor[:, :, :target_h, :]
+            elif sides.bottom and not sides.top:
+                tensor = tensor[:, :, h - target_h :, :]
+            else:
+                start = (h - target_h) // 2
+                tensor = tensor[:, :, start : start + target_h, :]
+
+        if w > target_w:
+            if sides.left and not sides.right:
+                tensor = tensor[:, :, :, :target_w]
+            elif sides.right and not sides.left:
+                tensor = tensor[:, :, :, w - target_w :]
+            else:
+                start = (w - target_w) // 2
+                tensor = tensor[:, :, :, start : start + target_w]
+
+        return tensor
+
+    def _align_trimmed_tensors(self, trimmed_grad, trimmed_output, sides):
+        target_h = min(trimmed_grad.shape[H_DIM], trimmed_output.shape[H_DIM])
+        target_w = min(trimmed_grad.shape[W_DIM], trimmed_output.shape[W_DIM])
+
+        trimmed_grad = self._crop_spatial_for_sides(trimmed_grad, target_h, target_w, sides)
+        trimmed_output = self._crop_spatial_for_sides(trimmed_output, target_h, target_w, sides)
+
+        return trimmed_grad, trimmed_output
+
     def _get_tile_output_shape(self, index):
         if isinstance(self._tile_output_shape, list):
             return self._tile_output_shape[index]
@@ -838,8 +871,7 @@ class StreamingCNN(torch.nn.Module):
                     trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
                     or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
                 ):
-                    assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                    trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
+                    trimmed_grad, trimmed_output = self._align_trimmed_tensors(trimmed_grad, trimmed_output, sides)
 
                 trimmed_output.backward(trimmed_grad)
 
@@ -954,12 +986,7 @@ class StreamingCNN(torch.nn.Module):
                         trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
                         or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
                     ):
-                        assert (
-                            image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                        )
-                        trimmed_grad = trimmed_grad[
-                            :, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]
-                        ]
+                        trimmed_grad, trimmed_output = self._align_trimmed_tensors(trimmed_grad, trimmed_output, sides)
 
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
