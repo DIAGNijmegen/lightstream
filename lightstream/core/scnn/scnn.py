@@ -1044,6 +1044,16 @@ class StreamingCNN(torch.nn.Module):
             for idx, grad_tensor in enumerate(grads):
                 if grad_tensor is None:
                     continue
+                if torch.count_nonzero(grad_tensor).item() == 0:
+                    continue
+
+                # Each output branch should start from a fresh streaming state.
+                # Otherwise, zero/other-output passes can advance seen_indices and
+                # under-count gradients for the current output.
+                for mod in self.stream_module.modules():
+                    if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+                        mod.reset()
+
                 self._backward_single_output(image, grad_tensor, output_index=idx)
 
         self._saved_tensors = {}
