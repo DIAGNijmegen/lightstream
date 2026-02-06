@@ -192,7 +192,9 @@ class StreamingCNN(torch.nn.Module):
                     out,
                     tile,
                     grad_outputs=gradient,
-                    retain_graph=idx < len(outputs) - 1,
+                    # Keep the graph intact for the subsequent full backward call
+                    # that populates module-level statistics.
+                    retain_graph=True,
                     create_graph=False,
                     allow_unused=False,
                 )[0]
