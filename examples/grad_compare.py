@@ -12,6 +12,8 @@ from torchvision.models import resnet18, resnet34, resnet50
 from lightstream.modules.streaming import StreamingModule
 from lightstream.models.segment.model import WSS
 
+# Make sure BN layers have eval on, or else massive differences
+#
 
 class StreamingWSS(StreamingModule):
     def __init__(
