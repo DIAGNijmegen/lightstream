@@ -491,12 +491,19 @@ class StreamingCNN(torch.nn.Module):
         shapes = self._tile_output_shape
         losts = self.tile_output_lost
         strides = self.output_stride
+
+        gradient_losts = None
+        if isinstance(self.tile_gradient_lost, list):
+            gradient_losts = self.tile_gradient_lost
+
         for idx in range(1, self._output_count()):
             if shapes[idx] != shapes[0]:
                 return False
             if losts[idx] != losts[0]:
                 return False
             if not torch.equal(strides[idx], strides[0]):
+                return False
+            if gradient_losts is not None and gradient_losts[idx] != gradient_losts[0]:
                 return False
         return True
 
