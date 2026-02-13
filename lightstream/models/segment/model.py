@@ -15,14 +15,17 @@ class WSS(nn.Module):
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
         self.decoder2 = nn.Sequential(
             nn.Conv2d(128, 1, 1),
+            nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
         self.decoder3 = nn.Sequential(
             nn.Conv2d(256, 1, 1),
+            nn.Upsample(scale_factor=16, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
 
@@ -36,7 +39,7 @@ class WSS(nn.Module):
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
 
-        y = self.w[0] * y1
+        y = self.w[0] * y1 + self.w[1] * y2 + self.w[2] * y3
 
         return y1, y2, y3, y
 

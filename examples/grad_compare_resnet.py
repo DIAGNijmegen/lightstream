@@ -60,6 +60,7 @@ def _compare_conv_weight_grads(
             f"{name}: "
             f"stream mean abs={stream_grad.abs().mean().item():.6e}, "
             f"normal mean abs={normal_grad.abs().mean().item():.6e}, "
+            f"mean abs diff={stream_grad.abs().mean().item() - normal_grad.abs().mean().item():.6e}, "
             f"max abs diff={diff.max().item():.6e}"
         )
 
@@ -99,6 +100,8 @@ def main() -> None:
     input_size = args.input_size
 
     img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    target = torch.tensor(50., device=device, dtype=dtype)  # large value so we get larger gradients
+    criterion = torch.nn.MSELoss()
 
     network = StreamingResNet(
         "resnet18",
@@ -110,17 +113,20 @@ def main() -> None:
         saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
+    network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_output = network(img)
-    target_value = 50.0
-    target = torch.full_like(stream_output, fill_value=target_value)
-    stream_grad = 2 * (stream_output - target) / stream_output.numel()
-    network.stream_network.backward(img, stream_grad)
+    stream_output.requires_grad = True
+    y_pred_streaming = torch.sigmoid(torch.mean(stream_output))
+    loss = criterion(y_pred_streaming, target)
+    loss.backward()
+    full_gradients = network.stream_network.backward(img, stream_output.grad)
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
@@ -131,8 +137,8 @@ def main() -> None:
     forward_diff = (stream_output - normal_output).abs()
     print(f"Forward output sum/max diff: {forward_diff.sum().item()}, {forward_diff.max().item()}")
 
-
-    normal_loss = torch.nn.functional.mse_loss(normal_output, torch.full_like(normal_output, target_value))
+    y_pred_normal=torch.sigmoid(torch.mean(normal_output))
+    normal_loss = criterion(y_pred_normal, target)
     normal_loss.backward()
     normal_param_grads = _gather_param_grads(normal_net)
 
