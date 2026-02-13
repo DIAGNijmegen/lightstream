@@ -433,8 +433,8 @@ class StreamingCNN(torch.nn.Module):
         normalize_on_gpu=False,
         mean=None,
         std=None,
-        only_backward_valid_gradients=False,
-        border_only_padding=False,
+        only_backward_valid_gradients=True,
+        border_only_padding=True,
         state_dict=None,
     ):
         """
