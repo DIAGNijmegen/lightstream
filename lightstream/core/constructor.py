@@ -31,6 +31,8 @@ class StreamingConstructor:
         normalize_on_gpu: bool = True,
         mean: Optional[tuple[float, float, float]] = None,
         std: Optional[tuple[float, float, float]] = None,
+        only_backward_valid_gradients: bool = False,
+        border_only_padding: bool = False,
         tile_cache: Optional[dict] = None,
         add_keep_modules: Optional[list[nn.Module]] = None,
         before_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
@@ -49,6 +51,8 @@ class StreamingConstructor:
         self.normalize_on_gpu = normalize_on_gpu
         self.mean = mean
         self.std = std
+        self.only_backward_valid_gradients = only_backward_valid_gradients
+        self.border_only_padding = border_only_padding
         self.tile_cache = tile_cache
 
         self.before_streaming_init_callbacks = before_streaming_init_callbacks or []
@@ -142,6 +146,8 @@ class StreamingConstructor:
             normalize_on_gpu=self.normalize_on_gpu,
             mean=self.mean,
             std=self.std,
+            only_backward_valid_gradients=self.only_backward_valid_gradients,
+            border_only_padding=self.border_only_padding,
             state_dict=self.tile_cache,
         )
 
