@@ -507,10 +507,16 @@ class StreamingCNN(torch.nn.Module):
         # Create all-ones tile
         tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
 
+        if self.border_only_padding:
+            self._set_padding_for_statistics(zero_padding=True)
+
         self._gather_forward_statistics(tile)
         if self.verbose:
             print("")
         self._gather_backward_statistics(tile)
+
+        if self.border_only_padding:
+            self._restore_padding_after_statistics()
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
@@ -536,6 +542,24 @@ class StreamingCNN(torch.nn.Module):
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
+
+    def _set_padding_for_statistics(self, zero_padding: bool):
+        self._statistics_padding_backup = {}
+        for mod in self.stream_module.modules():
+            if isinstance(mod, (torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d)):
+                self._statistics_padding_backup[mod] = mod.padding
+                if zero_padding:
+                    if isinstance(mod.padding, tuple):
+                        mod.padding = tuple(0 for _ in mod.padding)
+                    else:
+                        mod.padding = 0
+
+    def _restore_padding_after_statistics(self):
+        if not hasattr(self, "_statistics_padding_backup"):
+            return
+        for mod, padding in self._statistics_padding_backup.items():
+            mod.padding = padding
+        self._statistics_padding_backup = {}
 
     def _gather_backward_statistics(self, tile):
         # Forward pass with grads enabled
