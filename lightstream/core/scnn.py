@@ -509,14 +509,26 @@ class StreamingCNN(torch.nn.Module):
 
         if self.border_only_padding:
             self._set_padding_for_statistics(zero_padding=True)
-
-        self._gather_forward_statistics(tile)
-        if self.verbose:
-            print("")
-        self._gather_backward_statistics(tile)
-
-        if self.border_only_padding:
-            self._restore_padding_after_statistics()
+            try:
+                self._gather_forward_statistics(tile)
+                if self.verbose:
+                    print("")
+                self._gather_backward_statistics(tile)
+            except RuntimeError as err:
+                self._restore_padding_after_statistics()
+                if self.verbose:
+                    print(f"Border-only statistics fallback to legacy padding due to shape mismatch: {err}")
+                self._gather_forward_statistics(tile)
+                if self.verbose:
+                    print("")
+                self._gather_backward_statistics(tile)
+            else:
+                self._restore_padding_after_statistics()
+        else:
+            self._gather_forward_statistics(tile)
+            if self.verbose:
+                print("")
+            self._gather_backward_statistics(tile)
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
