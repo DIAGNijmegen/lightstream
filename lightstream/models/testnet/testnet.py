@@ -66,9 +66,9 @@ class StreamingTestNet(StreamingModule):
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
     dtype=torch.float32
-    img = torch.rand((1, 3, 4800, 4800)).to("cuda", dtype=dtype)
+    img = torch.rand((1, 3, 1024, 1024)).to("cuda", dtype=dtype)
     network = StreamingTestNet(
-        3200,
+        512,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,

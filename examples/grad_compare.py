@@ -95,17 +95,6 @@ def _zero_grads(parameters: Iterable[torch.nn.Parameter]) -> None:
             param.grad.detach_()
             param.grad.zero_()
 
-
-def _loss_grads_from_outputs(
-    outputs: tuple[torch.Tensor, ...], target_value: float
-) -> tuple[torch.Tensor, ...]:
-    grads = []
-    for out in outputs:
-        target = torch.full_like(out, fill_value=target_value)
-        grads.append(2 * (out - target) / out.numel())
-    return tuple(grads)
-
-
 def _compare_grads(stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor]) -> None:
     shared = sorted(set(stream_grads.keys()) & set(normal_grads.keys()))
     if not shared:
@@ -142,6 +131,7 @@ def _compare_conv_weight_grads(
             f"{name}: "
             f"stream mean abs={stream_grad.abs().mean().item():.6e}, "
             f"normal mean abs={normal_grad.abs().mean().item():.6e}, "
+            f"mean abs diff={stream_grad.abs().mean().item() - normal_grad.abs().mean().item():.6e}, "
             f"max abs diff={diff.max().item():.6e}"
         )
 
@@ -169,8 +159,8 @@ def _freeze_batchnorm(module: nn.Module) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=3200)
-    parser.add_argument("--input-size", type=int, default=4800)
+    parser.add_argument("--tile-size", type=int, default=1920)
+    parser.add_argument("--input-size", type=int, default=2560)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -181,6 +171,8 @@ def main() -> None:
     input_size = args.input_size
 
     img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    target = torch.tensor(50., device=device, dtype=dtype)  # large value so we get larger gradients
+    criterion = torch.nn.MSELoss()
 
     network = StreamingWSS(
         "resnet18",
@@ -192,17 +184,50 @@ def main() -> None:
         saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
+    network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
+
+    #PATCHED ===
+    network.stream_network._outputs_share_tiling = lambda: False
+    print("share_tiling:", network.stream_network._outputs_share_tiling())
+    print("output_structure:", network.stream_network._output_structure)
+    # -=======
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_outputs = network(img)
-    target_value = 10.0
-    stream_grads = _loss_grads_from_outputs(stream_outputs, target_value)
-    network.stream_network.backward(img, stream_grads)
+    for out in stream_outputs:
+        out.requires_grad = True
+        out.retain_grad()
+
+    # patch ==============
+    # streaming loss: only y
+    # y_pred_streaming = torch.sigmoid(torch.mean(stream_outputs[3]))
+    # total_loss = criterion(y_pred_streaming, target)
+    # total_loss.backward()
+
+    # build full grad tuple (no None)
+    output_grads = tuple(
+        out.grad if out.grad is not None else torch.zeros_like(out)
+        for out in stream_outputs
+    )
+    network.stream_network.backward(img, output_grads)
+    # ====================
+
+    # old =============================
+    y_pred_streaming = [torch.sigmoid(torch.mean(x)) for x in stream_outputs]
+    loss = [criterion(x, target) for x in y_pred_streaming]
+    total_loss = sum(loss)
+    total_loss.backward()
+    output_grads = tuple(out.grad for out in stream_outputs)
+    full_gradients = network.stream_network.backward(img, output_grads)
+    # ==================================
+
+
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
+    ## normal model
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     _freeze_batchnorm(normal_net)
@@ -214,8 +239,18 @@ def main() -> None:
         diff = (stream_out - normal_out).abs()
         print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
-    normal_loss = sum(torch.nn.functional.mse_loss(out, torch.full_like(out, target_value)) for out in normal_outputs)
-    normal_loss.backward()
+    # PATCHED=======
+    #y_pred_normal = torch.sigmoid(torch.mean(normal_outputs[3]))
+    #total_loss_normal = criterion(y_pred_normal, target)
+    #total_loss_normal.backward()
+    # ==============
+
+    # OLD ================
+    y_pred_normal=[torch.sigmoid(torch.mean(x)) for x in normal_outputs]
+    normal_loss = [criterion(x, target) for x in y_pred_normal]
+    total_loss = sum(normal_loss)
+    total_loss.backward()
+    # ====================
     normal_param_grads = _gather_param_grads(normal_net)
 
     if img_normal.grad is not None:

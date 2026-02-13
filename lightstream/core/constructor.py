@@ -64,6 +64,7 @@ class StreamingConstructor:
             torch.nn.MaxPool1d,
             torch.nn.MaxPool2d,
             torch.nn.MaxPool3d,
+            torch.nn.Upsample,
         ]
 
         if add_keep_modules is not None:
