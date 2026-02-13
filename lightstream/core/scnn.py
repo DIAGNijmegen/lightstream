@@ -82,7 +82,20 @@ class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
     def forward(
-        ctx, inpt, weight, bias, stride, padding, dilation, groups, grad_lost, seen_indices, output_stride, input_loc
+        ctx,
+        inpt,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        groups,
+        grad_lost,
+        seen_indices,
+        output_stride,
+        input_loc,
+        only_backward_valid_gradients,
+        padding_mode,
     ):
         ctx.save_for_backward(inpt, weight, bias)
         ctx.stride = stride
@@ -93,6 +106,8 @@ class StreamingConv2dF(torch.autograd.Function):
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
+        ctx.only_backward_valid_gradients = only_backward_valid_gradients
+        ctx.padding_mode = padding_mode
         return torch.nn.functional.conv2d(inpt, weight, bias, stride, padding, dilation, groups)
 
     @staticmethod
@@ -112,6 +127,27 @@ class StreamingConv2dF(torch.autograd.Function):
         grad_bias = None
         kernel_size = weight.shape[-1]
 
+        lost_top = grad_lost.top if not sides.top else 0
+        lost_bottom = grad_lost.bottom if not sides.bottom else 0
+        lost_left = grad_lost.left if not sides.left else 0
+        lost_right = grad_lost.right if not sides.right else 0
+
+        if ctx.only_backward_valid_gradients:
+            grad_for_input = torch.zeros_like(grad_output)
+            grad_for_input[
+                :,
+                :,
+                lost_top : grad_output.shape[H_DIM] - lost_bottom,
+                lost_left : grad_output.shape[W_DIM] - lost_right,
+            ] = grad_output[
+                :,
+                :,
+                lost_top : grad_output.shape[H_DIM] - lost_bottom,
+                lost_left : grad_output.shape[W_DIM] - lost_right,
+            ]
+        else:
+            grad_for_input = grad_output
+
         if ctx.needs_input_grad[0]:
             # TODO: performance improvements possible by only backpropping valid input
             # grad_input_padding = _grad_input_padding(grad_output, inpt.shape, stride, padding, (weight.shape[2], weight.shape[3]))
@@ -119,7 +155,7 @@ class StreamingConv2dF(torch.autograd.Function):
             grad_in = torch.nn.grad.conv2d_input(
                 inpt.shape,
                 weight.to(inpt.dtype),
-                grad_output,
+                grad_for_input,
                 stride,  # type:ignore
                 padding,
                 dilation,
@@ -129,11 +165,6 @@ class StreamingConv2dF(torch.autograd.Function):
             grad_in = None
 
         grad = grad_output
-
-        lost_top = grad_lost.top if not sides.top else 0
-        lost_bottom = grad_lost.bottom if not sides.bottom else 0
-        lost_left = grad_lost.left if not sides.left else 0
-        lost_right = grad_lost.right if not sides.right else 0
 
         valid_grad = grad[:, :, lost_top : grad.shape[H_DIM] - lost_bottom, lost_left : grad.shape[W_DIM] - lost_right]
 
@@ -204,15 +235,16 @@ class StreamingConv2dF(torch.autograd.Function):
                     input_x : input_x + relevant_input_width - crop_right,
                 ]
 
-                relevant_input = torch.nn.functional.pad(
-                    relevant_input,
-                    [
-                        padding[2] if sides.left else 0,
-                        padding[2] if sides.right else 0,
-                        padding[1] if sides.top else 0,
-                        padding[1] if sides.bottom else 0,
-                    ],
-                )
+                pad_spec = [
+                    padding[2] if sides.left else 0,
+                    padding[2] if sides.right else 0,
+                    padding[1] if sides.top else 0,
+                    padding[1] if sides.bottom else 0,
+                ]
+                if ctx.padding_mode == "zeros":
+                    relevant_input = torch.nn.functional.pad(relevant_input, pad_spec)
+                else:
+                    relevant_input = torch.nn.functional.pad(relevant_input, pad_spec, mode=ctx.padding_mode)
 
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
@@ -243,9 +275,9 @@ class StreamingConv2dF(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
 
         if bias is not None:
-            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None)
         else:
-            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None, None, None)
 
 
 conv2d = StreamingConv2dF.apply  # type:ignore
@@ -263,6 +295,8 @@ class StreamingConv2d(_ConvNd):
         groups=1,
         bias=True,
         padding_mode="zeros",
+        only_backward_valid_gradients=False,
+        border_only_padding=False,
     ):
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
@@ -282,6 +316,8 @@ class StreamingConv2d(_ConvNd):
             padding_mode,
         )
         self.grad_lost = Lost(0, 0, 0, 0)
+        self.only_backward_valid_gradients = only_backward_valid_gradients
+        self.border_only_padding = border_only_padding
         self.reset()
 
     def reset(self):
@@ -290,6 +326,56 @@ class StreamingConv2d(_ConvNd):
         self.tile_output_box = Box(0, 0, 0, 0, None)
 
     def forward(self, input):
+        if (
+            self.border_only_padding
+            and self.input_loc is not None
+            and self.input_loc.sides is not None
+            and self.padding[0] > 0
+            and self.padding[1] > 0
+            and self.stride == (1, 1)
+            and self.dilation == (1, 1)
+        ):
+            sides = self.input_loc.sides
+            pad_spec = [
+                self.padding[1] if sides.left else 0,
+                self.padding[1] if sides.right else 0,
+                self.padding[0] if sides.top else 0,
+                self.padding[0] if sides.bottom else 0,
+            ]
+            if any(pad_spec):
+                if self.padding_mode == "zeros":
+                    conv_input = torch.nn.functional.pad(input, pad_spec)
+                else:
+                    conv_input = torch.nn.functional.pad(input, pad_spec, mode=self.padding_mode)
+            else:
+                conv_input = input
+
+            out = conv2d(
+                conv_input,
+                self.weight,
+                self.bias,
+                self.stride,
+                (0, 0),
+                self.dilation,
+                self.groups,
+                self.grad_lost,
+                self.seen_indices,
+                self.output_stride,
+                self.input_loc,
+                self.only_backward_valid_gradients,
+                self.padding_mode,
+            )
+
+            missing_pad = [
+                self.padding[1] if not sides.left else 0,
+                self.padding[1] if not sides.right else 0,
+                self.padding[0] if not sides.top else 0,
+                self.padding[0] if not sides.bottom else 0,
+            ]
+            if any(missing_pad):
+                return torch.nn.functional.pad(out, missing_pad)
+            return out
+
         return conv2d(
             input,
             self.weight,
@@ -302,6 +388,8 @@ class StreamingConv2d(_ConvNd):
             self.seen_indices,
             self.output_stride,
             self.input_loc,
+            self.only_backward_valid_gradients,
+            self.padding_mode,
         )
 
 
@@ -345,6 +433,8 @@ class StreamingCNN(torch.nn.Module):
         normalize_on_gpu=False,
         mean=None,
         std=None,
+        only_backward_valid_gradients=False,
+        border_only_padding=False,
         state_dict=None,
     ):
         """
@@ -370,6 +460,8 @@ class StreamingCNN(torch.nn.Module):
         self.gather_input_gradient = saliency
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
+        self.only_backward_valid_gradients = only_backward_valid_gradients
+        self.border_only_padding = border_only_padding
 
         if mean is not None and not isinstance(mean, torch.Tensor):
             mean = torch.Tensor(mean)[:, None, None]
@@ -498,6 +590,8 @@ class StreamingCNN(torch.nn.Module):
                     module.dilation,
                     module.groups,
                     module.bias is not None,
+                    only_backward_valid_gradients=self.only_backward_valid_gradients,
+                    border_only_padding=self.border_only_padding,
                 )
                 mod = mod.to(module.weight.device, non_blocking=True)
                 mod = mod.to(module.weight.dtype)

@@ -19,6 +19,8 @@ class StreamingTestNet(StreamingModule):
         normalize_on_gpu: bool = True,
         mean: list | None = None,
         std: list | None = None,
+        only_backward_valid_gradients: bool = False,
+        border_only_padding: bool = False,
         tile_cache_path=None,
     ):
 
@@ -44,6 +46,8 @@ class StreamingTestNet(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
+            only_backward_valid_gradients=only_backward_valid_gradients,
+            border_only_padding=border_only_padding,
             add_keep_modules=[nn.BatchNorm2d],
         )
     @staticmethod
