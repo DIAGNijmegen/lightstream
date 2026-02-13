@@ -507,6 +507,26 @@ class StreamingCNN(torch.nn.Module):
                 return False
         return True
 
+    def _tiling_signature(self, output_index):
+        tile_shape = self._get_tile_output_shape(output_index)
+        tile_lost = self._get_tile_output_lost(output_index)
+        tile_grad_lost = self._get_tile_gradient_lost(output_index)
+        stride = self._get_output_stride(output_index)
+
+        if isinstance(stride, torch.Tensor):
+            stride = tuple(float(v) for v in stride.tolist())
+        else:
+            stride = tuple(float(v) for v in stride)
+
+        return tile_shape, tile_lost, tile_grad_lost, stride
+
+    def _output_tiling_groups(self):
+        groups = {}
+        for output_index in range(self._output_count()):
+            signature = self._tiling_signature(output_index)
+            groups.setdefault(signature, []).append(output_index)
+        return list(groups.values())
+
     def _forward_single_output(self, image, result_on_cpu, output_index=0, initialize_saliency=True):
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
         tile_output_shape = self._get_tile_output_shape(output_index)
@@ -908,18 +928,24 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_grad
                 del trimmed_output
 
-    def _backward_multi_output_shared(self, image, grads):
+    def _backward_multi_output_shared(self, image, grads, output_indices=None):
+        if output_indices is None:
+            output_indices = list(range(len(grads)))
+        if len(output_indices) == 0:
+            return
+
+        reference_output = output_indices[0]
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self._get_tile_gradient_lost(0)
+        grad_lost = self._get_tile_gradient_lost(reference_output)
 
-        output_stride = self._get_output_stride(0)
+        output_stride = self._get_output_stride(reference_output)
         stride_y = self._stride_value(output_stride, 1)
         stride_x = self._stride_value(output_stride, 2)
-        output_shape = self._get_tile_output_shape(0)
+        output_shape = self._get_tile_output_shape(reference_output)
 
         output_height = output_shape[H_DIM]
         output_width = output_shape[W_DIM]
@@ -948,16 +974,16 @@ class StreamingCNN(torch.nn.Module):
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
 
-                sides_bottom = True if output_y + output_height >= grads[0].shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= grads[0].shape[W_DIM] else False
+                sides_bottom = True if output_y + output_height >= grads[reference_output].shape[H_DIM] else False
+                sides_right = True if output_x + output_width >= grads[reference_output].shape[W_DIM] else False
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
-                lost = self._get_tile_lost_for_sides(sides, 0)
+                lost = self._get_tile_lost_for_sides(sides, reference_output)
 
                 if sides_bottom:
-                    output_y = max(grads[0].shape[H_DIM] - output_height, 0)
+                    output_y = max(grads[reference_output].shape[H_DIM] - output_height, 0)
                 if sides_right:
-                    output_x = max(grads[0].shape[W_DIM] - output_width, 0)
+                    output_x = max(grads[reference_output].shape[W_DIM] - output_width, 0)
 
                 input_y = self._mul_stride(output_y, stride_y)
                 input_x = self._mul_stride(output_x, stride_x)
@@ -993,7 +1019,8 @@ class StreamingCNN(torch.nn.Module):
 
                 trimmed_outputs = []
                 trimmed_grads = []
-                for output_index, gradient in enumerate(grads):
+                for output_index in output_indices:
+                    gradient = grads[output_index]
                     grad_tile = gradient[:, :, output_y : output_y + output_height, output_x : output_x + output_width]
                     trimmed_grad = grad_tile[
                         :,
@@ -1045,8 +1072,9 @@ class StreamingCNN(torch.nn.Module):
 
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
-        elif self._outputs_share_tiling() and grad_structure == self._output_structure:
-            self._backward_multi_output_shared(image, grads)
+        elif grad_structure == self._output_structure:
+            for output_group in self._output_tiling_groups():
+                self._backward_multi_output_shared(image, grads, output_indices=output_group)
         else:
             for idx, grad_tensor in enumerate(grads):
                 if grad_tensor is None:
