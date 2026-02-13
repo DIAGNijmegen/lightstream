@@ -527,6 +527,21 @@ class StreamingCNN(torch.nn.Module):
             groups.setdefault(signature, []).append(output_index)
         return list(groups.values())
 
+    def _output_overlap_groups(self):
+        groups = {}
+        for output_index in range(self._output_count()):
+            output_shape = self._get_tile_output_shape(output_index)
+            output_stride = self._get_output_stride(output_index)
+
+            if isinstance(output_stride, torch.Tensor):
+                stride_signature = tuple(float(v) for v in output_stride.tolist())
+            else:
+                stride_signature = tuple(float(v) for v in output_stride)
+
+            groups.setdefault((output_shape, stride_signature), []).append(output_index)
+
+        return list(groups.values())
+
     def _forward_single_output(self, image, result_on_cpu, output_index=0, initialize_saliency=True):
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
         tile_output_shape = self._get_tile_output_shape(output_index)
@@ -928,7 +943,7 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_grad
                 del trimmed_output
 
-    def _backward_multi_output_shared(self, image, grads, output_indices=None):
+    def _backward_multi_output_shared(self, image, grads, output_indices=None, grad_lost=None):
         if output_indices is None:
             output_indices = list(range(len(grads)))
         if len(output_indices) == 0:
@@ -940,7 +955,8 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self._get_tile_gradient_lost(reference_output)
+        if grad_lost is None:
+            grad_lost = self._get_tile_gradient_lost(reference_output)
 
         output_stride = self._get_output_stride(reference_output)
         stride_y = self._stride_value(output_stride, 1)
@@ -1021,20 +1037,21 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_grads = []
                 for output_index in output_indices:
                     gradient = grads[output_index]
+                    output_lost = self._get_tile_lost_for_sides(sides, output_index)
                     grad_tile = gradient[:, :, output_y : output_y + output_height, output_x : output_x + output_width]
                     trimmed_grad = grad_tile[
                         :,
                         :,
-                        lost.top : grad_tile.shape[H_DIM] - lost.bottom,
-                        lost.left : grad_tile.shape[W_DIM] - lost.right,
+                        output_lost.top : grad_tile.shape[H_DIM] - output_lost.bottom,
+                        output_lost.left : grad_tile.shape[W_DIM] - output_lost.right,
                     ]
 
                     tile_out = outputs[output_index]
                     trimmed_output = tile_out[
                         :,
                         :,
-                        lost.top : tile_out.shape[H_DIM] - lost.bottom,
-                        lost.left : tile_out.shape[W_DIM] - lost.right,
+                        output_lost.top : tile_out.shape[H_DIM] - output_lost.bottom,
+                        output_lost.left : tile_out.shape[W_DIM] - output_lost.right,
                     ]
                     trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
@@ -1073,8 +1090,24 @@ class StreamingCNN(torch.nn.Module):
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
         elif grad_structure == self._output_structure:
-            for output_group in self._output_tiling_groups():
-                self._backward_multi_output_shared(image, grads, output_indices=output_group)
+            for overlap_group in self._output_overlap_groups():
+                if len(overlap_group) == 1:
+                    self._backward_single_output(image, grads[overlap_group[0]], output_index=overlap_group[0])
+                    continue
+
+                grad_losts = [self._get_tile_gradient_lost(output_index) for output_index in overlap_group]
+                max_grad_lost = Lost(
+                    max(lost.top for lost in grad_losts),
+                    max(lost.left for lost in grad_losts),
+                    max(lost.bottom for lost in grad_losts),
+                    max(lost.right for lost in grad_losts),
+                )
+                self._backward_multi_output_shared(
+                    image,
+                    grads,
+                    output_indices=overlap_group,
+                    grad_lost=max_grad_lost,
+                )
         else:
             for idx, grad_tensor in enumerate(grads):
                 if grad_tensor is None:
