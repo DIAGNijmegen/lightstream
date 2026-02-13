@@ -275,9 +275,9 @@ class StreamingConv2dF(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
 
         if bias is not None:
-            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None)
         else:
-            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None, None, None)
 
 
 conv2d = StreamingConv2dF.apply  # type:ignore
