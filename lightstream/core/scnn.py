@@ -132,7 +132,21 @@ class StreamingConv2dF(torch.autograd.Function):
         lost_left = grad_lost.left if not sides.left else 0
         lost_right = grad_lost.right if not sides.right else 0
 
-        grad_for_input = grad_output
+        if ctx.only_backward_valid_gradients:
+            grad_for_input = torch.zeros_like(grad_output)
+            grad_for_input[
+                :,
+                :,
+                lost_top : grad_output.shape[H_DIM] - lost_bottom,
+                lost_left : grad_output.shape[W_DIM] - lost_right,
+            ] = grad_output[
+                :,
+                :,
+                lost_top : grad_output.shape[H_DIM] - lost_bottom,
+                lost_left : grad_output.shape[W_DIM] - lost_right,
+            ]
+        else:
+            grad_for_input = grad_output
 
         if ctx.needs_input_grad[0]:
             # TODO: performance improvements possible by only backpropping valid input
@@ -311,6 +325,56 @@ class StreamingConv2d(_ConvNd):
         self.tile_output_box = Box(0, 0, 0, 0, None)
 
     def forward(self, input):
+        if (
+            self.border_only_padding
+            and self.input_loc is not None
+            and self.input_loc.sides is not None
+            and self.padding[0] > 0
+            and self.padding[1] > 0
+            and self.stride == (1, 1)
+            and self.dilation == (1, 1)
+        ):
+            sides = self.input_loc.sides
+            pad_spec = [
+                self.padding[1] if sides.left else 0,
+                self.padding[1] if sides.right else 0,
+                self.padding[0] if sides.top else 0,
+                self.padding[0] if sides.bottom else 0,
+            ]
+            if any(pad_spec):
+                if self.padding_mode == "zeros":
+                    conv_input = torch.nn.functional.pad(input, pad_spec)
+                else:
+                    conv_input = torch.nn.functional.pad(input, pad_spec, mode=self.padding_mode)
+            else:
+                conv_input = input
+
+            out = conv2d(
+                conv_input,
+                self.weight,
+                self.bias,
+                self.stride,
+                (0, 0),
+                self.dilation,
+                self.groups,
+                self.grad_lost,
+                self.seen_indices,
+                self.output_stride,
+                self.input_loc,
+                self.only_backward_valid_gradients,
+                self.padding_mode,
+            )
+
+            missing_pad = [
+                self.padding[1] if not sides.left else 0,
+                self.padding[1] if not sides.right else 0,
+                self.padding[0] if not sides.top else 0,
+                self.padding[0] if not sides.bottom else 0,
+            ]
+            if any(missing_pad):
+                return torch.nn.functional.pad(out, missing_pad)
+            return out
+
         return conv2d(
             input,
             self.weight,
