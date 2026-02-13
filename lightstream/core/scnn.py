@@ -565,6 +565,8 @@ class StreamingCNN(torch.nn.Module):
 
         # tiles can have -1, see backward_statistics_hook
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
+        if self.border_only_padding:
+            self.tile_gradient_lost = Lost(0, 0, 0, 0)
 
         # lost statistics assume you're always in the middle of an image, so left,bottom,top,right lost can always happen
         if self.verbose:
@@ -574,6 +576,8 @@ class StreamingCNN(torch.nn.Module):
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
         self.tile_output_lost = self._non_max_border_amount(output)
+        if self.border_only_padding:
+            self.tile_output_lost = Lost(0, 0, 0, 0)
         if self.verbose:
             print("\n", "Output lost", self.tile_output_lost)
 
@@ -602,6 +606,8 @@ class StreamingCNN(torch.nn.Module):
 
                 mod.load_state_dict(module.state_dict())  # copy params
                 mod.grad_lost = self._module_stats[module]["grad_lost"]
+                if self.border_only_padding:
+                    mod.grad_lost = Lost(0, 0, 0, 0)
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
