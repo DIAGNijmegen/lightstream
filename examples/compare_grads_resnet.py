@@ -102,6 +102,8 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
+        only_backward_valid_gradients = True,
+        border_only_padding = True,
         tile_cache_path="/data/temporary/stephan/lightstream/examples/resnet18_vanilla_tile_cache_1_3_3200_3200"
     )
     network.to(device, dtype=dtype)
