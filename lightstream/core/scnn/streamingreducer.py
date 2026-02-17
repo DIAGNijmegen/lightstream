@@ -1,3 +1,4 @@
+import math
 import torch
 
 from torch import Tensor
@@ -56,8 +57,12 @@ class StreamingGlobalReducer(torch.nn.Module):
             lost_left : probs.shape[W_DIM] - lost_right,
         ]
 
-        data_loc_y = int(self.input_loc.y // stride_y) + lost_top
-        data_loc_x = int(self.input_loc.x // stride_x) + lost_left
+        # Use stable floor division for fractional strides (e.g. upsampled outputs).
+        # Tiny floating-point errors around tile boundaries can otherwise shift
+        # dedup indices by one pixel and cause aggregation mismatches.
+        eps = 1e-9
+        data_loc_y = int(math.floor((float(self.input_loc.y) / stride_y) + eps)) + lost_top
+        data_loc_x = int(math.floor((float(self.input_loc.x) / stride_x) + eps)) + lost_left
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, self.input_loc.sides)
 
         new_output_box, updated_total_indices = _new_value_indices(valid_probs.shape, data_loc, self.seen_indices)
