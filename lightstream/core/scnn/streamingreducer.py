@@ -26,6 +26,7 @@ class StreamingGlobalReducer(torch.nn.Module):
         self.lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1.0, 1.0, 1.0])
         self.input_loc = Box(0, 0, 0, 0, None)
+        self.data_loc = None
         self.reset()
 
     def reset(self):
@@ -33,6 +34,7 @@ class StreamingGlobalReducer(torch.nn.Module):
         self._sum_p_r = None
         self._sum_compensation = None
         self._count = 0
+        self.data_loc = None
 
     def _sum_unseen(self, probs: Tensor):
         if self.input_loc is None or self.input_loc.sides is None:
@@ -58,13 +60,16 @@ class StreamingGlobalReducer(torch.nn.Module):
             lost_left : probs.shape[W_DIM] - lost_right,
         ]
 
-        # Use stable floor division for fractional strides (e.g. upsampled outputs).
-        # Tiny floating-point errors around tile boundaries can otherwise shift
-        # dedup indices by one pixel and cause aggregation mismatches.
-        eps = 1e-9
-        data_loc_y = int(math.floor((float(self.input_loc.y) / stride_y) + eps)) + lost_top
-        data_loc_x = int(math.floor((float(self.input_loc.x) / stride_x) + eps)) + lost_left
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, self.input_loc.sides)
+        if self.data_loc is not None:
+            data_loc = self.data_loc
+        else:
+            # Use stable floor division for fractional strides (e.g. upsampled outputs).
+            # Tiny floating-point errors around tile boundaries can otherwise shift
+            # dedup indices by one pixel and cause aggregation mismatches.
+            eps = 1e-9
+            data_loc_y = int(math.floor((float(self.input_loc.y) / stride_y) + eps)) + lost_top
+            data_loc_x = int(math.floor((float(self.input_loc.x) / stride_x) + eps)) + lost_left
+            data_loc = Box(data_loc_y, 0, data_loc_x, 0, self.input_loc.sides)
 
         new_output_box, updated_total_indices = _new_value_indices(valid_probs.shape, data_loc, self.seen_indices)
         self.seen_indices = updated_total_indices

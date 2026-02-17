@@ -687,6 +687,7 @@ class StreamingCNN(torch.nn.Module):
                             if isinstance(mod, StreamingGlobalReducer):
                                 mod.lost = self._get_tile_output_lost(planning_index)
                                 mod.output_stride = self._get_output_stride(planning_index)
+                                mod.data_loc = Box(output_y + lost.top, 0, output_x + lost.left, 0, sides)
 
                     tile_output = self.stream_module(tile)
                     outputs, _ = self._split_outputs(tile_output)
@@ -887,6 +888,8 @@ class StreamingCNN(torch.nn.Module):
             if isinstance(mod, _STREAMING_MODULE_TYPES):
                 mod.reset()
                 mod.input_loc = None
+                if isinstance(mod, StreamingGlobalReducer):
+                    mod.data_loc = None
 
         if self._output_count() == 1:
             output = self._forward_single_output(image, result_on_cpu)
@@ -903,6 +906,8 @@ class StreamingCNN(torch.nn.Module):
                         if isinstance(mod, _STREAMING_MODULE_TYPES):
                             mod.reset()
                             mod.input_loc = None
+                            if isinstance(mod, StreamingGlobalReducer):
+                                mod.data_loc = None
                 outputs.append(
                     self._forward_single_output(image, result_on_cpu, output_index=idx, initialize_saliency=(idx == 0))
                 )
@@ -910,6 +915,8 @@ class StreamingCNN(torch.nn.Module):
         for mod in self.stream_module.modules():
             if isinstance(mod, _STREAMING_MODULE_TYPES):
                 mod.input_loc = None
+                if isinstance(mod, StreamingGlobalReducer):
+                    mod.data_loc = None
 
         del image
         return self._restore_outputs(outputs, self._output_structure)
@@ -1214,6 +1221,8 @@ class StreamingCNN(torch.nn.Module):
         for mod in self.stream_module.modules():
             if isinstance(mod, _STREAMING_MODULE_TYPES):
                 mod.input_loc = None
+                if isinstance(mod, StreamingGlobalReducer):
+                    mod.data_loc = None
                 mod.reset()
 
         del image
