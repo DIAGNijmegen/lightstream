@@ -68,6 +68,14 @@ class StreamingGlobalWSLossReducer(nn.Module):
         self.eps = float(eps)
         self.reset()
 
+    def forward(self, logits: Tensor) -> Tensor:
+        """Compute pooled score on a full map (non-streaming convenience path)."""
+        if logits.ndim != 4:
+            raise ValueError(f"Expected logits to be NCHW, got shape {tuple(logits.shape)}")
+        probs_r = torch.sigmoid(logits).pow(self.r)
+        mean_p_r = probs_r.mean(dim=(-2, -1))
+        return mean_p_r.clamp_min(self.eps).pow(1.0 / self.r)
+
     def reset(self, spatial_shape: tuple[int, int] | None = None) -> None:
         seen_indices = None
         if spatial_shape is not None:
