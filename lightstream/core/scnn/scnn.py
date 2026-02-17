@@ -609,6 +609,7 @@ class StreamingCNN(torch.nn.Module):
         #    iterator = tqdm(range(n_rows))
         # else:
         iterator = range(n_rows)
+        relevant_output = None
 
         with torch.no_grad():
             for row in iterator:
@@ -665,6 +666,11 @@ class StreamingCNN(torch.nn.Module):
                     if torch.backends.cudnn.benchmark:
                         torch.cuda.empty_cache()
 
+                    if tile_output.ndim < 4:
+                        output = tile_output.to(device, non_blocking=True)
+                        del tile
+                        continue
+
                     trimmed_output = tile_output[
                         :,
                         :,
@@ -696,7 +702,8 @@ class StreamingCNN(torch.nn.Module):
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         # mem management
-        del relevant_output  # type:ignore
+        if relevant_output is not None:
+            del relevant_output
         self._saved_tensors = {}
 
         return output
@@ -742,6 +749,7 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         iterator = range(n_rows)
+        relevant_output = None
 
         with torch.no_grad():
             for row in iterator:
@@ -788,6 +796,10 @@ class StreamingCNN(torch.nn.Module):
 
                     for output_index, output_tensor in enumerate(outputs):
                         tile_output = tile_outputs[output_index]
+                        if tile_output.ndim < 4:
+                            outputs[output_index] = tile_output.to(device, non_blocking=True)
+                            continue
+
                         trimmed_output = tile_output[
                             :,
                             :,
@@ -818,7 +830,8 @@ class StreamingCNN(torch.nn.Module):
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
-        del relevant_output  # type:ignore
+        if relevant_output is not None:
+            del relevant_output
         self._saved_tensors = {}
 
         return outputs
