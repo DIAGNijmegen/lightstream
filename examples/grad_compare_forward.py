@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.models.segment.streamingwss import StreamingWSS
+from lightstream.models.segment.reducer import GlobalReducer
 
 
 def _parse_dtype(value: str) -> torch.dtype:
@@ -91,6 +92,43 @@ def main() -> None:
             f"max abs diff={diff.max().item():.6e}, "
             f"sum abs diff={diff.sum().item():.6e}"
         )
+
+    # Extra reducer diagnostics:
+    # Compare streaming reducer heads [0:3] against reducing streamed feature maps [4:7]
+    if len(streaming_outputs) >= 7:
+        post_reducer = GlobalReducer().to(device=device)
+        post_reduce_stream = [post_reducer(streaming_outputs[4]), post_reducer(streaming_outputs[5]), post_reducer(streaming_outputs[6])]
+        post_reduce_normal = [post_reducer(normal_outputs[4]), post_reducer(normal_outputs[5]), post_reducer(normal_outputs[6])]
+
+        print("\nReducer diagnostics (head reducer vs post-reduce on feature map):")
+        for idx in range(3):
+            head_stream = streaming_outputs[idx]
+            head_normal = normal_outputs[idx]
+            stream_post = post_reduce_stream[idx]
+            normal_post = post_reduce_normal[idx]
+
+            diff_head_vs_post_stream = (head_stream - stream_post).abs()
+            diff_head_vs_post_normal = (head_normal - normal_post).abs()
+            diff_post_stream_vs_normal = (stream_post - normal_post).abs()
+
+            print(
+                f"head[{idx}] stream-vs-post(stream_map): "
+                f"mean={diff_head_vs_post_stream.mean().item():.6e}, "
+                f"max={diff_head_vs_post_stream.max().item():.6e}, "
+                f"sum={diff_head_vs_post_stream.sum().item():.6e}"
+            )
+            print(
+                f"head[{idx}] normal-vs-post(normal_map): "
+                f"mean={diff_head_vs_post_normal.mean().item():.6e}, "
+                f"max={diff_head_vs_post_normal.max().item():.6e}, "
+                f"sum={diff_head_vs_post_normal.sum().item():.6e}"
+            )
+            print(
+                f"head[{idx}] post(stream_map)-vs-post(normal_map): "
+                f"mean={diff_post_stream_vs_normal.mean().item():.6e}, "
+                f"max={diff_post_stream_vs_normal.max().item():.6e}, "
+                f"sum={diff_post_stream_vs_normal.sum().item():.6e}"
+            )
 
 
 if __name__ == "__main__":
