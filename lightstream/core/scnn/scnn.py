@@ -684,6 +684,9 @@ class StreamingCNN(torch.nn.Module):
                     for mod in self.stream_module.modules():
                         if isinstance(mod, _STREAMING_MODULE_TYPES):
                             mod.input_loc = input_loc
+                            if isinstance(mod, StreamingGlobalReducer):
+                                mod.lost = self._get_tile_output_lost(planning_index)
+                                mod.output_stride = self._get_output_stride(planning_index)
 
                     tile_output = self.stream_module(tile)
                     outputs, _ = self._split_outputs(tile_output)
