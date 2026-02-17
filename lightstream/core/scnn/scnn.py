@@ -567,11 +567,30 @@ class StreamingCNN(torch.nn.Module):
 
         return list(groups.values())
 
+    def _planning_output_index(self, output_index):
+        shape = self._get_tile_output_shape(output_index)
+        if len(shape) >= 4:
+            return output_index
+
+        # Debug/model-specific pairing: reducer heads often correspond to
+        # later full-resolution map outputs (e.g., [0:3] with [4:7]).
+        if output_index + 4 < self._output_count():
+            paired_shape = self._get_tile_output_shape(output_index + 4)
+            if len(paired_shape) >= 4:
+                return output_index + 4
+
+        # Fallback: first spatial output.
+        for idx in range(self._output_count()):
+            if len(self._get_tile_output_shape(idx)) >= 4:
+                return idx
+        return output_index
+
     def _forward_single_output(self, image, result_on_cpu, output_index=0, initialize_saliency=True):
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
-        tile_output_shape = self._get_tile_output_shape(output_index)
-        tile_output_lost = self._get_tile_output_lost(output_index)
-        output_stride = self._get_output_stride(output_index)
+        planning_index = self._planning_output_index(output_index)
+        tile_output_shape = self._get_tile_output_shape(planning_index)
+        tile_output_lost = self._get_tile_output_lost(planning_index)
+        output_stride = self._get_output_stride(planning_index)
         stride_y = self._stride_value(output_stride, 1)
         stride_x = self._stride_value(output_stride, 2)
 
