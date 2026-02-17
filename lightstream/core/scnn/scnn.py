@@ -661,6 +661,11 @@ class StreamingCNN(torch.nn.Module):
                     if self.should_normalize:
                         tile = self._normalize_on_gpu(tile)
 
+                    input_loc = Box(tile_y, tile_height, tile_x, tile_width, sides)
+                    for mod in self.stream_module.modules():
+                        if isinstance(mod, _STREAMING_MODULE_TYPES):
+                            mod.input_loc = input_loc
+
                     tile_output = self.stream_module(tile)
                     outputs, _ = self._split_outputs(tile_output)
                     if output_index >= len(outputs):
@@ -790,6 +795,11 @@ class StreamingCNN(torch.nn.Module):
                     if self.should_normalize:
                         tile = self._normalize_on_gpu(tile)
 
+                    input_loc = Box(tile_y, tile_height, tile_x, tile_width, sides)
+                    for mod in self.stream_module.modules():
+                        if isinstance(mod, _STREAMING_MODULE_TYPES):
+                            mod.input_loc = input_loc
+
                     tile_output = self.stream_module(tile)
                     tile_outputs, _ = self._split_outputs(tile_output)
                     if len(tile_outputs) != self._output_count():
@@ -851,6 +861,11 @@ class StreamingCNN(torch.nn.Module):
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
 
+        for mod in self.stream_module.modules():
+            if isinstance(mod, _STREAMING_MODULE_TYPES):
+                mod.reset()
+                mod.input_loc = None
+
         if self._output_count() == 1:
             output = self._forward_single_output(image, result_on_cpu)
             del image
@@ -861,9 +876,18 @@ class StreamingCNN(torch.nn.Module):
         else:
             outputs = []
             for idx in range(self._output_count()):
+                if idx > 0:
+                    for mod in self.stream_module.modules():
+                        if isinstance(mod, _STREAMING_MODULE_TYPES):
+                            mod.reset()
+                            mod.input_loc = None
                 outputs.append(
                     self._forward_single_output(image, result_on_cpu, output_index=idx, initialize_saliency=(idx == 0))
                 )
+
+        for mod in self.stream_module.modules():
+            if isinstance(mod, _STREAMING_MODULE_TYPES):
+                mod.input_loc = None
 
         del image
         return self._restore_outputs(outputs, self._output_structure)
