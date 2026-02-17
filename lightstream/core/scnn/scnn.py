@@ -1237,6 +1237,7 @@ class StreamingCNN(torch.nn.Module):
                 torch.nn.AvgPool2d,
                 torch.nn.Upsample,
                 StreamingUpsample,
+                GlobalReducer,
             ),
             back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, StreamingUpsample),
         )
@@ -1278,6 +1279,37 @@ class StreamingCNN(torch.nn.Module):
             hook.remove()
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
+        if isinstance(module, (GlobalReducer, StreamingGlobalReducer)):
+            stride = (1.0, 1.0, 1.0)
+            kernel_size = stride
+
+            if not torch.is_grad_enabled():  # type:ignore
+                prev_stats = self._prev_stats(inpt[0]) if len(inpt) > 0 else None
+                if prev_stats and "lost" in prev_stats:
+                    lost = prev_stats["lost"]
+                else:
+                    lost = self._non_max_border_amount(inpt[0])
+
+                module_stats = {"lost": lost, "stride": stride, "module": module}
+                if self.verbose:
+                    print(module, "\n", module_stats["lost"])
+
+                self._saved_tensors[module] = inpt
+                self._module_stats[module] = module_stats
+            else:
+                module_stats = self._module_stats[module]
+
+                p_stats = self._prev_stats(output)
+                if p_stats:
+                    output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                else:
+                    output_stride = torch.tensor([1, 1, 1])
+
+                module_stats["output_stride"] = output_stride.clone().detach()
+                self._stats_per_grad_fn[output.grad_fn] = module_stats
+                self._module_stats[module] = module_stats
+            return
+
         if isinstance(module, (torch.nn.Upsample, StreamingUpsample)):
             if module.mode != "bilinear":
                 raise ValueError("Streaming statistics only support bilinear upsample.")
