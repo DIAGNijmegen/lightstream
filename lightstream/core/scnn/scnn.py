@@ -15,9 +15,12 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample
+from lightstream.core.scnn.streamingreducer import StreamingGlobalReducer
+from lightstream.models.segment.reducer import GlobalReducer
 
 
 _triple = _ntuple(3)
+_STREAMING_MODULE_TYPES = (StreamingConv2d, StreamingUpsample, StreamingGlobalReducer)
 
 
 class StreamingCNN(torch.nn.Module):
@@ -280,6 +283,14 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, GlobalReducer):
+            mod = StreamingGlobalReducer(r=module.r, eps=module.eps)
+            mod = mod.to(self.device, non_blocking=True)
+            if module in self._module_stats:
+                mod.grad_lost = self._module_stats[module]["grad_lost"]
+                mod.output_stride = self._module_stats[module]["output_stride"]
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -321,6 +332,16 @@ class StreamingCNN(torch.nn.Module):
                 mode=module.mode,
                 align_corners=module.align_corners,
             )
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingGlobalReducer):
+            mod = GlobalReducer(r=module.r, eps=module.eps)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -902,7 +923,7 @@ class StreamingCNN(torch.nn.Module):
                     tile = tile.to(self.device, non_blocking=True)
 
                 for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+                    if isinstance(mod, _STREAMING_MODULE_TYPES):
                         mod.input_loc = input_loc
 
                 if self.should_normalize:
@@ -1014,7 +1035,7 @@ class StreamingCNN(torch.nn.Module):
                     tile = tile.to(self.device, non_blocking=True)
 
                 for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+                    if isinstance(mod, _STREAMING_MODULE_TYPES):
                         mod.input_loc = input_loc
 
                 if self.should_normalize:
@@ -1119,7 +1140,7 @@ class StreamingCNN(torch.nn.Module):
                 # Otherwise, zero/other-output passes can advance seen_indices and
                 # under-count gradients for the current output.
                 for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+                    if isinstance(mod, _STREAMING_MODULE_TYPES):
                         mod.reset()
 
                 self._backward_single_output(image, grad_tensor, output_index=idx)
@@ -1128,7 +1149,7 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+            if isinstance(mod, _STREAMING_MODULE_TYPES):
                 mod.input_loc = None
                 mod.reset()
 
