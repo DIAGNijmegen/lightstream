@@ -2,7 +2,7 @@ import torch
 
 from torch import Tensor
 
-from lightstream.core.scnn.utils import Box, H_DIM, W_DIM, _new_value_indices
+from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM, _new_value_indices
 
 
 class StreamingGlobalReducer(torch.nn.Module):
@@ -22,6 +22,7 @@ class StreamingGlobalReducer(torch.nn.Module):
         self.eps = float(eps)
 
         self.grad_lost = None
+        self.lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1.0, 1.0, 1.0])
         self.input_loc = Box(0, 0, 0, 0, None)
         self.reset()
@@ -41,17 +42,31 @@ class StreamingGlobalReducer(torch.nn.Module):
         stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
         stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
 
-        data_loc_y = int(self.input_loc.y // stride_y)
-        data_loc_x = int(self.input_loc.x // stride_x)
+        sides = self.input_loc.sides
+        lost = self.lost
+        lost_top = lost.top if not sides.top else 0
+        lost_bottom = lost.bottom if not sides.bottom else 0
+        lost_left = lost.left if not sides.left else 0
+        lost_right = lost.right if not sides.right else 0
+
+        valid_probs = probs[
+            :,
+            :,
+            lost_top : probs.shape[H_DIM] - lost_bottom,
+            lost_left : probs.shape[W_DIM] - lost_right,
+        ]
+
+        data_loc_y = int(self.input_loc.y // stride_y) + lost_top
+        data_loc_x = int(self.input_loc.x // stride_x) + lost_left
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, self.input_loc.sides)
 
-        new_output_box, updated_total_indices = _new_value_indices(probs.shape, data_loc, self.seen_indices)
+        new_output_box, updated_total_indices = _new_value_indices(valid_probs.shape, data_loc, self.seen_indices)
         self.seen_indices = updated_total_indices
 
         if new_output_box.height <= 0 or new_output_box.width <= 0:
             return torch.zeros((probs.shape[0], probs.shape[1]), dtype=probs.dtype, device=probs.device), 0
 
-        unseen = probs[
+        unseen = valid_probs[
             :,
             :,
             new_output_box.y : new_output_box.y + new_output_box.height,

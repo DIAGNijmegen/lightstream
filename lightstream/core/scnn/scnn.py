@@ -287,7 +287,10 @@ class StreamingCNN(torch.nn.Module):
             mod = StreamingGlobalReducer(r=module.r, eps=module.eps)
             mod = mod.to(self.device, non_blocking=True)
             if module in self._module_stats:
-                mod.grad_lost = self._module_stats[module]["grad_lost"]
+                if "grad_lost" in self._module_stats[module]:
+                    mod.grad_lost = self._module_stats[module]["grad_lost"]
+                if "lost" in self._module_stats[module]:
+                    mod.lost = self._module_stats[module]["lost"]
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
@@ -345,6 +348,7 @@ class StreamingCNN(torch.nn.Module):
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
+                stats["lost"] = module.lost
                 stats["output_stride"] = module.output_stride
                 self._module_stats[mod] = stats
             else:
