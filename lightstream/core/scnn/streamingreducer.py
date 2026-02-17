@@ -31,6 +31,7 @@ class StreamingGlobalReducer(torch.nn.Module):
     def reset(self):
         self.seen_indices = Box(0, 0, 0, 0, None)
         self._sum_p_r = None
+        self._sum_compensation = None
         self._count = 0
 
     def _sum_unseen(self, probs: Tensor):
@@ -90,9 +91,16 @@ class StreamingGlobalReducer(torch.nn.Module):
 
         if self._sum_p_r is None:
             self._sum_p_r = sum_p_r
+            self._sum_compensation = torch.zeros_like(sum_p_r)
             self._count = count
         else:
-            self._sum_p_r = self._sum_p_r + sum_p_r
+            # Kahan-style compensated summation for tile accumulation.
+            # This minimizes floating-point drift from summing tiles in a
+            # different order than full-image reduction.
+            y = sum_p_r - self._sum_compensation
+            t = self._sum_p_r + y
+            self._sum_compensation = (t - self._sum_p_r) - y
+            self._sum_p_r = t
             self._count += count
 
         if self._count <= 0:
