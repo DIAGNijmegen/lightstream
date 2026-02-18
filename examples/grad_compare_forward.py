@@ -54,11 +54,52 @@ def _print_stats(prefix: str, stats: dict[str, float]) -> None:
     )
 
 
+def _zero_grads(module: nn.Module) -> None:
+    for param in module.parameters():
+        if param.grad is not None:
+            param.grad.detach_()
+            param.grad.zero_()
+
+
+def _collect_grads(module: nn.Module) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for name, param in module.named_parameters():
+        if param.grad is not None:
+            out[name] = param.grad.detach().clone()
+    return out
+
+
+def _compare_grads(
+    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor], eps: float, topk: int
+) -> tuple[float, str]:
+    shared = sorted(set(stream_grads.keys()) & set(normal_grads.keys()))
+    if not shared:
+        print("No overlapping parameter gradients found to compare.")
+        return 0.0, ""
+
+    rows = []
+    for name in shared:
+        stats = _diff_stats(stream_grads[name], normal_grads[name], eps)
+        rows.append((name, stats))
+
+    rows.sort(key=lambda x: x[1]["max"], reverse=True)
+    k = min(topk, len(rows))
+    print(f"\nBackward diagnostics (top {k}/{len(rows)} parameters by max abs diff):")
+    worst_mean = 0.0
+    worst_name = ""
+    for name, stats in rows[:k]:
+        _print_stats(f"grad[{name}]", stats)
+        if stats["mean"] > worst_mean:
+            worst_mean = stats["mean"]
+            worst_name = f"grad[{name}]"
+    return worst_mean, worst_name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Forward-only comparison for streaming vs non-streaming WSS outputs. "
-            "(No backward comparison yet for GlobalReducer.)"
+            "Forward comparison for streaming vs non-streaming WSS outputs, with optional backward diagnostics. "
+            "(Reducer backward support is still WIP.)"
         )
     )
     parser.add_argument("--encoder", default="resnet18", help="resnet18, resnet34, or resnet50")
@@ -81,6 +122,23 @@ def main() -> None:
         "--skip-reducer-diagnostics",
         action="store_true",
         help="skip reducer-vs-post-reduce diagnostic section",
+    )
+    parser.add_argument(
+        "--debug-backward",
+        action="store_true",
+        help="run optional backward diagnostics (parameter-gradient comparison)",
+    )
+    parser.add_argument(
+        "--backward-output-index",
+        type=int,
+        default=3,
+        help="which output index to use for backward diagnostics (default: fused map index 3)",
+    )
+    parser.add_argument(
+        "--backward-topk",
+        type=int,
+        default=20,
+        help="print top-k parameter gradients by max absolute diff",
     )
     args = parser.parse_args()
 
@@ -164,6 +222,44 @@ def main() -> None:
             if stats_head_vs_post_stream["mean"] > worst_mean:
                 worst_mean = stats_head_vs_post_stream["mean"]
                 worst_name = f"head[{idx}] stream-vs-post(stream_map)"
+
+    if args.debug_backward:
+        print("\nRunning backward diagnostics...")
+        if args.backward_output_index < 0 or args.backward_output_index >= len(streaming_outputs):
+            raise ValueError(
+                f"Invalid --backward-output-index={args.backward_output_index}; "
+                f"valid range is [0, {len(streaming_outputs) - 1}]"
+            )
+
+        # Re-enable streaming hooks for streaming backward pass
+        network.stream_network.enable()
+        _freeze_batchnorm(network.stream_network.stream_module)
+        _zero_grads(network.stream_network.stream_module)
+
+        stream_input = image.detach().clone()
+        stream_outputs_train = _to_sequence(network(stream_input))
+        stream_target = stream_outputs_train[args.backward_output_index]
+        stream_loss = torch.sigmoid(stream_target).mean()
+        stream_loss.backward()
+        network.stream_network.backward(stream_input, stream_target.grad)
+        stream_grads = _collect_grads(network.stream_network.stream_module)
+
+        network.stream_network.disable()
+        normal_net = network.stream_network.stream_module
+        _freeze_batchnorm(normal_net)
+        _zero_grads(normal_net)
+
+        normal_input = image.detach().clone().requires_grad_(True)
+        normal_outputs_train = _to_sequence(normal_net(normal_input))
+        normal_target = normal_outputs_train[args.backward_output_index]
+        normal_loss = torch.sigmoid(normal_target).mean()
+        normal_loss.backward()
+        normal_grads = _collect_grads(normal_net)
+
+        grad_worst_mean, grad_worst_name = _compare_grads(stream_grads, normal_grads, args.eps, args.backward_topk)
+        if grad_worst_mean > worst_mean:
+            worst_mean = grad_worst_mean
+            worst_name = grad_worst_name
 
     print(f"\nWorst mean abs diff: {worst_name} = {worst_mean:.6e}")
     if args.warn_mean_threshold > 0 and worst_mean > args.warn_mean_threshold:
