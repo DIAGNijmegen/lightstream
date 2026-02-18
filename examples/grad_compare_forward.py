@@ -33,6 +33,27 @@ def _to_sequence(outputs):
     return [outputs]
 
 
+def _diff_stats(a: torch.Tensor, b: torch.Tensor, eps: float):
+    diff = (a - b).abs()
+    denom = b.abs().mean().clamp_min(eps)
+    return {
+        "mean": diff.mean().item(),
+        "max": diff.max().item(),
+        "sum": diff.sum().item(),
+        "rel_mean": (diff.mean() / denom).item(),
+    }
+
+
+def _print_stats(prefix: str, stats: dict[str, float]) -> None:
+    print(
+        f"{prefix}: "
+        f"mean abs diff={stats['mean']:.6e}, "
+        f"max abs diff={stats['max']:.6e}, "
+        f"sum abs diff={stats['sum']:.6e}, "
+        f"rel mean diff={stats['rel_mean']:.6e}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -44,6 +65,23 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=1920)
     parser.add_argument("--input-size", type=int, default=2560)
+    parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for relative-difference denominator")
+    parser.add_argument(
+        "--warn-mean-threshold",
+        type=float,
+        default=0.0,
+        help="warn if any output mean absolute difference is above this value",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit with code 1 when warn threshold is exceeded",
+    )
+    parser.add_argument(
+        "--skip-reducer-diagnostics",
+        action="store_true",
+        help="skip reducer-vs-post-reduce diagnostic section",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -84,21 +122,29 @@ def main() -> None:
         )
 
     print(f"Compared {len(streaming_outputs)} outputs ({args.encoder}, {dtype}, input={args.input_size}, tile={args.tile_size})")
+    worst_mean = 0.0
+    worst_name = ""
     for idx, (stream_out, normal_out) in enumerate(zip(streaming_outputs, normal_outputs)):
-        diff = (stream_out - normal_out).abs()
-        print(
-            f"output[{idx}]: "
-            f"mean abs diff={diff.mean().item():.6e}, "
-            f"max abs diff={diff.max().item():.6e}, "
-            f"sum abs diff={diff.sum().item():.6e}"
-        )
+        stats = _diff_stats(stream_out, normal_out, args.eps)
+        _print_stats(f"output[{idx}]", stats)
+        if stats["mean"] > worst_mean:
+            worst_mean = stats["mean"]
+            worst_name = f"output[{idx}]"
 
     # Extra reducer diagnostics:
     # Compare streaming reducer heads [0:3] against reducing streamed feature maps [4:7]
-    if len(streaming_outputs) >= 7:
+    if len(streaming_outputs) >= 7 and not args.skip_reducer_diagnostics:
         post_reducer = GlobalReducer().to(device=device)
-        post_reduce_stream = [post_reducer(streaming_outputs[4]), post_reducer(streaming_outputs[5]), post_reducer(streaming_outputs[6])]
-        post_reduce_normal = [post_reducer(normal_outputs[4]), post_reducer(normal_outputs[5]), post_reducer(normal_outputs[6])]
+        post_reduce_stream = [
+            post_reducer(streaming_outputs[4]),
+            post_reducer(streaming_outputs[5]),
+            post_reducer(streaming_outputs[6]),
+        ]
+        post_reduce_normal = [
+            post_reducer(normal_outputs[4]),
+            post_reducer(normal_outputs[5]),
+            post_reducer(normal_outputs[6]),
+        ]
 
         print("\nReducer diagnostics (head reducer vs post-reduce on feature map):")
         for idx in range(3):
@@ -107,28 +153,27 @@ def main() -> None:
             stream_post = post_reduce_stream[idx]
             normal_post = post_reduce_normal[idx]
 
-            diff_head_vs_post_stream = (head_stream - stream_post).abs()
-            diff_head_vs_post_normal = (head_normal - normal_post).abs()
-            diff_post_stream_vs_normal = (stream_post - normal_post).abs()
+            stats_head_vs_post_stream = _diff_stats(head_stream, stream_post, args.eps)
+            stats_head_vs_post_normal = _diff_stats(head_normal, normal_post, args.eps)
+            stats_post_stream_vs_normal = _diff_stats(stream_post, normal_post, args.eps)
 
-            print(
-                f"head[{idx}] stream-vs-post(stream_map): "
-                f"mean={diff_head_vs_post_stream.mean().item():.6e}, "
-                f"max={diff_head_vs_post_stream.max().item():.6e}, "
-                f"sum={diff_head_vs_post_stream.sum().item():.6e}"
-            )
-            print(
-                f"head[{idx}] normal-vs-post(normal_map): "
-                f"mean={diff_head_vs_post_normal.mean().item():.6e}, "
-                f"max={diff_head_vs_post_normal.max().item():.6e}, "
-                f"sum={diff_head_vs_post_normal.sum().item():.6e}"
-            )
-            print(
-                f"head[{idx}] post(stream_map)-vs-post(normal_map): "
-                f"mean={diff_post_stream_vs_normal.mean().item():.6e}, "
-                f"max={diff_post_stream_vs_normal.max().item():.6e}, "
-                f"sum={diff_post_stream_vs_normal.sum().item():.6e}"
-            )
+            _print_stats(f"head[{idx}] stream-vs-post(stream_map)", stats_head_vs_post_stream)
+            _print_stats(f"head[{idx}] normal-vs-post(normal_map)", stats_head_vs_post_normal)
+            _print_stats(f"head[{idx}] post(stream_map)-vs-post(normal_map)", stats_post_stream_vs_normal)
+
+            if stats_head_vs_post_stream["mean"] > worst_mean:
+                worst_mean = stats_head_vs_post_stream["mean"]
+                worst_name = f"head[{idx}] stream-vs-post(stream_map)"
+
+    print(f"\nWorst mean abs diff: {worst_name} = {worst_mean:.6e}")
+    if args.warn_mean_threshold > 0 and worst_mean > args.warn_mean_threshold:
+        message = (
+            f"Mean diff threshold exceeded: worst={worst_mean:.6e} > "
+            f"warn_mean_threshold={args.warn_mean_threshold:.6e} ({worst_name})"
+        )
+        if args.strict:
+            raise RuntimeError(message)
+        print(f"WARNING: {message}")
 
 
 if __name__ == "__main__":
