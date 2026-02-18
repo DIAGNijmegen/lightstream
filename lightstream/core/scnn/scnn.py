@@ -1267,11 +1267,14 @@ class StreamingCNN(torch.nn.Module):
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
         elif grad_structure == self._output_structure:
+            has_streaming_reducer = any(isinstance(mod, StreamingGlobalReducer) for mod in self.stream_module.modules())
+
             for overlap_group in self._output_overlap_groups():
-                # Shared backward currently supports only spatial outputs.
-                # Reducer/non-spatial outputs must be replayed individually.
+                # Shared backward currently supports only spatial outputs and can
+                # introduce parity issues when reducer outputs are present.
+                # In reducer-enabled models prefer per-output replay for correctness.
                 has_non_spatial = any(len(self._get_tile_output_shape(idx)) < 4 for idx in overlap_group)
-                if len(overlap_group) == 1 or has_non_spatial:
+                if len(overlap_group) == 1 or has_non_spatial or has_streaming_reducer:
                     for idx in overlap_group:
                         grad_tensor = grads[idx]
                         if grad_tensor is None:
