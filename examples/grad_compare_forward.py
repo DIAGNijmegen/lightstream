@@ -33,25 +33,16 @@ def _to_sequence(outputs):
     return [outputs]
 
 
-def _diff_stats(a: torch.Tensor, b: torch.Tensor, eps: float):
+def _diff_stats(a: torch.Tensor, b: torch.Tensor):
     diff = (a - b).abs()
-    denom = b.abs().mean().clamp_min(eps)
     return {
         "mean": diff.mean().item(),
         "max": diff.max().item(),
-        "sum": diff.sum().item(),
-        "rel_mean": (diff.mean() / denom).item(),
     }
 
 
 def _print_stats(prefix: str, stats: dict[str, float]) -> None:
-    print(
-        f"{prefix}: "
-        f"mean abs diff={stats['mean']:.6e}, "
-        f"max abs diff={stats['max']:.6e}, "
-        f"sum abs diff={stats['sum']:.6e}, "
-        f"rel mean diff={stats['rel_mean']:.6e}"
-    )
+    print(f"{prefix}: mean abs diff={stats['mean']:.6e}, max abs diff={stats['max']:.6e}")
 
 
 def _zero_grads(module: nn.Module) -> None:
@@ -70,7 +61,7 @@ def _collect_grads(module: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _compare_grads(
-    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor], eps: float, topk: int
+    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor], topk: int
 ) -> tuple[float, str]:
     shared = sorted(set(stream_grads.keys()) & set(normal_grads.keys()))
     if not shared:
@@ -79,7 +70,7 @@ def _compare_grads(
 
     rows = []
     for name in shared:
-        stats = _diff_stats(stream_grads[name], normal_grads[name], eps)
+        stats = _diff_stats(stream_grads[name], normal_grads[name])
         rows.append((name, stats))
 
     rows.sort(key=lambda x: x[1]["max"], reverse=True)
@@ -95,67 +86,48 @@ def _compare_grads(
     return worst_mean, worst_name
 
 
-def _streaming_losses(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module, target: torch.Tensor) -> list[torch.Tensor]:
+def _build_losses(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module) -> list[torch.Tensor]:
     if len(outputs) != 4:
         raise ValueError(f"Expected 4 outputs from WSS, got {len(outputs)}")
-    # y1, y2, y3 are already reduced scalars/maps from the model output.
+
     y1, y2, y3, y = outputs
     y_reduced = reducer(y)
+
     return [
-        criterion(y1, target),
-        criterion(y2, target),
-        criterion(y3, target),
-        criterion(y_reduced, target),
+        criterion(y1, torch.ones_like(y1)),
+        criterion(y2, torch.ones_like(y2)),
+        criterion(y3, torch.ones_like(y3)),
+        criterion(y_reduced, torch.ones_like(y_reduced)),
     ]
 
 
-def _normal_losses(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module, target: torch.Tensor) -> list[torch.Tensor]:
-    if len(outputs) != 4:
-        raise ValueError(f"Expected 4 outputs from WSS, got {len(outputs)}")
-    y1, y2, y3, y = outputs
-    y_reduced = reducer(y)
-    return [
-        criterion(y1, target),
-        criterion(y2, target),
-        criterion(y3, target),
-        criterion(y_reduced, target),
-    ]
+def _loss_grads_for_outputs(
+    outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module
+) -> list[torch.Tensor]:
+    detached = [out.detach().clone().requires_grad_(True) for out in outputs]
+    losses = _build_losses(detached, reducer, criterion)
+    sum(losses).backward()
+    grads = [out.grad for out in detached]
+    if any(grad is None for grad in grads):
+        raise RuntimeError("Missing output gradient(s) while building loss gradients.")
+    return grads
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Compare streaming vs non-streaming WSS on all 4 outputs and run backward diagnostics. "
-            "Backward uses BCE losses with target=1 on y1/y2/y3 and reducer(y)."
+            "Backward uses BCE target=1 on y1/y2/y3 and on GlobalReducer(y)."
         )
     )
     parser.add_argument("--encoder", default="resnet18", help="resnet18, resnet34, or resnet50")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=1920)
     parser.add_argument("--input-size", type=int, default=2560)
-    parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for relative-difference denominator")
-    parser.add_argument(
-        "--warn-mean-threshold",
-        type=float,
-        default=0.0,
-        help="warn if any output mean absolute difference is above this value",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="exit with code 1 when warn threshold is exceeded",
-    )
-    parser.add_argument(
-        "--debug-backward",
-        action="store_true",
-        help="run backward diagnostics (parameter-gradient comparison)",
-    )
-    parser.add_argument(
-        "--backward-topk",
-        type=int,
-        default=20,
-        help="print top-k parameter gradients by max absolute diff",
-    )
+    parser.add_argument("--warn-mean-threshold", type=float, default=0.0)
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--debug-backward", action="store_true")
+    parser.add_argument("--backward-topk", type=int, default=20)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -182,17 +154,52 @@ def main() -> None:
 
     _freeze_batchnorm(network.stream_network.stream_module)
 
-    # 1) STREAMING forward first
+    # 1) Do all streaming operations first.
     with torch.no_grad():
         streaming_outputs = _to_sequence(network(image))
 
-    # 2) then switch once to normal mode and compare all outputs
+    stream_grads: dict[str, torch.Tensor] | None = None
+    if args.debug_backward:
+        criterion = nn.BCELoss().to(device=device)
+
+        network.stream_network.enable()
+        _freeze_batchnorm(network.stream_network.stream_module)
+        _zero_grads(network.stream_network.stream_module)
+
+        stream_input = image.detach().clone()
+        stream_outputs_train = _to_sequence(network(stream_input))
+        stream_output_grads = _loss_grads_for_outputs(
+            stream_outputs_train,
+            GlobalReducer().to(device=device, dtype=dtype),
+            criterion,
+        )
+        network.stream_network.backward(stream_input, stream_output_grads)
+        stream_grads = _collect_grads(network.stream_network.stream_module)
+
+    # 2) Then switch to normal and do all normal operations.
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
     _freeze_batchnorm(normal_net)
+
     with torch.no_grad():
         normal_outputs = _to_sequence(normal_net(image))
 
+    normal_grads: dict[str, torch.Tensor] | None = None
+    if args.debug_backward:
+        criterion = nn.BCELoss().to(device=device)
+
+        _zero_grads(normal_net)
+        normal_input = image.detach().clone().requires_grad_(True)
+        normal_outputs_train = _to_sequence(normal_net(normal_input))
+        normal_output_grads = _loss_grads_for_outputs(
+            normal_outputs_train,
+            GlobalReducer().to(device=device, dtype=dtype),
+            criterion,
+        )
+        torch.autograd.backward(normal_outputs_train, grad_tensors=normal_output_grads)
+        normal_grads = _collect_grads(normal_net)
+
+    # 3) Finally compare and print differences.
     if len(streaming_outputs) != len(normal_outputs):
         raise ValueError(
             f"Output count mismatch: streaming={len(streaming_outputs)}, non-streaming={len(normal_outputs)}"
@@ -202,50 +209,14 @@ def main() -> None:
     worst_mean = 0.0
     worst_name = ""
     for idx, (stream_out, normal_out) in enumerate(zip(streaming_outputs, normal_outputs)):
-        stats = _diff_stats(stream_out, normal_out, args.eps)
+        stats = _diff_stats(stream_out, normal_out)
         _print_stats(f"output[{idx}] stream-vs-normal", stats)
         if stats["mean"] > worst_mean:
             worst_mean = stats["mean"]
             worst_name = f"output[{idx}] stream-vs-normal"
 
-    if args.debug_backward:
-        criterion = nn.BCELoss().to(device=device)
-        target = torch.ones((1, 1), device=device, dtype=dtype)
-
-        # Streaming backward first (as requested)
-        network.stream_network.enable()
-        _freeze_batchnorm(network.stream_network.stream_module)
-        _zero_grads(network.stream_network.stream_module)
-
-        stream_input = image.detach().clone()
-        stream_outputs_train = _to_sequence(network(stream_input))
-        stream_outputs_for_grad = [out.detach().clone().requires_grad_(True) for out in stream_outputs_train]
-
-        reducer_stream = GlobalReducer().to(device=device, dtype=dtype)
-        stream_losses = _streaming_losses(stream_outputs_for_grad, reducer_stream, criterion, target)
-        stream_total_loss = sum(stream_losses)
-        stream_total_loss.backward()
-
-        output_grads = [out.grad for out in stream_outputs_for_grad]
-        if any(grad is None for grad in output_grads):
-            raise RuntimeError("Missing output gradient(s) in streaming backward diagnostics.")
-
-        network.stream_network.backward(stream_input, output_grads)
-        stream_grads = _collect_grads(network.stream_network.stream_module)
-
-        # Normal backward second
-        network.stream_network.disable()
-        _zero_grads(normal_net)
-        normal_input = image.detach().clone().requires_grad_(True)
-        normal_outputs_train = _to_sequence(normal_net(normal_input))
-
-        reducer_normal = GlobalReducer().to(device=device, dtype=dtype)
-        normal_losses = _normal_losses(normal_outputs_train, reducer_normal, criterion, target)
-        normal_total_loss = sum(normal_losses)
-        normal_total_loss.backward()
-        normal_grads = _collect_grads(normal_net)
-
-        grad_worst_mean, grad_worst_name = _compare_grads(stream_grads, normal_grads, args.eps, args.backward_topk)
+    if args.debug_backward and stream_grads is not None and normal_grads is not None:
+        grad_worst_mean, grad_worst_name = _compare_grads(stream_grads, normal_grads, args.backward_topk)
         if grad_worst_mean > worst_mean:
             worst_mean = grad_worst_mean
             worst_name = grad_worst_name
