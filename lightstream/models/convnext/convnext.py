@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import torch.nn as nn
-from functools import partial
 from torch.nn import Sequential
 from typing import Callable
 
@@ -27,12 +26,6 @@ def _set_layer_gamma(model, val=1.0):
             x.gamma.data.fill_(val)
 
 
-def _disable_stochastic_depth(model):
-    for module in model.modules():
-        if hasattr(module, "drop_path"):
-            module.drop_path = nn.Identity()
-
-
 class StreamingConvNext(StreamingModule):
     def __init__(
         self,
@@ -49,21 +42,13 @@ class StreamingConvNext(StreamingModule):
         mean: list | None = None,
         std: list | None = None,
         tile_cache_path=None,
-        reset_gamma: bool = True,
-        gamma_value: float = 1.0,
-        disable_stochastic_depth: bool = True,
-        model_drop_path_rate: float | None = None,
     ):
         model_choices = self.get_model_choices()
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
-        network_kwargs: dict[str, object] = {"pretrained": True}
-        if model_drop_path_rate is not None:
-            network_kwargs["drop_path_rate"] = model_drop_path_rate
-
-        network = model_choices[encoder](**network_kwargs)
+        network = model_choices[encoder](pretrained=True)
 
         end = 3 if remove_last_block else 4
 
@@ -80,12 +65,6 @@ class StreamingConvNext(StreamingModule):
         if tile_cache_path is None:
             tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
 
-        before_streaming_init_callbacks = []
-        if reset_gamma:
-            before_streaming_init_callbacks.append(partial(_set_layer_gamma, val=gamma_value))
-        if disable_stochastic_depth:
-            before_streaming_init_callbacks.append(_disable_stochastic_depth)
-
         super().__init__(
             stream_network,
             tile_size,
@@ -98,7 +77,7 @@ class StreamingConvNext(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            before_streaming_init_callbacks=before_streaming_init_callbacks,
+            before_streaming_init_callbacks=[_set_layer_gamma],
         )
 
     @staticmethod

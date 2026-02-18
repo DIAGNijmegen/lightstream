@@ -6,6 +6,7 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
+from lightstream.core.utils import freeze_normalization_layers
 from lightstream.models.convnext.convnext import StreamingConvNext
 
 
@@ -77,13 +78,6 @@ def _parse_dtype(value: str) -> torch.dtype:
     return mapping[key]
 
 
-def _freeze_batchnorm(module: nn.Module) -> None:
-    for submodule in module.modules():
-        if isinstance(submodule, nn.BatchNorm2d):
-            submodule.eval()
-            for param in submodule.parameters():
-                param.requires_grad = False
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for ConvNeXt.")
@@ -92,10 +86,6 @@ def main() -> None:
     parser.add_argument("--tile-size", type=int, default=3200)
     parser.add_argument("--input-size", type=int, default=4800)
     parser.add_argument("--remove-last-block", action="store_true")
-    parser.add_argument("--no-reset-gamma", action="store_true", help="Keep timm layer-scale gamma values.")
-    parser.add_argument("--gamma-value", type=float, default=1.0, help="Gamma value used when resetting layer scale.")
-    parser.add_argument("--keep-stochastic-depth", action="store_true", help="Do not disable drop path blocks.")
-    parser.add_argument("--drop-path-rate", type=float, default=None, help="Optional timm drop_path_rate override.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -116,17 +106,13 @@ def main() -> None:
         std=[1, 1, 1],
         normalize_on_gpu=False,
         saliency=True,
-        reset_gamma=not args.no_reset_gamma,
-        gamma_value=args.gamma_value,
-        disable_stochastic_depth=not args.keep_stochastic_depth,
-        model_drop_path_rate=args.drop_path_rate,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
 
-    _freeze_batchnorm(network.stream_network.stream_module)
+    freeze_normalization_layers(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_output = network(img)
@@ -139,7 +125,7 @@ def main() -> None:
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
-    _freeze_batchnorm(normal_net)
+    freeze_normalization_layers(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
     normal_output = normal_net(img_normal)
