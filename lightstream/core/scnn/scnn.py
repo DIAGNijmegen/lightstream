@@ -942,8 +942,68 @@ class StreamingCNN(torch.nn.Module):
         del image
         return self._restore_outputs(outputs, self._output_structure)
 
+
+    def _streaming_reducer_for_output(self, output_index):
+        reducers = [m for m in self.stream_module.modules() if isinstance(m, StreamingGlobalReducer)]
+        if output_index < len(reducers):
+            return reducers[output_index]
+        return None
+
+    def _reducer_grad_to_spatial(self, spatial_output, reducer_grad, reducer_module):
+        if reducer_module is None:
+            return None
+
+        r = float(reducer_module.r)
+        eps = float(reducer_module.eps)
+
+        probs = torch.sigmoid(spatial_output)
+        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        scale = mean_p_r.pow((1.0 / r) - 1.0)
+
+        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
+        scale = scale / numel
+
+        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
+        return spatial_grad
+
     def _backward_single_output(self, image, grad, output_index=0):
         grad = grad
+
+        output_shape = self._get_tile_output_shape(output_index)
+        if len(output_shape) < 4:
+            planning_index = self._planning_output_index(output_index)
+            if planning_index == output_index:
+                raise ValueError("Non-spatial output does not have a paired spatial planning output for backward.")
+
+            # Reconstruct paired spatial output and convert reducer gradient to spatial gradient.
+            for mod in self.stream_module.modules():
+                if isinstance(mod, _STREAMING_MODULE_TYPES):
+                    mod.reset()
+                    mod.input_loc = None
+                    if isinstance(mod, StreamingGlobalReducer):
+                        mod.data_loc = None
+
+            with torch.no_grad():
+                spatial_output = self._forward_single_output(
+                    image,
+                    result_on_cpu=False,
+                    output_index=planning_index,
+                    initialize_saliency=False,
+                )
+
+            reducer_module = self._streaming_reducer_for_output(output_index)
+            spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
+            if spatial_grad is None:
+                raise ValueError("Could not map reducer output gradient to spatial gradient.")
+
+            for mod in self.stream_module.modules():
+                if isinstance(mod, _STREAMING_MODULE_TYPES):
+                    mod.reset()
+                    mod.input_loc = None
+                    if isinstance(mod, StreamingGlobalReducer):
+                        mod.data_loc = None
+
+            return self._backward_single_output(image, spatial_grad, output_index=planning_index)
 
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
