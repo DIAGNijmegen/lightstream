@@ -149,6 +149,20 @@ class StreamingConv2dF(torch.autograd.Function):
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
 
+            stride_hw = stride[1:3]
+            dilation_hw = _pair(dilation)
+            kernel_h, kernel_w = weight.shape[-2:]
+            expected_input_h = (relevant_grad.shape[H_DIM] - 1) * stride_hw[0] + dilation_hw[0] * (kernel_h - 1) + 1
+            expected_input_w = (relevant_grad.shape[W_DIM] - 1) * stride_hw[1] + dilation_hw[1] * (kernel_w - 1) + 1
+
+            # Keep input shape consistent with conv2d backward formula.
+            # Tile trimming/padding near boundaries can produce off-by-one shapes.
+            relevant_input = relevant_input[:, :, :expected_input_h, :expected_input_w]
+            pad_h = expected_input_h - relevant_input.shape[H_DIM]
+            pad_w = expected_input_w - relevant_input.shape[W_DIM]
+            if pad_h > 0 or pad_w > 0:
+                relevant_input = torch.nn.functional.pad(relevant_input, [0, max(0, pad_w), 0, max(0, pad_h)])
+
             grad_input_for_weight = relevant_input.to(weight.dtype)
             grad_output_for_weight = relevant_grad.to(weight.dtype)
 
@@ -157,9 +171,9 @@ class StreamingConv2dF(torch.autograd.Function):
                     grad_input_for_weight,
                     weight.shape,
                     grad_output_for_weight,
-                    stride[1:3],
+                    stride_hw,
                     (0, 0),  # padding
-                    dilation,
+                    dilation_hw,
                     groups,
                 )
             except RuntimeError as err:
@@ -172,9 +186,9 @@ class StreamingConv2dF(torch.autograd.Function):
                         grad_input_for_weight.float(),
                         weight.shape,
                         grad_output_for_weight.float(),
-                        stride[1:3],
+                        stride_hw,
                         (0, 0),  # padding
-                        dilation,
+                        dilation_hw,
                         groups,
                     ).to(weight.dtype)
 
