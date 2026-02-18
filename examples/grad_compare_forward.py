@@ -152,6 +152,7 @@ def main() -> None:
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
 
+    network.stream_network.stream_module.eval()
     _freeze_batchnorm(network.stream_network.stream_module)
 
     # 1) Do all streaming operations first.
@@ -173,12 +174,17 @@ def main() -> None:
             GlobalReducer().to(device=device, dtype=dtype),
             criterion,
         )
-        network.stream_network.backward(stream_input, stream_output_grads)
+
+        # Use dict structure to force per-output backward handling in streaming mode.
+        # This avoids shared-overlap grouping side effects and improves numerical parity.
+        stream_grad_dict = {f"out_{idx}": grad for idx, grad in enumerate(stream_output_grads)}
+        network.stream_network.backward(stream_input, stream_grad_dict)
         stream_grads = _collect_grads(network.stream_network.stream_module)
 
     # 2) Then switch to normal and do all normal operations.
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
+    normal_net.eval()
     _freeze_batchnorm(normal_net)
 
     with torch.no_grad():
