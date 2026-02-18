@@ -107,9 +107,16 @@ def _loss_grads_for_outputs(
     detached = [out.detach().clone().requires_grad_(True) for out in outputs]
     losses = _build_losses(detached, reducer, criterion)
     sum(losses).backward()
-    grads = [out.grad for out in detached]
-    if any(grad is None for grad in grads):
-        raise RuntimeError("Missing output gradient(s) while building loss gradients.")
+
+    grads: list[torch.Tensor] = []
+    for idx, out in enumerate(detached):
+        grad = out.grad
+        if grad is None:
+            # Only first 4 outputs participate in the diagnostic loss.
+            if idx < 4:
+                raise RuntimeError(f"Missing required output gradient at index {idx}.")
+            grad = torch.zeros_like(out)
+        grads.append(grad)
     return grads
 
 
