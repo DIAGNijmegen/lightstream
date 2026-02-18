@@ -169,24 +169,30 @@ class StreamingCNN(torch.nn.Module):
         if len(outputs) == 1:
             self._tile_output_shape = outputs[0].shape
             gradient = torch.zeros(*outputs[0].shape, dtype=self.dtype, device=self.device)
-            gradient[
-                :,
-                :,
-                self.tile_output_lost.top : outputs[0].shape[H_DIM] - self.tile_output_lost.bottom,
-                self.tile_output_lost.left : outputs[0].shape[W_DIM] - self.tile_output_lost.right,
-            ] = 1
+            if outputs[0].ndim >= 4:
+                gradient[
+                    :,
+                    :,
+                    self.tile_output_lost.top : outputs[0].shape[H_DIM] - self.tile_output_lost.bottom,
+                    self.tile_output_lost.left : outputs[0].shape[W_DIM] - self.tile_output_lost.right,
+                ] = 1
+            else:
+                gradient.fill_(1)
             outputs[0].backward(gradient=gradient)
         else:
             self._tile_output_shape = [out.shape for out in outputs]
             gradients = []
             for out, lost in zip(outputs, self.tile_output_lost):
                 gradient = torch.zeros(*out.shape, dtype=self.dtype, device=self.device)
-                gradient[
-                    :,
-                    :,
-                    lost.top : out.shape[H_DIM] - lost.bottom,
-                    lost.left : out.shape[W_DIM] - lost.right,
-                ] = 1
+                if out.ndim >= 4:
+                    gradient[
+                        :,
+                        :,
+                        lost.top : out.shape[H_DIM] - lost.bottom,
+                        lost.left : out.shape[W_DIM] - lost.right,
+                    ] = 1
+                else:
+                    gradient.fill_(1)
                 gradients.append(gradient)
 
             self.tile_gradient_lost = []
