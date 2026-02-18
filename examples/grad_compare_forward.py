@@ -239,8 +239,14 @@ def main() -> None:
         stream_input = image.detach().clone()
         stream_outputs_train = _to_sequence(network(stream_input))
         stream_target = stream_outputs_train[args.backward_output_index]
+        # Streaming forward runs under no_grad internally, so this tensor is detached.
+        # Re-enable gradient tracking on the selected output so we can obtain dL/d(stream_target)
+        # and pass it into StreamingCNN.backward.
+        stream_target.requires_grad_(True)
         stream_loss = torch.sigmoid(stream_target).mean()
         stream_loss.backward()
+        if stream_target.grad is None:
+            raise RuntimeError("Streaming target gradient was not populated for backward diagnostics.")
         network.stream_network.backward(stream_input, stream_target.grad)
         stream_grads = _collect_grads(network.stream_network.stream_module)
 
