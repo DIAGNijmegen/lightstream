@@ -149,15 +149,34 @@ class StreamingConv2dF(torch.autograd.Function):
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
 
-            grad_weight = conv2d_weight(
-                relevant_input.to(weight.dtype),
-                weight.shape,
-                relevant_grad.to(weight.dtype),
-                stride[1:3],
-                (0, 0),  # padding
-                dilation,
-                groups,
-            )
+            grad_input_for_weight = relevant_input.to(weight.dtype)
+            grad_output_for_weight = relevant_grad.to(weight.dtype)
+
+            try:
+                grad_weight = conv2d_weight(
+                    grad_input_for_weight,
+                    weight.shape,
+                    grad_output_for_weight,
+                    stride[1:3],
+                    (0, 0),  # padding
+                    dilation,
+                    groups,
+                )
+            except RuntimeError as err:
+                # Some tile shapes trigger CUDNN_STATUS_BAD_PARAM in cudnnFinalize.
+                # Fall back to the native implementation to preserve correctness.
+                if "CUDNN_STATUS_BAD_PARAM" not in str(err):
+                    raise
+                with torch.backends.cudnn.flags(enabled=False):
+                    grad_weight = conv2d_weight(
+                        grad_input_for_weight.float(),
+                        weight.shape,
+                        grad_output_for_weight.float(),
+                        stride[1:3],
+                        (0, 0),  # padding
+                        dilation,
+                        groups,
+                    ).to(weight.dtype)
 
             if bias is not None:
                 grad_bias = relevant_grad[0].sum((1, 2))
