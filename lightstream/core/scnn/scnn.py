@@ -591,15 +591,17 @@ class StreamingCNN(torch.nn.Module):
         if len(shape) >= 4:
             return output_index
 
-        # Non-spatial outputs require an explicit paired spatial output.
-        # If no such pairing is defined by the model/output contract,
-        # keep the same index so backward can fail loudly instead of
-        # silently routing gradients to an unrelated output.
+        # Debug/model-specific pairing: reducer heads often correspond to
+        # later full-resolution map outputs (e.g., [0:3] with [4:7]).
         if output_index + 4 < self._output_count():
             paired_shape = self._get_tile_output_shape(output_index + 4)
             if len(paired_shape) >= 4:
                 return output_index + 4
 
+        # Fallback: first spatial output.
+        for idx in range(self._output_count()):
+            if len(self._get_tile_output_shape(idx)) >= 4:
+                return idx
         return output_index
 
     def _forward_single_output(self, image, result_on_cpu, output_index=0, initialize_saliency=True):

@@ -87,10 +87,10 @@ def _compare_grads(
 
 
 def _build_losses(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module) -> list[torch.Tensor]:
-    if len(outputs) != 4:
-        raise ValueError(f"Expected 4 outputs from WSS, got {len(outputs)}")
+    if len(outputs) < 4:
+        raise ValueError(f"Expected at least 4 outputs from WSS, got {len(outputs)}")
 
-    y1, y2, y3, y = outputs
+    y1, y2, y3, y = outputs[:4]
     y_reduced = reducer(y)
 
     return [
