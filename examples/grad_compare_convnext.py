@@ -92,6 +92,10 @@ def main() -> None:
     parser.add_argument("--tile-size", type=int, default=3200)
     parser.add_argument("--input-size", type=int, default=4800)
     parser.add_argument("--remove-last-block", action="store_true")
+    parser.add_argument("--no-reset-gamma", action="store_true", help="Keep timm layer-scale gamma values.")
+    parser.add_argument("--gamma-value", type=float, default=1.0, help="Gamma value used when resetting layer scale.")
+    parser.add_argument("--keep-stochastic-depth", action="store_true", help="Do not disable drop path blocks.")
+    parser.add_argument("--drop-path-rate", type=float, default=None, help="Optional timm drop_path_rate override.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -112,6 +116,10 @@ def main() -> None:
         std=[1, 1, 1],
         normalize_on_gpu=False,
         saliency=True,
+        reset_gamma=not args.no_reset_gamma,
+        gamma_value=args.gamma_value,
+        disable_stochastic_depth=not args.keep_stochastic_depth,
+        model_drop_path_rate=args.drop_path_rate,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
