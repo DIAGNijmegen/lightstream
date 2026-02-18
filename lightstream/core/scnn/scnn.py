@@ -954,18 +954,17 @@ class StreamingCNN(torch.nn.Module):
         if reducer_module is None:
             return None
 
-        r = float(reducer_module.r)
-        eps = float(reducer_module.eps)
+        # Use autograd for exact parity with GlobalReducer forward definition.
+        # This avoids subtle drift from manual derivative implementations.
+        surrogate_reducer = GlobalReducer(r=float(reducer_module.r), eps=float(reducer_module.eps)).to(
+            device=spatial_output.device,
+            dtype=spatial_output.dtype,
+        )
 
-        probs = torch.sigmoid(spatial_output)
-        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-        scale = mean_p_r.pow((1.0 / r) - 1.0)
-
-        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
-        scale = scale / numel
-
-        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
-        return spatial_grad
+        surrogate_input = spatial_output.detach().requires_grad_(True)
+        surrogate_output = surrogate_reducer(surrogate_input)
+        torch.autograd.backward(surrogate_output, grad_tensors=reducer_grad)
+        return surrogate_input.grad
 
     def _backward_single_output(self, image, grad, output_index=0):
         grad = grad
