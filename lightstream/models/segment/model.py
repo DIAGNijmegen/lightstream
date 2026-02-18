@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.models.segment.reducer import GlobalReducer
 from torchinfo import summary
 
 
@@ -15,9 +14,6 @@ class WSS(nn.Module):
     def __init__(self, encoder: str, weights: str="default", remove_last_block: bool =True):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.reducer1 = GlobalReducer()
-        self.reducer2 = GlobalReducer()
-        self.reducer3 = GlobalReducer()
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
             nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
@@ -46,7 +42,7 @@ class WSS(nn.Module):
 
         y = self.w[0] * y1 + self.w[1] * y2 + self.w[2] * y3
 
-        return self.reducer1(y1), self.reducer2(y2), self.reducer3(y3), y
+        return y1, y2, y3, y
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
