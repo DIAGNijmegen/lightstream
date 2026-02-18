@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 from .scnn.scnn import StreamingCNN
+from lightstream.models.segment.reducer import GlobalReducer
 from typing import Callable, Optional, Any
 
 
@@ -65,6 +66,7 @@ class StreamingConstructor:
             torch.nn.MaxPool2d,
             torch.nn.MaxPool3d,
             torch.nn.Upsample,
+            GlobalReducer,
         ]
 
         if add_keep_modules is not None:
