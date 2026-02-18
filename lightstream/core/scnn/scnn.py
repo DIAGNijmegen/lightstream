@@ -12,7 +12,7 @@ import torch.autograd
 import torch.backends
 import torch.nn.functional
 
-from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices
+from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 
 

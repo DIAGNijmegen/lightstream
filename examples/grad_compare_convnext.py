@@ -80,7 +80,7 @@ def _parse_dtype(value: str) -> torch.dtype:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for ConvNeXt.")
-    parser.add_argument("--encoder", default="convnext_tiny_hnf")
+    parser.add_argument("--encoder", default="convnext_atto")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=3200)
     parser.add_argument("--input-size", type=int, default=4800)
