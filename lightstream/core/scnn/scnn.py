@@ -404,13 +404,25 @@ class StreamingCNN(torch.nn.Module):
         # different (e.g., DenseNet)
         if tensor.dim() > 3:
             tensor = torch.sum(tensor, dim=1)[0]
-        tensor = tensor / tensor.max()  # normalize
+
+        # Non-spatial tensors (e.g. [N, C] reducer outputs) do not have H/W borders.
+        if tensor.dim() < 2:
+            return Lost(0, 0, 0, 0)
+
+        max_val = tensor.max()
+        if not torch.isfinite(max_val) or float(max_val.abs().item()) <= self.eps:
+            return Lost(0, 0, 0, 0)
+
+        tensor = tensor / max_val  # normalize
         tensor = tensor > tensor.max() * (1 - self.eps)
         non_zero = tensor.nonzero(as_tuple=False)
+        if non_zero.numel() == 0:
+            return Lost(0, 0, 0, 0)
+
         top, left = non_zero.min(dim=0)[0]
         # for bottom and right we need to substract -1: correct index 3 is actually the 4th pixel
         bottom, right = (
-            torch.tensor([*tensor.size()], dtype=torch.long, device=self.device) - non_zero.max(dim=0)[0] - 1
+            torch.tensor([*tensor.size()], dtype=torch.long, device=tensor.device) - non_zero.max(dim=0)[0] - 1
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
