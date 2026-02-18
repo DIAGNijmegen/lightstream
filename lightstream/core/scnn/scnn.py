@@ -4,6 +4,7 @@ MIT License
 """
 import math
 import copy
+import contextlib
 from typing import List
 
 import numpy as np
@@ -1084,7 +1085,9 @@ class StreamingCNN(torch.nn.Module):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                autocast_enabled = tile.is_cuda and self.dtype in (torch.float16, torch.bfloat16)
+                autocast_ctx = torch.autocast(device_type="cuda", dtype=self.dtype) if autocast_enabled else contextlib.nullcontext()
+                with autocast_ctx:
                     tile_output = self.stream_module(tile)
 
                 del tile
@@ -1196,7 +1199,9 @@ class StreamingCNN(torch.nn.Module):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                autocast_enabled = tile.is_cuda and self.dtype in (torch.float16, torch.bfloat16)
+                autocast_ctx = torch.autocast(device_type="cuda", dtype=self.dtype) if autocast_enabled else contextlib.nullcontext()
+                with autocast_ctx:
                     tile_output = self.stream_module(tile)
 
                 del tile
