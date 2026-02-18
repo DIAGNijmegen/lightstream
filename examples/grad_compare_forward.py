@@ -104,15 +104,19 @@ def _build_losses(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion
 def _loss_grads_for_outputs(
     outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module
 ) -> list[torch.Tensor]:
-    detached = [out.detach().clone().requires_grad_(True) for out in outputs]
-    losses = _build_losses(detached, reducer, criterion)
+    prepared: list[torch.Tensor] = []
+    for out in outputs:
+        out.requires_grad_(True)
+        out.retain_grad()
+        prepared.append(out)
+
+    losses = _build_losses(prepared, reducer, criterion)
     sum(losses).backward()
 
     grads: list[torch.Tensor] = []
-    for idx, out in enumerate(detached):
+    for idx, out in enumerate(prepared):
         grad = out.grad
         if grad is None:
-            # Only first 4 outputs participate in the diagnostic loss.
             if idx < 4:
                 raise RuntimeError(f"Missing required output gradient at index {idx}.")
             grad = torch.zeros_like(out)
@@ -182,10 +186,7 @@ def main() -> None:
             criterion,
         )
 
-        # Use dict structure to force per-output backward handling in streaming mode.
-        # This avoids shared-overlap grouping side effects and improves numerical parity.
-        stream_grad_dict = {f"out_{idx}": grad for idx, grad in enumerate(stream_output_grads)}
-        network.stream_network.backward(stream_input, stream_grad_dict)
+        network.stream_network.backward(stream_input, tuple(stream_output_grads))
         stream_grads = _collect_grads(network.stream_network.stream_module)
 
     # 2) Then switch to normal and do all normal operations.
@@ -204,12 +205,12 @@ def main() -> None:
         _zero_grads(normal_net)
         normal_input = image.detach().clone().requires_grad_(True)
         normal_outputs_train = _to_sequence(normal_net(normal_input))
-        normal_output_grads = _loss_grads_for_outputs(
+        normal_losses = _build_losses(
             normal_outputs_train,
             GlobalReducer().to(device=device, dtype=dtype),
             criterion,
         )
-        torch.autograd.backward(normal_outputs_train, grad_tensors=normal_output_grads)
+        sum(normal_losses).backward()
         normal_grads = _collect_grads(normal_net)
 
     # 3) Finally compare and print differences.
