@@ -668,8 +668,11 @@ class StreamingCNN(torch.nn.Module):
                     sides_right = True if output_x * stride_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
                     sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
-                    # These values are used to crop invalid output values
-                    lost = self._get_tile_lost_for_sides(sides, output_index)
+                    # These values are used to crop invalid output values.
+                    # For non-spatial outputs (e.g. reducer heads), use the
+                    # paired spatial planning index so reducer tile coordinates
+                    # align with map reconstruction geometry.
+                    lost = self._get_tile_lost_for_sides(sides, planning_index)
 
                     # Since we need to stay at multiples of output stride we
                     # need to keep that into account when we are at the bottom
