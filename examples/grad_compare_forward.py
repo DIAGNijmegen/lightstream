@@ -166,12 +166,46 @@ def main() -> None:
 
     _freeze_batchnorm(network.stream_network.stream_module)
 
+    # 1) STREAMING pass(es) first
     with torch.no_grad():
         streaming_outputs = _to_sequence(network(image))
 
-        network.stream_network.disable()
-        normal_net = network.stream_network.stream_module
-        _freeze_batchnorm(normal_net)
+    stream_grads: dict[str, torch.Tensor] | None = None
+    if args.debug_backward:
+        print("\nRunning backward diagnostics...")
+        if args.backward_output_index < 0 or args.backward_output_index >= len(streaming_outputs):
+            raise ValueError(
+                f"Invalid --backward-output-index={args.backward_output_index}; "
+                f"valid range is [0, {len(streaming_outputs) - 1}]"
+            )
+
+        _freeze_batchnorm(network.stream_network.stream_module)
+        _zero_grads(network.stream_network.stream_module)
+
+        stream_input = image.detach().clone()
+        stream_outputs_train = _to_sequence(network(stream_input))
+        stream_target = stream_outputs_train[args.backward_output_index]
+
+        # Streaming forward runs under no_grad internally, so this tensor is detached.
+        # Re-enable gradient tracking only to obtain dL/d(stream_target).
+        stream_target.requires_grad_(True)
+        stream_loss = torch.sigmoid(stream_target).mean()
+        stream_loss.backward()
+        if stream_target.grad is None:
+            raise RuntimeError("Streaming target gradient was not populated for backward diagnostics.")
+
+        # StreamingCNN.backward expects gradients matching full output structure.
+        output_grads = [torch.zeros_like(t) for t in stream_outputs_train]
+        output_grads[args.backward_output_index] = stream_target.grad
+        network.stream_network.backward(stream_input, output_grads)
+        stream_grads = _collect_grads(network.stream_network.stream_module)
+
+    # 2) then switch once to normal mode
+    network.stream_network.disable()
+    normal_net = network.stream_network.stream_module
+    _freeze_batchnorm(normal_net)
+
+    with torch.no_grad():
         normal_outputs = _to_sequence(normal_net(image))
 
     if len(streaming_outputs) != len(normal_outputs):
@@ -224,37 +258,7 @@ def main() -> None:
                 worst_name = f"head[{idx}] stream-vs-post(stream_map)"
 
     if args.debug_backward:
-        print("\nRunning backward diagnostics...")
-        if args.backward_output_index < 0 or args.backward_output_index >= len(streaming_outputs):
-            raise ValueError(
-                f"Invalid --backward-output-index={args.backward_output_index}; "
-                f"valid range is [0, {len(streaming_outputs) - 1}]"
-            )
-
-        # Re-enable streaming hooks for streaming backward pass
-        network.stream_network.enable()
-        _freeze_batchnorm(network.stream_network.stream_module)
-        _zero_grads(network.stream_network.stream_module)
-
-        stream_input = image.detach().clone()
-        stream_outputs_train = _to_sequence(network(stream_input))
-        stream_target = stream_outputs_train[args.backward_output_index]
-        # Streaming forward runs under no_grad internally, so this tensor is detached.
-        # Re-enable gradient tracking on the selected output so we can obtain dL/d(stream_target)
-        # and pass it into StreamingCNN.backward.
-        stream_target.requires_grad_(True)
-        stream_loss = torch.sigmoid(stream_target).mean()
-        stream_loss.backward()
-        if stream_target.grad is None:
-            raise RuntimeError("Streaming target gradient was not populated for backward diagnostics.")
-        network.stream_network.backward(stream_input, stream_target.grad)
-        stream_grads = _collect_grads(network.stream_network.stream_module)
-
-        network.stream_network.disable()
-        normal_net = network.stream_network.stream_module
-        _freeze_batchnorm(normal_net)
         _zero_grads(normal_net)
-
         normal_input = image.detach().clone().requires_grad_(True)
         normal_outputs_train = _to_sequence(normal_net(normal_input))
         normal_target = normal_outputs_train[args.backward_output_index]
@@ -262,10 +266,11 @@ def main() -> None:
         normal_loss.backward()
         normal_grads = _collect_grads(normal_net)
 
-        grad_worst_mean, grad_worst_name = _compare_grads(stream_grads, normal_grads, args.eps, args.backward_topk)
-        if grad_worst_mean > worst_mean:
-            worst_mean = grad_worst_mean
-            worst_name = grad_worst_name
+        if stream_grads is not None:
+            grad_worst_mean, grad_worst_name = _compare_grads(stream_grads, normal_grads, args.eps, args.backward_topk)
+            if grad_worst_mean > worst_mean:
+                worst_mean = grad_worst_mean
+                worst_name = grad_worst_name
 
     print(f"\nWorst mean abs diff: {worst_name} = {worst_mean:.6e}")
     if args.warn_mean_threshold > 0 and worst_mean > args.warn_mean_threshold:
