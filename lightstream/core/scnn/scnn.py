@@ -103,6 +103,7 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._output_structure = None
+        self._last_forward_outputs = None
 
         if state_dict is None:
             self._configure()
@@ -916,6 +917,7 @@ class StreamingCNN(torch.nn.Module):
 
         if self._output_count() == 1:
             output = self._forward_single_output(image, result_on_cpu)
+            self._last_forward_outputs = [output]
             del image
             return output
 
@@ -941,6 +943,7 @@ class StreamingCNN(torch.nn.Module):
                 if isinstance(mod, StreamingGlobalReducer):
                     mod.data_loc = None
 
+        self._last_forward_outputs = outputs
         del image
         return self._restore_outputs(outputs, self._output_structure)
 
@@ -1327,8 +1330,18 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            with torch.no_grad():
-                spatial_output = self._reducer_input_spatial_output(image, idx)
+            planning_index = self._planning_output_index(idx)
+            spatial_output = None
+            if (
+                self._last_forward_outputs is not None
+                and planning_index < len(self._last_forward_outputs)
+                and isinstance(self._last_forward_outputs[planning_index], torch.Tensor)
+                and self._last_forward_outputs[planning_index].ndim >= 4
+            ):
+                spatial_output = self._last_forward_outputs[planning_index].detach()
+            else:
+                with torch.no_grad():
+                    spatial_output = self._reducer_input_spatial_output(image, idx)
 
             if spatial_output is None:
                 continue
@@ -1409,6 +1422,7 @@ class StreamingCNN(torch.nn.Module):
                     mod.data_loc = None
                 mod.reset()
 
+        self._last_forward_outputs = None
         del image
 
     def _get_tile_lost_for_sides(self, sides, output_index=0):
