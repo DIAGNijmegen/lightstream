@@ -111,13 +111,19 @@ def _losses_post_reduce_maps(outputs: list[torch.Tensor], reducer: GlobalReducer
     ]
 
 
-def _loss_grads_for_outputs(outputs: list[torch.Tensor], losses: list[torch.Tensor]) -> list[torch.Tensor]:
+def _loss_grads_for_outputs(
+    outputs: list[torch.Tensor],
+    losses_builder,
+    reducer: GlobalReducer,
+    criterion: nn.Module,
+) -> list[torch.Tensor]:
     prepared: list[torch.Tensor] = []
     for out in outputs:
         out.requires_grad_(True)
         out.retain_grad()
         prepared.append(out)
 
+    losses = losses_builder(prepared, reducer, criterion)
     sum(losses).backward()
 
     grads: list[torch.Tensor] = []
@@ -208,8 +214,7 @@ def main() -> None:
         stream_input_a = image.detach().clone()
         stream_outputs_a = _to_sequence(network(stream_input_a))
         reducer_a = GlobalReducer().to(device=device, dtype=dtype)
-        losses_a = _losses_model_heads(stream_outputs_a, reducer_a, criterion)
-        grads_a = _loss_grads_for_outputs(stream_outputs_a, losses_a)
+        grads_a = _loss_grads_for_outputs(stream_outputs_a, _losses_model_heads, reducer_a, criterion)
         network.stream_network.backward(stream_input_a, tuple(grads_a))
         stream_grads_heads = _collect_grads(network.stream_network.stream_module)
 
@@ -219,8 +224,7 @@ def main() -> None:
         stream_input_b = image.detach().clone()
         stream_outputs_b = _to_sequence(network(stream_input_b))
         reducer_b = GlobalReducer().to(device=device, dtype=dtype)
-        losses_b = _losses_post_reduce_maps(stream_outputs_b, reducer_b, criterion)
-        grads_b = _loss_grads_for_outputs(stream_outputs_b, losses_b)
+        grads_b = _loss_grads_for_outputs(stream_outputs_b, _losses_post_reduce_maps, reducer_b, criterion)
         network.stream_network.backward(stream_input_b, tuple(grads_b))
         stream_grads_post = _collect_grads(network.stream_network.stream_module)
 
