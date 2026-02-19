@@ -3,6 +3,7 @@ Author: Hans Pinckaers
 MIT License
 """
 import math
+import os
 import copy
 import contextlib
 from typing import List
@@ -73,6 +74,12 @@ class StreamingCNN(torch.nn.Module):
         global H_DIM, W_DIM
         self.stream_module = stream_module
         self.verbose = verbose
+        # Optional debug knobs (off by default) for reducer+upsample parity investigations.
+        # Set LIGHTSTREAM_DEBUG_ZERO_UPSAMPLE_GRAD_LOST_GE=<scale> (e.g. 16)
+        # to force grad_lost=0 for StreamingUpsample modules at/above that scale.
+        zero_ge = os.getenv("LIGHTSTREAM_DEBUG_ZERO_UPSAMPLE_GRAD_LOST_GE")
+        self._debug_zero_upsample_grad_lost_ge = float(zero_ge) if zero_ge else None
+        self._debug_upsample_grad_lost_backup = {}
         self.deterministic = deterministic
         self.eps = eps
         self.device = next(stream_module.parameters()).device
@@ -98,6 +105,11 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = None
         self._module_stats = {}
         self._backward_seen_indices = {}
+
+        self._restore_debug_upsample_grad_lost_override()
+
+        self._restore_debug_upsample_grad_lost_override()
+
         self._saved_tensors = {}
         self._current_tile_input_loc = None
         self._last_forward_outputs = None
@@ -1283,6 +1295,8 @@ class StreamingCNN(torch.nn.Module):
 
         grads, grad_structure = self._split_outputs(grad)
 
+        self._apply_debug_upsample_grad_lost_override()
+
         if len(grads) != self._output_count():
             raise ValueError("Gradient outputs do not match the number of model outputs.")
 
@@ -1357,6 +1371,8 @@ class StreamingCNN(torch.nn.Module):
 
                 self._backward_single_output(image, grad_tensor, output_index=idx)
 
+        self._restore_debug_upsample_grad_lost_override()
+
         self._saved_tensors = {}
         self._current_tile_input_loc = None
         self._last_forward_outputs = None
@@ -1369,6 +1385,33 @@ class StreamingCNN(torch.nn.Module):
                 mod.reset()
 
         del image
+
+    def _apply_debug_upsample_grad_lost_override(self):
+        if self._debug_zero_upsample_grad_lost_ge is None:
+            return
+        self._debug_upsample_grad_lost_backup = {}
+        for mod in self.stream_module.modules():
+            if not isinstance(mod, StreamingUpsample):
+                continue
+            sf = mod.scale_factor
+            if sf is None:
+                continue
+            if isinstance(sf, tuple):
+                scale = max(float(sf[0]), float(sf[1]))
+            else:
+                scale = float(sf)
+            if scale >= self._debug_zero_upsample_grad_lost_ge:
+                self._debug_upsample_grad_lost_backup[mod] = Lost(mod.grad_lost.top, mod.grad_lost.left, mod.grad_lost.bottom, mod.grad_lost.right)
+                mod.grad_lost = Lost(0, 0, 0, 0)
+                if self.verbose:
+                    print(f"[debug] zeroed grad_lost for StreamingUpsample scale_factor={scale}")
+
+    def _restore_debug_upsample_grad_lost_override(self):
+        if not self._debug_upsample_grad_lost_backup:
+            return
+        for mod, lost in self._debug_upsample_grad_lost_backup.items():
+            mod.grad_lost = lost
+        self._debug_upsample_grad_lost_backup = {}
 
     def _get_tile_lost_for_sides(self, sides, output_index=0):
         tile_output_lost = self._get_tile_output_lost(output_index)
