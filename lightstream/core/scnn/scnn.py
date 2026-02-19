@@ -972,93 +972,42 @@ class StreamingCNN(torch.nn.Module):
 
         output_shape = self._get_tile_output_shape(output_index)
         if len(output_shape) < 4:
-            # Replay tiled forward with autograd enabled and backprop directly
-            # from the non-spatial reducer output so reducer custom backward is used.
             planning_index = self._planning_output_index(output_index)
             if planning_index == output_index:
                 raise ValueError("Non-spatial output does not have a paired spatial planning output for backward.")
 
-            tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
-            tile_output_shape = self._get_tile_output_shape(planning_index)
-            tile_output_lost = self._get_tile_output_lost(planning_index)
-            output_stride = self._get_output_stride(planning_index)
-            stride_y = self._stride_value(output_stride, 1)
-            stride_x = self._stride_value(output_stride, 2)
+            # For reducer outputs, use paired spatial replay to preserve
+            # per-tile immediate backward order required by streaming ops.
+            # Chaining all tiles into one backward pass triggers reverse-order
+            # traversal and breaks seen-index assumptions in streaming upsample/conv.
+            for mod in self.stream_module.modules():
+                if isinstance(mod, _STREAMING_MODULE_TYPES):
+                    mod.reset()
+                    mod.input_loc = None
+                    if isinstance(mod, StreamingGlobalReducer):
+                        mod.data_loc = None
 
-            valid_output_height = tile_output_shape[H_DIM] - tile_output_lost.top - tile_output_lost.bottom
-            valid_output_width = tile_output_shape[W_DIM] - tile_output_lost.left - tile_output_lost.right
+            with torch.no_grad():
+                spatial_output = self._forward_single_output(
+                    image,
+                    result_on_cpu=False,
+                    output_index=planning_index,
+                    initialize_saliency=False,
+                )
 
-            output_height = self._floor_div(image.shape[H_DIM] - self.tile_shape[H_DIM], stride_y) + tile_output_shape[H_DIM]
-            output_width = self._floor_div(image.shape[W_DIM] - self.tile_shape[W_DIM], stride_x) + tile_output_shape[W_DIM]
+            reducer_module = self._streaming_reducer_for_output(output_index)
+            spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
+            if spatial_grad is None:
+                raise ValueError("Could not map reducer output gradient to spatial gradient.")
 
-            n_rows = math.ceil(float(output_height) / float(valid_output_height))
-            n_cols = math.ceil(float(output_width) / float(valid_output_width))
+            for mod in self.stream_module.modules():
+                if isinstance(mod, _STREAMING_MODULE_TYPES):
+                    mod.reset()
+                    mod.input_loc = None
+                    if isinstance(mod, StreamingGlobalReducer):
+                        mod.data_loc = None
 
-            if image.shape[W_DIM] <= tile_width:
-                n_cols = 1
-            if image.shape[H_DIM] <= tile_height:
-                n_rows = 1
-
-            reducer_output = None
-            for row in range(n_rows):
-                for col in range(n_cols):
-                    output_y = row * valid_output_height
-                    output_x = col * valid_output_width
-
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
-                    sides_bottom = True if output_y * stride_y + self.tile_shape[H_DIM] >= image.shape[H_DIM] else False
-                    sides_right = True if output_x * stride_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
-                    sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
-
-                    lost = self._get_tile_lost_for_sides(sides, planning_index)
-
-                    if sides_bottom:
-                        output_y = self._floor_div(image.shape[H_DIM] - self.tile_shape[H_DIM], stride_y)
-                    if sides_right:
-                        output_x = self._floor_div(image.shape[W_DIM] - self.tile_shape[W_DIM], stride_x)
-
-                    output_y = output_y if not sides.top else 0
-                    output_x = output_x if not sides.left else 0
-
-                    tile_y = self._mul_stride(output_y, stride_y)
-                    tile_x = self._mul_stride(output_x, stride_x)
-                    tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
-
-                    if not self.copy_to_gpu:
-                        tile = tile.to(self.device, non_blocking=True)
-                    if self.should_normalize:
-                        tile = self._normalize_on_gpu(tile)
-
-                    input_loc = Box(tile_y, tile_height, tile_x, tile_width, sides)
-                    for mod in self.stream_module.modules():
-                        if isinstance(mod, _STREAMING_MODULE_TYPES):
-                            mod.input_loc = input_loc
-                            if isinstance(mod, StreamingGlobalReducer):
-                                mod.lost = self._get_tile_output_lost(planning_index)
-                                mod.output_stride = self._get_output_stride(planning_index)
-                                mod.data_loc = Box(output_y + lost.top, 0, output_x + lost.left, 0, sides)
-
-                    autocast_enabled = tile.is_cuda and self.dtype in (torch.float16, torch.bfloat16)
-                    autocast_ctx = torch.autocast(device_type="cuda", dtype=self.dtype) if autocast_enabled else contextlib.nullcontext()
-                    with autocast_ctx:
-                        tile_output = self.stream_module(tile)
-
-                    outputs, _ = self._split_outputs(tile_output)
-                    if output_index >= len(outputs):
-                        raise ValueError("Streaming output index is out of range for the model outputs.")
-                    reducer_output = outputs[output_index]
-
-                    del tile_output
-                    del tile
-
-            if reducer_output is None:
-                raise ValueError("Could not compute reducer output during backward replay.")
-
-            reducer_output = reducer_output.to(self.device, non_blocking=True)
-            reducer_output.backward(grad)
-            del reducer_output
-            return
+            return self._backward_single_output(image, spatial_grad, output_index=planning_index)
 
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
