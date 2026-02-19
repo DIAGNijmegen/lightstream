@@ -111,6 +111,36 @@ def _losses_post_reduce_maps(outputs: list[torch.Tensor], reducer: GlobalReducer
     ]
 
 
+
+
+def _reduced_outputs_global(outputs: list[torch.Tensor], reducer: GlobalReducer) -> list[torch.Tensor]:
+    if len(outputs) < 4:
+        raise ValueError("Need at least 4 outputs for global-reduce view")
+    return [outputs[0], outputs[1], outputs[2], reducer(outputs[3])]
+
+
+def _reduced_outputs_post(outputs: list[torch.Tensor], reducer: GlobalReducer) -> list[torch.Tensor]:
+    if len(outputs) < 7:
+        raise ValueError("Need 7 outputs for post-reduce view")
+    return [reducer(outputs[4]), reducer(outputs[5]), reducer(outputs[6]), reducer(outputs[3])]
+
+
+def _compare_output_sets(name_a: str, outs_a: list[torch.Tensor], name_b: str, outs_b: list[torch.Tensor]) -> tuple[float, str]:
+    if len(outs_a) != len(outs_b):
+        raise ValueError(f"Output set size mismatch: {name_a}={len(outs_a)} vs {name_b}={len(outs_b)}")
+
+    print(f"\nForward pairwise [{name_a}] vs [{name_b}]:")
+    worst_mean = 0.0
+    worst_name = ""
+    for idx, (a, b) in enumerate(zip(outs_a, outs_b)):
+        stats = _diff_stats(a, b)
+        _print_stats(f"pair[{idx}]", stats)
+        if stats["mean"] > worst_mean:
+            worst_mean = stats["mean"]
+            worst_name = f"forward[{name_a} vs {name_b}][{idx}]"
+    return worst_mean, worst_name
+
+
 def _loss_grads_for_outputs(
     outputs: list[torch.Tensor],
     losses_builder,
@@ -157,7 +187,7 @@ def _compare_gradient_sets(
             worst_max = stats["max"]
             worst_name = f"{title}[{name}]"
 
-    print(f"\nGradient-set comparison [{title}]:")
+    print(f"\nBackward pairwise [{title}]:")
     _print_stats("worst", {"mean": worst_mean, "max": worst_max})
     return worst_mean, worst_name
 
@@ -269,28 +299,47 @@ def main() -> None:
     worst_mean = 0.0
     worst_name = ""
 
-    for idx, (stream_out, normal_out) in enumerate(zip(streaming_outputs, normal_outputs)):
-        stats = _diff_stats(stream_out, normal_out)
-        _print_stats(f"output[{idx}] stream-vs-normal", stats)
-        if stats["mean"] > worst_mean:
-            worst_mean = stats["mean"]
-            worst_name = f"output[{idx}] stream-vs-normal"
+    reducer_view = GlobalReducer().to(device=device, dtype=dtype)
+    forward_sets = {
+        "streaming global reduce": _reduced_outputs_global(streaming_outputs, reducer_view),
+        "streaming post reduce": _reduced_outputs_post(streaming_outputs, reducer_view),
+        "normal global reduce": _reduced_outputs_global(normal_outputs, reducer_view),
+        "normal post reduce": _reduced_outputs_post(normal_outputs, reducer_view),
+    }
+
+    names = list(forward_sets.keys())
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            m, n = _compare_output_sets(names[i], forward_sets[names[i]], names[j], forward_sets[names[j]])
+            if m > worst_mean:
+                worst_mean, worst_name = m, n
 
     if args.debug_backward and all(x is not None for x in [stream_grads_heads, normal_grads_heads, stream_grads_post, normal_grads_post]):
-        hm, hn = _compare_grads(stream_grads_heads, normal_grads_heads, args.backward_topk, title="model_heads")
-        pm, pn = _compare_grads(stream_grads_post, normal_grads_post, args.backward_topk, title="post_reduce_maps")
+        backward_sets = {
+            "streaming global reduce": stream_grads_heads,
+            "streaming post reduce": stream_grads_post,
+            "normal global reduce": normal_grads_heads,
+            "normal post reduce": normal_grads_post,
+        }
 
-        if hm > worst_mean:
-            worst_mean, worst_name = hm, hn
-        if pm > worst_mean:
-            worst_mean, worst_name = pm, pn
+        for key, (a, b) in {
+            "streaming global reduce": (stream_grads_heads, normal_grads_heads),
+            "streaming post reduce": (stream_grads_post, normal_grads_post),
+        }.items():
+            mm, nn = _compare_grads(a, b, args.backward_topk, title=key)
+            if mm > worst_mean:
+                worst_mean, worst_name = mm, nn
 
-        sm, sn = _compare_gradient_sets(stream_grads_heads, stream_grads_post, "stream(heads)-vs-stream(post_reduce)")
-        nm, nnn = _compare_gradient_sets(normal_grads_heads, normal_grads_post, "normal(heads)-vs-normal(post_reduce)")
-        if sm > worst_mean:
-            worst_mean, worst_name = sm, sn
-        if nm > worst_mean:
-            worst_mean, worst_name = nm, nnn
+        bnames = list(backward_sets.keys())
+        for i in range(len(bnames)):
+            for j in range(i + 1, len(bnames)):
+                sm, sn = _compare_gradient_sets(
+                    backward_sets[bnames[i]],
+                    backward_sets[bnames[j]],
+                    f"{bnames[i]} vs {bnames[j]}",
+                )
+                if sm > worst_mean:
+                    worst_mean, worst_name = sm, sn
 
     print(f"\nWorst mean abs diff: {worst_name} = {worst_mean:.6e}")
     if args.warn_mean_threshold > 0 and worst_mean > args.warn_mean_threshold:
