@@ -22,6 +22,8 @@ def _freeze_batchnorm(module: nn.Module) -> None:
     for submodule in module.modules():
         if isinstance(submodule, nn.BatchNorm2d):
             submodule.eval()
+            for param in submodule.parameters():
+                param.requires_grad = False
 
 
 def _to_sequence(outputs):
