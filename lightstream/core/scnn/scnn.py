@@ -954,17 +954,18 @@ class StreamingCNN(torch.nn.Module):
         if reducer_module is None:
             return None
 
-        # Use autograd for exact parity with GlobalReducer forward definition.
-        # This avoids subtle drift from manual derivative implementations.
-        surrogate_reducer = GlobalReducer(r=float(reducer_module.r), eps=float(reducer_module.eps)).to(
-            device=spatial_output.device,
-            dtype=spatial_output.dtype,
-        )
+        r = float(reducer_module.r)
+        eps = float(reducer_module.eps)
 
-        surrogate_input = spatial_output.detach().requires_grad_(True)
-        surrogate_output = surrogate_reducer(surrogate_input)
-        torch.autograd.backward(surrogate_output, grad_tensors=reducer_grad)
-        return surrogate_input.grad
+        probs = torch.sigmoid(spatial_output)
+        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        scale = mean_p_r.pow((1.0 / r) - 1.0)
+
+        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
+        scale = scale / numel
+
+        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
+        return spatial_grad
 
     def _backward_single_output(self, image, grad, output_index=0):
         grad = grad
@@ -983,18 +984,13 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            # Build paired spatial output in non-streaming mode for stable reducer->spatial mapping.
-            was_streaming = self._is_streaming
-            if was_streaming:
-                self.disable()
-            try:
-                with torch.no_grad():
-                    all_outputs = self.stream_module(image)
-                    split_outputs, _ = self._split_outputs(all_outputs)
-                    spatial_output = split_outputs[planning_index]
-            finally:
-                if was_streaming:
-                    self.enable()
+            with torch.no_grad():
+                spatial_output = self._forward_single_output(
+                    image,
+                    result_on_cpu=False,
+                    output_index=planning_index,
+                    initialize_saliency=False,
+                )
 
             reducer_module = self._streaming_reducer_for_output(output_index)
             spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
