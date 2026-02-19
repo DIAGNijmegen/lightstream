@@ -707,9 +707,11 @@ class StreamingCNN(torch.nn.Module):
                         if isinstance(mod, _STREAMING_MODULE_TYPES):
                             mod.input_loc = input_loc
                             if isinstance(mod, StreamingGlobalReducer):
-                                mod.lost = self._get_tile_output_lost(planning_index)
-                                mod.output_stride = self._get_output_stride(planning_index)
-                                mod.data_loc = Box(output_y + lost.top, 0, output_x + lost.left, 0, sides)
+                                # Keep reducer-specific lost/output_stride values from
+                                # initialization statistics; overriding with planning
+                                # output values can mismatch reducer heads that originate
+                                # from different scales and break seen-index monotonicity.
+                                mod.data_loc = None
 
                     tile_output = self.stream_module(tile)
                     outputs, _ = self._split_outputs(tile_output)
