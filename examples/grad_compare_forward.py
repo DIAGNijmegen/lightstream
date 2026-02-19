@@ -205,7 +205,15 @@ def main() -> None:
         net_sp.stream_network.backward(image.detach().clone(), tuple(sp_grads))
         g_sp = _collect_grads(net_sp.stream_network.stream_module)
 
-        # normal reduced/raw
+        # normal reduced/raw (ensure wrappers are disabled after streaming debug passes)
+        net_sr.stream_network.disable()
+        net_sp.stream_network.disable()
+        n_reduced = net_sr.stream_network.stream_module
+        n_raw = net_sp.stream_network.stream_module
+        n_reduced.eval(); n_raw.eval()
+        _freeze_batchnorm(n_reduced)
+        _freeze_batchnorm(n_raw)
+
         _zero_grads(n_reduced)
         nr_out = _to_sequence(n_reduced(image.detach().clone().requires_grad_(True)))
         sum(_losses_reduced(nr_out, GlobalReducer().to(device=device, dtype=dtype), criterion)).backward()
