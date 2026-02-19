@@ -208,11 +208,11 @@ def main() -> None:
     # total_loss.backward()
 
     # build full grad tuple (no None)
-    output_grads = tuple(
-        out.grad if out.grad is not None else torch.zeros_like(out)
-        for out in stream_outputs
-    )
-    network.stream_network.backward(img, output_grads)
+    # output_grads = tuple(
+    #     out.grad if out.grad is not None else torch.zeros_like(out)
+    #     for out in stream_outputs
+    # )
+    #network.stream_network.backward(img, output_grads)
     # ====================
 
     # old =============================

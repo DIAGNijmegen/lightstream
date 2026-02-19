@@ -64,7 +64,7 @@ class WSS(nn.Module):
 
         y = self.w[0] * y1 + self.w[1] * y2 + self.w[2] * y3
 
-        return self.reducer(y1), self.reducer(y2), self.reducer(y3), y
+        return y1, y2, y3, y
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
