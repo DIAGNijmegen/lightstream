@@ -742,7 +742,7 @@ class StreamingCNN(torch.nn.Module):
                     relevant_output = trimmed_output[
                         :,
                         :,
-                        new_output_box.y : updated_total_indices.y + new_output_box.height,
+                        new_output_box.y : new_output_box.y + new_output_box.height,
                         new_output_box.x : new_output_box.x + new_output_box.width,
                     ]
 
@@ -876,7 +876,7 @@ class StreamingCNN(torch.nn.Module):
                         relevant_output = trimmed_output[
                             :,
                             :,
-                            new_output_box.y : updated_total_indices.y + new_output_box.height,
+                            new_output_box.y : new_output_box.y + new_output_box.height,
                             new_output_box.x : new_output_box.x + new_output_box.width,
                         ]
 
