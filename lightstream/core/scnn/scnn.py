@@ -1269,9 +1269,58 @@ class StreamingCNN(torch.nn.Module):
             image = image.to(self.device, non_blocking=True)
 
         grads, grad_structure = self._split_outputs(grad)
+        grads = list(grads)
 
         if len(grads) != self._output_count():
             raise ValueError("Gradient outputs do not match the number of model outputs.")
+
+        # Convert reducer-head gradients to their paired spatial-map gradients
+        # before replaying tiled backward. This avoids non-spatial replay order
+        # effects and aligns reducer training with post-reduce behavior.
+        for idx in range(self._output_count()):
+            grad_tensor = grads[idx]
+            if grad_tensor is None:
+                continue
+            if torch.count_nonzero(grad_tensor).item() == 0:
+                continue
+
+            output_shape = self._get_tile_output_shape(idx)
+            if len(output_shape) >= 4:
+                continue
+
+            planning_index = self._planning_output_index(idx)
+            if planning_index == idx:
+                continue
+
+            reducer_module = self._streaming_reducer_for_output(idx)
+            if reducer_module is None:
+                continue
+
+            for mod in self.stream_module.modules():
+                if isinstance(mod, _STREAMING_MODULE_TYPES):
+                    mod.reset()
+                    mod.input_loc = None
+                    if isinstance(mod, StreamingGlobalReducer):
+                        mod.data_loc = None
+
+            with torch.no_grad():
+                spatial_output = self._forward_single_output(
+                    image,
+                    result_on_cpu=False,
+                    output_index=planning_index,
+                    initialize_saliency=False,
+                )
+
+            spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad_tensor, reducer_module)
+            if spatial_grad is None:
+                continue
+
+            if grads[planning_index] is None:
+                grads[planning_index] = spatial_grad
+            else:
+                grads[planning_index] = grads[planning_index] + spatial_grad
+
+            grads[idx] = torch.zeros_like(grad_tensor)
 
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
