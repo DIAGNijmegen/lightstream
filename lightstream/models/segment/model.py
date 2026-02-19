@@ -40,17 +40,27 @@ class WSSRaw(_WSSBase):
 
 
 class WSSReduced(_WSSBase):
-    """Returns reduced heads and fused map: reduce(y1), reduce(y2), reduce(y3), y."""
+    """Returns reduced heads and fused map; optionally also raw maps for pairing/debug."""
 
-    def __init__(self, encoder: str, weights: str = "default", remove_last_block: bool = True):
+    def __init__(
+        self,
+        encoder: str,
+        weights: str = "default",
+        remove_last_block: bool = True,
+        include_raw_outputs: bool = False,
+    ):
         super().__init__(encoder, weights=weights, remove_last_block=remove_last_block)
         self.reducer1 = GlobalReducer()
         self.reducer2 = GlobalReducer()
         self.reducer3 = GlobalReducer()
+        self.include_raw_outputs = include_raw_outputs
 
     def forward(self, x):
         y1, y2, y3, y = self._forward_maps(x)
-        return self.reducer1(y1), self.reducer2(y2), self.reducer3(y3), y
+        reduced = (self.reducer1(y1), self.reducer2(y2), self.reducer3(y3), y)
+        if self.include_raw_outputs:
+            return (*reduced, y1, y2, y3)
+        return reduced
 
 
 # Backwards-compatible default

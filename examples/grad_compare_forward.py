@@ -71,7 +71,7 @@ def _compare_grads(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor], topk:
 
 
 def _losses_reduced(outputs: list[torch.Tensor], reducer: GlobalReducer, criterion: nn.Module) -> list[torch.Tensor]:
-    y1r, y2r, y3r, y = outputs
+    y1r, y2r, y3r, y = outputs[:4]
     return [
         criterion(y1r, torch.ones_like(y1r)),
         criterion(y2r, torch.ones_like(y2r)),

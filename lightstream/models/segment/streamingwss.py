@@ -38,13 +38,21 @@ class StreamingWSS(StreamingModule):
 
         model_cls = WSSReduced if model_kind == "reduced" else WSSRaw
 
+        model_kwargs = {
+            "encoder": encoder,
+            "weights": "default",
+            "remove_last_block": remove_last_block,
+        }
+        if model_kind == "reduced":
+            model_kwargs["include_raw_outputs"] = True
+
         if additional_modules is not None:
             stream_network = Sequential(
-                model_cls(encoder=encoder, weights="default", remove_last_block=remove_last_block),
+                model_cls(**model_kwargs),
                 additional_modules,
             )
         else:
-            stream_network = model_cls(encoder=encoder, weights="default", remove_last_block=remove_last_block)
+            stream_network = model_cls(**model_kwargs)
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
