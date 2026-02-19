@@ -112,7 +112,7 @@ def main() -> None:
         std=[1, 1, 1],
         normalize_on_gpu=False,
         saliency=True,
-        model_kind="reduced",
+        model_kind="raw",
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
