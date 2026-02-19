@@ -100,6 +100,7 @@ class StreamingCNN(torch.nn.Module):
         self._backward_seen_indices = {}
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._last_forward_outputs = None
         self._hooks = []
         self._output_structure = None
 
@@ -942,6 +943,10 @@ class StreamingCNN(torch.nn.Module):
                 if isinstance(mod, StreamingGlobalReducer):
                     mod.data_loc = None
 
+        # Cache the most recent forward outputs for backward utilities that
+        # need paired spatial tensors (e.g. reducer gradient mapping).
+        self._last_forward_outputs = outputs
+
         del image
         return self._restore_outputs(outputs, self._output_structure)
 
@@ -992,13 +997,22 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            with torch.no_grad():
-                spatial_output = self._forward_single_output(
-                    image,
-                    result_on_cpu=False,
-                    output_index=planning_index,
-                    initialize_saliency=False,
-                )
+            spatial_output = None
+            if hasattr(self, "_last_forward_outputs"):
+                cached = self._last_forward_outputs
+                if isinstance(cached, list) and planning_index < len(cached):
+                    candidate = cached[planning_index]
+                    if isinstance(candidate, torch.Tensor):
+                        spatial_output = candidate.to(self.device, non_blocking=True)
+
+            if spatial_output is None:
+                with torch.no_grad():
+                    spatial_output = self._forward_single_output(
+                        image,
+                        result_on_cpu=False,
+                        output_index=planning_index,
+                        initialize_saliency=False,
+                    )
 
             reducer_module = self._streaming_reducer_for_output(output_index)
             spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
@@ -1308,6 +1322,7 @@ class StreamingCNN(torch.nn.Module):
 
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._last_forward_outputs = None
 
         for mod in self.stream_module.modules():
             if isinstance(mod, _STREAMING_MODULE_TYPES):
