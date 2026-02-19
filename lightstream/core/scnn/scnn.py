@@ -958,11 +958,21 @@ class StreamingCNN(torch.nn.Module):
         eps = float(reducer_module.eps)
 
         probs = torch.sigmoid(spatial_output)
-        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-        scale = mean_p_r.pow((1.0 / r) - 1.0)
+        p_r = probs.pow(r)
+        mean_p_r_raw = p_r.mean(dim=(-2, -1), keepdim=True)
+        mean_p_r = mean_p_r_raw.clamp_min(eps)
 
-        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
-        scale = scale / numel
+        # d/dx clamp_min(x, eps) = 0 when x < eps, 1 otherwise.
+        clamp_mask = (mean_p_r_raw >= eps).to(mean_p_r.dtype)
+
+        # Match denominator used by StreamingGlobalReducer forward accumulation.
+        reducer_count = getattr(reducer_module, "_count", None)
+        if reducer_count is None or int(reducer_count) <= 0:
+            numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
+        else:
+            numel = float(int(reducer_count))
+
+        scale = (mean_p_r.pow((1.0 / r) - 1.0) * clamp_mask) / numel
 
         spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
         return spatial_grad
