@@ -958,10 +958,18 @@ class StreamingCNN(torch.nn.Module):
         eps = float(reducer_module.eps)
 
         probs = torch.sigmoid(spatial_output)
-        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-        scale = mean_p_r.pow((1.0 / r) - 1.0)
+        sum_p_r = getattr(reducer_module, "_sum_p_r", None)
+        count = getattr(reducer_module, "_count", None)
 
-        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
+        if sum_p_r is not None and count is not None and int(count) > 0:
+            mean_p_r = (sum_p_r / float(count)).to(spatial_output.device, spatial_output.dtype)
+            mean_p_r = mean_p_r[:, :, None, None].clamp_min(eps)
+            numel = float(count)
+        else:
+            mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+            numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
+
+        scale = mean_p_r.pow((1.0 / r) - 1.0)
         scale = scale / numel
 
         spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
