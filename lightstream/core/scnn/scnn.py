@@ -1286,6 +1286,43 @@ class StreamingCNN(torch.nn.Module):
         if len(grads) != self._output_count():
             raise ValueError("Gradient outputs do not match the number of model outputs.")
 
+        # Normalize non-spatial reducer gradients into paired spatial gradients
+        # before tile replay so reducer-enabled and post-reduce variants use the
+        # same spatial backward path.
+        if grad_structure == self._output_structure and hasattr(self, "_last_forward_outputs"):
+            cached = self._last_forward_outputs
+            if isinstance(cached, list) and len(cached) == len(grads):
+                normalized_grads = list(grads)
+                for idx, grad_tensor in enumerate(grads):
+                    if grad_tensor is None:
+                        continue
+                    output_shape = self._get_tile_output_shape(idx)
+                    if len(output_shape) >= 4:
+                        continue
+
+                    planning_index = self._planning_output_index(idx)
+                    if planning_index == idx or planning_index >= len(cached):
+                        continue
+
+                    spatial_output = cached[planning_index]
+                    if not isinstance(spatial_output, torch.Tensor):
+                        continue
+
+                    reducer_module = self._streaming_reducer_for_output(idx)
+                    spatial_grad = self._reducer_grad_to_spatial(
+                        spatial_output.to(self.device, non_blocking=True),
+                        grad_tensor,
+                        reducer_module,
+                    )
+                    if spatial_grad is None:
+                        continue
+
+                    existing = normalized_grads[planning_index]
+                    normalized_grads[planning_index] = spatial_grad if existing is None else (existing + spatial_grad)
+                    normalized_grads[idx] = torch.zeros_like(grad_tensor)
+
+                grads = normalized_grads
+
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
         elif grad_structure == self._output_structure:
