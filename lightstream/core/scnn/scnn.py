@@ -983,13 +983,18 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            with torch.no_grad():
-                spatial_output = self._forward_single_output(
-                    image,
-                    result_on_cpu=False,
-                    output_index=planning_index,
-                    initialize_saliency=False,
-                )
+            # Build paired spatial output in non-streaming mode for stable reducer->spatial mapping.
+            was_streaming = self._is_streaming
+            if was_streaming:
+                self.disable()
+            try:
+                with torch.no_grad():
+                    all_outputs = self.stream_module(image)
+                    split_outputs, _ = self._split_outputs(all_outputs)
+                    spatial_output = split_outputs[planning_index]
+            finally:
+                if was_streaming:
+                    self.enable()
 
             reducer_module = self._streaming_reducer_for_output(output_index)
             spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
