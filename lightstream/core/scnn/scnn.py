@@ -957,24 +957,19 @@ class StreamingCNN(torch.nn.Module):
         r = float(reducer_module.r)
         eps = float(reducer_module.eps)
 
-        probs = torch.sigmoid(spatial_output)
-        p_r = probs.pow(r)
-        mean_p_r_raw = p_r.mean(dim=(-2, -1), keepdim=True)
-        mean_p_r = mean_p_r_raw.clamp_min(eps)
-
-        # d/dx clamp_min(x, eps) = 0 when x < eps, 1 otherwise.
-        clamp_mask = (mean_p_r_raw >= eps).to(mean_p_r.dtype)
-
-        # Match denominator used by StreamingGlobalReducer forward accumulation.
-        reducer_count = getattr(reducer_module, "_count", None)
-        if reducer_count is None or int(reducer_count) <= 0:
-            numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
-        else:
-            numel = float(int(reducer_count))
-
-        scale = (mean_p_r.pow((1.0 / r) - 1.0) * clamp_mask) / numel
-
-        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
+        # Use autograd to mirror GlobalReducer derivative exactly, including
+        # clamp_min behavior and broadcasting, instead of a manual formula.
+        with torch.enable_grad():
+            proxy = spatial_output.detach().requires_grad_(True)
+            reduced = torch.sigmoid(proxy).pow(r).mean(dim=(-2, -1)).clamp_min(eps).pow(1.0 / r)
+            spatial_grad = torch.autograd.grad(
+                outputs=reduced,
+                inputs=proxy,
+                grad_outputs=reducer_grad,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
         return spatial_grad
 
     def _backward_single_output(self, image, grad, output_index=0):
