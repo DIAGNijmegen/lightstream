@@ -985,10 +985,6 @@ class StreamingCNN(torch.nn.Module):
         if reducer_module is None:
             return None
 
-        cached_logits = getattr(reducer_module, "_last_logits", None)
-        if isinstance(cached_logits, torch.Tensor) and cached_logits.ndim >= 4:
-            return cached_logits.detach()
-
         original_forward = reducer_module.forward
 
         def _identity_forward(self, logits):
