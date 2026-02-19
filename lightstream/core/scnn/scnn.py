@@ -1007,6 +1007,12 @@ class StreamingCNN(torch.nn.Module):
             if planning_index == output_index:
                 raise ValueError("Non-spatial output does not have a paired spatial planning output for backward.")
 
+            # Some call sites pre-convert reducer gradients to spatial map gradients.
+            # If so, bypass reducer expansion and directly replay backward on the
+            # paired spatial output branch.
+            if isinstance(grad, torch.Tensor) and grad.ndim >= 4:
+                return self._backward_single_output(image, grad, output_index=planning_index)
+
             # Reconstruct paired spatial output and convert reducer gradient to spatial gradient.
             for mod in self.stream_module.modules():
                 if isinstance(mod, _STREAMING_MODULE_TYPES):
