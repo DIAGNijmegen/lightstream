@@ -1340,10 +1340,13 @@ class StreamingCNN(torch.nn.Module):
             if spatial_grad is None:
                 continue
 
-            # Route the reducer-head gradient back through the same output slot,
-            # now represented as the reducer input map.
-            if grads[idx] is None:
-                grads[idx] = spatial_grad
+            planning_index = self._planning_output_index(idx)
+            if planning_index != idx and len(self._get_tile_output_shape(planning_index)) >= 4:
+                if grads[planning_index] is None:
+                    grads[planning_index] = spatial_grad
+                else:
+                    grads[planning_index] = grads[planning_index] + spatial_grad
+                grads[idx] = torch.zeros_like(grad_tensor)
             else:
                 grads[idx] = spatial_grad
 
