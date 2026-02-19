@@ -213,7 +213,17 @@ class StreamingCNN(torch.nn.Module):
                 self.tile_gradient_lost.append(self._non_max_border_amount(tile_grad))
 
             tile.grad = None
-            torch.autograd.backward(outputs, grad_tensors=gradients)
+            # Non-spatial outputs (e.g., reducer heads) should not contribute
+            # to module-level border/stride statistics: they can skew lost
+            # estimates for shared spatial branches during initialization.
+            stats_gradients = []
+            for out, gradient in zip(outputs, gradients):
+                if out.ndim < 4:
+                    stats_gradients.append(torch.zeros_like(gradient))
+                else:
+                    stats_gradients.append(gradient)
+
+            torch.autograd.backward(outputs, grad_tensors=stats_gradients)
 
         # Calculate the output stride of the whole stream_module
         if len(outputs) == 1:
