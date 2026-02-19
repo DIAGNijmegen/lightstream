@@ -326,9 +326,9 @@ def main() -> None:
             "streaming global reduce": (stream_grads_heads, normal_grads_heads),
             "streaming post reduce": (stream_grads_post, normal_grads_post),
         }.items():
-            mm, nn = _compare_grads(a, b, args.backward_topk, title=key)
+            mm, grad_name = _compare_grads(a, b, args.backward_topk, title=key)
             if mm > worst_mean:
-                worst_mean, worst_name = mm, nn
+                worst_mean, worst_name = mm, grad_name
 
         bnames = list(backward_sets.keys())
         for i in range(len(bnames)):
