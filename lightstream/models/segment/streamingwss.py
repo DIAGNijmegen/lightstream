@@ -7,7 +7,7 @@ from torch.nn import Sequential
 
 from torchvision.models import resnet18, resnet34, resnet50
 from lightstream.modules.streaming import StreamingModule
-from lightstream.models.segment.model import WSS
+from lightstream.models.segment.model import WSSRaw, WSSReduced
 
 
 class StreamingWSS(StreamingModule):
@@ -26,19 +26,22 @@ class StreamingWSS(StreamingModule):
         mean: list | None = None,
         std: list | None = None,
         tile_cache_path=None,
+        model_kind: str = "reduced",
     ):
         model_choices = self.get_model_choices()
 
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
+        model_cls = WSSReduced if model_kind == "reduced" else WSSRaw
+
         if additional_modules is not None:
             stream_network = Sequential(
-                WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block),
+                model_cls(encoder=encoder, weights="default", remove_last_block=remove_last_block),
                 additional_modules,
             )
         else:
-            stream_network = WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block)
+            stream_network = model_cls(encoder=encoder, weights="default", remove_last_block=remove_last_block)
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
