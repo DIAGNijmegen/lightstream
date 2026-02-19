@@ -116,6 +116,7 @@ def _loss_grads_for_outputs(
     losses_builder,
     reducer: GlobalReducer,
     criterion: nn.Module,
+    required_grad_indices: set[int],
 ) -> list[torch.Tensor]:
     prepared: list[torch.Tensor] = []
     for out in outputs:
@@ -130,8 +131,7 @@ def _loss_grads_for_outputs(
     for idx, out in enumerate(prepared):
         grad = out.grad
         if grad is None:
-            # Only first 4 outputs are required by the streaming backward contract here.
-            if idx < 4:
+            if idx in required_grad_indices:
                 raise RuntimeError(f"Missing required output gradient at index {idx}.")
             grad = torch.zeros_like(out)
         grads.append(grad)
@@ -214,7 +214,7 @@ def main() -> None:
         stream_input_a = image.detach().clone()
         stream_outputs_a = _to_sequence(network(stream_input_a))
         reducer_a = GlobalReducer().to(device=device, dtype=dtype)
-        grads_a = _loss_grads_for_outputs(stream_outputs_a, _losses_model_heads, reducer_a, criterion)
+        grads_a = _loss_grads_for_outputs(stream_outputs_a, _losses_model_heads, reducer_a, criterion, {0, 1, 2, 3})
         network.stream_network.backward(stream_input_a, tuple(grads_a))
         stream_grads_heads = _collect_grads(network.stream_network.stream_module)
 
@@ -224,7 +224,7 @@ def main() -> None:
         stream_input_b = image.detach().clone()
         stream_outputs_b = _to_sequence(network(stream_input_b))
         reducer_b = GlobalReducer().to(device=device, dtype=dtype)
-        grads_b = _loss_grads_for_outputs(stream_outputs_b, _losses_post_reduce_maps, reducer_b, criterion)
+        grads_b = _loss_grads_for_outputs(stream_outputs_b, _losses_post_reduce_maps, reducer_b, criterion, {3, 4, 5, 6})
         network.stream_network.backward(stream_input_b, tuple(grads_b))
         stream_grads_post = _collect_grads(network.stream_network.stream_module)
 
