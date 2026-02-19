@@ -65,10 +65,13 @@ class StreamingUpsampleF(torch.autograd.Function):
             ctx.seen_indices.width = updated_total_indices.width
             ctx.seen_indices.sides = updated_total_indices.sides
 
-            # We keep tracking seen indices/lost borders for statistics, but
-            # propagate grad_input from the full grad_output to mirror
-            # StreamingConv2d behavior (which does not mask grad_input).
-            del new_output_box
+            dedup_grad = torch.zeros_like(grad_output)
+            if new_output_box.height > 0 and new_output_box.width > 0:
+                y0 = lost_top + new_output_box.y
+                y1 = y0 + new_output_box.height
+                x0 = lost_left + new_output_box.x
+                x1 = x0 + new_output_box.width
+                dedup_grad[:, :, y0:y1, x0:x1] = grad_output[:, :, y0:y1, x0:x1]
 
             # interpolate backward is not equivalent to interpolate downsample,
             # so compute grad_input through autograd on interpolate directly.
@@ -84,7 +87,7 @@ class StreamingUpsampleF(torch.autograd.Function):
                 grad_in = torch.autograd.grad(
                     outputs=proxy_output,
                     inputs=proxy_input,
-                    grad_outputs=grad_output,
+                    grad_outputs=dedup_grad,
                     retain_graph=False,
                     create_graph=False,
                     allow_unused=False,
