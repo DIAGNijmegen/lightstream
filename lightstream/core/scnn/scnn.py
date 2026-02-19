@@ -985,6 +985,10 @@ class StreamingCNN(torch.nn.Module):
         if reducer_module is None:
             return None
 
+        cached_logits = getattr(reducer_module, "_last_logits", None)
+        if isinstance(cached_logits, torch.Tensor) and cached_logits.ndim >= 4:
+            return cached_logits.detach()
+
         original_forward = reducer_module.forward
 
         def _identity_forward(self, logits):
@@ -1330,18 +1334,8 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            planning_index = self._planning_output_index(idx)
-            spatial_output = None
-            if (
-                self._last_forward_outputs is not None
-                and planning_index < len(self._last_forward_outputs)
-                and isinstance(self._last_forward_outputs[planning_index], torch.Tensor)
-                and self._last_forward_outputs[planning_index].ndim >= 4
-            ):
-                spatial_output = self._last_forward_outputs[planning_index].detach()
-            else:
-                with torch.no_grad():
-                    spatial_output = self._reducer_input_spatial_output(image, idx)
+            with torch.no_grad():
+                spatial_output = self._reducer_input_spatial_output(image, idx)
 
             if spatial_output is None:
                 continue

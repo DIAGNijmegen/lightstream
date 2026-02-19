@@ -35,6 +35,7 @@ class StreamingGlobalReducer(torch.nn.Module):
         self._sum_compensation = None
         self._count = 0
         self.data_loc = None
+        self._last_logits = None
 
     def _sum_unseen(self, probs: Tensor):
         if self.input_loc is None or self.input_loc.sides is None:
@@ -90,6 +91,10 @@ class StreamingGlobalReducer(torch.nn.Module):
     def forward(self, logits: Tensor) -> Tensor:
         if logits.ndim != 4:
             raise ValueError(f"Expected logits to be NCHW, got shape {tuple(logits.shape)}")
+
+        # Keep the latest reducer input map from the current streaming forward.
+        # Backward can reuse this exact tensor to avoid replay/pairing drift.
+        self._last_logits = logits.detach()
 
         probs = torch.sigmoid(logits)
         sum_p_r, count = self._sum_unseen(probs)
