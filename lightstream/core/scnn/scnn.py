@@ -1330,8 +1330,18 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            with torch.no_grad():
-                spatial_output = self._reducer_input_spatial_output(image, idx)
+            planning_index = self._planning_output_index(idx)
+            spatial_output = None
+            if (
+                self._last_forward_outputs is not None
+                and planning_index < len(self._last_forward_outputs)
+                and isinstance(self._last_forward_outputs[planning_index], torch.Tensor)
+                and self._last_forward_outputs[planning_index].ndim >= 4
+            ):
+                spatial_output = self._last_forward_outputs[planning_index].detach()
+            else:
+                with torch.no_grad():
+                    spatial_output = self._reducer_input_spatial_output(image, idx)
 
             if spatial_output is None:
                 continue
@@ -1340,7 +1350,6 @@ class StreamingCNN(torch.nn.Module):
             if spatial_grad is None:
                 continue
 
-            planning_index = self._planning_output_index(idx)
             if planning_index != idx and len(self._get_tile_output_shape(planning_index)) >= 4:
                 if grads[planning_index] is None:
                     grads[planning_index] = spatial_grad
