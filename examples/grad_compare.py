@@ -90,6 +90,7 @@ def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _zero_grads(parameters: Iterable[torch.nn.Parameter]) -> None:
+    # Should be replaced by model.zero_grad()
     for param in parameters:
         if param.grad is not None:
             param.grad.detach_()
