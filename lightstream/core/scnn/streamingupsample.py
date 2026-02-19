@@ -53,8 +53,12 @@ class StreamingUpsampleF(torch.autograd.Function):
             stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
             stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
 
-            data_loc_y = int(math.floor(ctx.input_loc.y / stride_y)) + lost_top
-            data_loc_x = int(math.floor(ctx.input_loc.x / stride_x)) + lost_left
+            # Use stable floor division for fractional output strides.
+            # Tiny floating-point boundary errors (common with large upsample
+            # factors) can shift dedup indices by one pixel.
+            eps = 1e-9
+            data_loc_y = int(math.floor((float(ctx.input_loc.y) / stride_y) + eps)) + lost_top
+            data_loc_x = int(math.floor((float(ctx.input_loc.x) / stride_x) + eps)) + lost_left
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
