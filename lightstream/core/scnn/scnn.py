@@ -5,6 +5,7 @@ MIT License
 import math
 import copy
 import contextlib
+import types
 from typing import List
 
 import numpy as np
@@ -976,6 +977,27 @@ class StreamingCNN(torch.nn.Module):
 
         return spatial_grad
 
+    def _reducer_input_spatial_output(self, image, output_index):
+        reducer_module = self._streaming_reducer_for_output(output_index)
+        if reducer_module is None:
+            return None
+
+        original_forward = reducer_module.forward
+
+        def _identity_forward(self, logits):
+            return logits
+
+        reducer_module.forward = types.MethodType(_identity_forward, reducer_module)
+        try:
+            return self._forward_single_output(
+                image,
+                result_on_cpu=False,
+                output_index=output_index,
+                initialize_saliency=False,
+            )
+        finally:
+            reducer_module.forward = original_forward
+
     def _backward_single_output(self, image, grad, output_index=0):
         grad = grad
 
@@ -1288,10 +1310,6 @@ class StreamingCNN(torch.nn.Module):
             if len(output_shape) >= 4:
                 continue
 
-            planning_index = self._planning_output_index(idx)
-            if planning_index == idx:
-                continue
-
             reducer_module = self._streaming_reducer_for_output(idx)
             if reducer_module is None:
                 continue
@@ -1304,23 +1322,21 @@ class StreamingCNN(torch.nn.Module):
                         mod.data_loc = None
 
             with torch.no_grad():
-                spatial_output = self._forward_single_output(
-                    image,
-                    result_on_cpu=False,
-                    output_index=planning_index,
-                    initialize_saliency=False,
-                )
+                spatial_output = self._reducer_input_spatial_output(image, idx)
+
+            if spatial_output is None:
+                continue
 
             spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad_tensor, reducer_module)
             if spatial_grad is None:
                 continue
 
-            if grads[planning_index] is None:
-                grads[planning_index] = spatial_grad
+            # Route the reducer-head gradient back through the same output slot,
+            # now represented as the reducer input map.
+            if grads[idx] is None:
+                grads[idx] = spatial_grad
             else:
-                grads[planning_index] = grads[planning_index] + spatial_grad
-
-            grads[idx] = torch.zeros_like(grad_tensor)
+                grads[idx] = spatial_grad
 
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
