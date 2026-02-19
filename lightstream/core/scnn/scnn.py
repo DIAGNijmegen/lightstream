@@ -954,25 +954,26 @@ class StreamingCNN(torch.nn.Module):
         if reducer_module is None:
             return None
 
-        r = float(reducer_module.r)
-        eps = float(reducer_module.eps)
+        # Use exact autograd through the same reducer function to avoid
+        # analytical/normalization drift between streaming and non-streaming
+        # backward paths (especially around generalized-mean scaling).
+        reducer = GlobalReducer(r=float(reducer_module.r), eps=float(reducer_module.eps)).to(
+            spatial_output.device,
+            dtype=spatial_output.dtype,
+        )
 
-        probs = torch.sigmoid(spatial_output)
-        sum_p_r = getattr(reducer_module, "_sum_p_r", None)
-        count = getattr(reducer_module, "_count", None)
+        with torch.enable_grad():
+            proxy_output = spatial_output.detach().requires_grad_(True)
+            reduced = reducer(proxy_output)
+            spatial_grad = torch.autograd.grad(
+                outputs=reduced,
+                inputs=proxy_output,
+                grad_outputs=reducer_grad,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
 
-        if sum_p_r is not None and count is not None and int(count) > 0:
-            mean_p_r = (sum_p_r / float(count)).to(spatial_output.device, spatial_output.dtype)
-            mean_p_r = mean_p_r[:, :, None, None].clamp_min(eps)
-            numel = float(count)
-        else:
-            mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-            numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
-
-        scale = mean_p_r.pow((1.0 / r) - 1.0)
-        scale = scale / numel
-
-        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
         return spatial_grad
 
     def _backward_single_output(self, image, grad, output_index=0):
