@@ -109,6 +109,16 @@ def _configure_stream_model(net: StreamingWSS, device: torch.device, dtype: torc
     _freeze_batchnorm(net.stream_network.stream_module)
 
 
+
+
+def _sync_raw_reduced_weights(reduced_net: nn.Module, raw_net: nn.Module) -> None:
+    """Copy shared decoder/backbone weights so raw/reduced variants are comparable."""
+    reduced_state = reduced_net.state_dict()
+    raw_state = raw_net.state_dict()
+    shared = {k: v for k, v in reduced_state.items() if k in raw_state}
+    raw_state.update(shared)
+    raw_net.load_state_dict(raw_state)
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--encoder", default="resnet18")
@@ -150,6 +160,12 @@ def main() -> None:
     for net in nets.values():
         _configure_stream_model(net, device, dtype)
 
+    # Ensure reduced/raw variants start from identical shared weights.
+    _sync_raw_reduced_weights(
+        nets["streaming global reduce"].stream_network.stream_module,
+        nets["streaming post reduce"].stream_network.stream_module,
+    )
+
     with torch.no_grad():
         s_reduced_out = _to_sequence(nets["streaming global reduce"](image))
         s_raw_out = _to_sequence(nets["streaming post reduce"](image))
@@ -159,6 +175,7 @@ def main() -> None:
         net.stream_network.disable()
     n_reduced = nets["streaming global reduce"].stream_network.stream_module
     n_raw = nets["streaming post reduce"].stream_network.stream_module
+    _sync_raw_reduced_weights(n_reduced, n_raw)
     _freeze_batchnorm(n_reduced)
     _freeze_batchnorm(n_raw)
     n_reduced.eval(); n_raw.eval()
