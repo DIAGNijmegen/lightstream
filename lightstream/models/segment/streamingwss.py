@@ -30,6 +30,9 @@ class StreamingWSS(StreamingModule):
     ):
         model_choices = self.get_model_choices()
 
+        if model_kind not in {"reduced", "raw"}:
+            raise ValueError("model_kind must be one of: reduced, raw")
+
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
@@ -49,7 +52,7 @@ class StreamingWSS(StreamingModule):
             std = [0.229, 0.224, 0.225]
 
         if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+            tile_cache_path = Path.cwd() / Path(f"{encoder}_{model_kind}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
 
         super().__init__(
             stream_network,

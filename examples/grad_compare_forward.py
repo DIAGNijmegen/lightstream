@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -123,9 +124,28 @@ def main() -> None:
     dtype = _parse_dtype(args.dtype)
     image = torch.rand((1, 3, args.input_size, args.input_size), device=device, dtype=dtype)
 
+    cache_root = Path(__file__).parent
     nets = {
-        "streaming global reduce": StreamingWSS(args.encoder, args.tile_size, mean=[0, 0, 0], std=[1, 1, 1], normalize_on_gpu=False, saliency=False, model_kind="reduced").to(device=device, dtype=dtype),
-        "streaming post reduce": StreamingWSS(args.encoder, args.tile_size, mean=[0, 0, 0], std=[1, 1, 1], normalize_on_gpu=False, saliency=False, model_kind="raw").to(device=device, dtype=dtype),
+        "streaming global reduce": StreamingWSS(
+            args.encoder,
+            args.tile_size,
+            mean=[0, 0, 0],
+            std=[1, 1, 1],
+            normalize_on_gpu=False,
+            saliency=False,
+            model_kind="reduced",
+            tile_cache_path=cache_root / f"{args.encoder}_reduced_tile_cache_1_3_{args.tile_size}_{args.tile_size}",
+        ).to(device=device, dtype=dtype),
+        "streaming post reduce": StreamingWSS(
+            args.encoder,
+            args.tile_size,
+            mean=[0, 0, 0],
+            std=[1, 1, 1],
+            normalize_on_gpu=False,
+            saliency=False,
+            model_kind="raw",
+            tile_cache_path=cache_root / f"{args.encoder}_raw_tile_cache_1_3_{args.tile_size}_{args.tile_size}",
+        ).to(device=device, dtype=dtype),
     }
     for net in nets.values():
         _configure_stream_model(net, device, dtype)
