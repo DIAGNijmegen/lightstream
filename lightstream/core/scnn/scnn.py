@@ -210,7 +210,13 @@ class StreamingCNN(torch.nn.Module):
                 gradients.append(gradient)
 
             self.tile_gradient_lost = []
+            spatial_tile_lost = {}
             for idx, (out, gradient) in enumerate(zip(outputs, gradients)):
+                if out.ndim < 4:
+                    # Non-spatial outputs (e.g. reducer heads) are mapped to their
+                    # paired spatial planning outputs for gradient replay.
+                    continue
+
                 tile_grad = torch.autograd.grad(
                     out,
                     tile,
@@ -221,10 +227,25 @@ class StreamingCNN(torch.nn.Module):
                     create_graph=False,
                     allow_unused=False,
                 )[0]
-                self.tile_gradient_lost.append(self._non_max_border_amount(tile_grad))
+                spatial_tile_lost[idx] = self._non_max_border_amount(tile_grad)
+
+            # Build per-output gradient lost list, reusing paired spatial lost
+            # for non-spatial outputs.
+            for idx, out in enumerate(outputs):
+                if out.ndim >= 4:
+                    self.tile_gradient_lost.append(spatial_tile_lost[idx])
+                else:
+                    planning_idx = self._planning_output_index(idx)
+                    self.tile_gradient_lost.append(spatial_tile_lost.get(planning_idx, Lost(0, 0, 0, 0)))
 
             tile.grad = None
-            torch.autograd.backward(outputs, grad_tensors=gradients)
+            # Populate module-level backward statistics from spatial outputs only.
+            # Including non-spatial reducer heads can skew upsample grad-lost
+            # geometry because their gradients are value-shaped (sigmoid/power)
+            # instead of pure valid-region masks.
+            spatial_outs = [out for out in outputs if out.ndim >= 4]
+            spatial_grads = [g for out, g in zip(outputs, gradients) if out.ndim >= 4]
+            torch.autograd.backward(spatial_outs, grad_tensors=spatial_grads)
 
         # Calculate the output stride of the whole stream_module
         if len(outputs) == 1:
