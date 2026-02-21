@@ -499,6 +499,17 @@ class StreamingCNN(torch.nn.Module):
     def _floor_div(self, numerator, denominator):
         return int(math.floor(float(numerator) / float(denominator)))
 
+    def _stable_tile_index(self, coord, stride):
+        stride_f = float(stride)
+        if stride_f <= 0:
+            raise ValueError(f"stride must be > 0, got {stride_f}")
+
+        stride_i = int(round(stride_f))
+        if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-3:
+            return int(coord) // stride_i
+
+        return int(math.floor((float(coord) / stride_f) + 1e-6))
+
     def _mul_stride(self, value, stride):
         return int(round(float(value) * float(stride)))
 
@@ -1754,13 +1765,18 @@ class StreamingCNN(torch.nn.Module):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = self._floor_div(input_loc.y, stride_y) + lost_top
-        data_loc_x = self._floor_div(input_loc.x, stride_x) + lost_left
+        data_loc_y = self._stable_tile_index(input_loc.y, stride_y) + lost_top
+        data_loc_x = self._stable_tile_index(input_loc.x, stride_x) + lost_left
 
+        old_value_indices = self.saliency_old_indices
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
+        if data_loc.x > old_value_indices.x and not sides.left:
+            data_loc = Box(data_loc.y, data_loc.height, old_value_indices.x, data_loc.width, data_loc.sides)
+        if data_loc.y > old_value_indices.y and not sides.top:
+            data_loc = Box(old_value_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
+
         # Calculate which part of the gradient is 'new'
-        old_value_indices = self.saliency_old_indices
         new_output_box, updated_total_indices = _new_value_indices(
             valid_grad.shape, data_loc, old_value_indices
         )
