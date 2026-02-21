@@ -85,12 +85,13 @@ def _new_value_indices(data_shape, data_indices, old_value_indices):
     data_y = int(data_indices.y)
     data_x = int(data_indices.x)
 
-    # Guard against tiny positive coordinate drift (e.g. float/rounding
-    # accumulation across many tiles). Treat forward jumps as contiguous from
-    # the already seen frontier instead of asserting.
-    if data_x > old_values_x:
+    # Guard only tiny +1 jitter from numeric mapping drift.
+    # Clamping larger forward jumps can hide real geometry mismatches and
+    # under-count unseen regions (causing gradient bias).
+    drift_tol = 1
+    if data_x > old_values_x and (data_x - old_values_x) <= drift_tol:
         data_x = int(old_values_x)
-    if data_y > old_values_y:
+    if data_y > old_values_y and (data_y - old_values_y) <= drift_tol:
         data_y = int(old_values_y)
 
     # Check x-axis:
