@@ -7,6 +7,20 @@ from torch.amp import custom_bwd, custom_fwd
 from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM, _new_value_indices
 
 
+def _stable_tile_index(coord: int, stride: float) -> int:
+    """Map input coordinates to output coordinates without float drift."""
+    stride_f = float(stride)
+    if stride_f <= 0:
+        raise ValueError(f"stride must be > 0, got {stride_f}")
+
+    stride_i = int(round(stride_f))
+    if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-6:
+        return int(coord) // stride_i
+
+    # Fallback for genuinely non-integer strides.
+    return int(math.floor((float(coord) / stride_f) + 1e-6))
+
+
 class StreamingGlobalReducerF(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
@@ -38,9 +52,8 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             else:
                 stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
                 stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
-                eps_floor = 1e-9
-                data_loc_y = int(math.floor((float(input_loc.y) / stride_y) + eps_floor)) + lost_top
-                data_loc_x = int(math.floor((float(input_loc.x) / stride_x) + eps_floor)) + lost_left
+                data_loc_y = _stable_tile_index(input_loc.y, stride_y) + lost_top
+                data_loc_x = _stable_tile_index(input_loc.x, stride_x) + lost_left
                 cur_data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_shape, cur_data_loc, seen_indices)
