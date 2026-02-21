@@ -77,8 +77,12 @@ class StreamingConv2dF(torch.autograd.Function):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = int(input_loc.y // output_stride[1]) + lost_top
-        data_loc_x = int(input_loc.x // output_stride[2]) + lost_left
+        # output_stride is tracked as floating tensor values. For large spatial
+        # coordinates, floor division on floats can introduce off-by-one index
+        # drift (e.g. x/stride ~= N+1e-7), which breaks monotonic tiling
+        # assumptions in _new_value_indices. Use rounded integer mapping.
+        data_loc_y = int(round(float(input_loc.y) / float(output_stride[1]))) + lost_top
+        data_loc_x = int(round(float(input_loc.x) / float(output_stride[2]))) + lost_left
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 

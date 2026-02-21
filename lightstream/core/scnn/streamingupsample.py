@@ -53,8 +53,10 @@ class StreamingUpsampleF(torch.autograd.Function):
             stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
             stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
 
-            data_loc_y = int(math.floor(ctx.input_loc.y / stride_y)) + lost_top
-            data_loc_x = int(math.floor(ctx.input_loc.x / stride_x)) + lost_left
+            # Keep coordinate mapping consistent with StreamingConv2d and avoid
+            # float floor drift on large coordinates.
+            data_loc_y = int(round(float(ctx.input_loc.y) / float(stride_y))) + lost_top
+            data_loc_x = int(round(float(ctx.input_loc.x) / float(stride_x))) + lost_left
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
