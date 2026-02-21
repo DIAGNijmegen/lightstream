@@ -59,6 +59,8 @@ class StreamingGlobalReducerF(torch.autograd.Function):
 
             if input_loc.sides.left:
                 cur_data_loc = Box(cur_data_loc.y, cur_data_loc.height, 0, cur_data_loc.width, cur_data_loc.sides)
+                if not input_loc.sides.top:
+                    cur_data_loc = Box(seen_indices.height, cur_data_loc.height, cur_data_loc.x, cur_data_loc.width, cur_data_loc.sides)
 
             # Guard against tiny numeric drift causing synthetic gaps between
             # tiles (which triggers `_new_value_indices` assertions).
