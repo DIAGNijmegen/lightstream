@@ -1796,12 +1796,16 @@ class StreamingCNN(torch.nn.Module):
                 new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
             ]
 
+            target_y_start = updated_total_indices.y * stride[1]
+            target_y_end = target_y_start + relevant_input_grad.shape[2]
+            target_x_end = updated_total_indices.x * stride[2]
+            target_x_start = target_x_end - relevant_input_grad.shape[3]
+
             self.saliency_map[
                 :,
                 :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
+                target_y_start:target_y_end,
+                target_x_start:target_x_end,
             ] = relevant_input_grad.detach().cpu()
 
             del relevant_input_grad
