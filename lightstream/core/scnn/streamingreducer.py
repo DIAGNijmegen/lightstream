@@ -14,7 +14,8 @@ def _stable_tile_index(coord: int, stride: float) -> int:
         raise ValueError(f"stride must be > 0, got {stride_f}")
 
     stride_i = int(round(stride_f))
-    if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-6:
+    # Allow small quantization drift from autocast/float16 tensors.
+    if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-3:
         return int(coord) // stride_i
 
     # Fallback for genuinely non-integer strides.
@@ -55,6 +56,14 @@ class StreamingGlobalReducerF(torch.autograd.Function):
                 data_loc_y = _stable_tile_index(input_loc.y, stride_y) + lost_top
                 data_loc_x = _stable_tile_index(input_loc.x, stride_x) + lost_left
                 cur_data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+            # Guard against tiny numeric drift causing synthetic gaps between
+            # tiles (which triggers `_new_value_indices` assertions).
+            # We only clamp when we are not starting a new row/column.
+            if cur_data_loc.x > seen_indices.x and not input_loc.sides.left:
+                cur_data_loc = Box(cur_data_loc.y, cur_data_loc.height, seen_indices.x, cur_data_loc.width, cur_data_loc.sides)
+            if cur_data_loc.y > seen_indices.y and not input_loc.sides.top:
+                cur_data_loc = Box(seen_indices.y, cur_data_loc.height, cur_data_loc.x, cur_data_loc.width, cur_data_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_shape, cur_data_loc, seen_indices)
 
