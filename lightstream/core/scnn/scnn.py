@@ -872,26 +872,33 @@ class StreamingCNN(torch.nn.Module):
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        iterator = range(n_rows)
+        step_y = max(self._floor_div(valid_grad_height, stride_y), 1)
+        step_x = max(self._floor_div(valid_grad_width, stride_x), 1)
 
-        for row in iterator:
-            for col in range(n_cols):
-                output_y = self._floor_div(row * valid_grad_height, stride_y)
-                output_x = self._floor_div(col * valid_grad_width, stride_x)
+        max_y = max(grad.shape[H_DIM] - output_height, 0)
+        max_x = max(grad.shape[W_DIM] - output_width, 0)
 
-                sides_top = True if row == 0 else False
-                sides_left = True if col == 0 else False
+        row_positions = []
+        for row in range(n_rows):
+            pos = min(row * step_y, max_y)
+            if len(row_positions) == 0 or pos != row_positions[-1]:
+                row_positions.append(pos)
 
-                sides_bottom = True if output_y + output_height >= grad.shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= grad.shape[W_DIM] else False
+        col_positions = []
+        for col in range(n_cols):
+            pos = min(col * step_x, max_x)
+            if len(col_positions) == 0 or pos != col_positions[-1]:
+                col_positions.append(pos)
+
+        for row_idx, output_y in enumerate(row_positions):
+            for col_idx, output_x in enumerate(col_positions):
+                sides_top = row_idx == 0
+                sides_left = col_idx == 0
+                sides_bottom = row_idx == len(row_positions) - 1
+                sides_right = col_idx == len(col_positions) - 1
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 lost = self._get_tile_lost_for_sides(sides, output_index)
-
-                if sides_bottom:
-                    output_y = max(grad.shape[H_DIM] - output_height, 0)
-                if sides_right:
-                    output_x = max(grad.shape[W_DIM] - output_width, 0)
 
                 input_y = self._mul_stride(output_y, stride_y)
                 input_x = self._mul_stride(output_x, stride_x)
@@ -990,26 +997,33 @@ class StreamingCNN(torch.nn.Module):
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        iterator = range(n_rows)
+        step_y = max(self._floor_div(valid_grad_height, stride_y), 1)
+        step_x = max(self._floor_div(valid_grad_width, stride_x), 1)
 
-        for row in iterator:
-            for col in range(n_cols):
-                output_y = self._floor_div(row * valid_grad_height, stride_y)
-                output_x = self._floor_div(col * valid_grad_width, stride_x)
+        max_y = max(grads[reference_output].shape[H_DIM] - output_height, 0)
+        max_x = max(grads[reference_output].shape[W_DIM] - output_width, 0)
 
-                sides_top = True if row == 0 else False
-                sides_left = True if col == 0 else False
+        row_positions = []
+        for row in range(n_rows):
+            pos = min(row * step_y, max_y)
+            if len(row_positions) == 0 or pos != row_positions[-1]:
+                row_positions.append(pos)
 
-                sides_bottom = True if output_y + output_height >= grads[reference_output].shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= grads[reference_output].shape[W_DIM] else False
+        col_positions = []
+        for col in range(n_cols):
+            pos = min(col * step_x, max_x)
+            if len(col_positions) == 0 or pos != col_positions[-1]:
+                col_positions.append(pos)
+
+        for row_idx, output_y in enumerate(row_positions):
+            for col_idx, output_x in enumerate(col_positions):
+                sides_top = row_idx == 0
+                sides_left = col_idx == 0
+                sides_bottom = row_idx == len(row_positions) - 1
+                sides_right = col_idx == len(col_positions) - 1
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 lost = self._get_tile_lost_for_sides(sides, reference_output)
-
-                if sides_bottom:
-                    output_y = max(grads[reference_output].shape[H_DIM] - output_height, 0)
-                if sides_right:
-                    output_x = max(grads[reference_output].shape[W_DIM] - output_width, 0)
 
                 input_y = self._mul_stride(output_y, stride_y)
                 input_x = self._mul_stride(output_x, stride_x)
