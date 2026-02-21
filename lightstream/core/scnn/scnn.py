@@ -663,11 +663,16 @@ class StreamingCNN(torch.nn.Module):
                         new_output_box.x : new_output_box.x + new_output_box.width,
                     ]
 
+                    output_y_start = int(output_loc.y + new_output_box.y)
+                    output_y_end = int(output_y_start + new_output_box.height)
+                    output_x_start = int(output_loc.x + new_output_box.x)
+                    output_x_end = int(output_x_start + new_output_box.width)
+
                     output[
                         :,
                         :,
-                        int(updated_total_indices.y) : int(updated_total_indices.height),
-                        int(updated_total_indices.x - new_output_box.width) : int(updated_total_indices.x),
+                        output_y_start:output_y_end,
+                        output_x_start:output_x_end,
                     ] = relevant_output
 
                     del tile
@@ -786,11 +791,16 @@ class StreamingCNN(torch.nn.Module):
                             new_output_box.x : new_output_box.x + new_output_box.width,
                         ]
 
+                        output_y_start = int(output_loc.y + new_output_box.y)
+                        output_y_end = int(output_y_start + new_output_box.height)
+                        output_x_start = int(output_loc.x + new_output_box.x)
+                        output_x_end = int(output_x_start + new_output_box.width)
+
                         output_tensor[
                             :,
                             :,
-                            int(updated_total_indices.y) : int(updated_total_indices.height),
-                            int(updated_total_indices.x - new_output_box.width) : int(updated_total_indices.x),
+                            output_y_start:output_y_end,
+                            output_x_start:output_x_end,
                         ] = relevant_output
 
                     del tile
