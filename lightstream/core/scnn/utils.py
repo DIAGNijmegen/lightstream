@@ -83,13 +83,7 @@ def _new_value_indices(data_shape, data_indices, old_value_indices):
     # Check x-axis:
     # If this gradient is exactly on the border of old_value_indices
     # everything is new.
-    #
-    # In practice, for large streamed coordinates, tiny numeric drift in the
-    # upstream coordinate mapping can occasionally make data_indices.x one
-    # (or a few) pixels ahead of old_values_x. Treat that as a no-overlap
-    # continuation instead of failing hard.
-    if data_indices.x >= old_values_x:
-        old_values_x = data_indices.x
+    if data_indices.x == old_values_x:
         rel_left = 0
         rel_right = data_shape[W_DIM]
 
@@ -102,8 +96,7 @@ def _new_value_indices(data_shape, data_indices, old_value_indices):
 
     # Check y-axis:
     # Equal to column logic (see above)
-    if data_indices.y >= old_values_y:
-        old_values_y = data_indices.y
+    if data_indices.y == old_values_y:
         rel_top = 0
         rel_bottom = data_shape[H_DIM]
     else:
