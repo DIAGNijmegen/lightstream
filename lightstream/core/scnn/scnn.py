@@ -1404,8 +1404,8 @@ class StreamingCNN(torch.nn.Module):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = self._floor_div(input_loc.y, stride_y) + lost_top
-        data_loc_x = self._floor_div(input_loc.x, stride_x) + lost_left
+        data_loc_y = int(round(float(input_loc.y) / float(stride_y))) + lost_top
+        data_loc_x = int(round(float(input_loc.x) / float(stride_x))) + lost_left
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
@@ -1430,13 +1430,12 @@ class StreamingCNN(torch.nn.Module):
                 new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
             ]
 
-            self.saliency_map[
-                :,
-                :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
-            ] = relevant_input_grad.detach().cpu()
+            y_start = int((data_loc.y + new_output_box.y) * stride[1])
+            y_end = int(y_start + relevant_input_grad.shape[2])
+            x_start = int((data_loc.x + new_output_box.x) * stride[2])
+            x_end = int(x_start + relevant_input_grad.shape[3])
+
+            self.saliency_map[:, :, y_start:y_end, x_start:x_end] = relevant_input_grad.detach().cpu()
 
             del relevant_input_grad
             del valid_grad_in
