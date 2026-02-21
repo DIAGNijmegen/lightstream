@@ -1807,12 +1807,31 @@ class StreamingCNN(torch.nn.Module):
             target_x_end = updated_total_indices.x * stride[2]
             target_x_start = target_x_end - relevant_input_grad.shape[3]
 
+            # Keep assignment robust near borders where target slicing can be
+            # clipped by saliency_map bounds (shape mismatch otherwise).
+            map_h = self.saliency_map.shape[H_DIM]
+            map_w = self.saliency_map.shape[W_DIM]
+            y0 = max(0, target_y_start)
+            x0 = max(0, target_x_start)
+            y1 = min(map_h, target_y_end)
+            x1 = min(map_w, target_x_end)
+
+            copy_h = max(0, y1 - y0)
+            copy_w = max(0, x1 - x0)
+            if copy_h == 0 or copy_w == 0:
+                return grad_in
+
+            src_y0 = max(0, y0 - target_y_start)
+            src_x0 = max(0, x0 - target_x_start)
+            src_y1 = src_y0 + copy_h
+            src_x1 = src_x0 + copy_w
+
             self.saliency_map[
                 :,
                 :,
-                target_y_start:target_y_end,
-                target_x_start:target_x_end,
-            ] = relevant_input_grad.detach().cpu()
+                y0:y1,
+                x0:x1,
+            ] = relevant_input_grad[:, :, src_y0:src_y1, src_x0:src_x1].detach().cpu()
 
             del relevant_input_grad
             del valid_grad_in
