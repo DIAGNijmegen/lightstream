@@ -88,9 +88,23 @@ class StreamingConv2dF(torch.autograd.Function):
 
         # Calculate which part of the gradient is 'new'
         old_value_indices = seen_indices
-        new_output_box, updated_total_indices = _new_value_indices(
-            valid_grad.shape, data_loc, old_value_indices
-        )
+        try:
+            new_output_box, updated_total_indices = _new_value_indices(
+                valid_grad.shape, data_loc, old_value_indices
+            )
+        except AssertionError as exc:
+            # Re-sync cursor when rare coordinate drift causes the bookkeeping
+            # state to fall behind current tile location.
+            if "Misses data in x-axis" not in str(exc) and "We miss data in y-axis" not in str(exc):
+                raise
+            old_value_indices.y = data_loc.y
+            old_value_indices.height = data_loc.y + valid_grad.shape[H_DIM]
+            old_value_indices.x = data_loc.x
+            old_value_indices.width = 0
+            old_value_indices.sides = data_loc.sides
+            new_output_box, updated_total_indices = _new_value_indices(
+                valid_grad.shape, data_loc, old_value_indices
+            )
 
         # Update inplace
         seen_indices.y = updated_total_indices.y

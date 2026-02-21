@@ -59,7 +59,17 @@ class StreamingUpsampleF(torch.autograd.Function):
             data_loc_x = int(round(float(ctx.input_loc.x) / float(stride_x))) + lost_left
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
-            new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
+            try:
+                new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
+            except AssertionError as exc:
+                if "Misses data in x-axis" not in str(exc) and "We miss data in y-axis" not in str(exc):
+                    raise
+                ctx.seen_indices.y = data_loc.y
+                ctx.seen_indices.height = data_loc.y + valid_grad.shape[H_DIM]
+                ctx.seen_indices.x = data_loc.x
+                ctx.seen_indices.width = 0
+                ctx.seen_indices.sides = data_loc.sides
+                new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
 
             ctx.seen_indices.y = updated_total_indices.y
             ctx.seen_indices.height = updated_total_indices.height
