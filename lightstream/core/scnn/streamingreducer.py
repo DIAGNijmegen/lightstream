@@ -62,7 +62,8 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             # We only clamp when we are not starting a new row/column.
             if cur_data_loc.x > seen_indices.x and not input_loc.sides.left:
                 cur_data_loc = Box(cur_data_loc.y, cur_data_loc.height, seen_indices.x, cur_data_loc.width, cur_data_loc.sides)
-            if cur_data_loc.y > seen_indices.y and not input_loc.sides.top:
+            # Y should only advance when we start a new row (left-most tile).
+            if cur_data_loc.y > seen_indices.y and not input_loc.sides.left:
                 cur_data_loc = Box(seen_indices.y, cur_data_loc.height, cur_data_loc.x, cur_data_loc.width, cur_data_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_shape, cur_data_loc, seen_indices)

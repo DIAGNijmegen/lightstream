@@ -97,7 +97,9 @@ class StreamingConv2dF(torch.autograd.Function):
         # Guard against precision drift creating synthetic forward gaps.
         if data_loc.x > seen_indices.x and not sides.left:
             data_loc = Box(data_loc.y, data_loc.height, seen_indices.x, data_loc.width, data_loc.sides)
-        if data_loc.y > seen_indices.y and not sides.top:
+        # Y should only advance when we start a new row (left-most tile).
+        # For non-left tiles, keep y monotonic with the current seen row.
+        if data_loc.y > seen_indices.y and not sides.left:
             data_loc = Box(seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
 
         # Calculate which part of the gradient is 'new'

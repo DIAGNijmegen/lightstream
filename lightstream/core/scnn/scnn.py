@@ -1773,7 +1773,8 @@ class StreamingCNN(torch.nn.Module):
 
         if data_loc.x > old_value_indices.x and not sides.left:
             data_loc = Box(data_loc.y, data_loc.height, old_value_indices.x, data_loc.width, data_loc.sides)
-        if data_loc.y > old_value_indices.y and not sides.top:
+        # Y should only advance at the start of a new row (left tile).
+        if data_loc.y > old_value_indices.y and not sides.left:
             data_loc = Box(old_value_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
 
         # Calculate which part of the gradient is 'new'
