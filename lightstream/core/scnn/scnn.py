@@ -1771,11 +1771,6 @@ class StreamingCNN(torch.nn.Module):
         old_value_indices = self.saliency_old_indices
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
-        if sides.left:
-            data_loc = Box(data_loc.y, data_loc.height, 0, data_loc.width, data_loc.sides)
-            if not sides.top:
-                data_loc = Box(old_value_indices.height, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
-
         if data_loc.x > old_value_indices.x and not sides.left:
             data_loc = Box(data_loc.y, data_loc.height, old_value_indices.x, data_loc.width, data_loc.sides)
         # Y should only advance at the start of a new row (left tile).

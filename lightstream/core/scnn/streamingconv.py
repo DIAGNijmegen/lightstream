@@ -94,15 +94,6 @@ class StreamingConv2dF(torch.autograd.Function):
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
-        # `_new_value_indices` uses x==0 to detect row transitions.
-        # For left-most tiles we must keep x anchored at 0 even when border
-        # adjustment nudges output/input coordinates.
-        if sides.left:
-            data_loc = Box(data_loc.y, data_loc.height, 0, data_loc.width, data_loc.sides)
-            if not sides.top:
-                # Start-of-row tile should begin exactly where previous rows ended.
-                data_loc = Box(seen_indices.height, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
-
         # Guard against precision drift creating synthetic forward gaps.
         if data_loc.x > seen_indices.x and not sides.left:
             data_loc = Box(data_loc.y, data_loc.height, seen_indices.x, data_loc.width, data_loc.sides)

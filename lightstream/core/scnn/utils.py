@@ -74,8 +74,10 @@ def _new_value_indices(data_shape, data_indices, old_value_indices):
     old_values_x = old_value_indices.x
     old_values_height = old_value_indices.height
 
-    # Check if new row
-    if data_indices.x == 0:
+    # Check if new row. Prefer explicit tile-side metadata when available,
+    # otherwise fall back to legacy x==0 heuristic.
+    is_left_edge = bool(getattr(data_indices, "sides", None) and data_indices.sides.left)
+    if is_left_edge or data_indices.x == 0:
         old_values_y = old_values_height
         old_values_height = data_indices.y + data_shape[H_DIM]
         old_values_x = 0
