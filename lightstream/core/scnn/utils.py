@@ -82,28 +82,39 @@ def _new_value_indices(data_shape, data_indices, old_value_indices):
         old_values_height = data_indices.y + data_shape[H_DIM]
         old_values_x = 0
 
+    data_y = int(data_indices.y)
+    data_x = int(data_indices.x)
+
+    # Guard against tiny positive coordinate drift (e.g. float/rounding
+    # accumulation across many tiles). Treat forward jumps as contiguous from
+    # the already seen frontier instead of asserting.
+    if data_x > old_values_x:
+        data_x = int(old_values_x)
+    if data_y > old_values_y:
+        data_y = int(old_values_y)
+
     # Check x-axis:
     # If this gradient is exactly on the border of old_value_indices
     # everything is new.
-    if data_indices.x == old_values_x:
+    if data_x == old_values_x:
         rel_left = 0
         rel_right = data_shape[W_DIM]
 
     # If data_indices has some overlap with old_value_indices, trim unique
     # indices.
     else:
-        assert old_values_x - data_indices.x >= 0, "Misses data in x-axis!"
-        rel_left = old_values_x - data_indices.x
+        assert old_values_x - data_x >= 0, "Misses data in x-axis!"
+        rel_left = old_values_x - data_x
         rel_right = data_shape[W_DIM]
 
     # Check y-axis:
     # Equal to column logic (see above)
-    if data_indices.y == old_values_y:
+    if data_y == old_values_y:
         rel_top = 0
         rel_bottom = data_shape[H_DIM]
     else:
-        assert old_values_y - data_indices.y >= 0, "We miss data in y-axis"
-        rel_top = old_values_y - data_indices.y
+        assert old_values_y - data_y >= 0, "We miss data in y-axis"
+        rel_top = old_values_y - data_y
         rel_bottom = data_shape[H_DIM]
 
     # Update old-value-indices
