@@ -3,6 +3,7 @@ Author: Hans Pinckaers
 MIT License
 """
 import math
+import os
 import copy
 import contextlib
 from typing import List
@@ -73,6 +74,12 @@ class StreamingCNN(torch.nn.Module):
         global H_DIM, W_DIM
         self.stream_module = stream_module
         self.verbose = verbose
+        # Optional debug knobs (off by default) for reducer+upsample parity investigations.
+        # Set LIGHTSTREAM_DEBUG_ZERO_UPSAMPLE_GRAD_LOST_GE=<scale> (e.g. 16)
+        # to force grad_lost=0 for StreamingUpsample modules at/above that scale.
+        zero_ge = os.getenv("LIGHTSTREAM_DEBUG_ZERO_UPSAMPLE_GRAD_LOST_GE")
+        self._debug_zero_upsample_grad_lost_ge = float(zero_ge) if zero_ge else None
+        self._debug_upsample_grad_lost_backup = {}
         self.deterministic = deterministic
         self.eps = eps
         self.device = next(stream_module.parameters()).device
@@ -98,8 +105,14 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = None
         self._module_stats = {}
         self._backward_seen_indices = {}
+
+        self._restore_debug_upsample_grad_lost_override()
+
+        self._restore_debug_upsample_grad_lost_override()
+
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._last_forward_outputs = None
         self._hooks = []
         self._output_structure = None
 
@@ -197,7 +210,13 @@ class StreamingCNN(torch.nn.Module):
                 gradients.append(gradient)
 
             self.tile_gradient_lost = []
+            spatial_tile_lost = {}
             for idx, (out, gradient) in enumerate(zip(outputs, gradients)):
+                if out.ndim < 4:
+                    # Non-spatial outputs (e.g. reducer heads) are mapped to their
+                    # paired spatial planning outputs for gradient replay.
+                    continue
+
                 tile_grad = torch.autograd.grad(
                     out,
                     tile,
@@ -208,10 +227,25 @@ class StreamingCNN(torch.nn.Module):
                     create_graph=False,
                     allow_unused=False,
                 )[0]
-                self.tile_gradient_lost.append(self._non_max_border_amount(tile_grad))
+                spatial_tile_lost[idx] = self._non_max_border_amount(tile_grad)
+
+            # Build per-output gradient lost list, reusing paired spatial lost
+            # for non-spatial outputs.
+            for idx, out in enumerate(outputs):
+                if out.ndim >= 4:
+                    self.tile_gradient_lost.append(spatial_tile_lost[idx])
+                else:
+                    planning_idx = self._planning_output_index(idx)
+                    self.tile_gradient_lost.append(spatial_tile_lost.get(planning_idx, Lost(0, 0, 0, 0)))
 
             tile.grad = None
-            torch.autograd.backward(outputs, grad_tensors=gradients)
+            # Populate module-level backward statistics from spatial outputs only.
+            # Including non-spatial reducer heads can skew upsample grad-lost
+            # geometry because their gradients are value-shaped (sigmoid/power)
+            # instead of pure valid-region masks.
+            spatial_outs = [out for out in outputs if out.ndim >= 4]
+            spatial_grads = [g for out, g in zip(outputs, gradients) if out.ndim >= 4]
+            torch.autograd.backward(spatial_outs, grad_tensors=spatial_grads)
 
         # Calculate the output stride of the whole stream_module
         if len(outputs) == 1:
@@ -465,6 +499,17 @@ class StreamingCNN(torch.nn.Module):
     def _floor_div(self, numerator, denominator):
         return int(math.floor(float(numerator) / float(denominator)))
 
+    def _stable_tile_index(self, coord, stride):
+        stride_f = float(stride)
+        if stride_f <= 0:
+            raise ValueError(f"stride must be > 0, got {stride_f}")
+
+        stride_i = int(round(stride_f))
+        if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-3:
+            return int(coord) // stride_i
+
+        return int(math.floor((float(coord) / stride_f) + 1e-6))
+
     def _mul_stride(self, value, stride):
         return int(round(float(value) * float(stride)))
 
@@ -707,9 +752,11 @@ class StreamingCNN(torch.nn.Module):
                         if isinstance(mod, _STREAMING_MODULE_TYPES):
                             mod.input_loc = input_loc
                             if isinstance(mod, StreamingGlobalReducer):
-                                mod.lost = self._get_tile_output_lost(planning_index)
-                                mod.output_stride = self._get_output_stride(planning_index)
-                                mod.data_loc = Box(output_y + lost.top, 0, output_x + lost.left, 0, sides)
+                                # Keep reducer-specific lost/output_stride values from
+                                # initialization statistics; overriding with planning
+                                # output values can mismatch reducer heads that originate
+                                # from different scales and break seen-index monotonicity.
+                                mod.data_loc = None
 
                     tile_output = self.stream_module(tile)
                     outputs, _ = self._split_outputs(tile_output)
@@ -740,7 +787,7 @@ class StreamingCNN(torch.nn.Module):
                     relevant_output = trimmed_output[
                         :,
                         :,
-                        new_output_box.y : updated_total_indices.y + new_output_box.height,
+                        new_output_box.y : new_output_box.y + new_output_box.height,
                         new_output_box.x : new_output_box.x + new_output_box.width,
                     ]
 
@@ -874,7 +921,7 @@ class StreamingCNN(torch.nn.Module):
                         relevant_output = trimmed_output[
                             :,
                             :,
-                            new_output_box.y : updated_total_indices.y + new_output_box.height,
+                            new_output_box.y : new_output_box.y + new_output_box.height,
                             new_output_box.x : new_output_box.x + new_output_box.width,
                         ]
 
@@ -940,6 +987,10 @@ class StreamingCNN(torch.nn.Module):
                 if isinstance(mod, StreamingGlobalReducer):
                     mod.data_loc = None
 
+        # Cache the most recent forward outputs for backward utilities that
+        # need paired spatial tensors (e.g. reducer gradient mapping).
+        self._last_forward_outputs = outputs
+
         del image
         return self._restore_outputs(outputs, self._output_structure)
 
@@ -957,14 +1008,19 @@ class StreamingCNN(torch.nn.Module):
         r = float(reducer_module.r)
         eps = float(reducer_module.eps)
 
-        probs = torch.sigmoid(spatial_output)
-        mean_p_r = probs.pow(r).mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-        scale = mean_p_r.pow((1.0 / r) - 1.0)
-
-        numel = float(spatial_output.shape[H_DIM] * spatial_output.shape[W_DIM])
-        scale = scale / numel
-
-        spatial_grad = reducer_grad[:, :, None, None] * scale * probs.pow(r - 1.0) * probs * (1.0 - probs)
+        # Use autograd to mirror GlobalReducer derivative exactly, including
+        # clamp_min behavior and broadcasting, instead of a manual formula.
+        with torch.enable_grad():
+            proxy = spatial_output.detach().requires_grad_(True)
+            reduced = torch.sigmoid(proxy).pow(r).mean(dim=(-2, -1)).clamp_min(eps).pow(1.0 / r)
+            spatial_grad = torch.autograd.grad(
+                outputs=reduced,
+                inputs=proxy,
+                grad_outputs=reducer_grad,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
         return spatial_grad
 
     def _backward_single_output(self, image, grad, output_index=0):
@@ -976,7 +1032,8 @@ class StreamingCNN(torch.nn.Module):
             if planning_index == output_index:
                 raise ValueError("Non-spatial output does not have a paired spatial planning output for backward.")
 
-            # Reconstruct paired spatial output and convert reducer gradient to spatial gradient.
+            # Reconstruct paired spatial output and map reducer gradient to
+            # spatial gradient, then backprop with the regular spatial path.
             for mod in self.stream_module.modules():
                 if isinstance(mod, _STREAMING_MODULE_TYPES):
                     mod.reset()
@@ -984,13 +1041,22 @@ class StreamingCNN(torch.nn.Module):
                     if isinstance(mod, StreamingGlobalReducer):
                         mod.data_loc = None
 
-            with torch.no_grad():
-                spatial_output = self._forward_single_output(
-                    image,
-                    result_on_cpu=False,
-                    output_index=planning_index,
-                    initialize_saliency=False,
-                )
+            spatial_output = None
+            if hasattr(self, "_last_forward_outputs"):
+                cached = self._last_forward_outputs
+                if isinstance(cached, list) and planning_index < len(cached):
+                    candidate = cached[planning_index]
+                    if isinstance(candidate, torch.Tensor):
+                        spatial_output = candidate.to(self.device, non_blocking=True)
+
+            if spatial_output is None:
+                with torch.no_grad():
+                    spatial_output = self._forward_single_output(
+                        image,
+                        result_on_cpu=False,
+                        output_index=planning_index,
+                        initialize_saliency=False,
+                    )
 
             reducer_module = self._streaming_reducer_for_output(output_index)
             spatial_grad = self._reducer_grad_to_spatial(spatial_output, grad, reducer_module)
@@ -1261,48 +1327,76 @@ class StreamingCNN(torch.nn.Module):
 
         grads, grad_structure = self._split_outputs(grad)
 
+        self._apply_debug_upsample_grad_lost_override()
+
         if len(grads) != self._output_count():
             raise ValueError("Gradient outputs do not match the number of model outputs.")
+
+        # Normalize non-spatial reducer gradients into paired spatial gradients
+        # before tile replay so reducer-enabled and post-reduce variants use the
+        # same spatial backward path.
+        if len(grads) == self._output_count():
+            cached = self._last_forward_outputs if hasattr(self, "_last_forward_outputs") else None
+            normalized_grads = list(grads)
+            for idx, grad_tensor in enumerate(grads):
+                if grad_tensor is None:
+                    continue
+                output_shape = self._get_tile_output_shape(idx)
+                if len(output_shape) >= 4:
+                    continue
+
+                planning_index = self._planning_output_index(idx)
+                if planning_index == idx:
+                    continue
+
+                spatial_output = None
+                if isinstance(cached, list) and planning_index < len(cached):
+                    candidate = cached[planning_index]
+                    if isinstance(candidate, torch.Tensor):
+                        spatial_output = candidate.to(self.device, non_blocking=True)
+
+                if spatial_output is None:
+                    with torch.no_grad():
+                        spatial_output = self._forward_single_output(
+                            image,
+                            result_on_cpu=False,
+                            output_index=planning_index,
+                            initialize_saliency=False,
+                        )
+
+                reducer_module = self._streaming_reducer_for_output(idx)
+                spatial_grad = self._reducer_grad_to_spatial(
+                    spatial_output,
+                    grad_tensor,
+                    reducer_module,
+                )
+                if spatial_grad is None:
+                    continue
+
+                existing = normalized_grads[planning_index]
+                normalized_grads[planning_index] = spatial_grad if existing is None else (existing + spatial_grad)
+                normalized_grads[idx] = torch.zeros_like(grad_tensor)
+
+            grads = normalized_grads
 
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
         elif grad_structure == self._output_structure:
-            has_streaming_reducer = any(isinstance(mod, StreamingGlobalReducer) for mod in self.stream_module.modules())
-
-            for overlap_group in self._output_overlap_groups():
-                # Shared backward currently supports only spatial outputs and can
-                # introduce parity issues when reducer outputs are present.
-                # In reducer-enabled models prefer per-output replay for correctness.
-                has_non_spatial = any(len(self._get_tile_output_shape(idx)) < 4 for idx in overlap_group)
-                if len(overlap_group) == 1 or has_non_spatial or has_streaming_reducer:
-                    for idx in overlap_group:
-                        grad_tensor = grads[idx]
-                        if grad_tensor is None:
-                            continue
-                        if torch.count_nonzero(grad_tensor).item() == 0:
-                            continue
-
-                        # Each output branch should start from a fresh streaming state.
-                        for mod in self.stream_module.modules():
-                            if isinstance(mod, _STREAMING_MODULE_TYPES):
-                                mod.reset()
-
-                        self._backward_single_output(image, grad_tensor, output_index=idx)
+            # Always replay per output for deterministic parity across model
+            # variants (reducer vs post-reduce). Shared multi-output backward can
+            # change accumulation/seen-index interaction when upsample/reducer
+            # branches coexist.
+            for idx, grad_tensor in enumerate(grads):
+                if grad_tensor is None:
+                    continue
+                if torch.count_nonzero(grad_tensor).item() == 0:
                     continue
 
-                grad_losts = [self._get_tile_gradient_lost(output_index) for output_index in overlap_group]
-                max_grad_lost = Lost(
-                    max(lost.top for lost in grad_losts),
-                    max(lost.left for lost in grad_losts),
-                    max(lost.bottom for lost in grad_losts),
-                    max(lost.right for lost in grad_losts),
-                )
-                self._backward_multi_output_shared(
-                    image,
-                    grads,
-                    output_indices=overlap_group,
-                    grad_lost=max_grad_lost,
-                )
+                for mod in self.stream_module.modules():
+                    if isinstance(mod, _STREAMING_MODULE_TYPES):
+                        mod.reset()
+
+                self._backward_single_output(image, grad_tensor, output_index=idx)
         else:
             for idx, grad_tensor in enumerate(grads):
                 if grad_tensor is None:
@@ -1319,8 +1413,11 @@ class StreamingCNN(torch.nn.Module):
 
                 self._backward_single_output(image, grad_tensor, output_index=idx)
 
+        self._restore_debug_upsample_grad_lost_override()
+
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._last_forward_outputs = None
 
         for mod in self.stream_module.modules():
             if isinstance(mod, _STREAMING_MODULE_TYPES):
@@ -1330,6 +1427,33 @@ class StreamingCNN(torch.nn.Module):
                 mod.reset()
 
         del image
+
+    def _apply_debug_upsample_grad_lost_override(self):
+        if self._debug_zero_upsample_grad_lost_ge is None:
+            return
+        self._debug_upsample_grad_lost_backup = {}
+        for mod in self.stream_module.modules():
+            if not isinstance(mod, StreamingUpsample):
+                continue
+            sf = mod.scale_factor
+            if sf is None:
+                continue
+            if isinstance(sf, tuple):
+                scale = max(float(sf[0]), float(sf[1]))
+            else:
+                scale = float(sf)
+            if scale >= self._debug_zero_upsample_grad_lost_ge:
+                self._debug_upsample_grad_lost_backup[mod] = Lost(mod.grad_lost.top, mod.grad_lost.left, mod.grad_lost.bottom, mod.grad_lost.right)
+                mod.grad_lost = Lost(0, 0, 0, 0)
+                if self.verbose:
+                    print(f"[debug] zeroed grad_lost for StreamingUpsample scale_factor={scale}")
+
+    def _restore_debug_upsample_grad_lost_override(self):
+        if not self._debug_upsample_grad_lost_backup:
+            return
+        for mod, lost in self._debug_upsample_grad_lost_backup.items():
+            mod.grad_lost = lost
+        self._debug_upsample_grad_lost_backup = {}
 
     def _get_tile_lost_for_sides(self, sides, output_index=0):
         tile_output_lost = self._get_tile_output_lost(output_index)
@@ -1641,13 +1765,19 @@ class StreamingCNN(torch.nn.Module):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = self._floor_div(input_loc.y, stride_y) + lost_top
-        data_loc_x = self._floor_div(input_loc.x, stride_x) + lost_left
+        data_loc_y = self._stable_tile_index(input_loc.y, stride_y) + lost_top
+        data_loc_x = self._stable_tile_index(input_loc.x, stride_x) + lost_left
 
+        old_value_indices = self.saliency_old_indices
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
+        if data_loc.x > old_value_indices.x and not sides.left:
+            data_loc = Box(data_loc.y, data_loc.height, old_value_indices.x, data_loc.width, data_loc.sides)
+        # Y should only advance at the start of a new row (left tile).
+        if data_loc.y > old_value_indices.y and not sides.left:
+            data_loc = Box(old_value_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
+
         # Calculate which part of the gradient is 'new'
-        old_value_indices = self.saliency_old_indices
         new_output_box, updated_total_indices = _new_value_indices(
             valid_grad.shape, data_loc, old_value_indices
         )
@@ -1667,13 +1797,36 @@ class StreamingCNN(torch.nn.Module):
                 new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
             ]
 
+            target_y_start = updated_total_indices.y * stride[1]
+            target_y_end = target_y_start + relevant_input_grad.shape[2]
+            target_x_end = updated_total_indices.x * stride[2]
+            target_x_start = target_x_end - relevant_input_grad.shape[3]
+
+            # Keep assignment robust near borders where target slicing can be
+            # clipped by saliency_map bounds (shape mismatch otherwise).
+            map_h = self.saliency_map.shape[H_DIM]
+            map_w = self.saliency_map.shape[W_DIM]
+            y0 = max(0, target_y_start)
+            x0 = max(0, target_x_start)
+            y1 = min(map_h, target_y_end)
+            x1 = min(map_w, target_x_end)
+
+            copy_h = max(0, y1 - y0)
+            copy_w = max(0, x1 - x0)
+            if copy_h == 0 or copy_w == 0:
+                return grad_in
+
+            src_y0 = max(0, y0 - target_y_start)
+            src_x0 = max(0, x0 - target_x_start)
+            src_y1 = src_y0 + copy_h
+            src_x1 = src_x0 + copy_w
+
             self.saliency_map[
                 :,
                 :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
-            ] = relevant_input_grad.detach().cpu()
+                y0:y1,
+                x0:x1,
+            ] = relevant_input_grad[:, :, src_y0:src_y1, src_x0:src_x1].detach().cpu()
 
             del relevant_input_grad
             del valid_grad_in

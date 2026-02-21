@@ -53,8 +53,12 @@ class StreamingUpsampleF(torch.autograd.Function):
             stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
             stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
 
-            data_loc_y = int(math.floor(ctx.input_loc.y / stride_y)) + lost_top
-            data_loc_x = int(math.floor(ctx.input_loc.x / stride_x)) + lost_left
+            # Use stable floor division for fractional output strides.
+            # Tiny floating-point boundary errors (common with large upsample
+            # factors) can shift dedup indices by one pixel.
+            eps = 1e-9
+            data_loc_y = int(math.floor((float(ctx.input_loc.y) / stride_y) + eps)) + lost_top
+            data_loc_x = int(math.floor((float(ctx.input_loc.x) / stride_x) + eps)) + lost_left
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
@@ -65,13 +69,13 @@ class StreamingUpsampleF(torch.autograd.Function):
             ctx.seen_indices.width = updated_total_indices.width
             ctx.seen_indices.sides = updated_total_indices.sides
 
-            # We keep tracking seen indices/lost borders for statistics, but
-            # propagate grad_input from the full grad_output to mirror
-            # StreamingConv2d behavior (which does not mask grad_input).
             del new_output_box
 
             # interpolate backward is not equivalent to interpolate downsample,
             # so compute grad_input through autograd on interpolate directly.
+            # Use the same valid (lost-trimmed) region used for seen-index logic
+            # to avoid cross-tile border leakage, which is amplified for large
+            # upsample factors.
             with torch.enable_grad():
                 proxy_input = inpt.detach().requires_grad_(True)
                 proxy_output = torch.nn.functional.interpolate(
@@ -81,10 +85,16 @@ class StreamingUpsampleF(torch.autograd.Function):
                     mode=ctx.mode,
                     align_corners=ctx.align_corners,
                 )
+                proxy_valid = proxy_output[
+                    :,
+                    :,
+                    lost_top : proxy_output.shape[H_DIM] - lost_bottom,
+                    lost_left : proxy_output.shape[W_DIM] - lost_right,
+                ]
                 grad_in = torch.autograd.grad(
-                    outputs=proxy_output,
+                    outputs=proxy_valid,
                     inputs=proxy_input,
-                    grad_outputs=grad_output,
+                    grad_outputs=valid_grad,
                     retain_graph=False,
                     create_graph=False,
                     allow_unused=False,

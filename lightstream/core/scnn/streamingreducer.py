@@ -2,18 +2,130 @@ import math
 import torch
 
 from torch import Tensor
+from torch.amp import custom_bwd, custom_fwd
 
 from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM, _new_value_indices
 
 
+def _stable_tile_index(coord: int, stride: float) -> int:
+    """Map input coordinates to output coordinates without float drift."""
+    stride_f = float(stride)
+    if stride_f <= 0:
+        raise ValueError(f"stride must be > 0, got {stride_f}")
+
+    stride_i = int(round(stride_f))
+    # Allow small quantization drift from autocast/float16 tensors.
+    if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-3:
+        return int(coord) // stride_i
+
+    # Fallback for genuinely non-integer strides.
+    return int(math.floor((float(coord) / stride_f) + 1e-6))
+
+
+class StreamingGlobalReducerF(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+    def forward(ctx, logits, prev_sum, prev_count, r, eps, lost, seen_indices, output_stride, input_loc, data_loc):
+        probs = torch.sigmoid(logits)
+
+        mask = torch.zeros_like(probs, dtype=torch.bool)
+        count_new = 0
+
+        if input_loc is None or input_loc.sides is None:
+            mask[:] = True
+            count_new = probs.shape[H_DIM] * probs.shape[W_DIM]
+        else:
+            sides = input_loc.sides
+            lost_top = lost.top if not sides.top else 0
+            lost_bottom = lost.bottom if not sides.bottom else 0
+            lost_left = lost.left if not sides.left else 0
+            lost_right = lost.right if not sides.right else 0
+
+            valid_shape = (
+                probs.shape[0],
+                probs.shape[1],
+                max(0, probs.shape[H_DIM] - lost_top - lost_bottom),
+                max(0, probs.shape[W_DIM] - lost_left - lost_right),
+            )
+
+            if data_loc is not None:
+                cur_data_loc = data_loc
+            else:
+                stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
+                stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
+                data_loc_y = _stable_tile_index(input_loc.y, stride_y) + lost_top
+                data_loc_x = _stable_tile_index(input_loc.x, stride_x) + lost_left
+                cur_data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+            # Guard against tiny numeric drift causing synthetic gaps between
+            # tiles (which triggers `_new_value_indices` assertions).
+            # We only clamp when we are not starting a new row/column.
+            if cur_data_loc.x > seen_indices.x and not input_loc.sides.left:
+                cur_data_loc = Box(cur_data_loc.y, cur_data_loc.height, seen_indices.x, cur_data_loc.width, cur_data_loc.sides)
+            # Y should only advance when we start a new row (left-most tile).
+            if cur_data_loc.y > seen_indices.y and not input_loc.sides.left:
+                cur_data_loc = Box(seen_indices.y, cur_data_loc.height, cur_data_loc.x, cur_data_loc.width, cur_data_loc.sides)
+
+            new_output_box, updated_total_indices = _new_value_indices(valid_shape, cur_data_loc, seen_indices)
+
+            seen_indices.y = updated_total_indices.y
+            seen_indices.height = updated_total_indices.height
+            seen_indices.x = updated_total_indices.x
+            seen_indices.width = updated_total_indices.width
+            seen_indices.sides = updated_total_indices.sides
+
+            if new_output_box.height > 0 and new_output_box.width > 0:
+                y0 = lost_top + new_output_box.y
+                y1 = y0 + new_output_box.height
+                x0 = lost_left + new_output_box.x
+                x1 = x0 + new_output_box.width
+                mask[:, :, y0:y1, x0:x1] = True
+                count_new = new_output_box.height * new_output_box.width
+
+        unseen_sum = (probs.pow(r) * mask.to(probs.dtype)).sum(dim=(-2, -1))
+        new_sum = prev_sum + unseen_sum
+        new_count = int(prev_count) + int(count_new)
+
+        if new_count <= 0:
+            output = torch.zeros_like(new_sum)
+        else:
+            output = (new_sum / float(new_count)).clamp_min(float(eps)).pow(1.0 / float(r))
+
+        ctx.r = float(r)
+        ctx.eps = float(eps)
+        ctx.new_count = new_count
+        ctx.save_for_backward(probs, mask, new_sum)
+        return output, new_sum, torch.tensor(float(new_count), device=logits.device, dtype=logits.dtype)
+
+    @staticmethod
+    @custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output, grad_new_sum, grad_count_ignored):
+        probs, mask, new_sum = ctx.saved_tensors
+
+        if ctx.new_count > 0:
+            inv_count = 1.0 / float(ctx.new_count)
+            mean_p_r = new_sum * inv_count
+            clamp_mask = (mean_p_r >= ctx.eps).to(mean_p_r.dtype)
+            dy_dmean = (1.0 / ctx.r) * mean_p_r.clamp_min(ctx.eps).pow((1.0 / ctx.r) - 1.0) * clamp_mask
+
+            grad_new_sum_total = grad_new_sum + (grad_output * dy_dmean * inv_count)
+            grad_prev_sum = grad_new_sum_total
+
+            grad_probs = grad_new_sum_total[:, :, None, None] * ctx.r * probs.pow(ctx.r - 1.0)
+            grad_probs = grad_probs * mask.to(grad_probs.dtype)
+            grad_logits = grad_probs * probs * (1.0 - probs)
+        else:
+            grad_prev_sum = torch.zeros_like(new_sum)
+            grad_logits = torch.zeros_like(probs)
+
+        return grad_logits, grad_prev_sum, None, None, None, None, None, None, None, None
+
+
+streaming_global_reduce = StreamingGlobalReducerF.apply
+
+
 class StreamingGlobalReducer(torch.nn.Module):
-    """Streaming version of the generalized-mean global reducer.
-
-    This module expects NCHW logits and computes:
-        g = (mean(sigmoid(logits) ** r)) ** (1 / r)
-
-    In streaming mode it only accumulates unseen spatial regions per tile.
-    """
+    """Streaming version of the generalized-mean global reducer."""
 
     def __init__(self, r: float = 4.0, eps: float = 1e-12):
         super().__init__()
@@ -32,85 +144,28 @@ class StreamingGlobalReducer(torch.nn.Module):
     def reset(self):
         self.seen_indices = Box(0, 0, 0, 0, None)
         self._sum_p_r = None
-        self._sum_compensation = None
         self._count = 0
         self.data_loc = None
-
-    def _sum_unseen(self, probs: Tensor):
-        if self.input_loc is None or self.input_loc.sides is None:
-            sum_p_r = probs.pow(self.r).sum(dim=(-2, -1))
-            count = probs.shape[H_DIM] * probs.shape[W_DIM]
-            return sum_p_r, count
-
-        output_stride = self.output_stride
-        stride_y = float(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[1])
-        stride_x = float(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else float(output_stride[2])
-
-        sides = self.input_loc.sides
-        lost = self.lost
-        lost_top = lost.top if not sides.top else 0
-        lost_bottom = lost.bottom if not sides.bottom else 0
-        lost_left = lost.left if not sides.left else 0
-        lost_right = lost.right if not sides.right else 0
-
-        valid_probs = probs[
-            :,
-            :,
-            lost_top : probs.shape[H_DIM] - lost_bottom,
-            lost_left : probs.shape[W_DIM] - lost_right,
-        ]
-
-        if self.data_loc is not None:
-            data_loc = self.data_loc
-        else:
-            # Use stable floor division for fractional strides (e.g. upsampled outputs).
-            # Tiny floating-point errors around tile boundaries can otherwise shift
-            # dedup indices by one pixel and cause aggregation mismatches.
-            eps = 1e-9
-            data_loc_y = int(math.floor((float(self.input_loc.y) / stride_y) + eps)) + lost_top
-            data_loc_x = int(math.floor((float(self.input_loc.x) / stride_x) + eps)) + lost_left
-            data_loc = Box(data_loc_y, 0, data_loc_x, 0, self.input_loc.sides)
-
-        new_output_box, updated_total_indices = _new_value_indices(valid_probs.shape, data_loc, self.seen_indices)
-        self.seen_indices = updated_total_indices
-
-        if new_output_box.height <= 0 or new_output_box.width <= 0:
-            return torch.zeros((probs.shape[0], probs.shape[1]), dtype=probs.dtype, device=probs.device), 0
-
-        unseen = valid_probs[
-            :,
-            :,
-            new_output_box.y : new_output_box.y + new_output_box.height,
-            new_output_box.x : new_output_box.x + new_output_box.width,
-        ]
-        sum_p_r = unseen.pow(self.r).sum(dim=(-2, -1))
-        count = unseen.shape[H_DIM] * unseen.shape[W_DIM]
-        return sum_p_r, count
 
     def forward(self, logits: Tensor) -> Tensor:
         if logits.ndim != 4:
             raise ValueError(f"Expected logits to be NCHW, got shape {tuple(logits.shape)}")
 
-        probs = torch.sigmoid(logits)
-        sum_p_r, count = self._sum_unseen(probs)
-
         if self._sum_p_r is None:
-            self._sum_p_r = sum_p_r
-            self._sum_compensation = torch.zeros_like(sum_p_r)
-            self._count = count
-        else:
-            # Kahan-style compensated summation for tile accumulation.
-            # This minimizes floating-point drift from summing tiles in a
-            # different order than full-image reduction.
-            y = sum_p_r - self._sum_compensation
-            t = self._sum_p_r + y
-            self._sum_compensation = (t - self._sum_p_r) - y
-            self._sum_p_r = t
-            self._count += count
+            self._sum_p_r = torch.zeros((logits.shape[0], logits.shape[1]), dtype=logits.dtype, device=logits.device)
 
-        if self._count <= 0:
-            mean_p_r = torch.zeros_like(self._sum_p_r)
-        else:
-            mean_p_r = self._sum_p_r / float(self._count)
-
-        return mean_p_r.clamp_min(self.eps).pow(1.0 / self.r)
+        out, new_sum, new_count = streaming_global_reduce(
+            logits,
+            self._sum_p_r,
+            self._count,
+            self.r,
+            self.eps,
+            self.lost,
+            self.seen_indices,
+            self.output_stride,
+            self.input_loc,
+            self.data_loc,
+        )
+        self._sum_p_r = new_sum
+        self._count = int(new_count.detach().item())
+        return out

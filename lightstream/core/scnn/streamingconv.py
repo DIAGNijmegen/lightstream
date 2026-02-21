@@ -10,6 +10,18 @@ from lightstream.core.scnn.utils import _ntuple, Box, Lost, _new_value_indices, 
 
 _triple = _ntuple(3)
 
+
+def _stable_tile_index(coord: int, stride: float) -> int:
+    stride_f = float(stride)
+    if stride_f <= 0:
+        raise ValueError(f"stride must be > 0, got {stride_f}")
+
+    stride_i = int(round(stride_f))
+    if stride_i > 0 and abs(stride_f - float(stride_i)) <= 1e-3:
+        return int(coord) // stride_i
+
+    return int((float(coord) / stride_f) // 1)
+
 class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
@@ -77,10 +89,18 @@ class StreamingConv2dF(torch.autograd.Function):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = int(input_loc.y // output_stride[1]) + lost_top
-        data_loc_x = int(input_loc.x // output_stride[2]) + lost_left
+        data_loc_y = _stable_tile_index(input_loc.y, output_stride[1]) + lost_top
+        data_loc_x = _stable_tile_index(input_loc.x, output_stride[2]) + lost_left
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+        # Guard against precision drift creating synthetic forward gaps.
+        if data_loc.x > seen_indices.x and not sides.left:
+            data_loc = Box(data_loc.y, data_loc.height, seen_indices.x, data_loc.width, data_loc.sides)
+        # Y should only advance when we start a new row (left-most tile).
+        # For non-left tiles, keep y monotonic with the current seen row.
+        if data_loc.y > seen_indices.y and not sides.left:
+            data_loc = Box(seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
 
         # Calculate which part of the gradient is 'new'
         old_value_indices = seen_indices
