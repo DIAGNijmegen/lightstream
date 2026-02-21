@@ -1425,9 +1425,22 @@ class StreamingCNN(torch.nn.Module):
 
         # Calculate which part of the gradient is 'new'
         old_value_indices = self.saliency_old_indices
-        new_output_box, updated_total_indices = _new_value_indices(
-            valid_grad.shape, data_loc, old_value_indices
-        )
+        try:
+            new_output_box, updated_total_indices = _new_value_indices(
+                valid_grad.shape, data_loc, old_value_indices
+            )
+        except AssertionError as exc:
+            if "Misses data in x-axis" not in str(exc) and "We miss data in y-axis" not in str(exc):
+                raise
+            # Re-sync saliency cursor and retry once.
+            old_value_indices = Box(data_loc.y, data_loc.y + valid_grad.shape[H_DIM], data_loc.x, 0, data_loc.sides)
+            new_output_box, updated_total_indices = _new_value_indices(
+                valid_grad.shape, data_loc, old_value_indices
+            )
+
+        # Persist cursor progression; without this we can repeatedly compare
+        # against stale indices across tiles and trigger x/y-axis assertions.
+        self.saliency_old_indices = updated_total_indices
 
         if module.in_channels == 3:
             valid_grad_in = grad_in[0][
