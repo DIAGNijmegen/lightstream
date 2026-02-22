@@ -189,17 +189,11 @@ class StreamingCNN(torch.nn.Module):
 
             self._output_stride_per_output.append(output_stride)
 
-        if len(self._output_stride_per_output) > 1:
-            reference_stride = self._output_stride_per_output[0]
-            for stride in self._output_stride_per_output[1:]:
-                if not torch.equal(stride, reference_stride):
-                    stride_values = [tuple(int(x) for x in s.tolist()) for s in self._output_stride_per_output]
-                    raise ValueError(
-                        "StreamingCNN currently requires all outputs to have equal output strides. "
-                        f"Found strides: {stride_values}"
-                    )
-
         self.output_stride = self._output_stride_per_output[0]
+        self._base_output_stride = self._output_stride_per_output[0].clone()
+        for stride in self._output_stride_per_output[1:]:
+            self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
+            self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         torch.autograd.backward(output_tensors, gradients)
 
         # tiles can have -1, see backward_statistics_hook
@@ -409,12 +403,12 @@ class StreamingCNN(torch.nn.Module):
         # Calculate size of output that we would get by inferencing the
         # whole image.
         output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // self.output_stride[1] + tile_shape[H_DIM]
-            for tile_shape in self._tile_output_shapes
+            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
         output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // self.output_stride[2] + tile_shape[W_DIM]
-            for tile_shape in self._tile_output_shapes
+            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
 
         if result_on_cpu:
@@ -431,8 +425,22 @@ class StreamingCNN(torch.nn.Module):
         ]
         already_filled = [Box(0, 0, 0, 0, None) for _ in range(len(self._tile_output_shapes))]
 
-        n_rows = math.ceil(float(output_heights[0]) / float(valid_output_heights[0]))
-        n_cols = math.ceil(float(output_widths[0]) / float(valid_output_widths[0]))
+        valid_input_height = max(
+            1,
+            min(
+                valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
+                for idx in range(len(self._tile_output_shapes))
+            ),
+        )
+        valid_input_width = max(
+            1,
+            min(
+                valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
+                for idx in range(len(self._tile_output_shapes))
+            ),
+        )
+        n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
+        n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
 
         if image.shape[W_DIM] <= tile_width:
             n_cols = 1
@@ -453,24 +461,16 @@ class StreamingCNN(torch.nn.Module):
             for row in iterator:
                 for col in range(n_cols):
                     # Coordinates of the output w.r.t. the output of full image
-                    output_y = row * valid_output_heights[0]
-                    output_x = col * valid_output_widths[0]
+                    tile_y = row * valid_input_height
+                    tile_x = col * valid_input_width
 
                     # Check if we are at borders, since we can not create
                     # overlap here and should not crop values.
                     sides_top = True if row == 0 else False
                     sides_left = True if col == 0 else False
 
-                    sides_bottom = (
-                        True
-                        if output_y * self.output_stride[1] + self.tile_shape[H_DIM] >= image.shape[H_DIM]
-                        else False
-                    )
-                    sides_right = (
-                        True
-                        if output_x * self.output_stride[2] + self.tile_shape[W_DIM] >= image.shape[W_DIM]
-                        else False
-                    )
+                    sides_bottom = True if tile_y + self.tile_shape[H_DIM] >= image.shape[H_DIM] else False
+                    sides_right = True if tile_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
                     sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                     # These values are used to crop invalid output values
@@ -480,17 +480,12 @@ class StreamingCNN(torch.nn.Module):
                     # need to keep that into account when we are at the bottom
                     # and right side of the output.
                     if sides_bottom:
-                        output_y = (image.shape[H_DIM] - self.tile_shape[H_DIM]) // self.output_stride[1]
+                        tile_y = max(image.shape[H_DIM] - self.tile_shape[H_DIM], 0)
                     if sides_right:
-                        output_x = (image.shape[W_DIM] - self.tile_shape[W_DIM]) // self.output_stride[2]
+                        tile_x = max(image.shape[W_DIM] - self.tile_shape[W_DIM], 0)
 
-                    output_y = output_y if not sides.top else 0
-                    output_x = output_x if not sides.left else 0
-                    output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
-
-                    # Coordinates of the input w.r.t. the output of full image
-                    tile_y = output_y * self.output_stride[1]
-                    tile_x = output_x * self.output_stride[2]
+                    tile_y = tile_y if not sides.top else 0
+                    tile_x = tile_x if not sides.left else 0
 
                     # Extract tile and perform forward pass
                     tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
@@ -511,6 +506,9 @@ class StreamingCNN(torch.nn.Module):
 
                     for idx, head_output in enumerate(tile_outputs):
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+                        head_stride = self._output_stride_per_output[idx]
+                        output_y = tile_y // int(head_stride[1])
+                        output_x = tile_x // int(head_stride[2])
                         output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
                         trimmed_output = head_output[
                             :,
@@ -576,10 +574,12 @@ class StreamingCNN(torch.nn.Module):
         output_height = self._tile_output_shape[H_DIM]
         output_width = self._tile_output_shape[W_DIM]
 
-        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // self.output_stride[1]
-        valid_grad_height *= self.output_stride[1]
-        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // self.output_stride[2]
-        valid_grad_width *= self.output_stride[2]
+        base_stride_h = int(self._base_output_stride[1])
+        base_stride_w = int(self._base_output_stride[2])
+        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // base_stride_h
+        valid_grad_height *= base_stride_h
+        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // base_stride_w
+        valid_grad_width *= base_stride_w
 
         n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
@@ -612,15 +612,15 @@ class StreamingCNN(torch.nn.Module):
             for col in range(n_cols):
                 # Since we determine output (gradient) coordinates based on input
                 # coordinates. We need to divide by output stride.
-                output_y = row * valid_grad_height // self.output_stride[1]
-                output_x = col * valid_grad_width // self.output_stride[2]
+                output_y = row * valid_grad_height // base_stride_h
+                output_x = col * valid_grad_width // base_stride_w
 
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
 
                 base_grad = grad_tensors[0]
-                sides_bottom = True if output_y + output_height >= base_grad.shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= base_grad.shape[W_DIM] else False
+                sides_bottom = True if (output_y * base_stride_h) + tile_height >= image.shape[H_DIM] else False
+                sides_right = True if (output_x * base_stride_w) + tile_width >= image.shape[W_DIM] else False
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 # We are doing a forward pass
@@ -631,12 +631,13 @@ class StreamingCNN(torch.nn.Module):
                 # over the border)
 
                 if sides_bottom:
-                    output_y = max(base_grad.shape[H_DIM] - output_height, 0)
+                    input_y = max(image.shape[H_DIM] - tile_height, 0)
+                else:
+                    input_y = output_y * base_stride_h
                 if sides_right:
-                    output_x = max(base_grad.shape[W_DIM] - output_width, 0)
-
-                input_y = output_y * self.output_stride[1]
-                input_x = output_x * self.output_stride[2]
+                    input_x = max(image.shape[W_DIM] - tile_width, 0)
+                else:
+                    input_x = output_x * base_stride_w
 
                 input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
 
@@ -672,8 +673,9 @@ class StreamingCNN(torch.nn.Module):
                     head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                     head_output_height = self._tile_output_shapes[idx][H_DIM]
                     head_output_width = self._tile_output_shapes[idx][W_DIM]
-                    head_output_y = output_y
-                    head_output_x = output_x
+                    head_stride = self._output_stride_per_output[idx]
+                    head_output_y = input_y // int(head_stride[1])
+                    head_output_x = input_x // int(head_stride[2])
 
                     if sides_bottom:
                         head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
@@ -1037,6 +1039,10 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = state["tile_output_shape"]
         self._tile_output_shapes = state.get("tile_output_shapes", [self._tile_output_shape])
         self._output_stride_per_output = state.get("output_stride_per_output", [self.output_stride])
+        self._base_output_stride = self._output_stride_per_output[0].clone()
+        for stride in self._output_stride_per_output[1:]:
+            self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
+            self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         self._output_spec = state.get("output_spec", ("tensor", None))
 
         for name, module in self.stream_module.named_modules():
