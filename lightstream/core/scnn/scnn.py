@@ -261,6 +261,32 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
+    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths):
+        step_candidates_h = [
+            valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
+            for idx in range(len(self._tile_output_shapes))
+        ]
+        step_candidates_w = [
+            valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
+            for idx in range(len(self._tile_output_shapes))
+        ]
+
+        # Extra safety from backward statistics (input gradient valid region)
+        grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
+        grad_safe_w = self.tile_shape[W_DIM] - self.tile_gradient_lost.left - self.tile_gradient_lost.right
+        step_candidates_h.append(int(grad_safe_h))
+        step_candidates_w.append(int(grad_safe_w))
+
+        align_h = 1
+        align_w = 1
+        for stride in self._output_stride_per_output:
+            align_h = math.lcm(align_h, int(stride[1]))
+            align_w = math.lcm(align_w, int(stride[2]))
+
+        valid_input_height = max(align_h, (min(step_candidates_h) // align_h) * align_h)
+        valid_input_width = max(align_w, (min(step_candidates_w) // align_w) * align_w)
+        return valid_input_height, valid_input_width
+
     def _convert_modules_for_streaming(self, module):
         mod = module
         if isinstance(module, torch.nn.Conv2d):
@@ -426,22 +452,20 @@ class StreamingCNN(torch.nn.Module):
         ]
         already_filled = [Box(0, 0, 0, 0, None) for _ in range(len(self._tile_output_shapes))]
 
-        step_candidates_h = [
-            valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        step_candidates_w = [
-            valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        align_h = 1
-        align_w = 1
-        for stride in self._output_stride_per_output:
-            align_h = math.lcm(align_h, int(stride[1]))
-            align_w = math.lcm(align_w, int(stride[2]))
-
-        valid_input_height = max(align_h, (min(step_candidates_h) // align_h) * align_h)
-        valid_input_width = max(align_w, (min(step_candidates_w) // align_w) * align_w)
+        if len(self._tile_output_shapes) > 1:
+            valid_input_height, valid_input_width = self._compute_multi_output_input_step(
+                valid_output_heights,
+                valid_output_widths,
+            )
+        else:
+            valid_input_height = max(
+                1,
+                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+            )
+            valid_input_width = max(
+                1,
+                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+            )
         n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
 
@@ -587,22 +611,20 @@ class StreamingCNN(torch.nn.Module):
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
 
-        step_candidates_h = [
-            valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        step_candidates_w = [
-            valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        align_h = 1
-        align_w = 1
-        for stride in self._output_stride_per_output:
-            align_h = math.lcm(align_h, int(stride[1]))
-            align_w = math.lcm(align_w, int(stride[2]))
-
-        valid_input_height = max(align_h, (min(step_candidates_h) // align_h) * align_h)
-        valid_input_width = max(align_w, (min(step_candidates_w) // align_w) * align_w)
+        if len(self._tile_output_shapes) > 1:
+            valid_input_height, valid_input_width = self._compute_multi_output_input_step(
+                valid_output_heights,
+                valid_output_widths,
+            )
+        else:
+            valid_input_height = max(
+                1,
+                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+            )
+            valid_input_width = max(
+                1,
+                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+            )
 
         n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, width - tile_width)) / float(valid_input_width)) + 1
