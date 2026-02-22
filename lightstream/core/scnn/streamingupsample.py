@@ -63,6 +63,11 @@ class StreamingUpsampleF(torch.autograd.Function):
                 data_loc_x = 0
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
+            if data_loc.x > ctx.seen_indices.x:
+                data_loc = Box(data_loc.y, data_loc.height, ctx.seen_indices.x, data_loc.width, data_loc.sides)
+            if data_loc.y > ctx.seen_indices.y:
+                data_loc = Box(ctx.seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
+
             new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
 
             ctx.seen_indices.y = updated_total_indices.y

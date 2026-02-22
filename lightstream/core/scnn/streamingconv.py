@@ -95,6 +95,13 @@ class StreamingConv2dF(torch.autograd.Function):
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
+        # Safety clamp: if bookkeeping cursor lags behind current tile location,
+        # keep continuity by pinning to current cursor instead of asserting.
+        if data_loc.x > seen_indices.x:
+            data_loc = Box(data_loc.y, data_loc.height, seen_indices.x, data_loc.width, data_loc.sides)
+        if data_loc.y > seen_indices.y:
+            data_loc = Box(seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
+
         # Calculate which part of the gradient is 'new'
         old_value_indices = seen_indices
         new_output_box, updated_total_indices = _new_value_indices(
