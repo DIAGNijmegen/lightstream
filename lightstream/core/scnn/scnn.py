@@ -424,6 +424,30 @@ class StreamingCNN(torch.nn.Module):
     def _mul_stride(self, value, stride):
         return int(round(float(value) * float(stride)))
 
+    def _tile_positions(self, total_size, tile_size, step_size):
+        """Generate monotonic tile start positions with right/bottom alignment.
+
+        This avoids forward gaps on awkward (input - tile) combinations while
+        still aligning the final tile to the boundary.
+        """
+        total_size = int(total_size)
+        tile_size = int(tile_size)
+        step_size = max(1, int(step_size))
+
+        if tile_size >= total_size:
+            return [0]
+
+        positions = [0]
+        last_start = total_size - tile_size
+        while positions[-1] < last_start:
+            nxt = positions[-1] + step_size
+            if nxt >= last_start:
+                nxt = last_start
+            if nxt == positions[-1]:
+                break
+            positions.append(nxt)
+        return positions
+
     def _upsample_scale_factors(self, module, inpt, output):
         scale_factor = module.scale_factor
         if scale_factor is None:
@@ -892,37 +916,29 @@ class StreamingCNN(torch.nn.Module):
         valid_grad_height = math.floor((tile_height - grad_lost.top - grad_lost.bottom) / stride_y) * stride_y
         valid_grad_width = math.floor((tile_width - grad_lost.left - grad_lost.right) / stride_x) * stride_x
 
-        n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
-        n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
-
-        if image.shape[W_DIM] <= tile_width:
-            n_cols = 1
-        if image.shape[H_DIM] <= tile_height:
-            n_rows = 1
+        step_output_height = max(1, self._floor_div(valid_grad_height, stride_y))
+        step_output_width = max(1, self._floor_div(valid_grad_width, stride_x))
+        row_positions = self._tile_positions(grad.shape[H_DIM], output_height, step_output_height)
+        col_positions = self._tile_positions(grad.shape[W_DIM], output_width, step_output_width)
 
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        iterator = range(n_rows)
+        iterator = range(len(row_positions))
 
         for row in iterator:
-            for col in range(n_cols):
-                output_y = self._floor_div(row * valid_grad_height, stride_y)
-                output_x = self._floor_div(col * valid_grad_width, stride_x)
+            for col in range(len(col_positions)):
+                output_y = row_positions[row]
+                output_x = col_positions[col]
 
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
 
-                sides_bottom = True if output_y + output_height >= grad.shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= grad.shape[W_DIM] else False
+                sides_bottom = row == len(row_positions) - 1
+                sides_right = col == len(col_positions) - 1
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 lost = self._get_tile_lost_for_sides(sides, output_index)
-
-                if sides_bottom:
-                    output_y = max(grad.shape[H_DIM] - output_height, 0)
-                if sides_right:
-                    output_x = max(grad.shape[W_DIM] - output_width, 0)
 
                 input_y = self._mul_stride(output_y, stride_y)
                 input_x = self._mul_stride(output_x, stride_x)
@@ -1010,37 +1026,29 @@ class StreamingCNN(torch.nn.Module):
         valid_grad_height = math.floor((tile_height - grad_lost.top - grad_lost.bottom) / stride_y) * stride_y
         valid_grad_width = math.floor((tile_width - grad_lost.left - grad_lost.right) / stride_x) * stride_x
 
-        n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
-        n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
-
-        if image.shape[W_DIM] <= tile_width:
-            n_cols = 1
-        if image.shape[H_DIM] <= tile_height:
-            n_rows = 1
+        step_output_height = max(1, self._floor_div(valid_grad_height, stride_y))
+        step_output_width = max(1, self._floor_div(valid_grad_width, stride_x))
+        row_positions = self._tile_positions(grads[reference_output].shape[H_DIM], output_height, step_output_height)
+        col_positions = self._tile_positions(grads[reference_output].shape[W_DIM], output_width, step_output_width)
 
         self._inputs = {}
         self._backward_seen_indices = {}
 
-        iterator = range(n_rows)
+        iterator = range(len(row_positions))
 
         for row in iterator:
-            for col in range(n_cols):
-                output_y = self._floor_div(row * valid_grad_height, stride_y)
-                output_x = self._floor_div(col * valid_grad_width, stride_x)
+            for col in range(len(col_positions)):
+                output_y = row_positions[row]
+                output_x = col_positions[col]
 
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
 
-                sides_bottom = True if output_y + output_height >= grads[reference_output].shape[H_DIM] else False
-                sides_right = True if output_x + output_width >= grads[reference_output].shape[W_DIM] else False
+                sides_bottom = row == len(row_positions) - 1
+                sides_right = col == len(col_positions) - 1
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 lost = self._get_tile_lost_for_sides(sides, reference_output)
-
-                if sides_bottom:
-                    output_y = max(grads[reference_output].shape[H_DIM] - output_height, 0)
-                if sides_right:
-                    output_x = max(grads[reference_output].shape[W_DIM] - output_width, 0)
 
                 input_y = self._mul_stride(output_y, stride_y)
                 input_x = self._mul_stride(output_x, stride_x)
