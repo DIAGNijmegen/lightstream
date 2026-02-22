@@ -59,9 +59,9 @@ class WSS(nn.Module):
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
 
-        y = self.w[0] * y1.sum() + self.w[1] * y2.sum() + self.w[2] * y3.sum()
-
-        return y1, y2, y3, y
+        # Keep streamed outputs spatial (NCHW). Global reductions (sum/mean over
+        # full feature maps) should be done outside the streamed module.
+        return y1, y2, y3
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
