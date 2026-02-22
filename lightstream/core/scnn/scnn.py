@@ -1469,22 +1469,6 @@ class StreamingCNN(torch.nn.Module):
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
-        # Calculate which part of the gradient is 'new'
-        old_value_indices = self.saliency_old_indices
-        if data_loc_x > old_value_indices.x:
-            data_loc_x = old_value_indices.x
-        if data_loc_y > old_value_indices.y:
-            data_loc_y = old_value_indices.y
-
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-        new_output_box, updated_total_indices = _new_value_indices(
-            valid_grad.shape, data_loc, old_value_indices
-        )
-
-        # Persist cursor progression; without this we can repeatedly compare
-        # against stale indices across tiles and trigger x/y-axis assertions.
-        self.saliency_old_indices = updated_total_indices
-
         if module.in_channels == 3:
             valid_grad_in = grad_in[0][
                 :,
@@ -1493,21 +1477,13 @@ class StreamingCNN(torch.nn.Module):
                 lost.left * stride[2] : grad_in[0].shape[3] - lost.right * stride[2],
             ]
 
-            relevant_input_grad = valid_grad_in[
-                :,
-                :,
-                new_output_box.y * stride[1] : new_output_box.y * stride[1] + new_output_box.height * stride[1],
-                new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
-            ]
+            y_start = int(input_loc.y + lost.top * stride[1])
+            y_end = int(y_start + valid_grad_in.shape[2])
+            x_start = int(input_loc.x + lost.left * stride[2])
+            x_end = int(x_start + valid_grad_in.shape[3])
 
-            y_start = int((data_loc.y + new_output_box.y) * stride[1])
-            y_end = int(y_start + relevant_input_grad.shape[2])
-            x_start = int((data_loc.x + new_output_box.x) * stride[2])
-            x_end = int(x_start + relevant_input_grad.shape[3])
+            self.saliency_map[:, :, y_start:y_end, x_start:x_end] = valid_grad_in.detach().cpu()
 
-            self.saliency_map[:, :, y_start:y_end, x_start:x_end] = relevant_input_grad.detach().cpu()
-
-            del relevant_input_grad
             del valid_grad_in
         return grad_in
 
