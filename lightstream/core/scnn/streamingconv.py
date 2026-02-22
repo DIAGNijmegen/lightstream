@@ -84,16 +84,12 @@ class StreamingConv2dF(torch.autograd.Function):
         data_loc_y = int(round(float(input_loc.y) / float(output_stride[1]))) + lost_top
         data_loc_x = int(round(float(input_loc.x) / float(output_stride[2]))) + lost_left
 
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+        # Keep row-start aligned with bookkeeping contract used by
+        # _new_value_indices: first tile in each row must start at x==0.
+        if input_loc.sides is not None and input_loc.sides.left:
+            data_loc_x = 0
 
-        # Numerical alignment guard: due to floating conversion of output_stride,
-        # data_loc can occasionally be 1-2 px ahead of the running cursor on
-        # very large tiles. Clamp tiny forward drift here to preserve strict
-        # overlap accounting without triggering hard assertion failures.
-        if data_loc.x > seen_indices.x and (data_loc.x - seen_indices.x) <= 2:
-            data_loc = Box(data_loc.y, data_loc.height, seen_indices.x, data_loc.width, data_loc.sides)
-        if data_loc.y > seen_indices.y and (data_loc.y - seen_indices.y) <= 2:
-            data_loc = Box(seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
+        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
         # Calculate which part of the gradient is 'new'
         old_value_indices = seen_indices

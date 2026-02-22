@@ -57,14 +57,9 @@ class StreamingUpsampleF(torch.autograd.Function):
             # float floor drift on large coordinates.
             data_loc_y = int(round(float(ctx.input_loc.y) / float(stride_y))) + lost_top
             data_loc_x = int(round(float(ctx.input_loc.x) / float(stride_x))) + lost_left
+            if ctx.input_loc.sides is not None and ctx.input_loc.sides.left:
+                data_loc_x = 0
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
-
-            # Clamp tiny forward drift to the current cursor to avoid spurious
-            # assertions while keeping large forward jumps strict.
-            if data_loc.x > ctx.seen_indices.x and (data_loc.x - ctx.seen_indices.x) <= 2:
-                data_loc = Box(data_loc.y, data_loc.height, ctx.seen_indices.x, data_loc.width, data_loc.sides)
-            if data_loc.y > ctx.seen_indices.y and (data_loc.y - ctx.seen_indices.y) <= 2:
-                data_loc = Box(ctx.seen_indices.y, data_loc.height, data_loc.x, data_loc.width, data_loc.sides)
 
             new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
 
