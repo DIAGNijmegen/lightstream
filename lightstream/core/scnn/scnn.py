@@ -691,9 +691,9 @@ class StreamingCNN(torch.nn.Module):
                     head_output_y = input_y // int(head_stride[1])
                     head_output_x = input_x // int(head_stride[2])
 
-                    if sides_bottom:
+                    if sides.bottom:
                         head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-                    if sides_right:
+                    if sides.right:
                         head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
 
                     gradient = head_grad[
