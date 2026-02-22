@@ -1,5 +1,6 @@
 import math
 import torch
+import math
 
 from torch.amp import custom_bwd, custom_fwd
 
@@ -55,8 +56,9 @@ class StreamingUpsampleF(torch.autograd.Function):
 
             # Keep coordinate mapping consistent with StreamingConv2d and avoid
             # float floor drift on large coordinates.
-            data_loc_y = int(round(float(ctx.input_loc.y) / float(stride_y))) + lost_top
-            data_loc_x = int(round(float(ctx.input_loc.x) / float(stride_x))) + lost_left
+            eps = 1e-6
+            data_loc_y = int(math.floor((float(ctx.input_loc.y) / float(stride_y)) + eps)) + lost_top
+            data_loc_x = int(math.floor((float(ctx.input_loc.x) / float(stride_x)) + eps)) + lost_left
             if ctx.input_loc.sides is not None and ctx.input_loc.sides.left:
                 data_loc_x = 0
             data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)

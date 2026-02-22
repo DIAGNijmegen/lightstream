@@ -1,4 +1,5 @@
 import torch
+import math
 
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.utils import _pair
@@ -81,8 +82,11 @@ class StreamingConv2dF(torch.autograd.Function):
         # coordinates, floor division on floats can introduce off-by-one index
         # drift (e.g. x/stride ~= N+1e-7), which breaks monotonic tiling
         # assumptions in _new_value_indices. Use rounded integer mapping.
-        data_loc_y = int(round(float(input_loc.y) / float(output_stride[1]))) + lost_top
-        data_loc_x = int(round(float(input_loc.x) / float(output_stride[2]))) + lost_left
+        # Use floor with a tiny epsilon to avoid accidental forward jumps from
+        # floating-point rounding at large coordinates.
+        eps = 1e-6
+        data_loc_y = int(math.floor((float(input_loc.y) / float(output_stride[1])) + eps)) + lost_top
+        data_loc_x = int(math.floor((float(input_loc.x) / float(output_stride[2])) + eps)) + lost_left
 
         # Keep row-start aligned with bookkeeping contract used by
         # _new_value_indices: first tile in each row must start at x==0.
