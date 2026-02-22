@@ -462,11 +462,42 @@ class StreamingCNN(torch.nn.Module):
         return tensor
 
     def _align_trimmed_tensors(self, trimmed_grad, trimmed_output, sides):
-        target_h = min(trimmed_grad.shape[H_DIM], trimmed_output.shape[H_DIM])
-        target_w = min(trimmed_grad.shape[W_DIM], trimmed_output.shape[W_DIM])
+        # Keep trimmed_output as the reference shape and adapt grad to it.
+        # Cropping both tensors to the minimum shape can under-cover tiles and
+        # desynchronize per-layer seen_indices bookkeeping in streaming backward.
+        target_h = trimmed_output.shape[H_DIM]
+        target_w = trimmed_output.shape[W_DIM]
 
         trimmed_grad = self._crop_spatial_for_sides(trimmed_grad, target_h, target_w, sides)
-        trimmed_output = self._crop_spatial_for_sides(trimmed_output, target_h, target_w, sides)
+
+        pad_h = target_h - trimmed_grad.shape[H_DIM]
+        pad_w = target_w - trimmed_grad.shape[W_DIM]
+
+        if pad_h > 0 or pad_w > 0:
+            pad_top = 0
+            pad_bottom = 0
+            pad_left = 0
+            pad_right = 0
+
+            if pad_h > 0:
+                if sides.top and not sides.bottom:
+                    pad_bottom = pad_h
+                elif sides.bottom and not sides.top:
+                    pad_top = pad_h
+                else:
+                    pad_top = pad_h // 2
+                    pad_bottom = pad_h - pad_top
+
+            if pad_w > 0:
+                if sides.left and not sides.right:
+                    pad_right = pad_w
+                elif sides.right and not sides.left:
+                    pad_left = pad_w
+                else:
+                    pad_left = pad_w // 2
+                    pad_right = pad_w - pad_left
+
+            trimmed_grad = torch.nn.functional.pad(trimmed_grad, [pad_left, pad_right, pad_top, pad_bottom])
 
         return trimmed_grad, trimmed_output
 
