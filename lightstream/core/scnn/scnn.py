@@ -186,13 +186,28 @@ class StreamingCNN(torch.nn.Module):
                 output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
             else:
                 output_stride = torch.tensor([1, 1, 1])
+
+            # Some branches include upsampling layers that are intentionally not
+            # part of streaming statistics hooks. Infer effective spatial stride
+            # from tile/output shapes so multi-head decoders can share a common
+            # final output stride when appropriate.
+            effective_h = max(1, int(round(float(tile.shape[H_DIM]) / float(out.shape[H_DIM]))))
+            effective_w = max(1, int(round(float(tile.shape[W_DIM]) / float(out.shape[W_DIM]))))
+            output_stride = output_stride.clone()
+            output_stride[1] = min(int(output_stride[1]), effective_h)
+            output_stride[2] = min(int(output_stride[2]), effective_w)
+
             self._output_stride_per_output.append(output_stride)
 
         if len(self._output_stride_per_output) > 1:
             reference_stride = self._output_stride_per_output[0]
             for stride in self._output_stride_per_output[1:]:
                 if not torch.equal(stride, reference_stride):
-                    raise ValueError("StreamingCNN currently requires all outputs to have equal output strides")
+                    stride_values = [tuple(int(x) for x in s.tolist()) for s in self._output_stride_per_output]
+                    raise ValueError(
+                        "StreamingCNN currently requires all outputs to have equal output strides. "
+                        f"Found strides: {stride_values}"
+                    )
 
         self.output_stride = self._output_stride_per_output[0]
         torch.autograd.backward(output_tensors, gradients)
