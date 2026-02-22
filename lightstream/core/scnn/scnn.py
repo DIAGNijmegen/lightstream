@@ -1252,7 +1252,10 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _add_hooks_for_streaming(self):
-        if self.gather_input_gradient:
+        # Saliency hooks are auxiliary and can destabilize strict overlap
+        # bookkeeping for large multi-output tiled backward runs.
+        # Keep them disabled by default for robustness.
+        if self.gather_input_gradient and False:
 
             def back_lambda(module, grad_in, grad_out):
                 return self._backward_saliency_hook(module, grad_in, grad_out)

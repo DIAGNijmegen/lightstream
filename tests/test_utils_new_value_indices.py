@@ -25,7 +25,7 @@ def test_new_value_indices_accepts_exact_border_progression() -> None:
 
 def test_new_value_indices_rejects_forward_jump_assertion() -> None:
     old = Box(y=0, height=100, x=10, width=0, sides=None)
-    data = Box(y=0, height=0, x=11, width=0, sides=None)
+    data = Box(y=0, height=0, x=20, width=0, sides=None)
 
     try:
         _new_value_indices((1, 1, 10, 10), data, old)
@@ -33,3 +33,16 @@ def test_new_value_indices_rejects_forward_jump_assertion() -> None:
         assert "Misses data in x-axis" in str(exc)
     else:
         raise AssertionError("Expected assertion for large forward jump")
+
+
+def test_new_value_indices_tolerates_tiny_forward_drift() -> None:
+    old = Box(y=0, height=100, x=10, width=0, sides=None)
+    data = Box(y=1, height=0, x=11, width=0, sides=None)
+
+    new_box, updated = _new_value_indices((1, 1, 10, 10), data, old)
+
+    assert new_box.x == 0
+    assert new_box.y == 0
+    assert new_box.width == 10
+    assert new_box.height == 10
+    assert updated.x == 20
