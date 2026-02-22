@@ -33,12 +33,9 @@ def _compare_grads(stream_grads: dict[str, torch.Tensor], normal_grads: dict[str
     print(f"Comparing {len(shared)} parameter gradients:")
     for name in shared:
         diff = (stream_grads[name] - normal_grads[name]).abs()
-        denom = normal_grads[name].abs().clamp_min(1e-12)
-        rel = diff / denom
         print(
             f"{name}: "
             f"mean abs diff={diff.mean().item():.6e}, max abs diff={diff.max().item():.6e}, "
-            f"mean rel diff={rel.mean().item():.6e}, max rel diff={rel.max().item():.6e}"
         )
 
 
@@ -63,6 +60,7 @@ def _compare_conv_weight_grads(
             f"{name}: "
             f"stream mean abs={stream_grad.abs().mean().item():.6e}, "
             f"normal mean abs={normal_grad.abs().mean().item():.6e}, "
+            f"mean abs diff={stream_grad.abs().mean().item() - normal_grad.abs().mean().item():.6e}, "
             f"max abs diff={diff.max().item():.6e}"
         )
 
@@ -77,6 +75,14 @@ def _parse_dtype(value: str) -> torch.dtype:
     if key not in mapping:
         raise ValueError(f"Unsupported dtype '{value}'. Choose from: {', '.join(mapping.keys())}")
     return mapping[key]
+
+
+def _freeze_batchnorm(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, nn.BatchNorm2d):
+            submodule.eval()
+            for param in submodule.parameters():
+                param.requires_grad = False
 
 
 def main() -> None:
@@ -94,47 +100,54 @@ def main() -> None:
     input_size = args.input_size
 
     img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    target = torch.tensor(50., device=device, dtype=dtype)  # large value so we get larger gradients
+    criterion = torch.nn.MSELoss()
 
     network = StreamingResNet(
         "resnet18",
         tile_size,
-        additional_modules=torch.nn.MaxPool2d((2, 2)),
+        remove_last_block=False,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        tile_cache_path="/data/temporary/stephan/lightstream/examples/resnet18_vanilla_tile_cache_1_3_3200_3200"
-    )
-    network.to(device, dtype=dtype)
+        saliency=True,
+    ).to(device=device, dtype=dtype)
     network.stream_network.device = device
+    network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.eval()
-    #_zero_grads(network.stream_network.stream_module.parameters())
+    _freeze_batchnorm(network.stream_network.stream_module)
+
+    _zero_grads(network.stream_network.stream_module.parameters())
     stream_output = network(img)
-    # target_value = 50.0
-    # target = torch.full_like(stream_output, fill_value=target_value)
-    # stream_grad = 2 * (stream_output - target) / stream_output.numel()
-    # network.stream_network.backward(img, stream_grad)
-    # streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+    stream_output.requires_grad = True
+    y_pred_streaming = torch.sigmoid(torch.mean(stream_output))
+    loss = criterion(y_pred_streaming, target)
+    loss.backward()
+    full_gradients = network.stream_network.backward(img, stream_output.grad)
+    streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
-    #_zero_grads(normal_net.parameters())
+    _freeze_batchnorm(normal_net)
+    _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
     normal_output = normal_net(img_normal)
     forward_diff = (stream_output - normal_output).abs()
     print(f"Forward output sum/max diff: {forward_diff.sum().item()}, {forward_diff.max().item()}")
 
-    #normal_loss = torch.nn.functional.mse_loss(normal_output, torch.full_like(normal_output, target_value))
-    #normal_loss.backward()
-    #normal_param_grads = _gather_param_grads(normal_net)
+    y_pred_normal=torch.sigmoid(torch.mean(normal_output))
+    normal_loss = criterion(y_pred_normal, target)
+    normal_loss.backward()
+    normal_param_grads = _gather_param_grads(normal_net)
 
-    #if img_normal.grad is not None:
-    #    input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
-    #    print(f"Input gradient max diff: {input_grad_diff.max()}")
+    if img_normal.grad is not None:
+        input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
+        print(f"Input gradient max diff: {input_grad_diff.max()}")
 
-    #_compare_grads(streaming_param_grads, normal_param_grads)
-    #_compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
+    _compare_grads(streaming_param_grads, normal_param_grads)
+    _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
 
 
 if __name__ == "__main__":
