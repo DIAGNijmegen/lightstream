@@ -702,7 +702,9 @@ class StreamingCNN(torch.nn.Module):
                     tile_x = tile_x if not sides_left else 0
                     tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
+        last_sides = None
         for input_y, input_x, sides in tile_iter:
+                last_sides = sides
                 output_y = input_y // base_stride_h
                 output_x = input_x // base_stride_w
 
@@ -798,7 +800,9 @@ class StreamingCNN(torch.nn.Module):
                 mod.input_loc = None
                 mod.reset()
 
-        assert sides_right and sides_bottom, "It seems like we could not reconstruct all output"  # type:ignore
+        assert last_sides is not None and last_sides.right and last_sides.bottom, (
+            "It seems like we could not reconstruct all output"
+        )
 
     def _get_tile_lost_for_sides(self, sides, output_lost=None):
         output_lost = self.tile_output_lost if output_lost is None else output_lost
