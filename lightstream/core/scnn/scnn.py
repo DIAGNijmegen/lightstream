@@ -627,7 +627,7 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if self._last_forward_tiles:
+        if len(self._tile_output_shapes) > 1 and self._last_forward_tiles:
             tile_iter = self._last_forward_tiles
         else:
             tile_iter = []
