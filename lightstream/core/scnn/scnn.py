@@ -1130,11 +1130,36 @@ class StreamingCNN(torch.nn.Module):
 
         if self._output_count() == 1:
             self._backward_single_output(image, grads[0])
+        elif grad_structure == self._output_structure:
+            # For structured multi-output models, prefer grouped/shared
+            # backward traversal so all outputs in the same tiling group
+            # advance streaming cursors in one coherent tile order.
+            for overlap_group in self._output_overlap_groups():
+                for mod in self.stream_module.modules():
+                    if isinstance(mod, (StreamingConv2d, StreamingUpsample)):
+                        mod.reset()
+
+                if len(overlap_group) == 1:
+                    out_idx = overlap_group[0]
+                    self._backward_single_output(image, grads[out_idx], output_index=out_idx)
+                    continue
+
+                grad_losts = [self._get_tile_gradient_lost(output_index) for output_index in overlap_group]
+                max_grad_lost = Lost(
+                    max(lost.top for lost in grad_losts),
+                    max(lost.left for lost in grad_losts),
+                    max(lost.bottom for lost in grad_losts),
+                    max(lost.right for lost in grad_losts),
+                )
+
+                self._backward_multi_output_shared(
+                    image,
+                    grads,
+                    output_indices=overlap_group,
+                    grad_lost=max_grad_lost,
+                )
         else:
-            # Correctness-first strategy for multi-output models:
-            # process each output branch independently with a fresh streaming
-            # state. This avoids cross-branch interference through seen_indices
-            # bookkeeping when outputs share downstream computations.
+            # Fallback for mismatched gradient structures.
             for idx, grad_tensor in enumerate(grads):
                 if grad_tensor is None:
                     continue
