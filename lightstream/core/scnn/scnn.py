@@ -1460,13 +1460,23 @@ class StreamingCNN(torch.nn.Module):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        data_loc_y = int(round(float(input_loc.y) / float(stride_y))) + lost_top
-        data_loc_x = int(round(float(input_loc.x) / float(stride_x))) + lost_left
+        eps = 1e-6
+        data_loc_y = int(math.floor((float(input_loc.y) / float(stride_y)) + eps)) + lost_top
+        data_loc_x = int(math.floor((float(input_loc.x) / float(stride_x)) + eps)) + lost_left
+
+        if input_loc.sides is not None and input_loc.sides.left:
+            data_loc_x = 0
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
         # Calculate which part of the gradient is 'new'
         old_value_indices = self.saliency_old_indices
+        if data_loc_x > old_value_indices.x:
+            data_loc_x = old_value_indices.x
+        if data_loc_y > old_value_indices.y:
+            data_loc_y = old_value_indices.y
+
+        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
         new_output_box, updated_total_indices = _new_value_indices(
             valid_grad.shape, data_loc, old_value_indices
         )
