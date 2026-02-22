@@ -1460,14 +1460,27 @@ class StreamingCNN(torch.nn.Module):
         # Move the location according to how many pixels have been trimmed
         # this will be the location of the valid gradient of this layer in relation
         # to the actual gradient in a normal backpass
-        eps = 1e-6
-        data_loc_y = int(math.floor((float(input_loc.y) / float(stride_y)) + eps)) + lost_top
-        data_loc_x = int(math.floor((float(input_loc.x) / float(stride_x)) + eps)) + lost_left
-
-        if input_loc.sides is not None and input_loc.sides.left:
-            data_loc_x = 0
+        data_loc_y = int(round(float(input_loc.y) / float(stride_y))) + lost_top
+        data_loc_x = int(round(float(input_loc.x) / float(stride_x))) + lost_left
 
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+        # Calculate which part of the gradient is 'new'
+        old_value_indices = self.saliency_old_indices
+        try:
+            new_output_box, updated_total_indices = _new_value_indices(
+                valid_grad.shape, data_loc, old_value_indices
+            )
+        except AssertionError as exc:
+            if "Misses data in x-axis" in str(exc) or "We miss data in y-axis" in str(exc):
+                # Saliency map generation is auxiliary; avoid aborting main
+                # backward/parameter gradients when cursor bookkeeping drifts.
+                return grad_in
+            raise
+
+        # Persist cursor progression; without this we can repeatedly compare
+        # against stale indices across tiles and trigger x/y-axis assertions.
+        self.saliency_old_indices = updated_total_indices
 
         if module.in_channels == 3:
             valid_grad_in = grad_in[0][
@@ -1477,13 +1490,21 @@ class StreamingCNN(torch.nn.Module):
                 lost.left * stride[2] : grad_in[0].shape[3] - lost.right * stride[2],
             ]
 
-            y_start = int(input_loc.y + lost.top * stride[1])
-            y_end = int(y_start + valid_grad_in.shape[2])
-            x_start = int(input_loc.x + lost.left * stride[2])
-            x_end = int(x_start + valid_grad_in.shape[3])
+            relevant_input_grad = valid_grad_in[
+                :,
+                :,
+                new_output_box.y * stride[1] : new_output_box.y * stride[1] + new_output_box.height * stride[1],
+                new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
+            ]
 
-            self.saliency_map[:, :, y_start:y_end, x_start:x_end] = valid_grad_in.detach().cpu()
+            y_start = int((data_loc.y + new_output_box.y) * stride[1])
+            y_end = int(y_start + relevant_input_grad.shape[2])
+            x_start = int((data_loc.x + new_output_box.x) * stride[2])
+            x_end = int(x_start + relevant_input_grad.shape[3])
 
+            self.saliency_map[:, :, y_start:y_end, x_start:x_end] = relevant_input_grad.detach().cpu()
+
+            del relevant_input_grad
             del valid_grad_in
         return grad_in
 
