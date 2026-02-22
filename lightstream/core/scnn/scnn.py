@@ -100,6 +100,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
         self._current_tile_input_loc = None
         self._hooks = []
+        self._last_forward_tiles = []
 
         if state_dict is None:
             self._configure()
@@ -456,6 +457,7 @@ class StreamingCNN(torch.nn.Module):
         #    iterator = tqdm(range(n_rows))
         # else:
         iterator = range(n_rows)
+        self._last_forward_tiles = []
 
         with torch.no_grad():
             for row in iterator:
@@ -486,6 +488,7 @@ class StreamingCNN(torch.nn.Module):
 
                     tile_y = tile_y if not sides.top else 0
                     tile_x = tile_x if not sides.left else 0
+                    self._last_forward_tiles.append((int(tile_y), int(tile_x), sides))
 
                     # Extract tile and perform forward pass
                     tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
@@ -624,37 +627,31 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        for row in iterator:
-            for col in range(n_cols):
-                # traverse tiles in input space, same as forward
-                tile_y = row * valid_input_height
-                tile_x = col * valid_input_width
-                output_y = tile_y // base_stride_h
-                output_x = tile_x // base_stride_w
+        if self._last_forward_tiles:
+            tile_iter = self._last_forward_tiles
+        else:
+            tile_iter = []
+            for row in iterator:
+                for col in range(n_cols):
+                    tile_y = row * valid_input_height
+                    tile_x = col * valid_input_width
+                    sides_top = True if row == 0 else False
+                    sides_left = True if col == 0 else False
+                    sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
+                    sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
+                    if sides_bottom:
+                        tile_y = max(image.shape[H_DIM] - tile_height, 0)
+                    if sides_right:
+                        tile_x = max(image.shape[W_DIM] - tile_width, 0)
+                    tile_y = tile_y if not sides_top else 0
+                    tile_x = tile_x if not sides_left else 0
+                    tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
-                sides_top = True if row == 0 else False
-                sides_left = True if col == 0 else False
+        for input_y, input_x, sides in tile_iter:
+                output_y = input_y // base_stride_h
+                output_x = input_x // base_stride_w
 
-                base_grad = grad_tensors[0]
-                sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
-                sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
-                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
-
-                # We are doing a forward pass
                 lost = self._get_tile_lost_for_sides(sides)
-
-                # If the tile is at the bottom or right side of the input image
-                # than we need to shift back so that the tile fits (does not go
-                # over the border)
-
-                if sides_bottom:
-                    input_y = max(image.shape[H_DIM] - tile_height, 0)
-                else:
-                    input_y = tile_y
-                if sides_right:
-                    input_x = max(image.shape[W_DIM] - tile_width, 0)
-                else:
-                    input_x = tile_x
 
                 input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
 
