@@ -627,7 +627,44 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if len(self._tile_output_shapes) > 1 and self._last_forward_tiles:
+        if len(self._tile_output_shapes) == 1:
+            grad_lost = self.tile_gradient_lost
+            output_height = self._tile_output_shape[H_DIM]
+            output_width = self._tile_output_shape[W_DIM]
+            valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // int(self.output_stride[1])
+            valid_grad_height *= int(self.output_stride[1])
+            valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // int(self.output_stride[2])
+            valid_grad_width *= int(self.output_stride[2])
+
+            n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
+            n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
+
+            if image.shape[W_DIM] <= tile_width:
+                n_cols = 1
+            if image.shape[H_DIM] <= tile_height:
+                n_rows = 1
+
+            base_grad = grad_tensors[0]
+            tile_iter = []
+            for row in range(n_rows):
+                for col in range(n_cols):
+                    output_y = row * valid_grad_height // int(self.output_stride[1])
+                    output_x = col * valid_grad_width // int(self.output_stride[2])
+
+                    sides_top = True if row == 0 else False
+                    sides_left = True if col == 0 else False
+                    sides_bottom = True if output_y + output_height >= base_grad.shape[H_DIM] else False
+                    sides_right = True if output_x + output_width >= base_grad.shape[W_DIM] else False
+
+                    if sides_bottom:
+                        output_y = max(base_grad.shape[H_DIM] - output_height, 0)
+                    if sides_right:
+                        output_x = max(base_grad.shape[W_DIM] - output_width, 0)
+
+                    input_y = output_y * int(self.output_stride[1])
+                    input_x = output_x * int(self.output_stride[2])
+                    tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+        elif self._last_forward_tiles:
             tile_iter = self._last_forward_tiles
         else:
             tile_iter = []
