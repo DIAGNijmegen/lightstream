@@ -42,9 +42,8 @@ class WSS(nn.Module):
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
 
-        y = self.w[0] * y1 + self.w[1] * y2 + self.w[2] * y3
 
-        return y1, y2, y3, y
+        return y1, y2, y3
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
