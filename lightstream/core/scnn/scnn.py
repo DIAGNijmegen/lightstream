@@ -569,20 +569,36 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
-        grad_lost = self.tile_gradient_lost
 
-        output_height = self._tile_output_shape[H_DIM]
-        output_width = self._tile_output_shape[W_DIM]
+        valid_output_heights = [
+            self._tile_output_shapes[idx][H_DIM] - self._tile_output_lost[idx].top - self._tile_output_lost[idx].bottom
+            for idx in range(len(self._tile_output_shapes))
+        ]
+        valid_output_widths = [
+            self._tile_output_shapes[idx][W_DIM] - self._tile_output_lost[idx].left - self._tile_output_lost[idx].right
+            for idx in range(len(self._tile_output_shapes))
+        ]
+
+        valid_input_height = max(
+            1,
+            min(
+                valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
+                for idx in range(len(self._tile_output_shapes))
+            ),
+        )
+        valid_input_width = max(
+            1,
+            min(
+                valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
+                for idx in range(len(self._tile_output_shapes))
+            ),
+        )
 
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
-        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // base_stride_h
-        valid_grad_height *= base_stride_h
-        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // base_stride_w
-        valid_grad_width *= base_stride_w
 
-        n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
-        n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
+        n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
+        n_cols = math.ceil(float(max(1, width - tile_width)) / float(valid_input_width)) + 1
 
         # if self.verbose:
         #    ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
@@ -610,17 +626,18 @@ class StreamingCNN(torch.nn.Module):
 
         for row in iterator:
             for col in range(n_cols):
-                # Since we determine output (gradient) coordinates based on input
-                # coordinates. We need to divide by output stride.
-                output_y = row * valid_grad_height // base_stride_h
-                output_x = col * valid_grad_width // base_stride_w
+                # traverse tiles in input space, same as forward
+                tile_y = row * valid_input_height
+                tile_x = col * valid_input_width
+                output_y = tile_y // base_stride_h
+                output_x = tile_x // base_stride_w
 
                 sides_top = True if row == 0 else False
                 sides_left = True if col == 0 else False
 
                 base_grad = grad_tensors[0]
-                sides_bottom = True if (output_y * base_stride_h) + tile_height >= image.shape[H_DIM] else False
-                sides_right = True if (output_x * base_stride_w) + tile_width >= image.shape[W_DIM] else False
+                sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
+                sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 # We are doing a forward pass
@@ -633,11 +650,11 @@ class StreamingCNN(torch.nn.Module):
                 if sides_bottom:
                     input_y = max(image.shape[H_DIM] - tile_height, 0)
                 else:
-                    input_y = output_y * base_stride_h
+                    input_y = tile_y
                 if sides_right:
                     input_x = max(image.shape[W_DIM] - tile_width, 0)
                 else:
-                    input_x = output_x * base_stride_w
+                    input_x = tile_x
 
                 input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
 
