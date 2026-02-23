@@ -316,6 +316,11 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, torch.nn.Upsample):
             mod = StreamingUpsample2d.from_torch_upsample(module)
+            if module in self._module_stats:
+                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
+                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -352,6 +357,14 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
         del module
@@ -872,8 +885,8 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d),
+        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
@@ -887,12 +900,35 @@ class StreamingCNN(torch.nn.Module):
         for hook in self._hooks:
             hook.remove()
 
+    def _resolve_upsample_scale(self, module, inpt, output):
+        if module.scale_factor is not None:
+            sf = module.scale_factor
+            if isinstance(sf, tuple):
+                return float(sf[-2]), float(sf[-1])
+            return float(sf), float(sf)
+        in_h, in_w = inpt[0].shape[H_DIM], inpt[0].shape[W_DIM]
+        out_h, out_w = output.shape[H_DIM], output.shape[W_DIM]
+        return float(out_h) / float(max(1, in_h)), float(out_w) / float(max(1, in_w))
+
+    def _update_output_stride_for_upsample(self, prev_output_stride, scale_h, scale_w):
+        out_stride = prev_output_stride.clone().detach().to(torch.float32)
+        out_stride[1] = max(1.0, out_stride[1] / max(scale_h, 1e-8))
+        out_stride[2] = max(1.0, out_stride[2] / max(scale_w, 1e-8))
+        out_stride = torch.round(out_stride).to(torch.long)
+        out_stride[0] = 1
+        return out_stride
+
     def _forward_gather_statistics_hook(self, module, inpt, output):
-        stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_upsample = isinstance(module, torch.nn.Upsample)
+        if not is_upsample:
+            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        else:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
-            if (
+            if (not is_upsample) and (
                 isinstance(module, (torch.nn.MaxPool2d))
                 or (stride[0] > 1 and stride[0] > kernel_size[0])
                 or (stride[1] > 1 and stride[1] > kernel_size[1])
@@ -925,7 +961,7 @@ class StreamingCNN(torch.nn.Module):
                 :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride, "module": module}
+            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
             if self.verbose:
                 print(module, "\n", module_stats["lost"])
 
@@ -936,16 +972,25 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(output)
             if p_stats:
-                output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                prev_output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
             else:
-                output_stride = torch.tensor([1, 1, 1])
+                prev_output_stride = torch.tensor([1, 1, 1])
+
+            if is_upsample:
+                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
+                output_stride = self._update_output_stride_for_upsample(prev_output_stride, scale_h, scale_w)
+                module_stats["scale_factor_hw"] = (scale_h, scale_w)
+            else:
+                output_stride = prev_output_stride
 
             module_stats["output_stride"] = output_stride.clone().detach()
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
-        stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_upsample = isinstance(module, torch.nn.Upsample)
+        if not is_upsample:
+            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
             # on groups of channels
@@ -994,7 +1039,7 @@ class StreamingCNN(torch.nn.Module):
 
             # When kernel_size > stride we have some _overlap_ of gradients,
             # this overlap makes extra positions in the input gradient invalid
-            if (
+            if (not is_upsample) and (
                 (stride[0] > 1 and kernel_size[0] > stride[0])
                 or (stride[1] > 1 and kernel_size[1] > stride[1])
                 or (stride[2] > 1 and kernel_size[2] > stride[2])

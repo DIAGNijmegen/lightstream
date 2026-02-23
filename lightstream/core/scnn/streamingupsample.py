@@ -23,6 +23,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         recompute_scale_factor,
         grad_lost,
         seen_indices,
+        output_stride,
         input_loc,
     ):
         ctx.save_for_backward(inpt)
@@ -33,6 +34,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.recompute_scale_factor = recompute_scale_factor
         ctx.grad_lost = grad_lost
         ctx.seen_indices = seen_indices
+        ctx.output_stride = output_stride
         ctx.input_loc = input_loc
         return F.interpolate(
             inpt,
@@ -66,9 +68,13 @@ class StreamingUpsample2dF(torch.autograd.Function):
         scale_h = float(output_h) / float(max(1, input_h))
         scale_w = float(output_w) / float(max(1, input_w))
 
+        post_stride = ctx.output_stride.clone().detach().to(torch.float32)
+        post_stride[1] = max(1.0, post_stride[1] / max(scale_h, 1e-8))
+        post_stride[2] = max(1.0, post_stride[2] / max(scale_w, 1e-8))
+
         input_loc = ctx.input_loc
-        data_loc_y = int(round(input_loc.y * scale_h)) + lost_top
-        data_loc_x = int(round(input_loc.x * scale_w)) + lost_left
+        data_loc_y = int(input_loc.y / float(post_stride[1])) + lost_top
+        data_loc_x = int(input_loc.x / float(post_stride[2])) + lost_left
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
         new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
@@ -107,7 +113,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         else:
             grad_in = None
 
-        return grad_in, None, None, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None, None, None, None
 
 
 upsample2d = StreamingUpsample2dF.apply
@@ -142,6 +148,7 @@ class StreamingUpsample2d(nn.Module):
         self.recompute_scale_factor = recompute_scale_factor
 
         self.grad_lost = Lost(0, 0, 0, 0)
+        self.output_stride = torch.tensor([1, 1, 1])
         self.reset()
 
     def reset(self):
@@ -158,6 +165,7 @@ class StreamingUpsample2d(nn.Module):
             self.recompute_scale_factor,
             self.grad_lost,
             self.seen_indices,
+            self.output_stride,
             self.input_loc,
         )
 
