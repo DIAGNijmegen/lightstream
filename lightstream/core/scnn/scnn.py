@@ -475,7 +475,7 @@ class StreamingCNN(torch.nn.Module):
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
                 valid_output_heights,
                 valid_output_widths,
-                include_grad_safe=False,
+                include_grad_safe=True,
             )
         else:
             valid_input_height = max(
