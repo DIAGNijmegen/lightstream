@@ -287,6 +287,29 @@ class StreamingCNN(torch.nn.Module):
 
         return max(1, min(candidates_h)), max(1, min(candidates_w))
 
+    def _compute_internal_alignment(self):
+        """Compute input-space alignment constraints from internal streamed layers.
+
+        When output heads are upsampled back to stride-1, alignment based only on
+        head output stride becomes 1 and can lose the internal phase constraints
+        required by earlier strided conv layers.
+        """
+
+        align_h = 1
+        align_w = 1
+        for mod in self.stream_module.modules():
+            if not isinstance(mod, StreamingConv2d):
+                continue
+
+            stride = _triple(mod.stride)
+            output_stride = getattr(mod, "output_stride", torch.tensor([1, 1, 1]))
+            eff_h = int(output_stride[1]) * int(stride[1])
+            eff_w = int(output_stride[2]) * int(stride[2])
+            align_h = math.lcm(align_h, max(1, eff_h))
+            align_w = math.lcm(align_w, max(1, eff_w))
+
+        return align_h, align_w
+
     def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
         step_candidates_h = [
             valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
@@ -308,6 +331,10 @@ class StreamingCNN(torch.nn.Module):
         for stride in self._output_stride_per_output:
             align_h = math.lcm(align_h, int(stride[1]))
             align_w = math.lcm(align_w, int(stride[2]))
+
+        internal_align_h, internal_align_w = self._compute_internal_alignment()
+        align_h = math.lcm(align_h, internal_align_h)
+        align_w = math.lcm(align_w, internal_align_w)
 
         valid_input_height = max(align_h, (min(step_candidates_h) // align_h) * align_h)
         valid_input_width = max(align_w, (min(step_candidates_w) // align_w) * align_w)
