@@ -55,7 +55,6 @@ class StreamingCNN(torch.nn.Module):
         mean=None,
         std=None,
         state_dict=None,
-        upsample_seam_margin=1,
     ):
         """
         Parameters:
@@ -103,9 +102,6 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._last_forward_tiles = []
-
-        self.upsample_seam_margin = int(max(0, upsample_seam_margin))
-        self._has_streaming_upsample = any(isinstance(m, (torch.nn.Upsample, StreamingUpsample2d)) for m in self.stream_module.modules())
 
         if state_dict is None:
             self._configure()
@@ -848,12 +844,10 @@ class StreamingCNN(torch.nn.Module):
 
     def _get_tile_lost_for_sides(self, sides, output_lost=None):
         output_lost = self.tile_output_lost if output_lost is None else output_lost
-        margin = self.upsample_seam_margin if self._has_streaming_upsample else 0
-
-        lost_top = output_lost.top + margin if not sides.top else 0
-        lost_bottom = output_lost.bottom + margin if not sides.bottom else 0
-        lost_left = output_lost.left + margin if not sides.left else 0
-        lost_right = output_lost.right + margin if not sides.right else 0
+        lost_top = output_lost.top if not sides.top else 0
+        lost_bottom = output_lost.bottom if not sides.bottom else 0
+        lost_left = output_lost.left if not sides.left else 0
+        lost_right = output_lost.right if not sides.right else 0
         lost = Lost(lost_top, lost_left, lost_bottom, lost_right)
         return lost
 
