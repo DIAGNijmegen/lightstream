@@ -595,17 +595,17 @@ class StreamingCNN(torch.nn.Module):
                         )
                         already_filled[idx] = updated_total_indices
 
-                        relevant_output = trimmed_output[
-                            :,
-                            :,
-                            new_output_box.y : new_output_box.y + new_output_box.height,
-                            new_output_box.x : new_output_box.x + new_output_box.width,
-                        ]
+                        src_y0 = int(new_output_box.y)
+                        src_y1 = int(new_output_box.y + new_output_box.height)
+                        src_x0 = int(new_output_box.x)
+                        src_x1 = int(new_output_box.x + new_output_box.width)
 
-                        dst_y0 = int(updated_total_indices.y)
-                        dst_y1 = int(updated_total_indices.height)
-                        dst_x0 = int(updated_total_indices.x - new_output_box.width)
-                        dst_x1 = int(updated_total_indices.x)
+                        relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
+
+                        dst_y0 = int(output_loc.y + new_output_box.y)
+                        dst_y1 = int(dst_y0 + new_output_box.height)
+                        dst_x0 = int(output_loc.x + new_output_box.x)
+                        dst_x1 = int(dst_x0 + new_output_box.width)
 
                         assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
@@ -615,6 +615,8 @@ class StreamingCNN(torch.nn.Module):
                             f"X-shape mismatch while stitching output head {idx}: "
                             f"dst=({dst_x0}:{dst_x1}) src_w={relevant_output.shape[W_DIM]}"
                         )
+                        assert dst_y0 >= 0 and dst_x0 >= 0
+                        assert dst_y1 <= outputs[idx].shape[H_DIM] and dst_x1 <= outputs[idx].shape[W_DIM]
 
                         outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
 
