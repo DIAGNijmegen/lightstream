@@ -574,16 +574,25 @@ class StreamingCNN(torch.nn.Module):
                         relevant_output = trimmed_output[
                             :,
                             :,
-                            new_output_box.y : updated_total_indices.y + new_output_box.height,
+                            new_output_box.y : new_output_box.y + new_output_box.height,
                             new_output_box.x : new_output_box.x + new_output_box.width,
                         ]
 
-                        outputs[idx][
-                            :,
-                            :,
-                            int(updated_total_indices.y) : int(updated_total_indices.height),
-                            int(updated_total_indices.x - new_output_box.width) : int(updated_total_indices.x),
-                        ] = relevant_output
+                        dst_y0 = int(updated_total_indices.y)
+                        dst_y1 = int(updated_total_indices.height)
+                        dst_x0 = int(updated_total_indices.x - new_output_box.width)
+                        dst_x1 = int(updated_total_indices.x)
+
+                        assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
+                            f"Y-shape mismatch while stitching output head {idx}: "
+                            f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
+                        )
+                        assert (dst_x1 - dst_x0) == relevant_output.shape[W_DIM], (
+                            f"X-shape mismatch while stitching output head {idx}: "
+                            f"dst=({dst_x0}:{dst_x1}) src_w={relevant_output.shape[W_DIM]}"
+                        )
+
+                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
 
                     del tile
 
