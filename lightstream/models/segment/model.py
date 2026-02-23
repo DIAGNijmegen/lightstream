@@ -18,14 +18,17 @@ class WSS(nn.Module):
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
         self.decoder2 = nn.Sequential(
             nn.Conv2d(128, 1, 1),
+            nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
         self.decoder3 = nn.Sequential(
             nn.Conv2d(256, 1, 1),
+            nn.Upsample(scale_factor=16, mode="bilinear", align_corners=False),
             nn.Sigmoid()
         )
 
