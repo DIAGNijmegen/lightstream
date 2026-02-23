@@ -493,10 +493,6 @@ class StreamingCNN(torch.nn.Module):
             ).fill_(999)
             for idx in range(len(self._tile_output_shapes))
         ]
-        coverage_masks = [
-            torch.zeros((output_heights[idx], output_widths[idx]), dtype=torch.bool, device=device)
-            for idx in range(len(self._tile_output_shapes))
-        ]
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -633,14 +629,9 @@ class StreamingCNN(torch.nn.Module):
                             f"dst=({dst_x0}:{dst_x1}) src_w={relevant_output.shape[W_DIM]}"
                         )
 
-                        dest_mask = ~coverage_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
-                        if dest_mask.any():
-                            for b in range(relevant_output.shape[B_DIM]):
-                                for c in range(relevant_output.shape[C_DIM]):
-                                    dest_view = outputs[idx][b, c, dst_y0:dst_y1, dst_x0:dst_x1]
-                                    src_view = relevant_output[b, c]
-                                    dest_view[dest_mask] = src_view[dest_mask]
-                            coverage_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1] |= dest_mask
+                        # Overlapping regions are intentionally overwritten by later tiles
+                        # (right/bottom preference), which is more robust for border tiles.
+                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
 
                     del tile
 
