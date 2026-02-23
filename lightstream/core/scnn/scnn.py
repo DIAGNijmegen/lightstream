@@ -744,8 +744,6 @@ class StreamingCNN(torch.nn.Module):
                     input_y = output_y * int(self.output_stride[1])
                     input_x = output_x * int(self.output_stride[2])
                     tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
-        elif self._last_forward_tiles:
-            tile_iter = self._last_forward_tiles
         else:
             tile_iter = []
             for row in iterator:
