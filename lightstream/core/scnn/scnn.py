@@ -262,7 +262,7 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
-    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths):
+    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
         step_candidates_h = [
             valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
             for idx in range(len(self._tile_output_shapes))
@@ -273,10 +273,11 @@ class StreamingCNN(torch.nn.Module):
         ]
 
         # Extra safety from backward statistics (input gradient valid region)
-        grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
-        grad_safe_w = self.tile_shape[W_DIM] - self.tile_gradient_lost.left - self.tile_gradient_lost.right
-        step_candidates_h.append(int(grad_safe_h))
-        step_candidates_w.append(int(grad_safe_w))
+        if include_grad_safe:
+            grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
+            grad_safe_w = self.tile_shape[W_DIM] - self.tile_gradient_lost.left - self.tile_gradient_lost.right
+            step_candidates_h.append(int(grad_safe_h))
+            step_candidates_w.append(int(grad_safe_w))
 
         align_h = 1
         align_w = 1
@@ -474,6 +475,7 @@ class StreamingCNN(torch.nn.Module):
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
                 valid_output_heights,
                 valid_output_widths,
+                include_grad_safe=False,
             )
         else:
             valid_input_height = max(
@@ -633,6 +635,7 @@ class StreamingCNN(torch.nn.Module):
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
                 valid_output_heights,
                 valid_output_widths,
+                include_grad_safe=True,
             )
         else:
             valid_input_height = max(
@@ -972,7 +975,7 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(output)
             if p_stats:
-                prev_output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                prev_output_stride = p_stats["output_stride"] * p_stats["stride"].clone().detach() if isinstance(p_stats["stride"], torch.Tensor) else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
             else:
                 prev_output_stride = torch.tensor([1, 1, 1])
 

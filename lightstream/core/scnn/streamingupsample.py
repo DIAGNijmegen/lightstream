@@ -79,24 +79,22 @@ class StreamingUpsample2dF(torch.autograd.Function):
 
         new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
 
+        # Keep state monotonic for debugging/introspection, but do not deduplicate
+        # gradients at upsample level. Deduplication for parameter gradients is handled
+        # by downstream streaming conv layers.
         seen_indices.y = updated_total_indices.y
         seen_indices.height = updated_total_indices.height
         seen_indices.x = updated_total_indices.x
         seen_indices.width = updated_total_indices.width
         seen_indices.sides = updated_total_indices.sides
 
-        grad_for_interp = torch.zeros_like(grad_output)
-        if new_output_box.height > 0 and new_output_box.width > 0:
-            rel_y0 = new_output_box.y
-            rel_y1 = rel_y0 + new_output_box.height
-            rel_x0 = new_output_box.x
-            rel_x1 = rel_x0 + new_output_box.width
-
-            abs_y0 = lost_top + rel_y0
-            abs_y1 = lost_top + rel_y1
-            abs_x0 = lost_left + rel_x0
-            abs_x1 = lost_left + rel_x1
-            grad_for_interp[:, :, abs_y0:abs_y1, abs_x0:abs_x1] = grad_output[:, :, abs_y0:abs_y1, abs_x0:abs_x1]
+        grad_for_interp = grad_output.clone()
+        grad_for_interp[:, :, :lost_top, :] = 0
+        if lost_bottom > 0:
+            grad_for_interp[:, :, grad_output.shape[H_DIM] - lost_bottom :, :] = 0
+        grad_for_interp[:, :, :, :lost_left] = 0
+        if lost_right > 0:
+            grad_for_interp[:, :, :, grad_output.shape[W_DIM] - lost_right :] = 0
 
         if ctx.needs_input_grad[0]:
             with torch.enable_grad():
