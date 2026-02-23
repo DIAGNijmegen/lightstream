@@ -14,6 +14,7 @@ import torch.nn.functional
 
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
+from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 
 
 _triple = _ntuple(3)
@@ -313,6 +314,8 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, torch.nn.Upsample):
+            mod = StreamingUpsample2d.from_torch_upsample(module)
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -347,6 +350,8 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, StreamingUpsample2d):
+            mod = module.to_torch_upsample()
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
         del module
