@@ -262,6 +262,31 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
+    def _compute_internal_safe_input_step(self):
+        """Compute conservative input-step bounds from per-layer backward stats."""
+        candidates_h = []
+        candidates_w = []
+
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingConv2d):
+                if not hasattr(mod, "grad_lost") or mod.grad_lost is None:
+                    continue
+                stride = torch.tensor(_triple(mod.stride))
+                output_stride = mod.output_stride * stride
+                step_h = self.tile_shape[H_DIM] - int(mod.grad_lost.top + mod.grad_lost.bottom) * int(output_stride[1])
+                step_w = self.tile_shape[W_DIM] - int(mod.grad_lost.left + mod.grad_lost.right) * int(output_stride[2])
+                if step_h > 0 and step_w > 0:
+                    candidates_h.append(step_h)
+                    candidates_w.append(step_w)
+
+        # Fallback to global backward-safe span if per-layer stats are unavailable
+        grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
+        grad_safe_w = self.tile_shape[W_DIM] - self.tile_gradient_lost.left - self.tile_gradient_lost.right
+        candidates_h.append(int(grad_safe_h))
+        candidates_w.append(int(grad_safe_w))
+
+        return max(1, min(candidates_h)), max(1, min(candidates_w))
+
     def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
         step_candidates_h = [
             valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
@@ -274,8 +299,7 @@ class StreamingCNN(torch.nn.Module):
 
         # Extra safety from backward statistics (input gradient valid region)
         if include_grad_safe:
-            grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
-            grad_safe_w = self.tile_shape[W_DIM] - self.tile_gradient_lost.left - self.tile_gradient_lost.right
+            grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
             step_candidates_h.append(int(grad_safe_h))
             step_candidates_w.append(int(grad_safe_w))
 
