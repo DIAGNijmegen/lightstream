@@ -60,21 +60,12 @@ class StreamingUpsample2dF(torch.autograd.Function):
 
         valid_grad = grad_output[:, :, lost_top : grad_output.shape[H_DIM] - lost_bottom, lost_left : grad_output.shape[W_DIM] - lost_right]
 
-        output_h = grad_output.shape[H_DIM]
-        output_w = grad_output.shape[W_DIM]
-        input_h = inpt.shape[H_DIM]
-        input_w = inpt.shape[W_DIM]
-
-        scale_h = float(output_h) / float(max(1, input_h))
-        scale_w = float(output_w) / float(max(1, input_w))
-
-        post_stride = ctx.output_stride.clone().detach().to(torch.float32)
-        post_stride[1] = max(1.0, post_stride[1] / max(scale_h, 1e-8))
-        post_stride[2] = max(1.0, post_stride[2] / max(scale_w, 1e-8))
-
         input_loc = ctx.input_loc
-        data_loc_y = int(input_loc.y / float(post_stride[1])) + lost_top
-        data_loc_x = int(input_loc.x / float(post_stride[2])) + lost_left
+        # `ctx.output_stride` already represents this module output's stride
+        # in input-image coordinates. Using this directly keeps data_loc aligned
+        # for mixed upsample factors (e.g. 2/4/8 heads).
+        data_loc_y = int(input_loc.y // int(ctx.output_stride[1])) + lost_top
+        data_loc_x = int(input_loc.x // int(ctx.output_stride[2])) + lost_left
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
 
         new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
