@@ -16,6 +16,7 @@ from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_in
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 from lightstream.core.scnn.streamingglobalreducer import StreamingGlobalReducer
+from lightstream.models.segment.globalreducer import GlobalReducer
 
 
 _triple = _ntuple(3)
@@ -103,6 +104,9 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._last_forward_tiles = []
+        self._reducer_output_indices = []
+        self._reducer_output_to_module = {}
+        self._reducer_global_stats = {}
 
         if state_dict is None:
             self._configure()
@@ -147,6 +151,7 @@ class StreamingCNN(torch.nn.Module):
         #
         self._restore_parameters(state_dict)
         self._convert_modules_for_streaming(self.stream_module)
+        self._setup_reducer_output_mapping()
         self._add_hooks_for_streaming()
 
         # Remove temporary data
@@ -374,7 +379,7 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif module.__class__.__name__ == "GlobalReducer":
+        elif isinstance(module, GlobalReducer):
             mod = StreamingGlobalReducer.from_global_reducer(module)
             if module in self._module_stats:
                 mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
@@ -439,6 +444,21 @@ class StreamingCNN(torch.nn.Module):
             mod.add_module(name, self._reset_converted_modules(child))
         del module
         return mod
+
+    def _setup_reducer_output_mapping(self):
+        self._reducer_output_indices = [
+            idx for idx, shape in enumerate(self._tile_output_shapes) if shape[H_DIM] == 1 and shape[W_DIM] == 1
+        ]
+        reducer_modules = [mod for mod in self.stream_module.modules() if isinstance(mod, StreamingGlobalReducer)]
+        self._reducer_output_to_module = {}
+        for idx, reducer_mod in zip(self._reducer_output_indices, reducer_modules):
+            self._reducer_output_to_module[idx] = reducer_mod
+
+    def _apply_reducer_global_stats(self):
+        for idx, mod in self._reducer_output_to_module.items():
+            if idx in self._reducer_global_stats:
+                sum_r, count = self._reducer_global_stats[idx]
+                mod.set_global_stats(sum_r, count)
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -530,14 +550,24 @@ class StreamingCNN(torch.nn.Module):
             device = torch.device("cpu")
         else:
             device = self.device
-        outputs = [
-            torch.empty(
-                (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
-                dtype=self.dtype,
-                device=device,
-            ).fill_(999)
-            for idx in range(len(self._tile_output_shapes))
-        ]
+        outputs = []
+        self._reducer_global_stats = {}
+        for idx in range(len(self._tile_output_shapes)):
+            if idx in self._reducer_output_to_module:
+                channels = self._tile_output_shapes[idx][C_DIM]
+                outputs.append(torch.zeros((image.shape[0], channels, 1, 1), dtype=self.dtype, device=device))
+                self._reducer_global_stats[idx] = (
+                    torch.zeros((image.shape[0], channels, 1, 1), dtype=self.dtype, device=self.device),
+                    torch.zeros(1, dtype=self.dtype, device=self.device),
+                )
+            else:
+                outputs.append(
+                    torch.empty(
+                        (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
+                        dtype=self.dtype,
+                        device=device,
+                    ).fill_(999)
+                )
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -572,6 +602,13 @@ class StreamingCNN(torch.nn.Module):
         # else:
         iterator = range(n_rows)
         self._last_forward_tiles = []
+
+        for mod in self._reducer_output_to_module.values():
+            mod.reset()
+            mod.set_global_stats(
+                torch.zeros_like(mod.global_sum_r, device=self.device, dtype=self.dtype),
+                torch.zeros_like(mod.global_count, device=self.device, dtype=self.dtype),
+            )
 
         with torch.no_grad():
             for row in iterator:
@@ -627,6 +664,16 @@ class StreamingCNN(torch.nn.Module):
                         torch.cuda.empty_cache()
 
                     for idx, head_output in enumerate(tile_outputs):
+                        if idx in self._reducer_output_to_module:
+                            reducer_mod = self._reducer_output_to_module[idx]
+                            new_count = int(reducer_mod.forward_count.item())
+                            if new_count > 0:
+                                sum_r, count = self._reducer_global_stats[idx]
+                                sum_r = sum_r + head_output.clamp_min(reducer_mod.eps).pow(reducer_mod.r) * float(new_count)
+                                count = count + float(new_count)
+                                self._reducer_global_stats[idx] = (sum_r, count)
+                            continue
+
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                         head_stride = self._output_stride_per_output[idx]
                         output_y = tile_y // int(head_stride[1])
@@ -687,8 +734,19 @@ class StreamingCNN(torch.nn.Module):
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
+        for idx, reducer_mod in self._reducer_output_to_module.items():
+            sum_r, count = self._reducer_global_stats[idx]
+            if float(count.item()) > 0:
+                mean_r = sum_r / count
+                outputs[idx] = mean_r.clamp_min(reducer_mod.eps).pow(1.0 / reducer_mod.r).to(device)
+            else:
+                outputs[idx].zero_()
+
+        self._apply_reducer_global_stats()
+
         # mem management
-        del relevant_output  # type:ignore
+        if "relevant_output" in locals():
+            del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
@@ -760,6 +818,9 @@ class StreamingCNN(torch.nn.Module):
 
         self._inputs = {}
         self._backward_seen_indices = {}
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingGlobalReducer):
+                mod.reset()
 
         # if self.verbose:
         #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
@@ -771,6 +832,8 @@ class StreamingCNN(torch.nn.Module):
         grad_tensors, grad_spec = self._flatten_output_structure(grad)
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
+
+        self._apply_reducer_global_stats()
 
         if len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
@@ -956,6 +1019,7 @@ class StreamingCNN(torch.nn.Module):
         """Enable the streaming hooks"""
         self._remove_hooks()
         self._convert_modules_for_streaming(self.stream_module)
+        self._setup_reducer_output_mapping()
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
