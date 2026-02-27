@@ -457,8 +457,8 @@ class StreamingCNN(torch.nn.Module):
     def _apply_reducer_global_stats(self):
         for idx, mod in self._reducer_output_to_module.items():
             if idx in self._reducer_global_stats:
-                sum_r, count = self._reducer_global_stats[idx]
-                mod.set_global_stats(sum_r, count)
+                sum_phi, count = self._reducer_global_stats[idx]
+                mod.set_global_stats(sum_phi, count)
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -606,7 +606,7 @@ class StreamingCNN(torch.nn.Module):
         for mod in self._reducer_output_to_module.values():
             mod.reset()
             mod.set_global_stats(
-                torch.zeros_like(mod.global_sum_r, device=self.device, dtype=self.dtype),
+                torch.zeros_like(mod.global_sum_phi, device=self.device, dtype=self.dtype),
                 torch.zeros_like(mod.global_count, device=self.device, dtype=self.dtype),
             )
 
@@ -668,10 +668,10 @@ class StreamingCNN(torch.nn.Module):
                             reducer_mod = self._reducer_output_to_module[idx]
                             new_count = int(reducer_mod.forward_count.item())
                             if new_count > 0:
-                                sum_r, count = self._reducer_global_stats[idx]
-                                sum_r = sum_r + head_output.clamp_min(reducer_mod.eps).pow(reducer_mod.r) * float(new_count)
+                                sum_phi, count = self._reducer_global_stats[idx]
+                                sum_phi = sum_phi + reducer_mod.inverse_post(head_output) * float(new_count)
                                 count = count + float(new_count)
-                                self._reducer_global_stats[idx] = (sum_r, count)
+                                self._reducer_global_stats[idx] = (sum_phi, count)
                             continue
 
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
@@ -735,10 +735,10 @@ class StreamingCNN(torch.nn.Module):
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         for idx, reducer_mod in self._reducer_output_to_module.items():
-            sum_r, count = self._reducer_global_stats[idx]
+            sum_phi, count = self._reducer_global_stats[idx]
             if float(count.item()) > 0:
-                mean_r = sum_r / count
-                outputs[idx] = mean_r.clamp_min(reducer_mod.eps).pow(1.0 / reducer_mod.r).to(device)
+                mean_phi = sum_phi / count
+                outputs[idx] = reducer_mod.apply_post(mean_phi).to(device)
             else:
                 outputs[idx].zero_()
 
