@@ -321,14 +321,21 @@ class StreamingCNN(torch.nn.Module):
 
         return align_h, align_w
 
-    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
+    def _non_reducer_output_indices(self):
+        non_reducer = [idx for idx in range(len(self._tile_output_shapes)) if idx not in self._reducer_output_to_module]
+        return non_reducer if len(non_reducer) > 0 else list(range(len(self._tile_output_shapes)))
+
+    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True, head_indices=None):
+        if head_indices is None:
+            head_indices = list(range(len(self._tile_output_shapes)))
+
         step_candidates_h = [
             valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
-            for idx in range(len(self._tile_output_shapes))
+            for idx in head_indices
         ]
         step_candidates_w = [
             valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
-            for idx in range(len(self._tile_output_shapes))
+            for idx in head_indices
         ]
 
         # Extra safety from backward statistics (input gradient valid region)
@@ -339,7 +346,8 @@ class StreamingCNN(torch.nn.Module):
 
         align_h = 1
         align_w = 1
-        for stride in self._output_stride_per_output:
+        for idx in head_indices:
+            stride = self._output_stride_per_output[idx]
             align_h = math.lcm(align_h, int(stride[1]))
             align_w = math.lcm(align_w, int(stride[2]))
 
@@ -533,6 +541,8 @@ class StreamingCNN(torch.nn.Module):
 
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
 
+        active_head_indices = self._non_reducer_output_indices()
+
         # Size of valid output of a tile
         valid_output_heights = [
             self._tile_output_shapes[idx][H_DIM] - self._tile_output_lost[idx].top - self._tile_output_lost[idx].bottom
@@ -577,20 +587,21 @@ class StreamingCNN(torch.nn.Module):
                     ).fill_(999)
                 )
 
-        if len(self._tile_output_shapes) > 1:
+        if len(active_head_indices) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
                 valid_output_heights,
                 valid_output_widths,
                 include_grad_safe=True,
+                head_indices=active_head_indices,
             )
         else:
             valid_input_height = max(
                 1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+                valid_output_heights[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][1]),
             )
             valid_input_width = max(
                 1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+                valid_output_widths[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][2]),
             )
         n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
@@ -782,6 +793,7 @@ class StreamingCNN(torch.nn.Module):
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
+        active_head_indices = self._non_reducer_output_indices()
 
         valid_output_heights = [
             self._tile_output_shapes[idx][H_DIM] - self._tile_output_lost[idx].top - self._tile_output_lost[idx].bottom
@@ -795,20 +807,21 @@ class StreamingCNN(torch.nn.Module):
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
 
-        if len(self._tile_output_shapes) > 1:
+        if len(active_head_indices) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
                 valid_output_heights,
                 valid_output_widths,
                 include_grad_safe=True,
+                head_indices=active_head_indices,
             )
         else:
             valid_input_height = max(
                 1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+                valid_output_heights[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][1]),
             )
             valid_input_width = max(
                 1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+                valid_output_widths[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][2]),
             )
 
         n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
