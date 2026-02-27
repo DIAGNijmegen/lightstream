@@ -1225,6 +1225,10 @@ class StreamingCNN(torch.nn.Module):
                     f_grad = f_grad[:grad_h, :grad_w]
 
             grad_lost = self._non_max_border_amount(grad_out[0])
+            if is_reducer:
+                reducer_input_lost = self._module_stats[module].get("input_lost")
+                if reducer_input_lost is not None:
+                    grad_lost = reducer_input_lost
 
             if self.verbose:
                 print(module, "\n", grad_lost)
