@@ -98,6 +98,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_lost = None
         self._output_stride_per_output = None
         self._output_spec = None
+        self._global_output_mask = None
         self._module_stats = {}
         self._backward_seen_indices = {}
         self._saved_tensors = {}
@@ -172,6 +173,7 @@ class StreamingCNN(torch.nn.Module):
         # Gather backward statistics
         self._tile_output_shapes = [out.shape for out in output_tensors]
         self._tile_output_shape = self._tile_output_shapes[0]
+        self._global_output_mask = [shape[H_DIM] == 1 and shape[W_DIM] == 1 for shape in self._tile_output_shapes]
         self._output_stride_per_output = []
         gradients = []
         for idx, out in enumerate(output_tensors):
@@ -317,14 +319,15 @@ class StreamingCNN(torch.nn.Module):
 
         return align_h, align_w
 
-    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
+    def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True, stride_subset=None):
+        strides = self._output_stride_per_output if stride_subset is None else stride_subset
         step_candidates_h = [
-            valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
-            for idx in range(len(self._tile_output_shapes))
+            valid_output_heights[idx] * int(strides[idx][1])
+            for idx in range(len(valid_output_heights))
         ]
         step_candidates_w = [
-            valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
-            for idx in range(len(self._tile_output_shapes))
+            valid_output_widths[idx] * int(strides[idx][2])
+            for idx in range(len(valid_output_widths))
         ]
 
         # Extra safety from backward statistics (input gradient valid region)
@@ -335,7 +338,7 @@ class StreamingCNN(torch.nn.Module):
 
         align_h = 1
         align_w = 1
-        for stride in self._output_stride_per_output:
+        for stride in strides:
             align_h = math.lcm(align_h, int(stride[1]))
             align_w = math.lcm(align_w, int(stride[2]))
 
@@ -528,14 +531,19 @@ class StreamingCNN(torch.nn.Module):
 
         # Calculate size of output that we would get by inferencing the
         # whole image.
-        output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-        output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
+        output_heights = []
+        output_widths = []
+        for idx, tile_shape in enumerate(self._tile_output_shapes):
+            if self._global_output_mask is not None and self._global_output_mask[idx]:
+                output_heights.append(tile_shape[H_DIM])
+                output_widths.append(tile_shape[W_DIM])
+                continue
+            output_heights.append(
+                (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+            )
+            output_widths.append(
+                (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+            )
 
         if result_on_cpu:
             device = torch.device("cpu")
@@ -550,21 +558,30 @@ class StreamingCNN(torch.nn.Module):
             for idx in range(len(self._tile_output_shapes))
         ]
 
-        if len(self._tile_output_shapes) > 1:
+        non_global_indices = [
+            idx for idx in range(len(self._tile_output_shapes))
+            if not (self._global_output_mask is not None and self._global_output_mask[idx])
+        ]
+
+        if len(non_global_indices) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
-                valid_output_heights,
-                valid_output_widths,
+                [valid_output_heights[idx] for idx in non_global_indices],
+                [valid_output_widths[idx] for idx in non_global_indices],
                 include_grad_safe=True,
+                stride_subset=[self._output_stride_per_output[idx] for idx in non_global_indices],
             )
-        else:
+        elif len(non_global_indices) == 1:
+            only = non_global_indices[0]
             valid_input_height = max(
                 1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+                valid_output_heights[only] * int(self._output_stride_per_output[only][1]),
             )
             valid_input_width = max(
                 1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+                valid_output_widths[only] * int(self._output_stride_per_output[only][2]),
             )
+        else:
+            valid_input_height, valid_input_width = self._compute_internal_safe_input_step()
         n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
 
@@ -635,8 +652,12 @@ class StreamingCNN(torch.nn.Module):
                     for idx, head_output in enumerate(tile_outputs):
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                         head_stride = self._output_stride_per_output[idx]
-                        output_y = tile_y // int(head_stride[1])
-                        output_x = tile_x // int(head_stride[2])
+                        if self._global_output_mask is not None and self._global_output_mask[idx]:
+                            output_y = 0
+                            output_x = 0
+                        else:
+                            output_y = tile_y // int(head_stride[1])
+                            output_x = tile_x // int(head_stride[2])
                         output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
                         trimmed_output = head_output[
                             :,
@@ -735,21 +756,30 @@ class StreamingCNN(torch.nn.Module):
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
 
-        if len(self._tile_output_shapes) > 1:
+        non_global_indices = [
+            idx for idx in range(len(self._tile_output_shapes))
+            if not (self._global_output_mask is not None and self._global_output_mask[idx])
+        ]
+
+        if len(non_global_indices) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
-                valid_output_heights,
-                valid_output_widths,
+                [valid_output_heights[idx] for idx in non_global_indices],
+                [valid_output_widths[idx] for idx in non_global_indices],
                 include_grad_safe=True,
+                stride_subset=[self._output_stride_per_output[idx] for idx in non_global_indices],
             )
-        else:
+        elif len(non_global_indices) == 1:
+            only = non_global_indices[0]
             valid_input_height = max(
                 1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+                valid_output_heights[only] * int(self._output_stride_per_output[only][1]),
             )
             valid_input_width = max(
                 1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+                valid_output_widths[only] * int(self._output_stride_per_output[only][2]),
             )
+        else:
+            valid_input_height, valid_input_width = self._compute_internal_safe_input_step()
 
         n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, width - tile_width)) / float(valid_input_width)) + 1
@@ -876,8 +906,12 @@ class StreamingCNN(torch.nn.Module):
                     head_output_height = self._tile_output_shapes[idx][H_DIM]
                     head_output_width = self._tile_output_shapes[idx][W_DIM]
                     head_stride = self._output_stride_per_output[idx]
-                    head_output_y = input_y // int(head_stride[1])
-                    head_output_x = input_x // int(head_stride[2])
+                    if self._global_output_mask is not None and self._global_output_mask[idx]:
+                        head_output_y = 0
+                        head_output_x = 0
+                    else:
+                        head_output_y = input_y // int(head_stride[1])
+                        head_output_x = input_x // int(head_stride[2])
 
                     if sides.bottom:
                         head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
