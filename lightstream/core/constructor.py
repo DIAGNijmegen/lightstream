@@ -168,7 +168,8 @@ class StreamingConstructor:
 
             # if new module is assigned to a variable, e.g. new = nn.Identity(), then it's considered a duplicate in
             # module.named_children used later. Instead, we use in-place assignment, so each new module is unique
-            if not isinstance(module, tuple(self.keep_modules)):
+            should_keep = isinstance(module, tuple(self.keep_modules)) or module.__class__.__name__ == "GlobalReducer"
+            if not should_keep:
                 try:
                     n = int(n)
                     model[n] = torch.nn.Identity()

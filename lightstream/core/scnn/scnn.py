@@ -351,6 +351,9 @@ class StreamingCNN(torch.nn.Module):
         valid_input_width = max(align_w, (min(step_candidates_w) // align_w) * align_w)
         return valid_input_height, valid_input_width
 
+    def _is_global_reducer_module(self, module):
+        return isinstance(module, GlobalReducer) or module.__class__.__name__ == "GlobalReducer"
+
     def _convert_modules_for_streaming(self, module):
         mod = module
         if isinstance(module, torch.nn.Conv2d):
@@ -384,7 +387,7 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif isinstance(module, GlobalReducer):
+        elif self._is_global_reducer_module(module):
             mod = StreamingGlobalReducer.from_global_reducer(module)
             if module in self._module_stats:
                 mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
@@ -1053,16 +1056,19 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample, GlobalReducer),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, GlobalReducer),
+        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
-            if isinstance(mod, forward_modules):
+            is_forward = isinstance(mod, forward_modules) or self._is_global_reducer_module(mod)
+            if is_forward:
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
-                if back_modules and isinstance(mod, back_modules):
-                    back_handle = mod.register_full_backward_hook(backward_hook)
-                    self._hooks.append(back_handle)
+
+            is_backward = back_modules and (isinstance(mod, back_modules) or self._is_global_reducer_module(mod))
+            if is_backward:
+                back_handle = mod.register_full_backward_hook(backward_hook)
+                self._hooks.append(back_handle)
 
     def _remove_hooks(self):
         for hook in self._hooks:
@@ -1088,7 +1094,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        is_global_reducer = isinstance(module, GlobalReducer)
+        is_global_reducer = self._is_global_reducer_module(module)
         if (not is_upsample) and (not is_global_reducer):
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         else:
@@ -1158,7 +1164,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        is_global_reducer = isinstance(module, GlobalReducer)
+        is_global_reducer = self._is_global_reducer_module(module)
         if (not is_upsample) and (not is_global_reducer):
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         else:
