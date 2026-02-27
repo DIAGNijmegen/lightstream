@@ -826,7 +826,14 @@ class StreamingCNN(torch.nn.Module):
 
         if all_global_outputs:
             if hasattr(self, "_last_forward_tiles") and len(self._last_forward_tiles) > 0:
-                tile_iter = list(self._last_forward_tiles)
+                tile_iter = []
+                seen_tiles = set()
+                for tile_y, tile_x, sides in self._last_forward_tiles:
+                    tile_key = (int(tile_y), int(tile_x), bool(sides.left), bool(sides.top), bool(sides.right), bool(sides.bottom))
+                    if tile_key in seen_tiles:
+                        continue
+                    seen_tiles.add(tile_key)
+                    tile_iter.append((int(tile_y), int(tile_x), sides))
             else:
                 tile_iter = []
                 for row in iterator:

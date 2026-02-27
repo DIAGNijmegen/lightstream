@@ -126,12 +126,34 @@ class StreamingGlobalReducer(nn.Module):
         self._count = 0
         self._cached_mean_pow_r = None
 
-    def _accumulate_unique_forward_sum(self, logits: torch.Tensor) -> None:
+    def _get_valid_forward_region(self, logits: torch.Tensor):
         if self.input_loc is None or self.input_loc.sides is None:
-            unique = logits
+            return logits, 0, 0
+
+        sides = self.input_loc.sides
+        lost_top = self.grad_lost.top if not sides.top else 0
+        lost_bottom = self.grad_lost.bottom if not sides.bottom else 0
+        lost_left = self.grad_lost.left if not sides.left else 0
+        lost_right = self.grad_lost.right if not sides.right else 0
+
+        valid = logits[
+            :,
+            :,
+            lost_top : logits.shape[H_DIM] - lost_bottom,
+            lost_left : logits.shape[W_DIM] - lost_right,
+        ]
+        return valid, lost_top, lost_left
+
+    def _accumulate_unique_forward_sum(self, logits: torch.Tensor) -> None:
+        valid_logits, lost_top, lost_left = self._get_valid_forward_region(logits)
+        if valid_logits.shape[H_DIM] <= 0 or valid_logits.shape[W_DIM] <= 0:
+            return
+
+        if self.input_loc is None or self.input_loc.sides is None:
+            unique = valid_logits
         else:
-            data_loc = Box(int(self.input_loc.y), 0, int(self.input_loc.x), 0, self.input_loc.sides)
-            new_box, updated = _new_value_indices(logits.shape, data_loc, self.forward_seen_indices)
+            data_loc = Box(int(self.input_loc.y) + lost_top, 0, int(self.input_loc.x) + lost_left, 0, self.input_loc.sides)
+            new_box, updated = _new_value_indices(valid_logits.shape, data_loc, self.forward_seen_indices)
             self.forward_seen_indices.y = updated.y
             self.forward_seen_indices.height = updated.height
             self.forward_seen_indices.x = updated.x
@@ -139,7 +161,7 @@ class StreamingGlobalReducer(nn.Module):
             self.forward_seen_indices.sides = updated.sides
             if new_box.height <= 0 or new_box.width <= 0:
                 return
-            unique = logits[
+            unique = valid_logits[
                 :,
                 :,
                 new_box.y : new_box.y + new_box.height,
