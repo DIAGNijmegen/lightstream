@@ -174,7 +174,7 @@ def main() -> None:
     criterion = torch.nn.MSELoss()
 
     network = StreamingWSS(
-        "resnet34",
+        "resnet18",
         tile_size,
         additional_modules=None,
         mean=[0, 0, 0],

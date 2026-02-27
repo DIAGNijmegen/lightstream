@@ -841,7 +841,7 @@ class StreamingCNN(torch.nn.Module):
                     tile = tile.to(self.device, non_blocking=True)
 
                 for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+                    if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingGlobalReducer)):
                         mod.input_loc = input_loc
 
                 # normalize on gpu for speed in dataloader
@@ -917,7 +917,7 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingGlobalReducer)):
                 mod.input_loc = None
                 mod.reset()
 
