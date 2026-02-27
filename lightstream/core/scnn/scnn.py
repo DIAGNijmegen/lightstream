@@ -187,7 +187,12 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(out)
             if p_stats:
-                output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                stride_tensor = (
+                    p_stats["stride"].clone().detach()
+                    if isinstance(p_stats["stride"], torch.Tensor)
+                    else torch.as_tensor(p_stats["stride"])
+                )
+                output_stride = p_stats["output_stride"] * stride_tensor
             else:
                 output_stride = torch.tensor([1, 1, 1])
 
@@ -480,9 +485,14 @@ class StreamingCNN(torch.nn.Module):
         # different (e.g., DenseNet)
         if tensor.dim() > 3:
             tensor = torch.sum(tensor, dim=1)[0]
-        tensor = tensor / tensor.max()  # normalize
+        t_max = tensor.max()
+        if not torch.isfinite(t_max) or t_max.abs() <= self.eps:
+            return Lost(0, 0, 0, 0)
+        tensor = tensor / t_max  # normalize
         tensor = tensor > tensor.max() * (1 - self.eps)
         non_zero = tensor.nonzero(as_tuple=False)
+        if non_zero.numel() == 0:
+            return Lost(0, 0, 0, 0)
         top, left = non_zero.min(dim=0)[0]
         # for bottom and right we need to substract -1: correct index 3 is actually the 4th pixel
         bottom, right = (
@@ -980,8 +990,8 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
+        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample, GlobalReducer),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, GlobalReducer),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
@@ -1015,7 +1025,8 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
+        is_reducer = isinstance(module, GlobalReducer)
+        if not is_upsample and not is_reducer:
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         else:
             stride = torch.tensor([1, 1, 1])
@@ -1067,7 +1078,12 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(output)
             if p_stats:
-                prev_output_stride = p_stats["output_stride"] * p_stats["stride"].clone().detach() if isinstance(p_stats["stride"], torch.Tensor) else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                prev_stride_tensor = (
+                    p_stats["stride"].clone().detach()
+                    if isinstance(p_stats["stride"], torch.Tensor)
+                    else torch.as_tensor(p_stats["stride"])
+                )
+                prev_output_stride = p_stats["output_stride"] * prev_stride_tensor
             else:
                 prev_output_stride = torch.tensor([1, 1, 1])
 
@@ -1084,8 +1100,12 @@ class StreamingCNN(torch.nn.Module):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
+        is_reducer = isinstance(module, GlobalReducer)
+        if not is_upsample and not is_reducer:
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        else:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
             # on groups of channels
