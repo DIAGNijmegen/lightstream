@@ -14,7 +14,9 @@ import torch.nn.functional
 
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
+from lightstream.core.scnn.streamingglobalreducer import StreamingGlobalReducer
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.models.segment.globalreducer import GlobalReducer
 
 
 _triple = _ntuple(3)
@@ -373,6 +375,13 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, GlobalReducer):
+            mod = StreamingGlobalReducer(r=module.r, eps=module.eps)
+            if module in self._module_stats:
+                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
+                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -409,6 +418,16 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingGlobalReducer):
+            mod = GlobalReducer(r=module.r, eps=module.eps)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
