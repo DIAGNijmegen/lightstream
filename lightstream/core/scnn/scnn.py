@@ -322,8 +322,7 @@ class StreamingCNN(torch.nn.Module):
         return align_h, align_w
 
     def _non_reducer_output_indices(self):
-        non_reducer = [idx for idx in range(len(self._tile_output_shapes)) if idx not in self._reducer_output_to_module]
-        return non_reducer if len(non_reducer) > 0 else list(range(len(self._tile_output_shapes)))
+        return [idx for idx in range(len(self._tile_output_shapes)) if idx not in self._reducer_output_to_module]
 
     def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True, head_indices=None):
         if head_indices is None:
@@ -594,7 +593,7 @@ class StreamingCNN(torch.nn.Module):
                 include_grad_safe=True,
                 head_indices=active_head_indices,
             )
-        else:
+        elif len(active_head_indices) == 1:
             valid_input_height = max(
                 1,
                 valid_output_heights[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][1]),
@@ -603,6 +602,11 @@ class StreamingCNN(torch.nn.Module):
                 1,
                 valid_output_widths[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][2]),
             )
+        else:
+            safe_h, safe_w = self._compute_internal_safe_input_step()
+            align_h, align_w = self._compute_internal_alignment()
+            valid_input_height = max(align_h, (int(safe_h) // max(1, align_h)) * max(1, align_h))
+            valid_input_width = max(align_w, (int(safe_w) // max(1, align_w)) * max(1, align_w))
         n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
 
@@ -814,7 +818,7 @@ class StreamingCNN(torch.nn.Module):
                 include_grad_safe=True,
                 head_indices=active_head_indices,
             )
-        else:
+        elif len(active_head_indices) == 1:
             valid_input_height = max(
                 1,
                 valid_output_heights[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][1]),
@@ -823,6 +827,11 @@ class StreamingCNN(torch.nn.Module):
                 1,
                 valid_output_widths[active_head_indices[0]] * int(self._output_stride_per_output[active_head_indices[0]][2]),
             )
+        else:
+            safe_h, safe_w = self._compute_internal_safe_input_step()
+            align_h, align_w = self._compute_internal_alignment()
+            valid_input_height = max(align_h, (int(safe_h) // max(1, align_h)) * max(1, align_h))
+            valid_input_width = max(align_w, (int(safe_w) // max(1, align_w)) * max(1, align_w))
 
         n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, width - tile_width)) / float(valid_input_width)) + 1
