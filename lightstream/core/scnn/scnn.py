@@ -517,6 +517,10 @@ class StreamingCNN(torch.nn.Module):
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
 
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingGlobalReducer):
+                mod.reset()
+
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
 
         # Size of valid output of a tile
