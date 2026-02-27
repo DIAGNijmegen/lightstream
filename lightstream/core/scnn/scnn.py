@@ -6,7 +6,6 @@ import math
 import copy
 from typing import List
 
-import numpy as np
 import torch
 import torch.autograd
 import torch.backends
@@ -823,7 +822,29 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if len(self._tile_output_shapes) == 1:
+        all_global_outputs = len(non_global_indices) == 0
+
+        if all_global_outputs:
+            if hasattr(self, "_last_forward_tiles") and len(self._last_forward_tiles) > 0:
+                tile_iter = list(self._last_forward_tiles)
+            else:
+                tile_iter = []
+                for row in iterator:
+                    for col in range(n_cols):
+                        tile_y = row * valid_input_height
+                        tile_x = col * valid_input_width
+                        sides_top = True if row == 0 else False
+                        sides_left = True if col == 0 else False
+                        sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
+                        sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
+                        if sides_bottom:
+                            tile_y = max(image.shape[H_DIM] - tile_height, 0)
+                        if sides_right:
+                            tile_x = max(image.shape[W_DIM] - tile_width, 0)
+                        tile_y = tile_y if not sides_top else 0
+                        tile_x = tile_x if not sides_left else 0
+                        tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+        elif len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
             output_height = self._tile_output_shape[H_DIM]
             output_width = self._tile_output_shape[W_DIM]
@@ -924,24 +945,28 @@ class StreamingCNN(torch.nn.Module):
                     head_output_height = self._tile_output_shapes[idx][H_DIM]
                     head_output_width = self._tile_output_shapes[idx][W_DIM]
                     head_stride = self._output_stride_per_output[idx]
-                    if self._global_output_mask is not None and self._global_output_mask[idx]:
+                    is_global_head = self._global_output_mask is not None and self._global_output_mask[idx]
+                    if is_global_head:
                         head_output_y = 0
                         head_output_x = 0
                     else:
                         head_output_y = input_y // int(head_stride[1])
                         head_output_x = input_x // int(head_stride[2])
 
-                    if sides.bottom:
+                    if (not is_global_head) and sides.bottom:
                         head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-                    if sides.right:
+                    if (not is_global_head) and sides.right:
                         head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
 
-                    gradient = head_grad[
-                        :,
-                        :,
-                        head_output_y : head_output_y + head_output_height,
-                        head_output_x : head_output_x + head_output_width,
-                    ]
+                    if is_global_head:
+                        gradient = head_grad
+                    else:
+                        gradient = head_grad[
+                            :,
+                            :,
+                            head_output_y : head_output_y + head_output_height,
+                            head_output_x : head_output_x + head_output_width,
+                        ]
                     trimmed_grad = gradient[
                         :,
                         :,
@@ -1189,16 +1214,15 @@ class StreamingCNN(torch.nn.Module):
 
                 f_grad = torch.sum(grad_out[0], dim=1)[0]
                 f_grad = f_grad * new_outpt
-                f_grad = f_grad.cpu()
-                f_grad = np.repeat(f_grad, stride[1], axis=0)
-                f_grad = np.repeat(f_grad, stride[2], axis=1)
-                grad = np.zeros(grad_in[0].shape[2:])
-
-                print("testing shape gradient fix")
-                grad[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[: grad.shape[0], : grad.shape[1]]
-
-                f_grad = torch.from_numpy(grad)
-                f_grad = f_grad.to(self.device)
+                f_grad = f_grad.repeat_interleave(int(stride[1]), dim=0)
+                f_grad = f_grad.repeat_interleave(int(stride[2]), dim=1)
+                grad_h, grad_w = grad_in[0].shape[2:]
+                if f_grad.shape[0] < grad_h or f_grad.shape[1] < grad_w:
+                    padded = torch.zeros((grad_h, grad_w), device=f_grad.device, dtype=f_grad.dtype)
+                    padded[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[:grad_h, :grad_w]
+                    f_grad = padded
+                else:
+                    f_grad = f_grad[:grad_h, :grad_w]
 
             grad_lost = self._non_max_border_amount(grad_out[0])
 
