@@ -959,6 +959,13 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_outputs = []
                 trimmed_grads = []
                 for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
+                    if idx in self._reducer_output_to_module:
+                        trimmed_output = head_output.to(self.device, non_blocking=True)
+                        trimmed_grad = head_grad.to(trimmed_output.device, non_blocking=True)
+                        trimmed_outputs.append(trimmed_output)
+                        trimmed_grads.append(trimmed_grad)
+                        continue
+
                     head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                     head_output_height = self._tile_output_shapes[idx][H_DIM]
                     head_output_width = self._tile_output_shapes[idx][W_DIM]
