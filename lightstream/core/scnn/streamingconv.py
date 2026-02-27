@@ -149,17 +149,31 @@ class StreamingConv2dF(torch.autograd.Function):
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
 
-            grad_weight = torch.nn.grad.conv2d_weight(
-                relevant_input.to(weight.dtype),
-                weight.shape,
-                relevant_grad.to(weight.dtype),
-                stride[1:3],
-                (0, 0),  # padding
-                dilation,
-                groups,
-            )
+            if (
+                relevant_grad.shape[H_DIM] <= 0
+                or relevant_grad.shape[W_DIM] <= 0
+                or relevant_input.shape[H_DIM] < kernel_size[1]
+                or relevant_input.shape[W_DIM] < kernel_size[2]
+            ):
+                grad_weight = torch.zeros_like(weight)
+                grad_bias = None if bias is None else torch.zeros_like(bias)
+            else:
+                grad_weight = torch.nn.grad.conv2d_weight(
+                    relevant_input.to(weight.dtype),
+                    weight.shape,
+                    relevant_grad.to(weight.dtype),
+                    stride[1:3],
+                    (0, 0),  # padding
+                    dilation,
+                    groups,
+                )
 
-            if bias is not None:
+            if bias is not None and not (
+                relevant_grad.shape[H_DIM] <= 0
+                or relevant_grad.shape[W_DIM] <= 0
+                or relevant_input.shape[H_DIM] < kernel_size[1]
+                or relevant_input.shape[W_DIM] < kernel_size[2]
+            ):
                 grad_bias = relevant_grad[0].sum((1, 2))
 
             del relevant_input

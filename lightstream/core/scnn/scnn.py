@@ -99,6 +99,8 @@ class StreamingCNN(torch.nn.Module):
         self._output_stride_per_output = None
         self._output_spec = None
         self._global_output_mask = None
+        self._tile_output_lost_display = None
+        self._global_reducer_input_lost_trace = []
         self._module_stats = {}
         self._backward_seen_indices = {}
         self._saved_tensors = {}
@@ -215,14 +217,20 @@ class StreamingCNN(torch.nn.Module):
             print("\n", "Input gradient lost", self.tile_gradient_lost)
 
     def _gather_forward_statistics(self, tile):
+        self._global_reducer_input_lost_trace = []
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
         output_tensors, output_spec = self._flatten_output_structure(output)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
+        self._tile_output_lost_display = list(self._tile_output_lost)
+        for idx, lost in enumerate(self._tile_output_lost_display):
+            if output_tensors[idx].shape[H_DIM] == 1 and output_tensors[idx].shape[W_DIM] == 1 and idx < len(self._global_reducer_input_lost_trace):
+                self._tile_output_lost_display[idx] = self._global_reducer_input_lost_trace[idx]
+
         self.tile_output_lost = self._tile_output_lost[0]
         if self.verbose:
-            print("\n", "Output lost", self._tile_output_lost)
+            print("\n", "Output lost", self._tile_output_lost_display)
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -654,7 +662,10 @@ class StreamingCNN(torch.nn.Module):
                         torch.cuda.empty_cache()
 
                     for idx, head_output in enumerate(tile_outputs):
-                        lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+                        if self._global_output_mask is not None and self._global_output_mask[idx]:
+                            lost = Lost(0, 0, 0, 0)
+                        else:
+                            lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                         head_stride = self._output_stride_per_output[idx]
                         if self._global_output_mask is not None and self._global_output_mask[idx]:
                             output_y = 0
@@ -906,7 +917,10 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_outputs = []
                 trimmed_grads = []
                 for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
-                    head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+                    if self._global_output_mask is not None and self._global_output_mask[idx]:
+                        head_lost = Lost(0, 0, 0, 0)
+                    else:
+                        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                     head_output_height = self._tile_output_shapes[idx][H_DIM]
                     head_output_width = self._tile_output_shapes[idx][W_DIM]
                     head_stride = self._output_stride_per_output[idx]
@@ -1098,6 +1112,10 @@ class StreamingCNN(torch.nn.Module):
 
             # Sum all dimensions (useful for DenseNet like networks)
             lost = self._non_max_border_amount(output)
+            reducer_input_lost = None
+            if is_reducer:
+                reducer_input_lost = self._non_max_border_amount(inpt[0])
+                self._global_reducer_input_lost_trace.append(reducer_input_lost)
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
@@ -1105,7 +1123,7 @@ class StreamingCNN(torch.nn.Module):
                 :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
+            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module, "input_lost": reducer_input_lost}
             if self.verbose:
                 print(module, "\n", module_stats["lost"])
 
@@ -1306,10 +1324,12 @@ class StreamingCNN(torch.nn.Module):
         named_stats["output_stride"] = self.output_stride
         named_stats["tile_output_lost"] = self.tile_output_lost  # type:ignore
         named_stats["tile_output_lost_all"] = self._tile_output_lost  # type:ignore
+        named_stats["tile_output_lost_display"] = self._tile_output_lost_display
         named_stats["tile_gradient_lost"] = self.tile_gradient_lost  # type:ignore
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
+        named_stats["global_output_mask"] = self._global_output_mask
         named_stats["output_spec"] = self._output_spec
         return named_stats
 
@@ -1319,10 +1339,12 @@ class StreamingCNN(torch.nn.Module):
         self.output_stride = state["output_stride"]
         self.tile_output_lost = state["tile_output_lost"]
         self._tile_output_lost = state.get("tile_output_lost_all", [self.tile_output_lost])
+        self._tile_output_lost_display = state.get("tile_output_lost_display", self._tile_output_lost)
         self.tile_gradient_lost = state["tile_gradient_lost"]
         self._tile_output_shape = state["tile_output_shape"]
         self._tile_output_shapes = state.get("tile_output_shapes", [self._tile_output_shape])
         self._output_stride_per_output = state.get("output_stride_per_output", [self.output_stride])
+        self._global_output_mask = state.get("global_output_mask", [shape[H_DIM] == 1 and shape[W_DIM] == 1 for shape in self._tile_output_shapes])
         self._base_output_stride = self._output_stride_per_output[0].clone()
         for stride in self._output_stride_per_output[1:]:
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
