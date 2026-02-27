@@ -5,41 +5,38 @@ from torch import Tensor
 
 
 class GlobalReducer(nn.Module):
-    """Generic global reducer: y = post(mean(pointwise(x)))."""
-
-    SUPPORTED_POINTWISE = {"pow", "identity"}
-    SUPPORTED_POST = {"pow_inv", "identity"}
-
-    def __init__(self, r: float = 4.0, eps: float = 1e-12, pointwise: str = "pow", post: str = "pow_inv"):
+    def __init__(self, r: float = 4.0, eps: float = 1e-12):
         super().__init__()
         if r <= 0:
             raise ValueError("r must be > 0 for the generalized mean reducer.")
-        if pointwise not in self.SUPPORTED_POINTWISE:
-            raise ValueError(f"Unsupported pointwise mode '{pointwise}'. Supported: {sorted(self.SUPPORTED_POINTWISE)}")
-        if post not in self.SUPPORTED_POST:
-            raise ValueError(f"Unsupported post mode '{post}'. Supported: {sorted(self.SUPPORTED_POST)}")
-
         self.r = float(r)
         self.eps = float(eps)
-        self.pointwise = pointwise
-        self.post = post
-
-    def _pointwise(self, x: Tensor) -> Tensor:
-        if self.pointwise == "pow":
-            return x.pow(self.r)
-        return x
-
-    def _post(self, mean_phi: Tensor) -> Tensor:
-        mean_phi = mean_phi.clamp_min(self.eps)
-        if self.post == "pow_inv":
-            return mean_phi.pow(1.0 / self.r)
-        return mean_phi
 
     def aggregate(self, x: Tensor) -> Tensor:
+        """
+        Aggregation function
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            A tensor of shape (N, C, H, W).
+
+        Returns
+        -------
+        y: torch.Tensor
+            A tensor of shape (N, C, 1, 1). Spatial dimensions are not reduced for streaming compatibility
+        """
         if x.ndim != 4:
             raise ValueError(f"Expected logits to be NCHW, got shape {tuple(x.shape)}")
-        mean_phi = self._pointwise(x).mean(dim=(-2, -1), keepdim=True)
-        return self._post(mean_phi)
+        mean_p_r = x.pow(self.r).mean(dim=(-2, -1),keepdim=True)
+        return mean_p_r.clamp_min(self.eps).pow(1.0 / self.r)
 
     def forward(self, logits: Tensor) -> Tensor:
         return self.aggregate(logits)
+
+if __name__ == "__main__":
+    inputs = torch.randn(2, 3, 64, 64)
+    print(inputs.shape)
+    reducer = GlobalReducer()
+    out = reducer(inputs)
+    print(out.shape)
