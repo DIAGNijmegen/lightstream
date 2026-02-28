@@ -96,6 +96,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_lost = None
         self._output_stride_per_output = None
         self._output_spec = None
+        self._output_is_global_reducer = []
         self._module_stats = {}
         self._backward_seen_indices = {}
         self._saved_tensors = {}
@@ -170,6 +171,7 @@ class StreamingCNN(torch.nn.Module):
         # Gather backward statistics
         self._tile_output_shapes = [out.shape for out in output_tensors]
         self._tile_output_shape = self._tile_output_shapes[0]
+        self._output_is_global_reducer = []
         self._output_stride_per_output = []
         gradients = []
         for idx, out in enumerate(output_tensors):
@@ -190,6 +192,9 @@ class StreamingCNN(torch.nn.Module):
                 output_stride = torch.tensor([1, 1, 1])
 
             self._output_stride_per_output.append(output_stride)
+            valid_h = int(out.shape[H_DIM] - lost.top - lost.bottom)
+            valid_w = int(out.shape[W_DIM] - lost.left - lost.right)
+            self._output_is_global_reducer.append(valid_h <= 1 and valid_w <= 1)
 
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
@@ -804,8 +809,17 @@ class StreamingCNN(torch.nn.Module):
                     tile_x = tile_x if not sides_left else 0
                     tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
+        reducer_head_case = False
+        if self._output_is_global_reducer and any(self._output_is_global_reducer) and len(self._last_forward_tiles) > 0:
+            reducer_head_case = True
+
+        if reducer_head_case:
+            for mod in self.stream_module.modules():
+                if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+                    mod.reset(keep_backward_state=True)
+
         last_sides = None
-        for input_y, input_x, sides in tile_iter:
+        for tile_idx, (input_y, input_x, sides) in enumerate(tile_iter):
                 last_sides = sides
                 output_y = input_y // base_stride_h
                 output_x = input_x // base_stride_w
@@ -885,6 +899,16 @@ class StreamingCNN(torch.nn.Module):
 
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
+
+                for head_idx, (trimmed_output, trimmed_grad) in enumerate(zip(trimmed_outputs, trimmed_grads)):
+                    if bool(self._output_is_global_reducer) and self._output_is_global_reducer[head_idx]:
+                        continue
+                    assert trimmed_output.shape[-2:] == trimmed_grad.shape[-2:], (
+                        "Backward shape mismatch for non-reducer head "
+                        f"{head_idx} at tile_index={tile_idx}, "
+                        f"sides=(left={sides.left}, top={sides.top}, right={sides.right}, bottom={sides.bottom}): "
+                        f"output_hw={tuple(trimmed_output.shape[-2:])}, grad_hw={tuple(trimmed_grad.shape[-2:])}"
+                    )
 
                 torch.autograd.backward(trimmed_outputs, trimmed_grads)
 

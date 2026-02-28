@@ -140,7 +140,7 @@ class StreamingUpsample2d(nn.Module):
         self.output_stride = torch.tensor([1, 1, 1])
         self.reset()
 
-    def reset(self):
+    def reset(self, keep_backward_state: bool = False):
         self.seen_indices = Box(0, 0, 0, 0, None)
         self.input_loc = Box(0, 0, 0, 0, None)
 

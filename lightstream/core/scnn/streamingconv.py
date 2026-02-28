@@ -216,7 +216,7 @@ class StreamingConv2d(_ConvNd):
         self.grad_lost = Lost(0, 0, 0, 0)
         self.reset()
 
-    def reset(self):
+    def reset(self, keep_backward_state: bool = False):
         self.seen_indices = Box(0, 0, 0, 0, None)
         self.input_loc = Box(0, 0, 0, 0, None)
         self.tile_output_box = Box(0, 0, 0, 0, None)
