@@ -97,6 +97,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = None
         self._tile_output_lost = None
         self._output_stride_per_output = None
+        self._output_is_global_reducer = None
         self._output_spec = None
         self._module_stats = {}
         self._backward_seen_indices = {}
@@ -173,6 +174,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = [out.shape for out in output_tensors]
         self._tile_output_shape = self._tile_output_shapes[0]
         self._output_stride_per_output = []
+        self._output_is_global_reducer = []
         gradients = []
         for idx, out in enumerate(output_tensors):
             lost = self._tile_output_lost[idx]
@@ -192,6 +194,8 @@ class StreamingCNN(torch.nn.Module):
                 output_stride = torch.tensor([1, 1, 1])
 
             self._output_stride_per_output.append(output_stride)
+            is_global_reducer_out = bool(p_stats and isinstance(p_stats.get("module", None), GlobalReducer))
+            self._output_is_global_reducer.append(is_global_reducer_out)
 
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
@@ -313,14 +317,19 @@ class StreamingCNN(torch.nn.Module):
         return align_h, align_w
 
     def _compute_multi_output_input_step(self, valid_output_heights, valid_output_widths, include_grad_safe=True):
-        step_candidates_h = [
-            valid_output_heights[idx] * int(self._output_stride_per_output[idx][1])
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        step_candidates_w = [
-            valid_output_widths[idx] * int(self._output_stride_per_output[idx][2])
-            for idx in range(len(self._tile_output_shapes))
-        ]
+        step_candidates_h = []
+        step_candidates_w = []
+        for idx in range(len(self._tile_output_shapes)):
+            if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
+                continue
+            step_candidates_h.append(valid_output_heights[idx] * int(self._output_stride_per_output[idx][1]))
+            step_candidates_w.append(valid_output_widths[idx] * int(self._output_stride_per_output[idx][2]))
+
+        # For pure global-reducer heads, rely on internal conservative step limits.
+        if not step_candidates_h or not step_candidates_w:
+            grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
+            step_candidates_h.append(int(grad_safe_h))
+            step_candidates_w.append(int(grad_safe_w))
 
         # Extra safety from backward statistics (input gradient valid region)
         if include_grad_safe:
@@ -518,14 +527,19 @@ class StreamingCNN(torch.nn.Module):
 
         # Calculate size of output that we would get by inferencing the
         # whole image.
-        output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-        output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
+        output_heights = []
+        output_widths = []
+        for idx, tile_shape in enumerate(self._tile_output_shapes):
+            if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
+                output_heights.append(1)
+                output_widths.append(1)
+            else:
+                output_heights.append(
+                    (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+                )
+                output_widths.append(
+                    (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+                )
 
         if result_on_cpu:
             device = torch.device("cpu")
@@ -631,6 +645,10 @@ class StreamingCNN(torch.nn.Module):
                         torch.cuda.empty_cache()
 
                     for idx, head_output in enumerate(tile_outputs):
+                        if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
+                            outputs[idx].copy_(head_output)
+                            continue
+
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                         head_stride = self._output_stride_per_output[idx]
                         output_y = tile_y // int(head_stride[1])
@@ -877,36 +895,40 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_outputs = []
                 trimmed_grads = []
                 for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
-                    head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-                    head_output_height = self._tile_output_shapes[idx][H_DIM]
-                    head_output_width = self._tile_output_shapes[idx][W_DIM]
-                    head_stride = self._output_stride_per_output[idx]
-                    head_output_y = input_y // int(head_stride[1])
-                    head_output_x = input_x // int(head_stride[2])
+                    if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
+                        trimmed_output = head_output
+                        trimmed_grad = head_grad
+                    else:
+                        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+                        head_output_height = self._tile_output_shapes[idx][H_DIM]
+                        head_output_width = self._tile_output_shapes[idx][W_DIM]
+                        head_stride = self._output_stride_per_output[idx]
+                        head_output_y = input_y // int(head_stride[1])
+                        head_output_x = input_x // int(head_stride[2])
 
-                    if sides.bottom:
-                        head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-                    if sides.right:
-                        head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+                        if sides.bottom:
+                            head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
+                        if sides.right:
+                            head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
 
-                    gradient = head_grad[
-                        :,
-                        :,
-                        head_output_y : head_output_y + head_output_height,
-                        head_output_x : head_output_x + head_output_width,
-                    ]
-                    trimmed_grad = gradient[
-                        :,
-                        :,
-                        head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : gradient.shape[W_DIM] - head_lost.right,
-                    ]
-                    trimmed_output = head_output[
-                        :,
-                        :,
-                        head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : head_output.shape[W_DIM] - head_lost.right,
-                    ]
+                        gradient = head_grad[
+                            :,
+                            :,
+                            head_output_y : head_output_y + head_output_height,
+                            head_output_x : head_output_x + head_output_width,
+                        ]
+                        trimmed_grad = gradient[
+                            :,
+                            :,
+                            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
+                            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
+                        ]
+                        trimmed_output = head_output[
+                            :,
+                            :,
+                            head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
+                            head_lost.left : head_output.shape[W_DIM] - head_lost.right,
+                        ]
 
                     trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
