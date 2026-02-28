@@ -103,17 +103,10 @@ class StreamingConv2dF(torch.autograd.Function):
                 new_output_box.x : new_output_box.x + new_output_box.width,
             ]
 
+            # Work in padded-input coordinates to keep conv2d_weight geometry
+            # exact for all tiles, including borders.
             input_y = (new_output_box.y + lost_top) * stride[1]
             input_x = (new_output_box.x + lost_left) * stride[2]
-
-            # Accounting for padding:
-            # the kernel locations are relative to the padded input, inpt[0] is not padded
-            # this means that the corresponding input of the grad_loc is modules.padding shifted to the left
-            # we account for this:
-            input_y -= padding[1]
-            input_x -= padding[2]
-            input_x = max(0, input_x)
-            input_y = max(0, input_y)
 
             # conv2d_weight requires strict geometric consistency between
             # grad-output and selected input window:
@@ -125,50 +118,14 @@ class StreamingConv2dF(torch.autograd.Function):
             dil_w = int(dilation_t[2])
             relevant_input_height = (relevant_grad.shape[H_DIM] - 1) * stride[1] + dil_h * (kernel_size[1] - 1) + 1
             relevant_input_width = (relevant_grad.shape[W_DIM] - 1) * stride[2] + dil_w * (kernel_size[2] - 1) + 1
-            relevant_input = inpt[
+            if padding[1] > 0 or padding[2] > 0:
+                padded_inpt = torch.nn.functional.pad(inpt, [padding[2], padding[2], padding[1], padding[1]])
+            else:
+                padded_inpt = inpt
+
+            relevant_input = padded_inpt[
                 :, :, input_y : input_y + relevant_input_height, input_x : input_x + relevant_input_width
             ]
-
-            # If layer has padding we need to pad based on if the current tile
-            # is at the sides of the input.
-            if (padding[0] > 0 or padding[1] > 0 or padding[2] > 0) and (
-                sides.top or sides.left or sides.right or sides.bottom
-            ):
-                # The size of the tile should remain equal.
-                crop_bottom = padding[1] if sides.top else 0
-                crop_right = padding[2] if sides.left else 0
-                relevant_input = inpt[
-                    :,
-                    :,
-                    input_y : input_y + relevant_input_height - crop_bottom,
-                    input_x : input_x + relevant_input_width - crop_right,
-                ]
-
-                relevant_input = torch.nn.functional.pad(
-                    relevant_input,
-                    [
-                        padding[2] if sides.left else 0,
-                        padding[2] if sides.right else 0,
-                        padding[1] if sides.top else 0,
-                        padding[1] if sides.bottom else 0,
-                    ],
-                )
-
-            # Safety clamp: in edge/corner tiles (especially when upstream
-            # modules have their own overlap trimming), border crop/pad rules
-            # can still produce +/-1 drift. Normalize to the exact size
-            # required by conv2d_weight to avoid CUDNN BAD_PARAM.
-            exp_h = int(relevant_input_height)
-            exp_w = int(relevant_input_width)
-            cur_h = int(relevant_input.shape[H_DIM])
-            cur_w = int(relevant_input.shape[W_DIM])
-            if cur_h != exp_h or cur_w != exp_w:
-                pad_bottom = max(0, exp_h - cur_h)
-                pad_right = max(0, exp_w - cur_w)
-                if pad_bottom > 0 or pad_right > 0:
-                    relevant_input = torch.nn.functional.pad(relevant_input, [0, pad_right, 0, pad_bottom])
-                if relevant_input.shape[H_DIM] > exp_h or relevant_input.shape[W_DIM] > exp_w:
-                    relevant_input = relevant_input[:, :, :exp_h, :exp_w]
 
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
