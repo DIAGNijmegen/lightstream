@@ -197,6 +197,8 @@ class StreamingCNN(torch.nn.Module):
             is_global_reducer_out = bool(p_stats and isinstance(p_stats.get("module", None), GlobalReducer))
             self._output_is_global_reducer.append(is_global_reducer_out)
 
+        self._log_output_head_statistics()
+
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
         for stride in self._output_stride_per_output[1:]:
@@ -220,6 +222,24 @@ class StreamingCNN(torch.nn.Module):
         self.tile_output_lost = self._tile_output_lost[0]
         if self.verbose:
             print("\n", "Output lost", self._tile_output_lost)
+
+    def _log_output_head_statistics(self):
+        if not self.verbose:
+            return
+
+        print("\nOutput head statistics:")
+        for idx in range(len(self._tile_output_shapes)):
+            is_global = bool(self._output_is_global_reducer and self._output_is_global_reducer[idx])
+            head_type = "global_reducer" if is_global else "spatial"
+            shape = tuple(int(x) for x in self._tile_output_shapes[idx])
+            stride = tuple(int(x) for x in self._output_stride_per_output[idx].tolist())
+            if is_global:
+                lost_msg = "N/A (global reducer)"
+            else:
+                lost = self._tile_output_lost[idx]
+                lost_msg = f"Lost(top={lost.top}, left={lost.left}, bottom={lost.bottom}, right={lost.right})"
+
+            print(f"  head[{idx}] type={head_type}, tile_shape={shape}, output_stride={stride}, output_lost={lost_msg}")
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -577,6 +597,12 @@ class StreamingCNN(torch.nn.Module):
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
 
+        if self.verbose:
+            print(
+                f"Forward tiling step: valid_input_height={valid_input_height}, valid_input_width={valid_input_width}, "
+                f"tiles={n_rows}x{n_cols}={n_rows * n_cols}"
+            )
+
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
@@ -714,7 +740,6 @@ class StreamingCNN(torch.nn.Module):
                 mod.finalize_forward_state()
 
         # mem management
-        del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
