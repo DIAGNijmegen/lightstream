@@ -860,9 +860,7 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if self._output_is_global_reducer and any(self._output_is_global_reducer):
-            tile_iter = [(int(y), int(x), sides) for (y, x, sides) in self._last_forward_tiles]
-        elif len(self._tile_output_shapes) == 1:
+        if len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
             output_height = self._tile_output_shape[H_DIM]
             output_width = self._tile_output_shape[W_DIM]
@@ -1007,11 +1005,7 @@ class StreamingCNN(torch.nn.Module):
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
 
-                if self._output_is_global_reducer and any(self._output_is_global_reducer):
-                    with torch.backends.cudnn.flags(enabled=False):
-                        torch.autograd.backward(trimmed_outputs, trimmed_grads)
-                else:
-                    torch.autograd.backward(trimmed_outputs, trimmed_grads)
+                torch.autograd.backward(trimmed_outputs, trimmed_grads)
 
                 # Memory management
                 del tile_output
@@ -1089,8 +1083,8 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample, GlobalReducer),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, GlobalReducer),
+        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
