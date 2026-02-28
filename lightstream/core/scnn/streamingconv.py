@@ -149,6 +149,18 @@ class StreamingConv2dF(torch.autograd.Function):
             # Calculate the kernel gradients with the new unseen gradient values
             relevant_grad = relevant_grad.contiguous()
 
+            expected_h = (relevant_grad.shape[H_DIM] - 1) * stride[1] + dilation[0] * (kernel_size[1] - 1) + 1
+            expected_w = (relevant_grad.shape[W_DIM] - 1) * stride[2] + dilation[1] * (kernel_size[2] - 1) + 1
+
+            if relevant_input.shape[H_DIM] != expected_h or relevant_input.shape[W_DIM] != expected_w:
+                # Border bookkeeping can be off by one due mixed trim/pad paths.
+                # Enforce conv2d_weight input/grad geometric contract.
+                pad_h = max(0, expected_h - relevant_input.shape[H_DIM])
+                pad_w = max(0, expected_w - relevant_input.shape[W_DIM])
+                if pad_h > 0 or pad_w > 0:
+                    relevant_input = torch.nn.functional.pad(relevant_input, [0, pad_w, 0, pad_h])
+                relevant_input = relevant_input[:, :, :expected_h, :expected_w]
+
             grad_weight = torch.nn.grad.conv2d_weight(
                 relevant_input.to(weight.dtype),
                 weight.shape,
