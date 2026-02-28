@@ -118,8 +118,11 @@ class StreamingConv2dF(torch.autograd.Function):
             # conv2d_weight requires strict geometric consistency between
             # grad-output and selected input window:
             #   in = (out - 1) * stride + dilation * (kernel - 1) + 1
-            dil_h = int(dilation[0] if isinstance(dilation, tuple) else dilation)
-            dil_w = int(dilation[1] if isinstance(dilation, tuple) else dilation)
+            # NOTE: `_triple` encodes 2D args as (dummy, h, w), so dilation
+            # factors must use indices 1/2 (not 0/1).
+            dilation_t = _triple(dilation)
+            dil_h = int(dilation_t[1])
+            dil_w = int(dilation_t[2])
             relevant_input_height = (relevant_grad.shape[H_DIM] - 1) * stride[1] + dil_h * (kernel_size[1] - 1) + 1
             relevant_input_width = (relevant_grad.shape[W_DIM] - 1) * stride[2] + dil_w * (kernel_size[2] - 1) + 1
             relevant_input = inpt[
