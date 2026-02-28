@@ -220,16 +220,20 @@ class StreamingCNN(torch.nn.Module):
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
+
+        # For global-reducer heads, the effective border loss is inherited from the
+        # spatial predecessor (the reducer output itself is always 1x1 and has no border).
+        for idx, out in enumerate(output_tensors):
+            p_stats = self._prev_stats(out)
+            if p_stats and isinstance(p_stats.get("module", None), GlobalReducer):
+                inherited_lost = p_stats.get("inpt_lost", p_stats.get("lost", Lost(0, 0, 0, 0)))
+                self._tile_output_lost[idx] = inherited_lost
+
+        if len(self._tile_output_lost) > 0:
+            self.tile_output_lost = self._tile_output_lost[0]
+
         if self.verbose:
-            has_global_reducer = any(isinstance(mod, GlobalReducer) for mod in self.stream_module.modules())
-            if has_global_reducer:
-                lost_msg = [
-                    "N/A (global reducer)" if tuple(out.shape[-2:]) == (1, 1) else str(self._tile_output_lost[idx])
-                    for idx, out in enumerate(output_tensors)
-                ]
-                print("\n", "Output lost (effective)", lost_msg)
-            else:
-                print("\n", "Output lost", self._tile_output_lost)
+            print("\n", "Output lost (effective)", self._tile_output_lost)
 
     def _log_output_head_statistics(self):
         if not self.verbose:
@@ -241,10 +245,13 @@ class StreamingCNN(torch.nn.Module):
             head_type = "global_reducer" if is_global else "spatial"
             shape = tuple(int(x) for x in self._tile_output_shapes[idx])
             stride = tuple(int(x) for x in self._output_stride_per_output[idx].tolist())
+            lost = self._tile_output_lost[idx]
             if is_global:
-                lost_msg = "N/A (global reducer)"
+                lost_msg = (
+                    f"Lost(top={lost.top}, left={lost.left}, bottom={lost.bottom}, right={lost.right}) "
+                    "(inherited from spatial predecessor)"
+                )
             else:
-                lost = self._tile_output_lost[idx]
                 lost_msg = f"Lost(top={lost.top}, left={lost.left}, bottom={lost.bottom}, right={lost.right})"
 
             print(f"  head[{idx}] type={head_type}, tile_shape={shape}, output_stride={stride}, output_lost={lost_msg}")
@@ -1159,6 +1166,9 @@ class StreamingCNN(torch.nn.Module):
                 scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
                 output_stride = self._update_output_stride_for_upsample(prev_output_stride, scale_h, scale_w)
                 module_stats["scale_factor_hw"] = (scale_h, scale_w)
+            elif is_global_reducer:
+                output_stride = prev_output_stride
+                module_stats["inpt_lost"] = p_stats["lost"] if p_stats and "lost" in p_stats else Lost(0, 0, 0, 0)
             else:
                 output_stride = prev_output_stride
 
@@ -1214,7 +1224,10 @@ class StreamingCNN(torch.nn.Module):
 
             if self.verbose:
                 print(module, "\n", grad_lost)
-            self._module_stats[module]["grad_lost"] = grad_lost
+            if is_global_reducer:
+                self._module_stats[module]["grad_lost"] = self._module_stats[module].get("inpt_lost", Lost(0, 0, 0, 0))
+            else:
+                self._module_stats[module]["grad_lost"] = grad_lost
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
