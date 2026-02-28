@@ -215,9 +215,18 @@ class StreamingCNN(torch.nn.Module):
         output_tensors, output_spec = self._flatten_output_structure(output)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
+        self._tile_output_lost_display = []
+        for idx, out in enumerate(output_tensors):
+            lost = self._tile_output_lost[idx]
+            if out.shape[H_DIM] == 1 and out.shape[W_DIM] == 1:
+                p_stats = self._prev_stats(out)
+                if p_stats and "lost" in p_stats:
+                    lost = p_stats["lost"]
+            self._tile_output_lost_display.append(lost)
+
         self.tile_output_lost = self._tile_output_lost[0]
         if self.verbose:
-            print("\n", "Output lost", self._tile_output_lost)
+            print("\n", "Output lost", self._tile_output_lost_display)
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -394,6 +403,7 @@ class StreamingCNN(torch.nn.Module):
             mod = StreamingGlobalReducer.from_global_reducer(module)
             if module in self._module_stats:
                 mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
+                mod.input_lost = self._module_stats[module].get("lost", Lost(0, 0, 0, 0))
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
@@ -446,6 +456,7 @@ class StreamingCNN(torch.nn.Module):
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
+                stats["lost"] = module.input_lost
                 stats["output_stride"] = module.output_stride
                 self._module_stats[mod] = stats
             else:
@@ -520,6 +531,10 @@ class StreamingCNN(torch.nn.Module):
             image = image.to(self.device, non_blocking=True)
 
         tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
+
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingGlobalReducer):
+                mod.reset()
 
         # Size of valid output of a tile
         valid_output_heights = [
@@ -1086,12 +1101,19 @@ class StreamingCNN(torch.nn.Module):
 
             # Sum all dimensions (useful for DenseNet like networks)
             lost = self._non_max_border_amount(output)
+            if is_global_reducer:
+                p_stats = self._prev_stats(inpt[0])
+                if p_stats and "lost" in p_stats:
+                    lost = p_stats["lost"]
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
-            output[
-                :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
-            ] = 1
+            if is_global_reducer:
+                output.fill_(1)
+            else:
+                output[
+                    :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
+                ] = 1
 
             module_stats = {"lost": lost, "stride": stride if (not is_upsample and not is_global_reducer) else torch.tensor([1, 1, 1]), "module": module}
             if self.verbose:
@@ -1286,6 +1308,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["output_stride"] = self.output_stride
         named_stats["tile_output_lost"] = self.tile_output_lost  # type:ignore
         named_stats["tile_output_lost_all"] = self._tile_output_lost  # type:ignore
+        named_stats["tile_output_lost_display"] = getattr(self, "_tile_output_lost_display", self._tile_output_lost)  # type:ignore
         named_stats["tile_gradient_lost"] = self.tile_gradient_lost  # type:ignore
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
@@ -1299,6 +1322,7 @@ class StreamingCNN(torch.nn.Module):
         self.output_stride = state["output_stride"]
         self.tile_output_lost = state["tile_output_lost"]
         self._tile_output_lost = state.get("tile_output_lost_all", [self.tile_output_lost])
+        self._tile_output_lost_display = state.get("tile_output_lost_display", self._tile_output_lost)
         self.tile_gradient_lost = state["tile_gradient_lost"]
         self._tile_output_shape = state["tile_output_shape"]
         self._tile_output_shapes = state.get("tile_output_shapes", [self._tile_output_shape])
