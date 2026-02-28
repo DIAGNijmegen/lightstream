@@ -601,13 +601,17 @@ class StreamingCNN(torch.nn.Module):
                     1,
                     valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
                 )
-        n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
-        n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
+        max_tile_y = max(image.shape[H_DIM] - self.tile_shape[H_DIM], 0)
+        max_tile_x = max(image.shape[W_DIM] - self.tile_shape[W_DIM], 0)
+        y_positions = list(range(0, max_tile_y + 1, max(1, int(valid_input_height))))
+        x_positions = list(range(0, max_tile_x + 1, max(1, int(valid_input_width))))
+        if y_positions[-1] != max_tile_y:
+            y_positions.append(max_tile_y)
+        if x_positions[-1] != max_tile_x:
+            x_positions.append(max_tile_x)
 
-        if image.shape[W_DIM] <= tile_width:
-            n_cols = 1
-        if image.shape[H_DIM] <= tile_height:
-            n_rows = 1
+        n_rows = len(y_positions)
+        n_cols = len(x_positions)
 
         if self.verbose:
             print(
@@ -628,34 +632,19 @@ class StreamingCNN(torch.nn.Module):
         relevant_output = outputs[0][:, :, :0, :0]
 
         with torch.no_grad():
-            for row in iterator:
-                for col in range(n_cols):
-                    # Coordinates of the output w.r.t. the output of full image
-                    tile_y = row * valid_input_height
-                    tile_x = col * valid_input_width
-
+            for row, tile_y in enumerate(y_positions):
+                for col, tile_x in enumerate(x_positions):
                     # Check if we are at borders, since we can not create
                     # overlap here and should not crop values.
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
-
-                    sides_bottom = True if tile_y + self.tile_shape[H_DIM] >= image.shape[H_DIM] else False
-                    sides_right = True if tile_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
+                    sides_top = row == 0
+                    sides_left = col == 0
+                    sides_bottom = row == (n_rows - 1)
+                    sides_right = col == (n_cols - 1)
                     sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                     # These values are used to crop invalid output values
                     lost = self._get_tile_lost_for_sides(sides)
 
-                    # Since we need to stay at multiples of output stride we
-                    # need to keep that into account when we are at the bottom
-                    # and right side of the output.
-                    if sides_bottom:
-                        tile_y = max(image.shape[H_DIM] - self.tile_shape[H_DIM], 0)
-                    if sides_right:
-                        tile_x = max(image.shape[W_DIM] - self.tile_shape[W_DIM], 0)
-
-                    tile_y = tile_y if not sides.top else 0
-                    tile_x = tile_x if not sides.left else 0
                     self._last_forward_tiles.append((int(tile_y), int(tile_x), sides))
 
                     # Extract tile and perform forward pass
@@ -868,21 +857,22 @@ class StreamingCNN(torch.nn.Module):
                     input_x = output_x * int(self.output_stride[2])
                     tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
         else:
+            max_tile_y = max(image.shape[H_DIM] - tile_height, 0)
+            max_tile_x = max(image.shape[W_DIM] - tile_width, 0)
+            y_positions = list(range(0, max_tile_y + 1, max(1, int(valid_input_height))))
+            x_positions = list(range(0, max_tile_x + 1, max(1, int(valid_input_width))))
+            if y_positions[-1] != max_tile_y:
+                y_positions.append(max_tile_y)
+            if x_positions[-1] != max_tile_x:
+                x_positions.append(max_tile_x)
+
             tile_iter = []
-            for row in iterator:
-                for col in range(n_cols):
-                    tile_y = row * valid_input_height
-                    tile_x = col * valid_input_width
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
-                    sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
-                    sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
-                    if sides_bottom:
-                        tile_y = max(image.shape[H_DIM] - tile_height, 0)
-                    if sides_right:
-                        tile_x = max(image.shape[W_DIM] - tile_width, 0)
-                    tile_y = tile_y if not sides_top else 0
-                    tile_x = tile_x if not sides_left else 0
+            for row, tile_y in enumerate(y_positions):
+                for col, tile_x in enumerate(x_positions):
+                    sides_top = row == 0
+                    sides_left = col == 0
+                    sides_bottom = row == (len(y_positions) - 1)
+                    sides_right = col == (len(x_positions) - 1)
                     tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
         last_sides = None
