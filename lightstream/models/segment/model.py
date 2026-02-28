@@ -14,7 +14,13 @@ from torchinfo import summary
 
 
 class WSS(nn.Module):
-    def __init__(self, encoder: str, weights: str="default", remove_last_block: bool =True):
+    def __init__(
+        self,
+        encoder: str,
+        weights: str = "default",
+        remove_last_block: bool = True,
+        apply_reducers: bool = True,
+    ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
         self.decoder1 = nn.Sequential(
@@ -34,6 +40,7 @@ class WSS(nn.Module):
         )
 
         self.w = [0.3, 0.4, 0.3]
+        self.apply_reducers = apply_reducers
         self.reducer1 = GlobalReducer()
         self.reducer2 = GlobalReducer()
         self.reducer3 = GlobalReducer()
@@ -46,9 +53,10 @@ class WSS(nn.Module):
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
 
-        y1 = self.reducer1(y1)
-        y2 = self.reducer2(y2)
-        y3 = self.reducer3(y3)
+        if self.apply_reducers:
+            y1 = self.reducer1(y1)
+            y2 = self.reducer2(y2)
+            y3 = self.reducer3(y3)
 
         return y1, y2, y3
 

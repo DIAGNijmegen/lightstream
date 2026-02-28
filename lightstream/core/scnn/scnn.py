@@ -187,7 +187,9 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(out)
             if p_stats:
-                output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                stride = p_stats["stride"]
+                stride_tensor = stride.clone().detach() if isinstance(stride, torch.Tensor) else torch.tensor(stride)
+                output_stride = p_stats["output_stride"] * stride_tensor
             else:
                 output_stride = torch.tensor([1, 1, 1])
 

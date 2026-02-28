@@ -35,11 +35,11 @@ class StreamingWSS(StreamingModule):
 
         if additional_modules is not None:
             stream_network = Sequential(
-                WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block),
+                WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block, apply_reducers=False),
                 additional_modules,
             )
         else:
-            stream_network = WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block)
+            stream_network = WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block, apply_reducers=False)
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -48,6 +48,10 @@ class StreamingWSS(StreamingModule):
 
         if tile_cache_path is None:
             tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+
+        self.reducer1 = GlobalReducer()
+        self.reducer2 = GlobalReducer()
+        self.reducer3 = GlobalReducer()
 
         super().__init__(
             stream_network,
@@ -61,8 +65,12 @@ class StreamingWSS(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            add_keep_modules=[nn.BatchNorm2d, GlobalReducer],
+            add_keep_modules=[nn.BatchNorm2d],
         )
+
+    def forward(self, x):
+        y1, y2, y3 = super().forward(x)
+        return self.reducer1(y1), self.reducer2(y2), self.reducer3(y3)
 
     @staticmethod
     def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
