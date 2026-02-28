@@ -211,17 +211,17 @@ class StreamingCNN(torch.nn.Module):
 
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
+        self._reducer_forward_lost = []
         output = self.stream_module(tile)
         output_tensors, output_spec = self._flatten_output_structure(output)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self._tile_output_lost_display = []
+        reducer_lost_iter = iter(getattr(self, "_reducer_forward_lost", []))
         for idx, out in enumerate(output_tensors):
             lost = self._tile_output_lost[idx]
             if out.shape[H_DIM] == 1 and out.shape[W_DIM] == 1:
-                p_stats = self._prev_stats(out)
-                if p_stats and "lost" in p_stats:
-                    lost = p_stats["lost"]
+                lost = next(reducer_lost_iter, lost)
             self._tile_output_lost_display.append(lost)
 
         self.tile_output_lost = self._tile_output_lost[0]
@@ -1102,9 +1102,9 @@ class StreamingCNN(torch.nn.Module):
             # Sum all dimensions (useful for DenseNet like networks)
             lost = self._non_max_border_amount(output)
             if is_global_reducer:
-                p_stats = self._prev_stats(inpt[0])
-                if p_stats and "lost" in p_stats:
-                    lost = p_stats["lost"]
+                lost = self._non_max_border_amount(inpt[0])
+                if hasattr(self, "_reducer_forward_lost"):
+                    self._reducer_forward_lost.append(lost)
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
