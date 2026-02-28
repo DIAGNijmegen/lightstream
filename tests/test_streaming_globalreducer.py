@@ -1,6 +1,6 @@
 import torch
 
-from lightstream.core.scnn.utils import Box, Sides
+from lightstream.core.scnn.utils import Box, Lost, Sides
 from lightstream.models.segment.globalreducer import GlobalReducer, StreamingGlobalReducer
 
 
@@ -50,3 +50,35 @@ def test_streaming_global_reducer_matches_dense_forward_and_backward():
         stream_grad[:, :, y : y + tile_h, x0 : x0 + tile_w] = tile.grad
 
     assert torch.allclose(stream_grad, dense_grad, atol=1e-10, rtol=1e-8)
+
+
+def test_reducer_only_scheduler_uses_effective_predecessor_lost_and_stride():
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.tile_shape = (1, 1, 2560, 2560)
+    scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_shapes = [(1, 1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1)]
+    scnn._output_is_global_reducer = [True, True, True]
+    scnn._output_stride_per_output = [
+        torch.tensor([1, 1, 1]),
+        torch.tensor([1, 1, 1]),
+        torch.tensor([1, 1, 1]),
+    ]
+    scnn._output_effective_stride = [
+        torch.tensor([1, 16, 16]),
+        torch.tensor([1, 8, 8]),
+        torch.tensor([1, 4, 4]),
+    ]
+    scnn._output_effective_lost = [
+        Lost(120, 120, 104, 104),
+        Lost(60, 60, 52, 52),
+        Lost(30, 30, 26, 26),
+    ]
+    scnn._compute_internal_safe_input_step = lambda: (4000, 4000)
+    scnn._compute_internal_alignment = lambda: (16, 16)
+
+    h, w = StreamingCNN._compute_multi_output_input_step(scnn, [1, 1, 1], [1, 1, 1], include_grad_safe=True)
+
+    assert h == 2336
+    assert w == 2336
