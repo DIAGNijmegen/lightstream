@@ -599,6 +599,7 @@ class StreamingCNN(torch.nn.Module):
         # else:
         iterator = range(n_rows)
         self._last_forward_tiles = []
+        relevant_output = outputs[0][:, :, :0, :0]
 
         with torch.no_grad():
             for row in iterator:
