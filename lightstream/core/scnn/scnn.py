@@ -104,6 +104,8 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._last_forward_tiles = []
+        self._reducer_head_stats = []
+        self._last_reducer_runtime_stats = []
 
         if state_dict is None:
             self._configure()
@@ -225,8 +227,20 @@ class StreamingCNN(torch.nn.Module):
             self._tile_output_lost_display.append(lost)
 
         self.tile_output_lost = self._tile_output_lost[0]
+        self._reducer_head_stats = []
+        reducer_modules = [m for m in self.stream_module.modules() if isinstance(m, StreamingGlobalReducer)]
+        reducer_idx = 0
+        for idx, out in enumerate(output_tensors):
+            if out.shape[H_DIM] == 1 and out.shape[W_DIM] == 1 and reducer_idx < len(reducer_modules):
+                stats = reducer_modules[reducer_idx].get_coverage_stats()
+                stats["head_idx"] = float(idx)
+                self._reducer_head_stats.append(stats)
+                reducer_idx += 1
+
         if self.verbose:
             print("\n", "Output lost", self._tile_output_lost_display)
+            if self._reducer_head_stats:
+                print("Reducer head coverage stats", self._reducer_head_stats)
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -631,6 +645,8 @@ class StreamingCNN(torch.nn.Module):
         # else:
         iterator = range(n_rows)
         self._last_forward_tiles = []
+        self._reducer_head_stats = []
+        self._last_reducer_runtime_stats = []
         relevant_output = outputs[0][:, :, :0, :0]
 
         with torch.no_grad():
@@ -735,6 +751,15 @@ class StreamingCNN(torch.nn.Module):
         del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
+        self._last_reducer_runtime_stats = []
+        reducer_modules = [m for m in self.stream_module.modules() if isinstance(m, StreamingGlobalReducer)]
+        for idx, mod in enumerate(reducer_modules):
+            stats = mod.get_coverage_stats()
+            stats["reducer_idx"] = float(idx)
+            self._last_reducer_runtime_stats.append(stats)
+        if self.verbose and self._last_reducer_runtime_stats:
+            print("Reducer runtime coverage stats", self._last_reducer_runtime_stats)
+
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
@@ -1313,6 +1338,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
         named_stats["output_spec"] = self._output_spec
+        named_stats["reducer_head_stats"] = getattr(self, "_reducer_head_stats", [])
         return named_stats
 
     def load_tile_cache(self, state):
@@ -1331,6 +1357,7 @@ class StreamingCNN(torch.nn.Module):
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
             self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         self._output_spec = state.get("output_spec", ("tensor", None))
+        self._reducer_head_stats = state.get("reducer_head_stats", [])
 
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
