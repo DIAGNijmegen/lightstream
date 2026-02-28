@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
+from lightstream.models.segment.globalreducer import GlobalReducer
 from torchinfo import summary
 
 
@@ -33,6 +34,9 @@ class WSS(nn.Module):
         )
 
         self.w = [0.3, 0.4, 0.3]
+        self.reducer1 = GlobalReducer()
+        self.reducer2 = GlobalReducer()
+        self.reducer3 = GlobalReducer()
 
 
     def forward(self, x):
@@ -41,6 +45,10 @@ class WSS(nn.Module):
         y1 = self.decoder1(x1)
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
+
+        y1 = self.reducer1(y1)
+        y2 = self.reducer2(y2)
+        y3 = self.reducer3(y3)
 
         return y1, y2, y3
 

@@ -8,6 +8,7 @@ from torch.nn import Sequential
 from torchvision.models import resnet18, resnet34, resnet50
 from lightstream.modules.streaming import StreamingModule
 from lightstream.models.segment.model import WSS
+from lightstream.models.segment.globalreducer import GlobalReducer
 
 
 class StreamingWSS(StreamingModule):
@@ -60,7 +61,7 @@ class StreamingWSS(StreamingModule):
             normalize_on_gpu=normalize_on_gpu,
             mean=mean,
             std=std,
-            add_keep_modules=[nn.BatchNorm2d],
+            add_keep_modules=[nn.BatchNorm2d, GlobalReducer],
         )
 
     @staticmethod

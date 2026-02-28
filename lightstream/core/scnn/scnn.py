@@ -15,6 +15,8 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.scnn.streamingglobalreducer import StreamingGlobalReducer
+from lightstream.models.segment.globalreducer import GlobalReducer
 
 
 _triple = _ntuple(3)
@@ -373,6 +375,13 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, GlobalReducer):
+            mod = StreamingGlobalReducer.from_global_reducer(module)
+            if module in self._module_stats:
+                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
+                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -409,6 +418,16 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingGlobalReducer):
+            mod = module.to_global_reducer()
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -822,7 +841,7 @@ class StreamingCNN(torch.nn.Module):
                     tile = tile.to(self.device, non_blocking=True)
 
                 for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+                    if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingGlobalReducer)):
                         mod.input_loc = input_loc
 
                 # normalize on gpu for speed in dataloader
@@ -898,7 +917,7 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingGlobalReducer)):
                 mod.input_loc = None
                 mod.reset()
 
@@ -961,8 +980,8 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
+        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample, GlobalReducer),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, GlobalReducer),
     ):
         for mod in self.stream_module.modules():
             if isinstance(mod, forward_modules):
@@ -996,7 +1015,8 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
+        is_global_reducer = isinstance(module, GlobalReducer)
+        if not is_upsample and not is_global_reducer:
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         else:
             stride = torch.tensor([1, 1, 1])
@@ -1004,7 +1024,7 @@ class StreamingCNN(torch.nn.Module):
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
-            if (not is_upsample) and (
+            if (not is_upsample and not is_global_reducer) and (
                 isinstance(module, (torch.nn.MaxPool2d))
                 or (stride[0] > 1 and stride[0] > kernel_size[0])
                 or (stride[1] > 1 and stride[1] > kernel_size[1])
@@ -1037,7 +1057,7 @@ class StreamingCNN(torch.nn.Module):
                 :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
+            module_stats = {"lost": lost, "stride": stride if (not is_upsample and not is_global_reducer) else torch.tensor([1, 1, 1]), "module": module}
             if self.verbose:
                 print(module, "\n", module_stats["lost"])
 
@@ -1065,7 +1085,8 @@ class StreamingCNN(torch.nn.Module):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
+        is_global_reducer = isinstance(module, GlobalReducer)
+        if not is_upsample and not is_global_reducer:
             stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
@@ -1115,7 +1136,7 @@ class StreamingCNN(torch.nn.Module):
 
             # When kernel_size > stride we have some _overlap_ of gradients,
             # this overlap makes extra positions in the input gradient invalid
-            if (not is_upsample) and (
+            if (not is_upsample and not is_global_reducer) and (
                 (stride[0] > 1 and kernel_size[0] > stride[0])
                 or (stride[1] > 1 and kernel_size[1] > stride[1])
                 or (stride[2] > 1 and kernel_size[2] > stride[2])
