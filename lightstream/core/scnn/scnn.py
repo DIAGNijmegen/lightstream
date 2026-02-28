@@ -341,10 +341,17 @@ class StreamingCNN(torch.nn.Module):
         step_candidates_h = []
         step_candidates_w = []
         for idx in range(len(self._tile_output_shapes)):
+            head_stride_h = int(self._output_stride_per_output[idx][1])
+            head_stride_w = int(self._output_stride_per_output[idx][2])
             if self._is_reduced_output_head(idx):
+                display_lost = getattr(self, "_tile_output_lost_display", self._tile_output_lost)[idx]
+                step_h = self.tile_shape[H_DIM] - int(display_lost.top) - int(display_lost.bottom)
+                step_w = self.tile_shape[W_DIM] - int(display_lost.left) - int(display_lost.right)
+                step_candidates_h.append(max(1, step_h) * head_stride_h)
+                step_candidates_w.append(max(1, step_w) * head_stride_w)
                 continue
-            step_candidates_h.append(valid_output_heights[idx] * int(self._output_stride_per_output[idx][1]))
-            step_candidates_w.append(valid_output_widths[idx] * int(self._output_stride_per_output[idx][2]))
+            step_candidates_h.append(valid_output_heights[idx] * head_stride_h)
+            step_candidates_w.append(valid_output_widths[idx] * head_stride_w)
 
         # Extra safety from backward statistics (input gradient valid region)
         if include_grad_safe or not step_candidates_h or not step_candidates_w:
@@ -582,7 +589,9 @@ class StreamingCNN(torch.nn.Module):
             )
         else:
             if self._is_reduced_output_head(0):
-                valid_input_height, valid_input_width = self._compute_internal_safe_input_step()
+                display_lost = getattr(self, "_tile_output_lost_display", self._tile_output_lost)[0]
+                valid_input_height = max(1, self.tile_shape[H_DIM] - int(display_lost.top) - int(display_lost.bottom))
+                valid_input_width = max(1, self.tile_shape[W_DIM] - int(display_lost.left) - int(display_lost.right))
             else:
                 valid_input_height = max(
                     1,
@@ -781,7 +790,9 @@ class StreamingCNN(torch.nn.Module):
             )
         else:
             if self._is_reduced_output_head(0):
-                valid_input_height, valid_input_width = self._compute_internal_safe_input_step()
+                display_lost = getattr(self, "_tile_output_lost_display", self._tile_output_lost)[0]
+                valid_input_height = max(1, self.tile_shape[H_DIM] - int(display_lost.top) - int(display_lost.bottom))
+                valid_input_width = max(1, self.tile_shape[W_DIM] - int(display_lost.left) - int(display_lost.right))
             else:
                 valid_input_height = max(
                     1,
