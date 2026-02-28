@@ -523,6 +523,12 @@ class StreamingCNN(torch.nn.Module):
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
+    def _compute_tile_positions(self, max_start: int, step: int) -> list[int]:
+        step = max(1, int(step))
+        starts = list(range(0, int(max_start) + 1, step))
+        starts.append(int(max_start))
+        return sorted(set(starts))
+
     def forward(self, image, result_on_cpu=False):
         """Perform forward pass with lightstream.
 
@@ -603,12 +609,8 @@ class StreamingCNN(torch.nn.Module):
                 )
         max_tile_y = max(image.shape[H_DIM] - self.tile_shape[H_DIM], 0)
         max_tile_x = max(image.shape[W_DIM] - self.tile_shape[W_DIM], 0)
-        y_positions = list(range(0, max_tile_y + 1, max(1, int(valid_input_height))))
-        x_positions = list(range(0, max_tile_x + 1, max(1, int(valid_input_width))))
-        if y_positions[-1] != max_tile_y:
-            y_positions.append(max_tile_y)
-        if x_positions[-1] != max_tile_x:
-            x_positions.append(max_tile_x)
+        y_positions = self._compute_tile_positions(max_tile_y, int(valid_input_height))
+        x_positions = self._compute_tile_positions(max_tile_x, int(valid_input_width))
 
         n_rows = len(y_positions)
         n_cols = len(x_positions)
@@ -859,12 +861,8 @@ class StreamingCNN(torch.nn.Module):
         else:
             max_tile_y = max(image.shape[H_DIM] - tile_height, 0)
             max_tile_x = max(image.shape[W_DIM] - tile_width, 0)
-            y_positions = list(range(0, max_tile_y + 1, max(1, int(valid_input_height))))
-            x_positions = list(range(0, max_tile_x + 1, max(1, int(valid_input_width))))
-            if y_positions[-1] != max_tile_y:
-                y_positions.append(max_tile_y)
-            if x_positions[-1] != max_tile_x:
-                x_positions.append(max_tile_x)
+            y_positions = self._compute_tile_positions(max_tile_y, int(valid_input_height))
+            x_positions = self._compute_tile_positions(max_tile_x, int(valid_input_width))
 
             tile_iter = []
             for row, tile_y in enumerate(y_positions):
