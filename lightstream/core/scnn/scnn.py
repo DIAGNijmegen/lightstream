@@ -868,7 +868,11 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if len(self._tile_output_shapes) == 1:
+        if self._output_is_global_reducer and any(self._output_is_global_reducer) and len(self._last_forward_tiles) > 0:
+            # Keep backward tile traversal identical to forward when global reducers
+            # are present, to avoid phase drift in streamed conv-gradient extraction.
+            tile_iter = [(int(y), int(x), sides) for (y, x, sides) in self._last_forward_tiles]
+        elif len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
             output_height = self._tile_output_shape[H_DIM]
             output_width = self._tile_output_shape[W_DIM]
