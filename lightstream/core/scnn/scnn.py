@@ -617,6 +617,7 @@ class StreamingCNN(torch.nn.Module):
             if isinstance(mod, StreamingGlobalReducer):
                 mod.reset()
 
+        relevant_output = None
         with torch.no_grad():
             for row in iterator:
                 for col in range(n_cols):
@@ -673,6 +674,7 @@ class StreamingCNN(torch.nn.Module):
                     for idx, head_output in enumerate(tile_outputs):
                         if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
                             outputs[idx].copy_(head_output)
+                            relevant_output = head_output
                             continue
 
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
@@ -740,6 +742,7 @@ class StreamingCNN(torch.nn.Module):
                 mod.finalize_forward_state()
 
         # mem management
+        del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
