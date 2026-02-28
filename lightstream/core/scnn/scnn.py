@@ -196,7 +196,15 @@ class StreamingCNN(torch.nn.Module):
                 output_stride = torch.tensor([1, 1, 1])
 
             self._output_stride_per_output.append(output_stride)
-            is_global_reducer_out = bool(p_stats and isinstance(p_stats.get("module", None), GlobalReducer))
+            p_mod = p_stats.get("module", None) if p_stats else None
+            is_global_reducer_out = bool(
+                (p_stats and isinstance(p_mod, GlobalReducer))
+                or (
+                    out.shape[H_DIM] == 1
+                    and out.shape[W_DIM] == 1
+                    and any(isinstance(m, GlobalReducer) for m in self.stream_module.modules())
+                )
+            )
             self._output_is_global_reducer.append(is_global_reducer_out)
             if is_global_reducer_out:
                 inherited_lost = p_stats.get("inpt_lost", p_stats.get("lost", Lost(0, 0, 0, 0))) if p_stats else Lost(0, 0, 0, 0)
@@ -230,7 +238,7 @@ class StreamingCNN(torch.nn.Module):
         self.tile_output_lost = self._tile_output_lost[0]
 
         if self.verbose:
-            print("\n", "Output lost (raw)", self._tile_output_lost)
+            print("\n", "Output lost (effective)", self._tile_output_lost)
 
     def _log_output_head_statistics(self):
         if not self.verbose:
@@ -852,7 +860,9 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        if len(self._tile_output_shapes) == 1:
+        if self._output_is_global_reducer and any(self._output_is_global_reducer):
+            tile_iter = [(int(y), int(x), sides) for (y, x, sides) in self._last_forward_tiles]
+        elif len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
             output_height = self._tile_output_shape[H_DIM]
             output_width = self._tile_output_shape[W_DIM]
@@ -937,7 +947,10 @@ class StreamingCNN(torch.nn.Module):
                     tile.requires_grad = True
                     self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                if self.device.type == "cuda" and self.dtype in (torch.float16, torch.bfloat16):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        tile_output = self.stream_module(tile)
+                else:
                     tile_output = self.stream_module(tile)
                 tile_outputs, _ = self._flatten_output_structure(tile_output)
 
