@@ -43,6 +43,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
 
         contrib = torch.zeros_like(inpt)
         contrib_mask = torch.zeros_like(inpt, dtype=torch.bool)
+        accum_dtype = running_sum.dtype
         if new_box.height > 0 and new_box.width > 0:
             rel = valid[
                 :,
@@ -50,7 +51,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
                 new_box.y : new_box.y + new_box.height,
                 new_box.x : new_box.x + new_box.width,
             ]
-            rel_p = rel.pow(r)
+            rel_p = rel.to(accum_dtype).pow(r)
             running_sum.add_(rel_p.sum(dim=(-2, -1), keepdim=True))
             running_count.add_(float(rel.shape[-2] * rel.shape[-1]))
 
@@ -62,7 +63,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             contrib_mask[:, :, y0:y1, x0:x1] = True
 
         mean_running = running_sum / running_count.clamp_min(1.0)
-        out_running = mean_running.clamp_min(eps).pow(1.0 / r)
+        out_running = mean_running.clamp_min(eps).pow(1.0 / r).to(inpt.dtype)
 
         mean_final = backward_sum / backward_count.clamp_min(1.0)
         out_final = mean_final.clamp_min(eps).pow(1.0 / r)
@@ -81,8 +82,13 @@ class StreamingGlobalReducerF(torch.autograd.Function):
 
         grad_in = torch.zeros(ctx.input_shape, dtype=contrib.dtype, device=contrib.device)
         if contrib_mask.any():
+            accum_dtype = out.dtype
             factor = out.clamp_min(eps).pow(1.0 - r) / backward_count.clamp_min(1.0)
-            grad_pixels = grad_output * factor * contrib.clamp_min(eps).pow(r - 1.0)
+            grad_pixels = (
+                grad_output.to(accum_dtype)
+                * factor
+                * contrib.to(accum_dtype).clamp_min(eps).pow(r - 1.0)
+            ).to(contrib.dtype)
             grad_in[contrib_mask] = grad_pixels[contrib_mask]
 
         return grad_in, None, None, None, None, None, None, None, None, None, None
@@ -113,15 +119,16 @@ class StreamingGlobalReducer(nn.Module):
 
     def _ensure_buffers(self, inpt: Tensor):
         shape = (inpt.shape[0], inpt.shape[1], 1, 1)
+        accum_dtype = torch.float64
         if self.running_sum is None or self.running_sum.shape != shape or self.running_sum.device != inpt.device:
-            self.running_sum = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
-            self.running_count = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
+            self.running_sum = torch.zeros(shape, dtype=accum_dtype, device=inpt.device)
+            self.running_count = torch.zeros(shape, dtype=accum_dtype, device=inpt.device)
 
         if self.backward_sum is None or self.backward_sum.shape != shape or self.backward_sum.device != inpt.device:
-            self.backward_sum = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
+            self.backward_sum = torch.zeros(shape, dtype=accum_dtype, device=inpt.device)
 
         if self.backward_count is None or self.backward_count.shape != shape or self.backward_count.device != inpt.device:
-            self.backward_count = torch.ones(shape, dtype=inpt.dtype, device=inpt.device)
+            self.backward_count = torch.ones(shape, dtype=accum_dtype, device=inpt.device)
 
     def finalize_forward_state(self):
         if self.running_count is None:
