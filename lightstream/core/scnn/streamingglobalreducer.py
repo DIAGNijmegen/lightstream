@@ -19,6 +19,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
         input_loc: Box,
         running_sum: Tensor,
         running_count: Tensor,
+        backward_sum: Tensor,
         backward_count: Tensor,
     ):
         sides = input_loc.sides
@@ -60,14 +61,17 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             contrib[:, :, y0:y1, x0:x1].copy_(rel)
             contrib_mask[:, :, y0:y1, x0:x1] = True
 
-        mean = running_sum / running_count.clamp_min(1.0)
-        out = mean.clamp_min(eps).pow(1.0 / r)
+        mean_running = running_sum / running_count.clamp_min(1.0)
+        out_running = mean_running.clamp_min(eps).pow(1.0 / r)
+
+        mean_final = backward_sum / backward_count.clamp_min(1.0)
+        out_final = mean_final.clamp_min(eps).pow(1.0 / r)
 
         ctx.r = r
         ctx.eps = eps
         ctx.input_shape = inpt.shape
-        ctx.save_for_backward(contrib, contrib_mask, out, backward_count)
-        return out
+        ctx.save_for_backward(contrib, contrib_mask, out_final, backward_count)
+        return out_running
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -81,7 +85,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             grad_pixels = grad_output * factor * contrib.clamp_min(eps).pow(r - 1.0)
             grad_in[contrib_mask] = grad_pixels[contrib_mask]
 
-        return grad_in, None, None, None, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None, None, None, None, None
 
 
 streaming_global_reducer = StreamingGlobalReducerF.apply
@@ -104,6 +108,7 @@ class StreamingGlobalReducer(nn.Module):
         self.running_sum = None
         self.running_count = None
         if not keep_backward_state:
+            self.backward_sum = None
             self.backward_count = None
 
     def _ensure_buffers(self, inpt: Tensor):
@@ -112,12 +117,16 @@ class StreamingGlobalReducer(nn.Module):
             self.running_sum = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
             self.running_count = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
 
+        if self.backward_sum is None or self.backward_sum.shape != shape or self.backward_sum.device != inpt.device:
+            self.backward_sum = torch.zeros(shape, dtype=inpt.dtype, device=inpt.device)
+
         if self.backward_count is None or self.backward_count.shape != shape or self.backward_count.device != inpt.device:
             self.backward_count = torch.ones(shape, dtype=inpt.dtype, device=inpt.device)
 
     def finalize_forward_state(self):
         if self.running_count is None:
             return
+        self.backward_sum = self.running_sum.detach().clone()
         self.backward_count = self.running_count.detach().clone()
 
     def forward(self, inpt: Tensor) -> Tensor:
@@ -132,6 +141,7 @@ class StreamingGlobalReducer(nn.Module):
             self.input_loc,
             self.running_sum,
             self.running_count,
+            self.backward_sum,
             self.backward_count,
         )
 
