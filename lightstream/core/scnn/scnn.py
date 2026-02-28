@@ -98,6 +98,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_lost = None
         self._output_stride_per_output = None
         self._output_is_global_reducer = None
+        self._output_effective_lost = None
         self._output_spec = None
         self._module_stats = {}
         self._backward_seen_indices = {}
@@ -175,6 +176,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = self._tile_output_shapes[0]
         self._output_stride_per_output = []
         self._output_is_global_reducer = []
+        self._output_effective_lost = []
         gradients = []
         for idx, out in enumerate(output_tensors):
             lost = self._tile_output_lost[idx]
@@ -196,6 +198,12 @@ class StreamingCNN(torch.nn.Module):
             self._output_stride_per_output.append(output_stride)
             is_global_reducer_out = bool(p_stats and isinstance(p_stats.get("module", None), GlobalReducer))
             self._output_is_global_reducer.append(is_global_reducer_out)
+            if is_global_reducer_out:
+                inherited_lost = p_stats.get("inpt_lost", p_stats.get("lost", Lost(0, 0, 0, 0))) if p_stats else Lost(0, 0, 0, 0)
+                self._output_effective_lost.append(inherited_lost)
+                self._tile_output_lost[idx] = inherited_lost
+            else:
+                self._output_effective_lost.append(self._tile_output_lost[idx])
 
         self._log_output_head_statistics()
 
@@ -221,19 +229,8 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
 
-        # For global-reducer heads, the effective border loss is inherited from the
-        # spatial predecessor (the reducer output itself is always 1x1 and has no border).
-        for idx, out in enumerate(output_tensors):
-            p_stats = self._prev_stats(out)
-            if p_stats and isinstance(p_stats.get("module", None), GlobalReducer):
-                inherited_lost = p_stats.get("inpt_lost", p_stats.get("lost", Lost(0, 0, 0, 0)))
-                self._tile_output_lost[idx] = inherited_lost
-
-        if len(self._tile_output_lost) > 0:
-            self.tile_output_lost = self._tile_output_lost[0]
-
         if self.verbose:
-            print("\n", "Output lost (effective)", self._tile_output_lost)
+            print("\n", "Output lost (raw)", self._tile_output_lost)
 
     def _log_output_head_statistics(self):
         if not self.verbose:
@@ -360,11 +357,22 @@ class StreamingCNN(torch.nn.Module):
             step_candidates_h.append(valid_output_heights[idx] * int(self._output_stride_per_output[idx][1]))
             step_candidates_w.append(valid_output_widths[idx] * int(self._output_stride_per_output[idx][2]))
 
-        # For pure global-reducer heads, rely on internal conservative step limits.
+        # For pure global-reducer heads, infer valid input-step from inherited
+        # spatial border-loss statistics (reducer output itself is always 1x1).
         if not step_candidates_h or not step_candidates_w:
-            grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
-            step_candidates_h.append(int(grad_safe_h))
-            step_candidates_w.append(int(grad_safe_w))
+            if self._output_effective_lost is not None and len(self._output_effective_lost) > 0:
+                for idx in range(len(self._tile_output_shapes)):
+                    if self._output_is_global_reducer and self._output_is_global_reducer[idx]:
+                        lost = self._output_effective_lost[idx]
+                        cand_h = max(1, self.tile_shape[H_DIM] - int(lost.top) - int(lost.bottom))
+                        cand_w = max(1, self.tile_shape[W_DIM] - int(lost.left) - int(lost.right))
+                        step_candidates_h.append(int(cand_h))
+                        step_candidates_w.append(int(cand_w))
+
+            if not step_candidates_h or not step_candidates_w:
+                grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
+                step_candidates_h.append(int(grad_safe_h))
+                step_candidates_w.append(int(grad_safe_w))
 
         # Extra safety from backward statistics (input gradient valid region)
         if include_grad_safe:
