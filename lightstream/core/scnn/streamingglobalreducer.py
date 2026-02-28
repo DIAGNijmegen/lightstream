@@ -81,7 +81,7 @@ class StreamingGlobalReducerF(torch.autograd.Function):
             grad_pixels = grad_output * factor * contrib.clamp_min(eps).pow(r - 1.0)
             grad_in[contrib_mask] = grad_pixels[contrib_mask]
 
-        return grad_in, None, None, None, None, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None, None, None, None
 
 
 streaming_global_reducer = StreamingGlobalReducerF.apply

@@ -221,7 +221,15 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
         if self.verbose:
-            print("\n", "Output lost", self._tile_output_lost)
+            has_global_reducer = any(isinstance(mod, GlobalReducer) for mod in self.stream_module.modules())
+            if has_global_reducer:
+                lost_msg = [
+                    "N/A (global reducer)" if tuple(out.shape[-2:]) == (1, 1) else str(self._tile_output_lost[idx])
+                    for idx, out in enumerate(output_tensors)
+                ]
+                print("\n", "Output lost (effective)", lost_msg)
+            else:
+                print("\n", "Output lost", self._tile_output_lost)
 
     def _log_output_head_statistics(self):
         if not self.verbose:
@@ -959,6 +967,7 @@ class StreamingCNN(torch.nn.Module):
                         ]
 
                     trimmed_output = trimmed_output.to(self.device, non_blocking=True)
+                    trimmed_grad = trimmed_grad.to(trimmed_output.device, dtype=trimmed_output.dtype, non_blocking=True)
 
                     if (
                         trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
