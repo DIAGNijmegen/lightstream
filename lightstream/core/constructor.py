@@ -26,7 +26,6 @@ class StreamingConstructor:
         verbose: bool = True,
         deterministic: bool = False,
         saliency: bool = False,
-        reduction_mode: str = "none",
         copy_to_gpu: bool = False,
         statistics_on_cpu: bool = True,
         normalize_on_gpu: bool = True,
@@ -45,7 +44,6 @@ class StreamingConstructor:
         self.verbose = verbose
         self.deterministic = deterministic
         self.saliency = saliency
-        self.reduction_mode = reduction_mode
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
         self.normalize_on_gpu = normalize_on_gpu
@@ -139,7 +137,6 @@ class StreamingConstructor:
             tile_shape=(1, 3, self.tile_size, self.tile_size),
             deterministic=self.deterministic,
             saliency=self.saliency,
-            reduction_mode=self.reduction_mode,
             copy_to_gpu=self.copy_to_gpu,
             verbose=self.verbose,
             statistics_on_cpu=self.statistics_on_cpu,

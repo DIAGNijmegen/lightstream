@@ -12,6 +12,7 @@ import torch.autograd
 import torch.backends
 import torch.nn.functional
 
+from lightstream.core.scnn.reduction import StreamingReductionHint
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
@@ -44,7 +45,6 @@ class StreamingCNN(torch.nn.Module):
         self,
         stream_module,
         tile_shape,
-        reduction_mode="none",
         verbose=False,
         deterministic=False,
         saliency=False,
@@ -77,11 +77,6 @@ class StreamingCNN(torch.nn.Module):
         if dtype is not None:
             self.dtype = dtype
         self.tile_shape = tile_shape
-        self.reduction_mode = str(reduction_mode).lower()
-        if self.reduction_mode not in {"none", "sum", "mean"}:
-            raise ValueError(
-                f"Unsupported reduction_mode='{reduction_mode}'. Expected one of: none, sum, mean"
-            )
         self.gather_input_gradient = saliency
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
@@ -108,6 +103,8 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._last_forward_tiles = []
+        self._reduction_hint_invocations = []
+        self._reduction_modes_per_output = []
 
         if state_dict is None:
             self._configure()
@@ -216,10 +213,30 @@ class StreamingCNN(torch.nn.Module):
         output = self.stream_module(tile)
         output_tensors, output_spec = self._flatten_output_structure(output)
         self._output_spec = output_spec
+        self._resolve_reduction_modes_for_outputs(len(output_tensors))
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
         if self.verbose:
             print("\n", "Output lost", self._tile_output_lost)
+
+    def _reduction_hint_hook(self, mod, _, __):
+        self._reduction_hint_invocations.append((mod.mode, mod.tag))
+
+    def _resolve_reduction_modes_for_outputs(self, n_outputs):
+        if len(self._reduction_hint_invocations) == 0:
+            self._reduction_modes_per_output = ["none" for _ in range(n_outputs)]
+            return
+
+        if len(self._reduction_hint_invocations) != n_outputs:
+            modes = [mode for mode, _ in self._reduction_hint_invocations]
+            tags = [tag for _, tag in self._reduction_hint_invocations]
+            raise ValueError(
+                "Number of StreamingReductionHint invocations does not match number of output tensors. "
+                f"hints={len(self._reduction_hint_invocations)} outputs={n_outputs} modes={modes} tags={tags}. "
+                "Add one hint module per output head or remove all hints."
+            )
+
+        self._reduction_modes_per_output = [mode for mode, _ in self._reduction_hint_invocations]
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -521,9 +538,9 @@ class StreamingCNN(torch.nn.Module):
         outputs = []
         reduce_sums = []
         reduce_counts = []
-        is_reduction = self.reduction_mode in {"sum", "mean"}
         for idx in range(len(self._tile_output_shapes)):
-            if is_reduction:
+            mode = self._reduction_modes_per_output[idx]
+            if mode in {"sum", "mean"}:
                 outputs.append(
                     torch.zeros(
                         (image.shape[0], self._tile_output_shapes[idx][1], 1, 1),
@@ -647,7 +664,8 @@ class StreamingCNN(torch.nn.Module):
                             lost.left : head_output.shape[W_DIM] - lost.right,
                         ]
 
-                        if is_reduction:
+                        mode = self._reduction_modes_per_output[idx]
+                        if mode in {"sum", "mean"}:
                             reduce_sums[idx] += trimmed_output.sum(dim=(-2, -1), keepdim=True)
                             valid_pixel_count = trimmed_output.shape[H_DIM] * trimmed_output.shape[W_DIM]
                             reduce_counts[idx] += valid_pixel_count
@@ -705,14 +723,15 @@ class StreamingCNN(torch.nn.Module):
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
-        if self.reduction_mode == "mean":
-            for idx in range(len(outputs)):
+        for idx in range(len(outputs)):
+            mode = self._reduction_modes_per_output[idx]
+            if mode == "mean":
                 outputs[idx] = reduce_sums[idx] / reduce_counts[idx].clamp_min(1)
-        elif self.reduction_mode == "sum":
-            outputs = reduce_sums
+            elif mode == "sum":
+                outputs[idx] = reduce_sums[idx]
 
         # mem management
-        if not is_reduction:
+        if "none" in self._reduction_modes_per_output and "relevant_output" in locals():
             del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
@@ -728,9 +747,10 @@ class StreamingCNN(torch.nn.Module):
             grad (torch.Tensor): this should be the gradient of the output of
                 the stream_layers.
         """
-        if self.reduction_mode != "none":
+        if any(mode != "none" for mode in self._reduction_modes_per_output):
             raise NotImplementedError(
-                f"Streaming backward for reduction_mode='{self.reduction_mode}' is not implemented yet"
+                "Streaming backward for reduced outputs is not implemented yet "
+                f"(modes={self._reduction_modes_per_output})"
             )
 
         # The input image is likely quite small in terms of channels, for
@@ -989,6 +1009,11 @@ class StreamingCNN(torch.nn.Module):
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
+        self._reduction_hint_invocations = []
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingReductionHint):
+                self._hooks.append(mod.register_forward_hook(self._reduction_hint_hook))
+
         def forw_lambda(module, inpt, outpt):
             self._forward_gather_statistics_hook(module, inpt, outpt)
 
@@ -1287,7 +1312,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
         named_stats["output_spec"] = self._output_spec
-        named_stats["reduction_mode"] = self.reduction_mode
+        named_stats["reduction_modes_per_output"] = self._reduction_modes_per_output
         return named_stats
 
     def load_tile_cache(self, state):
@@ -1305,7 +1330,14 @@ class StreamingCNN(torch.nn.Module):
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
             self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         self._output_spec = state.get("output_spec", ("tensor", None))
-        self.reduction_mode = state.get("reduction_mode", self.reduction_mode)
+        reduction_modes = state.get("reduction_modes_per_output", None)
+        has_reduction_hints = any(isinstance(mod, StreamingReductionHint) for mod in self.stream_module.modules())
+        if reduction_modes is None and has_reduction_hints:
+            raise ValueError(
+                "Tile cache does not include reduction hint metadata but model contains StreamingReductionHint modules. "
+                "Please regenerate the tile cache."
+            )
+        self._reduction_modes_per_output = reduction_modes or ["none" for _ in range(len(self._tile_output_shapes))]
 
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:

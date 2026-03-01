@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
+from lightstream.core.scnn.reduction import StreamingReductionHint
 from torchinfo import summary
 
 
@@ -33,14 +34,17 @@ class WSS(nn.Module):
         )
 
         self.w = [0.3, 0.4, 0.3]
+        self.reduction1 = StreamingReductionHint(mode="mean", tag="wss_head_1")
+        self.reduction2 = StreamingReductionHint(mode="mean", tag="wss_head_2")
+        self.reduction3 = StreamingReductionHint(mode="none", tag="wss_head_3")
 
 
     def forward(self, x):
         x1, x2, x3 = self.backbone(x)
 
-        y1 = self.decoder1(x1)
-        y2 = self.decoder2(x2)
-        y3 = self.decoder3(x3)
+        y1 = self.reduction1(self.decoder1(x1))
+        y2 = self.reduction2(self.decoder2(x2))
+        y3 = self.reduction3(self.decoder3(x3))
 
         return y1, y2, y3
 

@@ -1,6 +1,7 @@
 import torch
 
 from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.core.scnn.reduction import StreamingReductionHint
 
 
 class TinyBackbone(torch.nn.Module):
@@ -16,17 +17,29 @@ class TinyBackbone(torch.nn.Module):
         return self.net(x)
 
 
-class TinyMultiHead(torch.nn.Module):
+class TinyMultiHeadMixed(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False)
+        self.reduce_head_0 = StreamingReductionHint("mean", tag="head_0")
+        self.reduce_head_1 = StreamingReductionHint("none", tag="head_1")
 
     def forward(self, x):
         y = self.conv(x)
-        return y, y[:, :2]
+        return self.reduce_head_0(y), self.reduce_head_1(y[:, :2])
 
 
-def _build_streaming(module: torch.nn.Module, reduction_mode: str = "none") -> StreamingCNN:
+class TinySingleHeadReduced(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Conv2d(3, 2, kernel_size=3, padding=1, bias=False)
+        self.reduce = StreamingReductionHint("sum", tag="main")
+
+    def forward(self, x):
+        return self.reduce(self.net(x))
+
+
+def _build_streaming(module: torch.nn.Module) -> StreamingCNN:
     module.eval()
     return StreamingCNN(
         module,
@@ -35,16 +48,15 @@ def _build_streaming(module: torch.nn.Module, reduction_mode: str = "none") -> S
         copy_to_gpu=False,
         statistics_on_cpu=True,
         normalize_on_gpu=False,
-        reduction_mode=reduction_mode,
     )
 
 
-def test_forward_none_matches_non_streaming():
+def test_forward_without_hints_matches_non_streaming():
     torch.manual_seed(0)
     model = TinyBackbone().eval()
     image = torch.randn(1, 3, 13, 11)
 
-    streaming = _build_streaming(model, reduction_mode="none")
+    streaming = _build_streaming(model)
     streamed = streaming(image)
 
     with torch.no_grad():
@@ -53,51 +65,47 @@ def test_forward_none_matches_non_streaming():
     torch.testing.assert_close(streamed, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_forward_sum_and_mean_match_non_streaming():
+def test_forward_with_sum_hint_matches_non_streaming_sum():
     torch.manual_seed(1)
-    model = TinyBackbone().eval()
+    model = TinySingleHeadReduced().eval()
     image = torch.randn(1, 3, 15, 12)
 
     with torch.no_grad():
-        expected_map = model(image)
+        expected_map = model.net(image)
         expected_sum = expected_map.sum(dim=(-2, -1), keepdim=True)
-        expected_mean = expected_map.mean(dim=(-2, -1), keepdim=True)
 
-    streaming_sum = _build_streaming(model, reduction_mode="sum")
-    streaming_mean = _build_streaming(model, reduction_mode="mean")
-
+    streaming_sum = _build_streaming(model)
     out_sum = streaming_sum(image)
-    out_mean = streaming_mean(image)
 
     assert out_sum.shape[-2:] == (1, 1)
-    assert out_mean.shape[-2:] == (1, 1)
     torch.testing.assert_close(out_sum, expected_sum, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(out_mean, expected_mean, atol=1e-5, rtol=1e-5)
 
 
-def test_reduction_mode_works_with_multi_output_structure():
+def test_mixed_reduction_modes_with_multi_output_structure():
     torch.manual_seed(2)
-    model = TinyMultiHead().eval()
+    model = TinyMultiHeadMixed().eval()
     image = torch.randn(1, 3, 14, 10)
 
-    streaming = _build_streaming(model, reduction_mode="mean")
+    streaming = _build_streaming(model)
     out1, out2 = streaming(image)
 
     with torch.no_grad():
-        exp1, exp2 = model(image)
-        exp1 = exp1.mean(dim=(-2, -1), keepdim=True)
-        exp2 = exp2.mean(dim=(-2, -1), keepdim=True)
+        y = model.conv(image)
+        exp1 = y.mean(dim=(-2, -1), keepdim=True)
+        exp2 = y[:, :2]
 
+    assert out1.shape[-2:] == (1, 1)
+    assert out2.shape[-2:] != (1, 1)
     torch.testing.assert_close(out1, exp1, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out2, exp2, atol=1e-5, rtol=1e-5)
 
 
-def test_backward_raises_for_reduction_modes():
-    model = TinyBackbone().eval()
+def test_backward_raises_if_any_output_is_reduced():
+    model = TinyMultiHeadMixed().eval()
     image = torch.randn(1, 3, 13, 11)
 
-    streaming = _build_streaming(model, reduction_mode="sum")
-    grad = torch.ones(1, 2, 1, 1)
+    streaming = _build_streaming(model)
+    grad = (torch.ones(1, 4, 1, 1), torch.ones(1, 2, 13, 11))
 
     try:
         streaming.backward(image, grad)
