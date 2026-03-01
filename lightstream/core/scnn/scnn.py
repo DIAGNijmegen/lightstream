@@ -555,6 +555,13 @@ class StreamingCNN(torch.nn.Module):
         iterator = range(n_rows)
         self._last_forward_tiles = []
 
+        if self.verbose:
+            print(
+                f"Forward tiling step: valid_input_height={valid_input_height}, "
+                f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
+            )
+
+
         with torch.no_grad():
             for row in iterator:
                 for col in range(n_cols):

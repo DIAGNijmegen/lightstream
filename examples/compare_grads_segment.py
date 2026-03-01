@@ -128,7 +128,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img, reduction_mode="none")
+    stream_outputs = network(img)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
