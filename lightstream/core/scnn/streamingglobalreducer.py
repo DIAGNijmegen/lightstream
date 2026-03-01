@@ -30,6 +30,9 @@ class StreamingGlobalReducer(nn.Module):
         self.min_x = None
         self.max_y = None
         self.max_x = None
+        self.head_origin_y = None
+        self.head_origin_x = None
+        self.head_sides = None
 
     def _ensure_state(self, x: torch.Tensor):
         if (
@@ -79,8 +82,15 @@ class StreamingGlobalReducer(nn.Module):
         stride_h = max(1, stride_h)
         stride_w = max(1, stride_w)
 
-        abs_y0 = int(self.input_loc.y // stride_h) + rel_y0
-        abs_x0 = int(self.input_loc.x // stride_w) + rel_x0
+        base_y = int(self.input_loc.y // stride_h)
+        base_x = int(self.input_loc.x // stride_w)
+        if self.head_origin_y is not None:
+            base_y = int(self.head_origin_y)
+        if self.head_origin_x is not None:
+            base_x = int(self.head_origin_x)
+
+        abs_y0 = base_y + rel_y0
+        abs_x0 = base_x + rel_x0
         abs_y1 = abs_y0 + int(valid.shape[H_DIM])
         abs_x1 = abs_x0 + int(valid.shape[W_DIM])
         return valid, abs_y0, abs_y1, abs_x0, abs_x1

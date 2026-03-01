@@ -106,6 +106,7 @@ class StreamingCNN(torch.nn.Module):
         self._last_forward_tiles = []
         self._reducer_head_stats = []
         self._last_reducer_runtime_stats = []
+        self._reduced_head_indices = []
 
         if state_dict is None:
             self._configure()
@@ -588,6 +589,9 @@ class StreamingCNN(torch.nn.Module):
             for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
 
+        self._reduced_head_indices = [idx for idx in range(len(self._tile_output_shapes)) if self._is_reduced_output_head(idx)]
+        reducer_modules = [m for m in self.stream_module.modules() if isinstance(m, StreamingGlobalReducer)]
+
         if result_on_cpu:
             device = torch.device("cpu")
         else:
@@ -680,6 +684,14 @@ class StreamingCNN(torch.nn.Module):
                     if self.should_normalize:
                         tile = self._normalize_on_gpu(tile)
 
+                    for red_i, mod in enumerate(reducer_modules):
+                        if red_i < len(self._reduced_head_indices):
+                            head_idx = self._reduced_head_indices[red_i]
+                            head_stride = self._output_stride_per_output[head_idx]
+                            mod.head_origin_y = int(tile_y // int(head_stride[1]))
+                            mod.head_origin_x = int(tile_x // int(head_stride[2]))
+                            mod.head_sides = sides
+
                     tile_output = self.stream_module(tile)
                     tile_outputs, _ = self._flatten_output_structure(tile_output)
 
@@ -757,15 +769,26 @@ class StreamingCNN(torch.nn.Module):
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         # mem management
+        image_h = int(image.shape[H_DIM])
+        image_w = int(image.shape[W_DIM])
         del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         self._last_reducer_runtime_stats = []
-        reducer_modules = [m for m in self.stream_module.modules() if isinstance(m, StreamingGlobalReducer)]
         for idx, mod in enumerate(reducer_modules):
             stats = mod.get_coverage_stats()
             stats["reducer_idx"] = float(idx)
+            if idx < len(self._reduced_head_indices):
+                head_idx = self._reduced_head_indices[idx]
+                stride = self._output_stride_per_output[head_idx]
+                exp_h = max(1, int(image_h // int(stride[1])))
+                exp_w = max(1, int(image_w // int(stride[2])))
+                stats["expected_bbox"] = float(exp_h * exp_w)
+                stats["head_idx"] = float(head_idx)
+                if stats["expected_bbox"] > 0:
+                    stats["expected_ratio"] = float(stats["covered"] / stats["expected_bbox"])
             self._last_reducer_runtime_stats.append(stats)
+
         if self.verbose and self._last_reducer_runtime_stats:
             print("Reducer runtime coverage stats", self._last_reducer_runtime_stats)
 
