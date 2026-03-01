@@ -63,3 +63,57 @@ def test_streaming_forward_invalid_reduction_mode_raises_value_error():
 
     with pytest.raises(ValueError, match="Unsupported reduction_mode"):
         scnn.forward(image, reduction_mode="median")
+
+
+def test_streaming_forward_uses_constructor_reduction_mode_by_default():
+    torch.manual_seed(2)
+    module = _build_module()
+    image = torch.randn(1, 3, 20, 19)
+
+    scnn = StreamingCNN(
+        module,
+        tile_shape=(1, 3, 16, 16),
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        dtype=torch.float32,
+        reduction_mode="sum",
+    )
+
+    baseline = module(image).sum(dim=(2, 3), keepdim=True)
+    actual = scnn.forward(image)
+    assert actual.shape == baseline.shape
+    assert torch.allclose(actual, baseline, rtol=1e-4, atol=1e-5)
+
+
+def test_streaming_forward_call_override_reduction_mode():
+    torch.manual_seed(3)
+    module = _build_module()
+    image = torch.randn(1, 3, 20, 19)
+
+    scnn = StreamingCNN(
+        module,
+        tile_shape=(1, 3, 16, 16),
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        dtype=torch.float32,
+        reduction_mode="none",
+    )
+
+    expected = module(image).mean(dim=(2, 3), keepdim=True)
+    actual = scnn(image, reduction_mode="mean")
+    assert actual.shape == expected.shape
+    assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_streamingcnn_invalid_constructor_reduction_mode_raises_value_error():
+    module = _build_module()
+
+    with pytest.raises(ValueError, match="Unsupported reduction_mode"):
+        StreamingCNN(
+            module,
+            tile_shape=(1, 3, 16, 16),
+            copy_to_gpu=False,
+            statistics_on_cpu=True,
+            dtype=torch.float32,
+            reduction_mode="median",
+        )

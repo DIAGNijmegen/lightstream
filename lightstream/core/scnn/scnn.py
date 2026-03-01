@@ -55,6 +55,7 @@ class StreamingCNN(torch.nn.Module):
         mean=None,
         std=None,
         state_dict=None,
+        reduction_mode="none",
     ):
         """
         Parameters:
@@ -90,6 +91,11 @@ class StreamingCNN(torch.nn.Module):
         self.std = std if std is not None else torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
         self.should_normalize = normalize_on_gpu
+        if reduction_mode not in {"none", "sum", "mean"}:
+            raise ValueError(
+                f"Unsupported reduction_mode '{reduction_mode}'. Use one of: 'none', 'sum', 'mean'."
+            )
+        self.reduction_mode = reduction_mode
 
         self._tile_output_shape = None
         self._tile_output_shapes = None
@@ -471,15 +477,18 @@ class StreamingCNN(torch.nn.Module):
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
-    def forward(self, image, result_on_cpu=False, reduction_mode="none"):
+    def forward(self, image, result_on_cpu=False, reduction_mode=None):
         """Perform forward pass with lightstream.
 
         Parameters:
             image (torch.Tensor): CHW the image to lightstream
-            reduction_mode (str): global spatial reduction mode. "none" returns
-                stitched feature maps (N,C,H,W), "sum" returns summed
-                (N,C,1,1), and "mean" returns averaged (N,C,1,1).
+            reduction_mode (str|None): global spatial reduction mode. If None,
+                uses ``self.reduction_mode``. "none" returns stitched feature maps
+                (N,C,H,W), "sum" returns summed (N,C,1,1), and "mean"
+                returns averaged (N,C,1,1).
         """
+        if reduction_mode is None:
+            reduction_mode = self.reduction_mode
         if reduction_mode not in {"none", "sum", "mean"}:
             raise ValueError(f"Unsupported reduction_mode '{reduction_mode}'. Use one of: 'none', 'sum', 'mean'.")
 
@@ -513,6 +522,8 @@ class StreamingCNN(torch.nn.Module):
             (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
             for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
+
+        output_bounds = list(zip(output_heights, output_widths))
 
         if result_on_cpu:
             device = torch.device("cpu")
@@ -569,6 +580,12 @@ class StreamingCNN(torch.nn.Module):
             n_cols = 1
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
+
+        if self.verbose:
+            print(
+                f"Forward tiling step: valid_input_height={valid_input_height}, "
+                f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
+            )
 
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
@@ -655,8 +672,8 @@ class StreamingCNN(torch.nn.Module):
                         # Clip to output bounds (safety near borders)
                         clip_top = max(0, -dst_y0)
                         clip_left = max(0, -dst_x0)
-                        clip_bottom = max(0, dst_y1 - outputs[idx].shape[H_DIM])
-                        clip_right = max(0, dst_x1 - outputs[idx].shape[W_DIM])
+                        clip_bottom = max(0, dst_y1 - output_bounds[idx][0])
+                        clip_right = max(0, dst_x1 - output_bounds[idx][1])
 
                         if clip_top or clip_left or clip_bottom or clip_right:
                             src_y0 += clip_top
@@ -1270,6 +1287,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
         named_stats["output_spec"] = self._output_spec
+        named_stats["reduction_mode"] = self.reduction_mode
         return named_stats
 
     def load_tile_cache(self, state):
@@ -1287,6 +1305,7 @@ class StreamingCNN(torch.nn.Module):
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
             self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         self._output_spec = state.get("output_spec", ("tensor", None))
+        self.reduction_mode = state.get("reduction_mode", self.reduction_mode)
 
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
@@ -1296,5 +1315,5 @@ class StreamingCNN(torch.nn.Module):
 
     def __call__(self, image, **kwargs):
         result_on_cpu = kwargs.pop("result_on_cpu", False)
-        reduction_mode = kwargs.pop("reduction_mode", "none")
+        reduction_mode = kwargs.pop("reduction_mode", None)
         return self.forward(image, result_on_cpu, reduction_mode)
