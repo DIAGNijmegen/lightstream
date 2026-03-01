@@ -471,12 +471,18 @@ class StreamingCNN(torch.nn.Module):
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
-    def forward(self, image, result_on_cpu=False):
+    def forward(self, image, result_on_cpu=False, reduction_mode="none"):
         """Perform forward pass with lightstream.
 
         Parameters:
             image (torch.Tensor): CHW the image to lightstream
+            reduction_mode (str): global spatial reduction mode. "none" returns
+                stitched feature maps (N,C,H,W), "sum" returns summed
+                (N,C,1,1), and "mean" returns averaged (N,C,1,1).
         """
+        if reduction_mode not in {"none", "sum", "mean"}:
+            raise ValueError(f"Unsupported reduction_mode '{reduction_mode}'. Use one of: 'none', 'sum', 'mean'.")
+
         # The input image is likely quite small in terms of channels, for
         # performance reasons it is beneficial to copy to the GPU as a whole
         # instead of tile-by-tile.
@@ -512,14 +518,34 @@ class StreamingCNN(torch.nn.Module):
             device = torch.device("cpu")
         else:
             device = self.device
-        outputs = [
-            torch.empty(
-                (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
-                dtype=self.dtype,
-                device=device,
-            ).fill_(999)
-            for idx in range(len(self._tile_output_shapes))
-        ]
+        if reduction_mode == "none":
+            outputs = [
+                torch.empty(
+                    (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
+                    dtype=self.dtype,
+                    device=device,
+                ).fill_(999)
+                for idx in range(len(self._tile_output_shapes))
+            ]
+        else:
+            outputs = [
+                torch.zeros(
+                    (image.shape[0], self._tile_output_shapes[idx][1], 1, 1),
+                    dtype=self.dtype,
+                    device=device,
+                )
+                for idx in range(len(self._tile_output_shapes))
+            ]
+        reduced_counts = None
+        if reduction_mode == "mean":
+            reduced_counts = [
+                torch.zeros(
+                    (image.shape[0], self._tile_output_shapes[idx][1], 1, 1),
+                    dtype=self.dtype,
+                    device=device,
+                )
+                for idx in range(len(self._tile_output_shapes))
+            ]
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -656,16 +682,26 @@ class StreamingCNN(torch.nn.Module):
                             f"dst=({dst_x0}:{dst_x1}) src_w={relevant_output.shape[W_DIM]}"
                         )
 
-                        # Overlapping regions are intentionally overwritten by later tiles
-                        # (right/bottom preference), which is more robust for border tiles.
-                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
+                        if reduction_mode == "none":
+                            # Overlapping regions are intentionally overwritten by later tiles
+                            # (right/bottom preference), which is more robust for border tiles.
+                            outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
+                        else:
+                            outputs[idx] += relevant_output.sum(dim=(H_DIM, W_DIM), keepdim=True)
+                            if reduced_counts is not None:
+                                reduced_counts[idx] += relevant_output.new_tensor(
+                                    relevant_output.shape[H_DIM] * relevant_output.shape[W_DIM]
+                                )
 
                     del tile
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
+        if reduced_counts is not None:
+            for idx in range(len(outputs)):
+                outputs[idx] = outputs[idx] / torch.clamp_min(reduced_counts[idx], 1)
+
         # mem management
-        del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
@@ -1260,4 +1296,5 @@ class StreamingCNN(torch.nn.Module):
 
     def __call__(self, image, **kwargs):
         result_on_cpu = kwargs.pop("result_on_cpu", False)
-        return self.forward(image, result_on_cpu)
+        reduction_mode = kwargs.pop("reduction_mode", "none")
+        return self.forward(image, result_on_cpu, reduction_mode)
