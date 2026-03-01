@@ -35,6 +35,7 @@ class StreamingConstructor:
         add_keep_modules: Optional[list[nn.Module]] = None,
         before_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
         after_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
+        reduction_mode: str = "none",
     ):
         self.model = model
         self.model_copy = deepcopy(self.model)
@@ -50,6 +51,7 @@ class StreamingConstructor:
         self.mean = mean
         self.std = std
         self.tile_cache = tile_cache
+        self.reduction_mode = reduction_mode
 
         self.before_streaming_init_callbacks = before_streaming_init_callbacks or []
         self.after_streaming_init_callbacks = after_streaming_init_callbacks or []
@@ -144,6 +146,7 @@ class StreamingConstructor:
             mean=self.mean,
             std=self.std,
             state_dict=self.tile_cache,
+            reduction_mode=self.reduction_mode,
         )
 
     def save_parameters(self) -> dict:

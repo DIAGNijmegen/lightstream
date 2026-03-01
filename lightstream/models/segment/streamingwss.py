@@ -26,6 +26,7 @@ class StreamingWSS(StreamingModule):
         mean: list | None = None,
         std: list | None = None,
         tile_cache_path=None,
+        reduction_mode: str = "none",
     ):
         model_choices = self.get_model_choices()
 
@@ -61,6 +62,7 @@ class StreamingWSS(StreamingModule):
             mean=mean,
             std=std,
             add_keep_modules=[nn.BatchNorm2d],
+            reduction_mode=reduction_mode,
         )
 
     @staticmethod
