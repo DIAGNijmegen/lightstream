@@ -44,6 +44,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         stream_module,
         tile_shape,
+        reduction_mode="none",
         verbose=False,
         deterministic=False,
         saliency=False,
@@ -76,6 +77,11 @@ class StreamingCNN(torch.nn.Module):
         if dtype is not None:
             self.dtype = dtype
         self.tile_shape = tile_shape
+        self.reduction_mode = str(reduction_mode).lower()
+        if self.reduction_mode not in {"none", "sum", "mean"}:
+            raise ValueError(
+                f"Unsupported reduction_mode='{reduction_mode}'. Expected one of: none, sum, mean"
+            )
         self.gather_input_gradient = saliency
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
@@ -512,14 +518,35 @@ class StreamingCNN(torch.nn.Module):
             device = torch.device("cpu")
         else:
             device = self.device
-        outputs = [
-            torch.empty(
-                (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
-                dtype=self.dtype,
-                device=device,
-            ).fill_(999)
-            for idx in range(len(self._tile_output_shapes))
-        ]
+        outputs = []
+        reduce_sums = []
+        reduce_counts = []
+        is_reduction = self.reduction_mode in {"sum", "mean"}
+        for idx in range(len(self._tile_output_shapes)):
+            if is_reduction:
+                outputs.append(
+                    torch.zeros(
+                        (image.shape[0], self._tile_output_shapes[idx][1], 1, 1),
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                )
+                reduce_sums.append(outputs[idx])
+                reduce_counts.append(
+                    torch.zeros(
+                        (image.shape[0], 1, 1, 1),
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                )
+            else:
+                outputs.append(
+                    torch.empty(
+                        (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
+                        dtype=self.dtype,
+                        device=device,
+                    ).fill_(999)
+                )
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -613,15 +640,22 @@ class StreamingCNN(torch.nn.Module):
                     for idx, head_output in enumerate(tile_outputs):
                         lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
                         head_stride = self._output_stride_per_output[idx]
-                        output_y = tile_y // int(head_stride[1])
-                        output_x = tile_x // int(head_stride[2])
-                        output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
                         trimmed_output = head_output[
                             :,
                             :,
                             lost.top : head_output.shape[H_DIM] - lost.bottom,
                             lost.left : head_output.shape[W_DIM] - lost.right,
                         ]
+
+                        if is_reduction:
+                            reduce_sums[idx] += trimmed_output.sum(dim=(-2, -1), keepdim=True)
+                            valid_pixel_count = trimmed_output.shape[H_DIM] * trimmed_output.shape[W_DIM]
+                            reduce_counts[idx] += valid_pixel_count
+                            continue
+
+                        output_y = tile_y // int(head_stride[1])
+                        output_x = tile_x // int(head_stride[2])
+                        output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
 
                         src_y0 = 0
                         src_y1 = int(trimmed_output.shape[H_DIM])
@@ -671,8 +705,15 @@ class StreamingCNN(torch.nn.Module):
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
+        if self.reduction_mode == "mean":
+            for idx in range(len(outputs)):
+                outputs[idx] = reduce_sums[idx] / reduce_counts[idx].clamp_min(1)
+        elif self.reduction_mode == "sum":
+            outputs = reduce_sums
+
         # mem management
-        del relevant_output  # type:ignore
+        if not is_reduction:
+            del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
@@ -687,6 +728,11 @@ class StreamingCNN(torch.nn.Module):
             grad (torch.Tensor): this should be the gradient of the output of
                 the stream_layers.
         """
+        if self.reduction_mode != "none":
+            raise NotImplementedError(
+                f"Streaming backward for reduction_mode='{self.reduction_mode}' is not implemented yet"
+            )
+
         # The input image is likely quite small in terms of channels, for
         # performance reasons it is beneficial to copy to the GPU as a whole
         # instead of tile-by-tile.
@@ -1241,6 +1287,7 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
         named_stats["output_spec"] = self._output_spec
+        named_stats["reduction_mode"] = self.reduction_mode
         return named_stats
 
     def load_tile_cache(self, state):
@@ -1258,6 +1305,7 @@ class StreamingCNN(torch.nn.Module):
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
             self._base_output_stride[2] = min(int(self._base_output_stride[2]), int(stride[2]))
         self._output_spec = state.get("output_spec", ("tensor", None))
+        self.reduction_mode = state.get("reduction_mode", self.reduction_mode)
 
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
