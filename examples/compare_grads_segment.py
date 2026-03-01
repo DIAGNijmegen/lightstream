@@ -1,82 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 import argparse
 
 import torch
 import torch.nn as nn
-from torch.nn import Sequential
-from torchvision.models import resnet18, resnet34, resnet50
 
-from lightstream.modules.streaming import StreamingModule
-from lightstream.models.segment.model import WSS
-
-
-class StreamingWSS(StreamingModule):
-    def __init__(
-        self,
-        encoder: str,
-        tile_size: int,
-        additional_modules: nn.Module | None = None,
-        remove_last_block: bool = True,
-        verbose: bool = True,
-        deterministic: bool = True,
-        saliency: bool = False,
-        copy_to_gpu: bool = False,
-        statistics_on_cpu: bool = True,
-        normalize_on_gpu: bool = True,
-        mean: list | None = None,
-        std: list | None = None,
-        tile_cache_path: Path | None = None,
-    ):
-        model_choices = self.get_model_choices()
-
-        if encoder not in model_choices:
-            raise ValueError(f"Invalid model name '{encoder}'. Choose one of: {', '.join(model_choices.keys())}")
-
-        if additional_modules is not None:
-            stream_network = Sequential(
-                WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block),
-                additional_modules,
-            )
-        else:
-            stream_network = WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block)
-
-        if mean is None:
-            mean = [0.485, 0.456, 0.406]
-        if std is None:
-            std = [0.229, 0.224, 0.225]
-
-        if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"{encoder}_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
-
-        super().__init__(
-            stream_network,
-            tile_size,
-            tile_cache_path,
-            verbose=verbose,
-            deterministic=deterministic,
-            saliency=saliency,
-            copy_to_gpu=copy_to_gpu,
-            statistics_on_cpu=statistics_on_cpu,
-            normalize_on_gpu=normalize_on_gpu,
-            mean=mean,
-            std=std,
-            add_keep_modules=[nn.BatchNorm2d],
-        )
-
-    @staticmethod
-    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
-        return {
-            "resnet18": resnet18,
-            "resnet34": resnet34,
-            "resnet50": resnet50,
-        }
-
-    @classmethod
-    def get_model_names(cls) -> list[str]:
-        return list(cls.get_model_choices().keys())
+from lightstream.models.segment.streamingwss import StreamingWSS
+#Forward tiling step: valid_input_height=2336, valid_input_width=2336, tiles=3x3=9
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -197,7 +128,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img)
+    stream_outputs = network(img, reduction_mode="none")
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
@@ -207,9 +138,9 @@ def main() -> None:
     total_loss = sum(loss)
     total_loss.backward()
     output_grads = tuple(out.grad for out in stream_outputs)
-    network.stream_network.backward(img, output_grads)
+    #network.stream_network.backward(img, output_grads)
 
-    streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+    #streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
@@ -222,18 +153,18 @@ def main() -> None:
         diff = (stream_out - normal_out).abs()
         print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
-    y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
-    normal_loss = [criterion(x, target) for x in y_pred_normal]
-    total_loss = sum(normal_loss)
-    total_loss.backward()
-    normal_param_grads = _gather_param_grads(normal_net)
-
-    if img_normal.grad is not None:
-        input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
-        print(f"Input gradient max diff: {input_grad_diff.max()}")
-
-    _compare_grads(streaming_param_grads, normal_param_grads)
-    _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
+    # y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
+    # normal_loss = [criterion(x, target) for x in y_pred_normal]
+    # total_loss = sum(normal_loss)
+    # total_loss.backward()
+    # normal_param_grads = _gather_param_grads(normal_net)
+    #
+    # if img_normal.grad is not None:
+    #     input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
+    #     print(f"Input gradient max diff: {input_grad_diff.max()}")
+    #
+    # _compare_grads(streaming_param_grads, normal_param_grads)
+    # _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
 
 
 if __name__ == "__main__":
