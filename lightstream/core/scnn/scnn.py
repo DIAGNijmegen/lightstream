@@ -1032,21 +1032,18 @@ class StreamingCNN(torch.nn.Module):
                                 f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
                             )
 
-                        new_mask = stored_mask.to(self.device)
-                        if torch.any(new_mask):
-                            reducer = self._reducer_head_map[idx]
-                            per_pixel_grad = gradient
-                            if reducer.mode == "mean":
-                                denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
-                                per_pixel_grad = per_pixel_grad / denom
-                            trimmed_grad = per_pixel_grad.expand(
-                                -1,
-                                -1,
-                                expected_h,
-                                expected_w,
-                            ) * new_mask.to(per_pixel_grad.dtype)[None, None]
-                        else:
-                            trimmed_grad = torch.zeros_like(trimmed_output)
+                        _ = stored_mask  # replay-validated metadata; backward uses full valid trimmed region
+                        reducer = self._reducer_head_map[idx]
+                        per_pixel_grad = gradient
+                        if reducer.mode == "mean":
+                            denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
+                            per_pixel_grad = per_pixel_grad / denom
+                        trimmed_grad = per_pixel_grad.expand(
+                            -1,
+                            -1,
+                            expected_h,
+                            expected_w,
+                        )
                     else:
                         trimmed_grad = gradient[
                             :,
