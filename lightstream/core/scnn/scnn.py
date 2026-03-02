@@ -753,8 +753,6 @@ class StreamingCNN(torch.nn.Module):
             image = image.to(self.device, non_blocking=True)
         grad = grad
 
-        if self._reducer_head_map:
-            raise NotImplementedError("Streaming backward for reducer-backed outputs is not implemented yet.")
 
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
@@ -773,6 +771,15 @@ class StreamingCNN(torch.nn.Module):
 
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
+
+        output_heights = [
+            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
+        ]
+        output_widths = [
+            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
+        ]
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -816,6 +823,15 @@ class StreamingCNN(torch.nn.Module):
         grad_tensors, grad_spec = self._flatten_output_structure(grad)
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
+        reducer_backward_seen_masks = {}
+        if self._reducer_head_map:
+            for head_idx in self._reducer_head_map:
+                reducer_backward_seen_masks[head_idx] = torch.zeros(
+                    (output_heights[head_idx], output_widths[head_idx]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+
 
         if len(self._tile_output_shapes) == 1:
             grad_lost = self.tile_gradient_lost
@@ -919,22 +935,29 @@ class StreamingCNN(torch.nn.Module):
                     head_output_x = input_x // int(head_stride[2])
 
                     if sides.bottom:
-                        head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
+                        if idx in self._reducer_head_map:
+                            head_output_y = max(output_heights[idx] - head_output_height, 0)
+                        else:
+                            head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
                     if sides.right:
-                        head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+                        if idx in self._reducer_head_map:
+                            head_output_x = max(output_widths[idx] - head_output_width, 0)
+                        else:
+                            head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
 
-                    gradient = head_grad[
-                        :,
-                        :,
-                        head_output_y : head_output_y + head_output_height,
-                        head_output_x : head_output_x + head_output_width,
-                    ]
-                    trimmed_grad = gradient[
-                        :,
-                        :,
-                        head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : gradient.shape[W_DIM] - head_lost.right,
-                    ]
+                    if idx in self._reducer_head_map:
+                        gradient = head_grad.to(self.device, non_blocking=True)
+                        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+                            raise ValueError(
+                                f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}"
+                            )
+                    else:
+                        gradient = head_grad[
+                            :,
+                            :,
+                            head_output_y : head_output_y + head_output_height,
+                            head_output_x : head_output_x + head_output_width,
+                        ]
                     trimmed_output = head_output[
                         :,
                         :,
@@ -944,13 +967,42 @@ class StreamingCNN(torch.nn.Module):
 
                     trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
-                    if (
-                        trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
-                        or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
-                    ):
-                        assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                        trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
+                    if idx in self._reducer_head_map:
+                        dst_y0 = int(head_output_y + head_lost.top)
+                        dst_x0 = int(head_output_x + head_lost.left)
+                        dst_y1 = int(dst_y0 + trimmed_output.shape[H_DIM])
+                        dst_x1 = int(dst_x0 + trimmed_output.shape[W_DIM])
+                        seen_slice = reducer_backward_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
+                        new_mask = ~seen_slice
+                        if torch.any(new_mask):
+                            reducer = self._reducer_head_map[idx]
+                            per_pixel_grad = gradient
+                            if reducer.mode == "mean":
+                                denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
+                                per_pixel_grad = per_pixel_grad / denom
+                            trimmed_grad = per_pixel_grad.expand(
+                                -1,
+                                -1,
+                                trimmed_output.shape[H_DIM],
+                                trimmed_output.shape[W_DIM],
+                            ) * new_mask.to(per_pixel_grad.dtype)[None, None]
+                            seen_slice |= new_mask
+                        else:
+                            trimmed_grad = torch.zeros_like(trimmed_output)
+                    else:
+                        trimmed_grad = gradient[
+                            :,
+                            :,
+                            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
+                            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
+                        ]
 
+                        if (
+                            trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
+                            or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
+                        ):
+                            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
+                            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
 
