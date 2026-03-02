@@ -598,6 +598,8 @@ class StreamingCNN(torch.nn.Module):
             )
 
 
+        relevant_output = None
+
         with torch.no_grad():
             for row in iterator:
                 for col in range(n_cols):
@@ -758,7 +760,8 @@ class StreamingCNN(torch.nn.Module):
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         # mem management
-        del relevant_output  # type:ignore
+        if relevant_output is not None:
+            del relevant_output
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
