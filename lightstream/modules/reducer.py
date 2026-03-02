@@ -57,7 +57,7 @@ class StreamingReducer(nn.Module):
             return full_output.sum(dim=(-2, -1), keepdim=True)
         return full_output.mean(dim=(-2, -1), keepdim=True)
 
-    def accumulate_tile(self, tile_valid_output: torch.Tensor):
+    def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
         if tile_valid_output.ndim != 4:
             raise ValueError(f"StreamingReducer expects NCHW tile, got shape={tuple(tile_valid_output.shape)}")
         if self.running_sum.numel() == 0:
@@ -68,8 +68,16 @@ class StreamingReducer(nn.Module):
                 dtype=tile_valid_output.dtype,
             )
 
-        self.running_sum = self.running_sum + tile_valid_output.sum(dim=(-2, -1), keepdim=True)
-        n_pixels = tile_valid_output.shape[-1] * tile_valid_output.shape[-2]
+        if valid_mask is None:
+            self.running_sum = self.running_sum + tile_valid_output.sum(dim=(-2, -1), keepdim=True)
+            n_pixels = tile_valid_output.shape[-1] * tile_valid_output.shape[-2]
+        else:
+            if valid_mask.ndim != 2:
+                raise ValueError(f"valid_mask must be 2D (H,W), got shape={tuple(valid_mask.shape)}")
+            mask = valid_mask.to(tile_valid_output.dtype)[None, None]
+            self.running_sum = self.running_sum + (tile_valid_output * mask).sum(dim=(-2, -1), keepdim=True)
+            n_pixels = int(valid_mask.sum().item())
+
         if self.mode == "mean":
             self.running_count = self.running_count + n_pixels
 
