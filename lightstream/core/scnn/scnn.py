@@ -541,14 +541,17 @@ class StreamingCNN(torch.nn.Module):
             device = torch.device("cpu")
         else:
             device = self.device
-        outputs = [
-            torch.empty(
-                (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
-                dtype=self.dtype,
-                device=device,
-            ).fill_(999)
-            for idx in range(len(self._tile_output_shapes))
-        ]
+        outputs = [None] * len(self._tile_output_shapes)
+
+        def _allocate_non_reducer_outputs():
+            for idx in range(len(self._tile_output_shapes)):
+                if idx in self._reducer_head_map or outputs[idx] is not None:
+                    continue
+                outputs[idx] = torch.empty(
+                    (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
+                    dtype=self.dtype,
+                    device=device,
+                ).fill_(999)
         self._reducer_head_map = {}
         self._reducer_forward_assignments = {}
         reducer_seen_masks = {}
@@ -595,6 +598,8 @@ class StreamingCNN(torch.nn.Module):
             )
 
 
+        relevant_output = None
+
         with torch.no_grad():
             for row in iterator:
                 for col in range(n_cols):
@@ -640,6 +645,7 @@ class StreamingCNN(torch.nn.Module):
                     tile_output = self.stream_module(tile)
                     tile_outputs, _ = self._flatten_output_structure(tile_output)
                     self._resolve_reducer_head_map(tile_outputs)
+                    _allocate_non_reducer_outputs()
 
                     if self._reducer_head_map and not reducers_initialized:
                         for head_idx, reducer in self._reducer_head_map.items():
@@ -675,6 +681,36 @@ class StreamingCNN(torch.nn.Module):
                             lost.left : head_output.shape[W_DIM] - lost.right,
                         ]
 
+                        if idx in self._reducer_head_map:
+                            dst_y0 = int(output_loc.y)
+                            dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
+                            dst_x0 = int(output_loc.x)
+                            dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+
+                            seen_slice = reducer_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
+                            new_mask = ~seen_slice
+                            if self.debug_reducer_replay:
+                                self._reducer_forward_assignments[idx].append(
+                                    (
+                                        int(tile_y),
+                                        int(tile_x),
+                                        bool(sides.top),
+                                        bool(sides.left),
+                                        bool(sides.right),
+                                        bool(sides.bottom),
+                                        int(trimmed_output.shape[H_DIM]),
+                                        int(trimmed_output.shape[W_DIM]),
+                                        dst_y0,
+                                        dst_y1,
+                                        dst_x0,
+                                        dst_x1,
+                                    )
+                                )
+                            if torch.any(new_mask):
+                                self._reducer_head_map[idx].accumulate_tile(trimmed_output, valid_mask=new_mask)
+                                seen_slice |= new_mask
+                            continue
+
                         src_y0 = 0
                         src_y1 = int(trimmed_output.shape[H_DIM])
                         src_x0 = 0
@@ -706,32 +742,6 @@ class StreamingCNN(torch.nn.Module):
 
                         relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
-                        if idx in self._reducer_head_map:
-                            seen_slice = reducer_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
-                            new_mask = ~seen_slice
-                            if self.debug_reducer_replay:
-                                self._reducer_forward_assignments[idx].append(
-                                    (
-                                        int(tile_y),
-                                        int(tile_x),
-                                        bool(sides.top),
-                                        bool(sides.left),
-                                        bool(sides.right),
-                                        bool(sides.bottom),
-                                        int(trimmed_output.shape[H_DIM]),
-                                        int(trimmed_output.shape[W_DIM]),
-                                        dst_y0,
-                                        dst_y1,
-                                        dst_x0,
-                                        dst_x1,
-                                    )
-                                )
-                            if torch.any(new_mask):
-                                self._reducer_head_map[idx].accumulate_tile(relevant_output, valid_mask=new_mask)
-                                seen_slice |= new_mask
-                            continue
-
-
                         assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
                             f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
@@ -750,11 +760,15 @@ class StreamingCNN(torch.nn.Module):
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         # mem management
-        del relevant_output  # type:ignore
+        if relevant_output is not None:
+            del relevant_output
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finalize_stream().to(device)
+        for idx, output in enumerate(outputs):
+            if output is None:
+                raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
