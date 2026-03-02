@@ -15,6 +15,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.modules.reducer import Reducer, StreamingReducer
 
 
 _triple = _ntuple(3)
@@ -102,6 +103,8 @@ class StreamingCNN(torch.nn.Module):
         self._current_tile_input_loc = None
         self._hooks = []
         self._last_forward_tiles = []
+        self._streaming_reducers = []
+        self._reducer_head_map = {}
 
         if state_dict is None:
             self._configure()
@@ -116,6 +119,7 @@ class StreamingCNN(torch.nn.Module):
 
         # Add hooks to each layer to gather statistics
         self._add_hooks_for_statistics()
+        self._set_reducer_passthrough(True)
 
         # We need to temporary store statistics per layer to keep track of the
         # total output stride at each layer
@@ -143,6 +147,7 @@ class StreamingCNN(torch.nn.Module):
         # Remove all hooks and add hooks for correcting gradients
         # during lightstream
         self._remove_hooks()
+        self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
         self._convert_modules_for_streaming(self.stream_module)
@@ -159,6 +164,11 @@ class StreamingCNN(torch.nn.Module):
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
+
+    def _set_reducer_passthrough(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, Reducer):
+                mod._streaming_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
         # Forward pass with grads enabled
@@ -373,6 +383,9 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, Reducer):
+            mod = StreamingReducer.from_reducer(module)
+            self._streaming_reducers.append(mod)
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -417,10 +430,36 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, StreamingReducer):
+            mod = module.to_reducer()
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
         del module
         return mod
+
+    def _resolve_reducer_head_map(self, flat_outputs):
+        if self._reducer_head_map or not self._streaming_reducers:
+            return
+
+        output_id_to_index = {id(tensor): idx for idx, tensor in enumerate(flat_outputs)}
+        for reducer in self._streaming_reducers:
+            if reducer._last_output is None:
+                continue
+            output_index = output_id_to_index.get(id(reducer._last_output))
+            if output_index is not None:
+                self._reducer_head_map[output_index] = reducer
+
+    def _initialize_reducer_states(self, flat_outputs):
+        if not self._reducer_head_map:
+            return
+        for idx, reducer in self._reducer_head_map.items():
+            out = flat_outputs[idx]
+            reducer.reset_stream_state(
+                batch_size=out.shape[B_DIM],
+                channels=out.shape[C_DIM],
+                device=out.device,
+                dtype=out.dtype,
+            )
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -520,6 +559,8 @@ class StreamingCNN(torch.nn.Module):
             ).fill_(999)
             for idx in range(len(self._tile_output_shapes))
         ]
+        self._reducer_head_map = {}
+        reducers_initialized = False
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -606,6 +647,11 @@ class StreamingCNN(torch.nn.Module):
 
                     tile_output = self.stream_module(tile)
                     tile_outputs, _ = self._flatten_output_structure(tile_output)
+                    self._resolve_reducer_head_map(tile_outputs)
+
+                    if self._reducer_head_map and not reducers_initialized:
+                        self._initialize_reducer_states(tile_outputs)
+                        reducers_initialized = True
 
                     if torch.backends.cudnn.benchmark:
                         torch.cuda.empty_cache()
@@ -654,6 +700,10 @@ class StreamingCNN(torch.nn.Module):
 
                         relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
+                        if idx in self._reducer_head_map:
+                            self._reducer_head_map[idx].accumulate_tile(relevant_output)
+                            continue
+
                         assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
                             f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
@@ -675,6 +725,8 @@ class StreamingCNN(torch.nn.Module):
         del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
+        for idx, reducer in self._reducer_head_map.items():
+            outputs[idx] = reducer.finalize_stream()
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
@@ -694,6 +746,9 @@ class StreamingCNN(torch.nn.Module):
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
         grad = grad
+
+        if self._reducer_head_map:
+            raise NotImplementedError("Streaming backward for reducer-backed outputs is not implemented yet.")
 
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
