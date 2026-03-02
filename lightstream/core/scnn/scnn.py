@@ -708,7 +708,21 @@ class StreamingCNN(torch.nn.Module):
                             seen_slice = reducer_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
                             new_mask = ~seen_slice
                             self._reducer_forward_assignments[idx].append(
-                                (dst_y0, dst_y1, dst_x0, dst_x1, new_mask.detach().cpu())
+                                (
+                                    int(tile_y),
+                                    int(tile_x),
+                                    bool(sides.top),
+                                    bool(sides.left),
+                                    bool(sides.right),
+                                    bool(sides.bottom),
+                                    int(trimmed_output.shape[H_DIM]),
+                                    int(trimmed_output.shape[W_DIM]),
+                                    dst_y0,
+                                    dst_y1,
+                                    dst_x0,
+                                    dst_x1,
+                                    new_mask.detach().cpu(),
+                                )
                             )
                             if torch.any(new_mask):
                                 self._reducer_head_map[idx].accumulate_tile(relevant_output, valid_mask=new_mask)
@@ -973,11 +987,45 @@ class StreamingCNN(torch.nn.Module):
                         cursor = reducer_assignment_cursors[idx]
                         if cursor >= len(assignments):
                             raise RuntimeError(f"Reducer assignment cursor out of range for head {idx}")
-                        dst_y0, dst_y1, dst_x0, dst_x1, stored_mask = assignments[cursor]
+                        (
+                            f_tile_y,
+                            f_tile_x,
+                            f_top,
+                            f_left,
+                            f_right,
+                            f_bottom,
+                            f_h,
+                            f_w,
+                            dst_y0,
+                            dst_y1,
+                            dst_x0,
+                            dst_x1,
+                            stored_mask,
+                        ) = assignments[cursor]
                         reducer_assignment_cursors[idx] = cursor + 1
+
+                        if (
+                            int(input_y) != int(f_tile_y)
+                            or int(input_x) != int(f_tile_x)
+                            or bool(sides.top) != bool(f_top)
+                            or bool(sides.left) != bool(f_left)
+                            or bool(sides.right) != bool(f_right)
+                            or bool(sides.bottom) != bool(f_bottom)
+                        ):
+                            raise RuntimeError(
+                                f"Reducer tile replay mismatch for head {idx}: "
+                                f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
+                                f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
+                            )
 
                         expected_h = int(trimmed_output.shape[H_DIM])
                         expected_w = int(trimmed_output.shape[W_DIM])
+                        if expected_h != int(f_h) or expected_w != int(f_w):
+                            raise RuntimeError(
+                                f"Reducer trimmed shape mismatch for head {idx}: forward=({f_h},{f_w}) "
+                                f"backward=({expected_h},{expected_w})"
+                            )
+
                         if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
                             raise RuntimeError(
                                 f"Reducer assignment mismatch for head {idx}: "
@@ -1022,6 +1070,13 @@ class StreamingCNN(torch.nn.Module):
                 del tile_output
                 del trimmed_grads
                 del trimmed_outputs
+
+        for idx, assignments in self._reducer_forward_assignments.items():
+            consumed = reducer_assignment_cursors.get(idx, 0)
+            if consumed != len(assignments):
+                raise RuntimeError(
+                    f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
+                )
 
         # Memory management
         self._saved_tensors = {}
