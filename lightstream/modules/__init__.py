@@ -1,3 +1,5 @@
 from .lightningstreaming import LightningStreamingModule
 from .imagenet_template import ImageNetClassifier
-__all__ = ["LightningStreamingModule", "ImageNetClassifier"]
+from .reducer import Reducer, StreamingReducer
+
+__all__ = ["LightningStreamingModule", "ImageNetClassifier", "Reducer", "StreamingReducer"]

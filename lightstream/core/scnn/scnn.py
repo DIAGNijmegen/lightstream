@@ -15,6 +15,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.modules.reducer import Reducer, StreamingReducer
 
 
 _triple = _ntuple(3)
@@ -100,8 +101,12 @@ class StreamingCNN(torch.nn.Module):
         self._backward_seen_indices = {}
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._reducer_forward_assignments = {}
+        self.debug_reducer_replay = False
         self._hooks = []
         self._last_forward_tiles = []
+        self._streaming_reducers = []
+        self._reducer_head_map = {}
 
         if state_dict is None:
             self._configure()
@@ -116,6 +121,7 @@ class StreamingCNN(torch.nn.Module):
 
         # Add hooks to each layer to gather statistics
         self._add_hooks_for_statistics()
+        self._set_reducer_passthrough(True)
 
         # We need to temporary store statistics per layer to keep track of the
         # total output stride at each layer
@@ -143,6 +149,7 @@ class StreamingCNN(torch.nn.Module):
         # Remove all hooks and add hooks for correcting gradients
         # during lightstream
         self._remove_hooks()
+        self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
         self._convert_modules_for_streaming(self.stream_module)
@@ -159,6 +166,11 @@ class StreamingCNN(torch.nn.Module):
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
+
+    def _set_reducer_passthrough(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, Reducer):
+                mod._streaming_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
         # Forward pass with grads enabled
@@ -373,6 +385,9 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, Reducer):
+            mod = StreamingReducer.from_reducer(module)
+            self._streaming_reducers.append(mod)
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -417,10 +432,24 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, StreamingReducer):
+            mod = module.to_reducer()
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
         del module
         return mod
+
+    def _resolve_reducer_head_map(self, flat_outputs):
+        if self._reducer_head_map or not self._streaming_reducers:
+            return
+
+        output_id_to_index = {id(tensor): idx for idx, tensor in enumerate(flat_outputs)}
+        for reducer in self._streaming_reducers:
+            if reducer._last_output is None:
+                continue
+            output_index = output_id_to_index.get(id(reducer._last_output))
+            if output_index is not None:
+                self._reducer_head_map[output_index] = reducer
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -520,6 +549,10 @@ class StreamingCNN(torch.nn.Module):
             ).fill_(999)
             for idx in range(len(self._tile_output_shapes))
         ]
+        self._reducer_head_map = {}
+        self._reducer_forward_assignments = {}
+        reducer_seen_masks = {}
+        reducers_initialized = False
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -606,6 +639,25 @@ class StreamingCNN(torch.nn.Module):
 
                     tile_output = self.stream_module(tile)
                     tile_outputs, _ = self._flatten_output_structure(tile_output)
+                    self._resolve_reducer_head_map(tile_outputs)
+
+                    if self._reducer_head_map and not reducers_initialized:
+                        for head_idx, reducer in self._reducer_head_map.items():
+                            reducer.reset_stream_state(
+                                batch_size=image.shape[B_DIM],
+                                channels=self._tile_output_shapes[head_idx][C_DIM],
+                                device=self.device,
+                                dtype=self.dtype,
+                            )
+                            reducer_seen_masks[head_idx] = torch.zeros(
+                                (output_heights[head_idx], output_widths[head_idx]),
+                                dtype=torch.bool,
+                                device=self.device,
+                            )
+                            if self.debug_reducer_replay:
+                                self._reducer_forward_assignments[head_idx] = []
+                        reducers_initialized = True
+
 
                     if torch.backends.cudnn.benchmark:
                         torch.cuda.empty_cache()
@@ -654,6 +706,32 @@ class StreamingCNN(torch.nn.Module):
 
                         relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
+                        if idx in self._reducer_head_map:
+                            seen_slice = reducer_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
+                            new_mask = ~seen_slice
+                            if self.debug_reducer_replay:
+                                self._reducer_forward_assignments[idx].append(
+                                    (
+                                        int(tile_y),
+                                        int(tile_x),
+                                        bool(sides.top),
+                                        bool(sides.left),
+                                        bool(sides.right),
+                                        bool(sides.bottom),
+                                        int(trimmed_output.shape[H_DIM]),
+                                        int(trimmed_output.shape[W_DIM]),
+                                        dst_y0,
+                                        dst_y1,
+                                        dst_x0,
+                                        dst_x1,
+                                    )
+                                )
+                            if torch.any(new_mask):
+                                self._reducer_head_map[idx].accumulate_tile(relevant_output, valid_mask=new_mask)
+                                seen_slice |= new_mask
+                            continue
+
+
                         assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
                             f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
@@ -675,6 +753,8 @@ class StreamingCNN(torch.nn.Module):
         del relevant_output  # type:ignore
         del image
         self._saved_tensors = {}
+        for idx, reducer in self._reducer_head_map.items():
+            outputs[idx] = reducer.finalize_stream().to(device)
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
@@ -695,6 +775,7 @@ class StreamingCNN(torch.nn.Module):
             image = image.to(self.device, non_blocking=True)
         grad = grad
 
+
         height = image.shape[H_DIM]
         width = image.shape[W_DIM]
 
@@ -712,6 +793,15 @@ class StreamingCNN(torch.nn.Module):
 
         base_stride_h = int(self._base_output_stride[1])
         base_stride_w = int(self._base_output_stride[2])
+
+        output_heights = [
+            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
+        ]
+        output_widths = [
+            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+            for idx, tile_shape in enumerate(self._tile_output_shapes)
+        ]
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -811,6 +901,8 @@ class StreamingCNN(torch.nn.Module):
                     tile_x = tile_x if not sides_left else 0
                     tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
+        reducer_assignment_cursors = {idx: 0 for idx in self._reducer_head_map} if self.debug_reducer_replay else {}
+
         last_sides = None
         for input_y, input_x, sides in tile_iter:
                 last_sides = sides
@@ -858,22 +950,29 @@ class StreamingCNN(torch.nn.Module):
                     head_output_x = input_x // int(head_stride[2])
 
                     if sides.bottom:
-                        head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
+                        if idx in self._reducer_head_map:
+                            head_output_y = max(output_heights[idx] - head_output_height, 0)
+                        else:
+                            head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
                     if sides.right:
-                        head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+                        if idx in self._reducer_head_map:
+                            head_output_x = max(output_widths[idx] - head_output_width, 0)
+                        else:
+                            head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
 
-                    gradient = head_grad[
-                        :,
-                        :,
-                        head_output_y : head_output_y + head_output_height,
-                        head_output_x : head_output_x + head_output_width,
-                    ]
-                    trimmed_grad = gradient[
-                        :,
-                        :,
-                        head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : gradient.shape[W_DIM] - head_lost.right,
-                    ]
+                    if idx in self._reducer_head_map:
+                        gradient = head_grad.to(self.device, non_blocking=True)
+                        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+                            raise ValueError(
+                                f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}"
+                            )
+                    else:
+                        gradient = head_grad[
+                            :,
+                            :,
+                            head_output_y : head_output_y + head_output_height,
+                            head_output_x : head_output_x + head_output_width,
+                        ]
                     trimmed_output = head_output[
                         :,
                         :,
@@ -883,13 +982,84 @@ class StreamingCNN(torch.nn.Module):
 
                     trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
-                    if (
-                        trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
-                        or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
-                    ):
-                        assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                        trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
+                    if idx in self._reducer_head_map:
+                        expected_h = int(trimmed_output.shape[H_DIM])
+                        expected_w = int(trimmed_output.shape[W_DIM])
 
+                        if self.debug_reducer_replay:
+                            assignments = self._reducer_forward_assignments.get(idx)
+                            if assignments is None:
+                                raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
+                            cursor = reducer_assignment_cursors[idx]
+                            if cursor >= len(assignments):
+                                raise RuntimeError(f"Reducer assignment cursor out of range for head {idx}")
+                            (
+                                f_tile_y,
+                                f_tile_x,
+                                f_top,
+                                f_left,
+                                f_right,
+                                f_bottom,
+                                f_h,
+                                f_w,
+                                dst_y0,
+                                dst_y1,
+                                dst_x0,
+                                dst_x1,
+                            ) = assignments[cursor]
+                            reducer_assignment_cursors[idx] = cursor + 1
+
+                            if (
+                                int(input_y) != int(f_tile_y)
+                                or int(input_x) != int(f_tile_x)
+                                or bool(sides.top) != bool(f_top)
+                                or bool(sides.left) != bool(f_left)
+                                or bool(sides.right) != bool(f_right)
+                                or bool(sides.bottom) != bool(f_bottom)
+                            ):
+                                raise RuntimeError(
+                                    f"Reducer tile replay mismatch for head {idx}: "
+                                    f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
+                                    f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
+                                )
+
+                            if expected_h != int(f_h) or expected_w != int(f_w):
+                                raise RuntimeError(
+                                    f"Reducer trimmed shape mismatch for head {idx}: forward=({f_h},{f_w}) "
+                                    f"backward=({expected_h},{expected_w})"
+                                )
+
+                            if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
+                                raise RuntimeError(
+                                    f"Reducer assignment mismatch for head {idx}: "
+                                    f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
+                                )
+
+                        reducer = self._reducer_head_map[idx]
+                        per_pixel_grad = gradient
+                        if reducer.mode == "mean":
+                            denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
+                            per_pixel_grad = per_pixel_grad / denom
+                        trimmed_grad = per_pixel_grad.expand(
+                            -1,
+                            -1,
+                            expected_h,
+                            expected_w,
+                        )
+                    else:
+                        trimmed_grad = gradient[
+                            :,
+                            :,
+                            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
+                            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
+                        ]
+
+                        if (
+                            trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
+                            or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
+                        ):
+                            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
+                            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
                     trimmed_outputs.append(trimmed_output)
                     trimmed_grads.append(trimmed_grad)
 
@@ -900,9 +1070,18 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_grads
                 del trimmed_outputs
 
+        if self.debug_reducer_replay:
+            for idx, assignments in self._reducer_forward_assignments.items():
+                consumed = reducer_assignment_cursors.get(idx, 0)
+                if consumed != len(assignments):
+                    raise RuntimeError(
+                        f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
+                    )
+
         # Memory management
         self._saved_tensors = {}
         self._current_tile_input_loc = None
+        self._reducer_forward_assignments = {}
 
         for mod in self.stream_module.modules():
             if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
