@@ -449,18 +449,6 @@ class StreamingCNN(torch.nn.Module):
             if output_index is not None:
                 self._reducer_head_map[output_index] = reducer
 
-    def _initialize_reducer_states(self, flat_outputs):
-        if not self._reducer_head_map:
-            return
-        for idx, reducer in self._reducer_head_map.items():
-            out = flat_outputs[idx]
-            reducer.reset_stream_state(
-                batch_size=out.shape[B_DIM],
-                channels=out.shape[C_DIM],
-                device=out.device,
-                dtype=out.dtype,
-            )
-
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
             if isinstance(mod, (torch.nn.Conv2d)):
@@ -560,7 +548,6 @@ class StreamingCNN(torch.nn.Module):
             for idx in range(len(self._tile_output_shapes))
         ]
         self._reducer_head_map = {}
-        reducers_initialized = False
 
         if len(self._tile_output_shapes) > 1:
             valid_input_height, valid_input_width = self._compute_multi_output_input_step(
@@ -649,9 +636,6 @@ class StreamingCNN(torch.nn.Module):
                     tile_outputs, _ = self._flatten_output_structure(tile_output)
                     self._resolve_reducer_head_map(tile_outputs)
 
-                    if self._reducer_head_map and not reducers_initialized:
-                        self._initialize_reducer_states(tile_outputs)
-                        reducers_initialized = True
 
                     if torch.backends.cudnn.benchmark:
                         torch.cuda.empty_cache()
@@ -700,10 +684,6 @@ class StreamingCNN(torch.nn.Module):
 
                         relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
-                        if idx in self._reducer_head_map:
-                            self._reducer_head_map[idx].accumulate_tile(relevant_output)
-                            continue
-
                         assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
                             f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
@@ -726,7 +706,7 @@ class StreamingCNN(torch.nn.Module):
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
-            outputs[idx] = reducer.finalize_stream()
+            outputs[idx] = reducer.reduce_full_output(outputs[idx])
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
