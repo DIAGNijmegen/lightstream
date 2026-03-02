@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
+from lightstream.modules.reducer import Reducer
 from torchinfo import summary
 
 
@@ -19,17 +20,20 @@ class WSS(nn.Module):
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
             nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
+            Reducer(mode="mean"),
         )
         self.decoder2 = nn.Sequential(
             nn.Conv2d(128, 1, 1),
             nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
+            Reducer(mode="mean"),
         )
         self.decoder3 = nn.Sequential(
             nn.Conv2d(256, 1, 1),
             nn.Upsample(scale_factor=16, mode="bilinear", align_corners=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
+            Reducer(mode="mean"),
         )
 
         self.w = [0.3, 0.4, 0.3]
