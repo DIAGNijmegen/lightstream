@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 
 from lightstream.models.segment.streamingwss import StreamingWSS
-#Forward tiling step: valid_input_height=2336, valid_input_width=2336, tiles=3x3=9
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -89,8 +88,8 @@ def _freeze_batchnorm(module: nn.Module) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=2560)
-    parser.add_argument("--input-size", type=int, default=6400)
+    parser.add_argument("--tile-size", type=int, default=2240)
+    parser.add_argument("--input-size", type=int, default=4800)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -105,7 +104,7 @@ def main() -> None:
     criterion = torch.nn.MSELoss()
 
     network = StreamingWSS(
-        "resnet18",
+        "resnet34",
         tile_size,
         additional_modules=None,
         mean=[0, 0, 0],
@@ -138,9 +137,9 @@ def main() -> None:
     total_loss = sum(loss)
     total_loss.backward()
     output_grads = tuple(out.grad for out in stream_outputs)
-    #network.stream_network.backward(img, output_grads)
+    network.stream_network.backward(img, output_grads)
 
-    #streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+    streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
@@ -153,18 +152,18 @@ def main() -> None:
         diff = (stream_out - normal_out).abs()
         print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
-    # y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
-    # normal_loss = [criterion(x, target) for x in y_pred_normal]
-    # total_loss = sum(normal_loss)
-    # total_loss.backward()
-    # normal_param_grads = _gather_param_grads(normal_net)
-    #
-    # if img_normal.grad is not None:
-    #     input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
-    #     print(f"Input gradient max diff: {input_grad_diff.max()}")
-    #
-    # _compare_grads(streaming_param_grads, normal_param_grads)
-    # _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
+    y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
+    normal_loss = [criterion(x, target) for x in y_pred_normal]
+    total_loss = sum(normal_loss)
+    total_loss.backward()
+    normal_param_grads = _gather_param_grads(normal_net)
+
+    if img_normal.grad is not None:
+        input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
+        print(f"Input gradient max diff: {input_grad_diff.max()}")
+
+    _compare_grads(streaming_param_grads, normal_param_grads)
+    _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
 
 
 if __name__ == "__main__":

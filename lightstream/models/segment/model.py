@@ -17,23 +17,25 @@ class WSS(nn.Module):
     def __init__(self, encoder: str, weights: str="default", remove_last_block: bool =True):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
+        self.red1 = Reducer(mode="mean")
+        self.red2 = Reducer(mode="mean")
+        self.red3 = Reducer(mode="mean")
+
+
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
             nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
             nn.Sigmoid(),
-            Reducer(mode="mean"),
         )
         self.decoder2 = nn.Sequential(
             nn.Conv2d(128, 1, 1),
             nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
             nn.Sigmoid(),
-            Reducer(mode="mean"),
         )
         self.decoder3 = nn.Sequential(
             nn.Conv2d(256, 1, 1),
             nn.Upsample(scale_factor=16, mode="bilinear", align_corners=False),
             nn.Sigmoid(),
-            Reducer(mode="mean"),
         )
 
         self.w = [0.3, 0.4, 0.3]
@@ -45,8 +47,8 @@ class WSS(nn.Module):
         y1 = self.decoder1(x1)
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
-
-        return y1, y2, y3
+        y = 0.3 * y1 + 0.3*y2 + 0.3*y3
+        return self.red1(y1), self.red2(y2), self.red3(y3), y
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
