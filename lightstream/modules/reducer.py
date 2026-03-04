@@ -89,8 +89,11 @@ class Reducer(nn.Module):
 class StreamingReducer(nn.Module):
     """Streaming counterpart of :class:`Reducer`.
 
-    In streaming mode this module acts as a marker and keeps accumulation state
-    managed from SCNN's tile loop.
+    Responsibility split:
+    - SCNN orchestrates tile traversal/placement and decides which tile pixels
+      are valid contributors.
+    - StreamingReducer owns tile-local reducer math via ``reduce_tile``
+      (custom autograd op) and keeps stream accumulation state.
     """
 
     def __init__(self, mode: str = "mean"):
