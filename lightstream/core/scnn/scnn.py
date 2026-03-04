@@ -100,7 +100,6 @@ class StreamingCNN(torch.nn.Module):
         self._module_stats = {}
         self._backward_seen_indices = {}
         self._saved_tensors = {}
-        self._current_tile_input_loc = None
         self._reducer_forward_assignments = {}
         self.debug_reducer_replay = False
         self._hooks = []
@@ -476,8 +475,6 @@ class StreamingCNN(torch.nn.Module):
         # The input image is likely quite small in terms of channels, for
         # performance reasons it is beneficial to copy to the GPU as a whole
         # instead of tile-by-tile.
-        image = image
-
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
 
@@ -563,9 +560,6 @@ class StreamingCNN(torch.nn.Module):
                 f"Forward tiling step: valid_input_height={valid_input_height}, "
                 f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
             )
-
-
-        relevant_output = None
 
         with torch.no_grad():
             for row in iterator:
@@ -707,28 +701,26 @@ class StreamingCNN(torch.nn.Module):
                         if dst_y1 <= dst_y0 or dst_x1 <= dst_x0:
                             continue
 
-                        relevant_output = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
-
-                        assert (dst_y1 - dst_y0) == relevant_output.shape[H_DIM], (
+                        assert (dst_y1 - dst_y0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM], (
                             f"Y-shape mismatch while stitching output head {idx}: "
-                            f"dst=({dst_y0}:{dst_y1}) src_h={relevant_output.shape[H_DIM]}"
+                            f"dst=({dst_y0}:{dst_y1}) src_h={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM]}"
                         )
-                        assert (dst_x1 - dst_x0) == relevant_output.shape[W_DIM], (
+                        assert (dst_x1 - dst_x0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM], (
                             f"X-shape mismatch while stitching output head {idx}: "
-                            f"dst=({dst_x0}:{dst_x1}) src_w={relevant_output.shape[W_DIM]}"
+                            f"dst=({dst_x0}:{dst_x1}) src_w={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM]}"
                         )
 
                         # Overlapping regions are intentionally overwritten by later tiles
                         # (right/bottom preference), which is more robust for border tiles.
-                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = relevant_output
+                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[
+                            :, :, src_y0:src_y1, src_x0:src_x1
+                        ]
 
                     del tile
 
             assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
 
         # mem management
-        if relevant_output is not None:
-            del relevant_output
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
@@ -751,10 +743,8 @@ class StreamingCNN(torch.nn.Module):
         # The input image is likely quite small in terms of channels, for
         # performance reasons it is beneficial to copy to the GPU as a whole
         # instead of tile-by-tile.
-        image = image
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
-        grad = grad
 
 
         height = image.shape[H_DIM]
@@ -771,9 +761,6 @@ class StreamingCNN(torch.nn.Module):
             self._tile_output_shapes[idx][W_DIM] - self._tile_output_lost[idx].left - self._tile_output_lost[idx].right
             for idx in range(len(self._tile_output_shapes))
         ]
-
-        base_stride_h = int(self._base_output_stride[1])
-        base_stride_w = int(self._base_output_stride[2])
 
         output_heights = [
             (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
@@ -887,11 +874,6 @@ class StreamingCNN(torch.nn.Module):
         last_sides = None
         for input_y, input_x, sides in tile_iter:
                 last_sides = sides
-                output_y = input_y // base_stride_h
-                output_x = input_x // base_stride_w
-
-                lost = self._get_tile_lost_for_sides(sides)
-
                 input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
 
                 tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
@@ -950,7 +932,6 @@ class StreamingCNN(torch.nn.Module):
 
         # Memory management
         self._saved_tensors = {}
-        self._current_tile_input_loc = None
         self._reducer_forward_assignments = {}
 
         for mod in self.stream_module.modules():
