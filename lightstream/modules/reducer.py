@@ -117,13 +117,6 @@ class StreamingReducer(nn.Module):
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
         self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=dtype)
 
-    def reduce_full_output(self, full_output: torch.Tensor) -> torch.Tensor:
-        if full_output.ndim != 4:
-            raise ValueError(f"StreamingReducer expects NCHW tensor, got shape={tuple(full_output.shape)}")
-        if self.mode == "sum":
-            return full_output.sum(dim=(-2, -1), keepdim=True)
-        return full_output.mean(dim=(-2, -1), keepdim=True)
-
     def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
         if self.running_sum.numel() == 0:
             self.reset_stream_state(
