@@ -978,7 +978,8 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_grads
                 del trimmed_outputs
 
-        self._validate_reducer_replay_consumed(reducer_assignment_cursors)
+        if self.debug_reducer_replay:
+            StreamingReducer.validate_replay_consumed(self._reducer_forward_assignments, reducer_assignment_cursors)
 
         # Memory management
         self._saved_tensors = {}
@@ -1089,94 +1090,30 @@ class StreamingCNN(torch.nn.Module):
         sides,
         reducer_assignment_cursors,
     ):
-        expected_h = int(trimmed_output.shape[H_DIM])
-        expected_w = int(trimmed_output.shape[W_DIM])
-
-        if self.debug_reducer_replay:
-            self._validate_reducer_replay_assignment(
-                idx=idx,
-                expected_h=expected_h,
-                expected_w=expected_w,
-                input_y=input_y,
-                input_x=input_x,
-                sides=sides,
-                reducer_assignment_cursors=reducer_assignment_cursors,
-            )
-
         reducer = self._reducer_head_map[idx]
-        normalization = reducer.running_count if reducer.mode == "mean" else None
-        reduced_output = reducer.reduce_tile(trimmed_output, normalization=normalization)
-        return reduced_output, gradient
 
-    def _validate_reducer_replay_assignment(
-        self,
-        idx,
-        expected_h,
-        expected_w,
-        input_y,
-        input_x,
-        sides,
-        reducer_assignment_cursors,
-    ):
-        assignments = self._reducer_forward_assignments.get(idx)
-        if assignments is None:
-            raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
+        assignments = None
+        cursor = None
+        if self.debug_reducer_replay:
+            assignments = self._reducer_forward_assignments.get(idx)
+            if assignments is None:
+                raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
+            cursor = reducer_assignment_cursors[idx]
 
-        cursor = reducer_assignment_cursors[idx]
-        if cursor >= len(assignments):
-            raise RuntimeError(f"Reducer assignment cursor out of range for head {idx}")
+        reduced_output, reduced_grad, next_cursor = reducer.build_backward_pair(
+            trimmed_output,
+            gradient,
+            input_y=int(input_y),
+            input_x=int(input_x),
+            sides=sides,
+            assignments=assignments,
+            cursor=cursor,
+        )
 
-        (
-            f_tile_y,
-            f_tile_x,
-            f_top,
-            f_left,
-            f_right,
-            f_bottom,
-            f_h,
-            f_w,
-            dst_y0,
-            dst_y1,
-            dst_x0,
-            dst_x1,
-        ) = assignments[cursor]
-        reducer_assignment_cursors[idx] = cursor + 1
+        if next_cursor is not None:
+            reducer_assignment_cursors[idx] = next_cursor
 
-        if (
-            int(input_y) != int(f_tile_y)
-            or int(input_x) != int(f_tile_x)
-            or bool(sides.top) != bool(f_top)
-            or bool(sides.left) != bool(f_left)
-            or bool(sides.right) != bool(f_right)
-            or bool(sides.bottom) != bool(f_bottom)
-        ):
-            raise RuntimeError(
-                f"Reducer tile replay mismatch for head {idx}: "
-                f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
-                f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
-            )
-
-        if expected_h != int(f_h) or expected_w != int(f_w):
-            raise RuntimeError(
-                f"Reducer trimmed shape mismatch for head {idx}: forward=({f_h},{f_w}) "
-                f"backward=({expected_h},{expected_w})"
-            )
-
-        if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
-            raise RuntimeError(
-                f"Reducer assignment mismatch for head {idx}: "
-                f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
-            )
-
-    def _validate_reducer_replay_consumed(self, reducer_assignment_cursors):
-        if not self.debug_reducer_replay:
-            return
-        for idx, assignments in self._reducer_forward_assignments.items():
-            consumed = reducer_assignment_cursors.get(idx, 0)
-            if consumed != len(assignments):
-                raise RuntimeError(
-                    f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
-                )
+        return reduced_output, reduced_grad
 
     def _get_tile_lost_for_sides(self, sides, output_lost=None):
         output_lost = self.tile_output_lost if output_lost is None else output_lost

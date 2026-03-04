@@ -160,6 +160,113 @@ class StreamingReducer(nn.Module):
     ) -> torch.Tensor:
         return streaming_reduce_tile(tile_output, valid_mask, normalization)
 
+    def build_backward_pair(
+        self,
+        trimmed_output: torch.Tensor,
+        gradient: torch.Tensor,
+        *,
+        input_y: int,
+        input_x: int,
+        sides,
+        assignments: list[tuple] | None = None,
+        cursor: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+        """Build reducer-backed backward pair for a single tile output.
+
+        SCNN provides orchestration metadata (tile location/sides) and optional
+        replay assignment entries; reducer applies reducer-specific checks and
+        tile-local reduction math.
+        """
+        expected_h = int(trimmed_output.shape[-2])
+        expected_w = int(trimmed_output.shape[-1])
+
+        next_cursor = cursor
+        if assignments is not None:
+            if cursor is None:
+                raise RuntimeError("Reducer replay cursor is required when assignments are provided.")
+            next_cursor = self._validate_replay_assignment(
+                assignments=assignments,
+                cursor=cursor,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                expected_h=expected_h,
+                expected_w=expected_w,
+            )
+
+        normalization = self.running_count if self.mode == "mean" else None
+        reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
+        return reduced_output, gradient, next_cursor
+
+    def _validate_replay_assignment(
+        self,
+        *,
+        assignments: list[tuple],
+        cursor: int,
+        input_y: int,
+        input_x: int,
+        sides,
+        expected_h: int,
+        expected_w: int,
+    ) -> int:
+        if cursor >= len(assignments):
+            raise RuntimeError("Reducer assignment cursor out of range.")
+
+        (
+            f_tile_y,
+            f_tile_x,
+            f_top,
+            f_left,
+            f_right,
+            f_bottom,
+            f_h,
+            f_w,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+        ) = assignments[cursor]
+
+        if (
+            int(input_y) != int(f_tile_y)
+            or int(input_x) != int(f_tile_x)
+            or bool(sides.top) != bool(f_top)
+            or bool(sides.left) != bool(f_left)
+            or bool(sides.right) != bool(f_right)
+            or bool(sides.bottom) != bool(f_bottom)
+        ):
+            raise RuntimeError(
+                "Reducer tile replay mismatch: "
+                f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
+                f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
+            )
+
+        if expected_h != int(f_h) or expected_w != int(f_w):
+            raise RuntimeError(
+                "Reducer trimmed shape mismatch: "
+                f"forward=({f_h},{f_w}) backward=({expected_h},{expected_w})"
+            )
+
+        if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
+            raise RuntimeError(
+                "Reducer assignment mismatch: "
+                f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
+            )
+
+        return cursor + 1
+
+    @staticmethod
+    def validate_replay_consumed(
+        assignments_map: dict[int, list[tuple]],
+        assignment_cursors: dict[int, int],
+    ) -> None:
+        for idx, assignments in assignments_map.items():
+            consumed = assignment_cursors.get(idx, 0)
+            if consumed != len(assignments):
+                raise RuntimeError(
+                    f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
+                )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.
         self._last_output = x
