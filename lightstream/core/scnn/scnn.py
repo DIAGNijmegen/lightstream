@@ -956,75 +956,20 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_outputs = []
                 trimmed_grads = []
                 for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
-                    head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-                    head_output_height = self._tile_output_shapes[idx][H_DIM]
-                    head_output_width = self._tile_output_shapes[idx][W_DIM]
-                    head_stride = self._output_stride_per_output[idx]
-                    head_output_y = input_y // int(head_stride[1])
-                    head_output_x = input_x // int(head_stride[2])
-
-                    if sides.bottom:
-                        if idx in self._reducer_head_map:
-                            head_output_y = max(output_heights[idx] - head_output_height, 0)
-                        else:
-                            head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-                    if sides.right:
-                        if idx in self._reducer_head_map:
-                            head_output_x = max(output_widths[idx] - head_output_width, 0)
-                        else:
-                            head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
-
-                    if idx in self._reducer_head_map:
-                        gradient = head_grad.to(self.device, non_blocking=True)
-                        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
-                            raise ValueError(
-                                f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}"
-                            )
-                    else:
-                        gradient = head_grad[
-                            :,
-                            :,
-                            head_output_y : head_output_y + head_output_height,
-                            head_output_x : head_output_x + head_output_width,
-                        ]
-                    trimmed_output = head_output[
-                        :,
-                        :,
-                        head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : head_output.shape[W_DIM] - head_lost.right,
-                    ]
-
-                    trimmed_output = trimmed_output.to(self.device, non_blocking=True)
-
-                    if idx in self._reducer_head_map:
-                        reduced_output, reduced_grad = self._build_reducer_backward_pair(
-                            idx=idx,
-                            trimmed_output=trimmed_output,
-                            gradient=gradient,
-                            input_y=input_y,
-                            input_x=input_x,
-                            sides=sides,
-                            reducer_assignment_cursors=reducer_assignment_cursors,
-                        )
-                        trimmed_outputs.append(reduced_output)
-                        trimmed_grads.append(reduced_grad)
-                        continue
-                    else:
-                        trimmed_grad = gradient[
-                            :,
-                            :,
-                            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
-                            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
-                        ]
-
-                        if (
-                            trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
-                            or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
-                        ):
-                            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
-                    trimmed_outputs.append(trimmed_output)
-                    trimmed_grads.append(trimmed_grad)
+                    paired_output, paired_grad = self._build_head_backward_pair(
+                        idx=idx,
+                        head_output=head_output,
+                        head_grad=head_grad,
+                        input_y=input_y,
+                        input_x=input_x,
+                        sides=sides,
+                        output_heights=output_heights,
+                        output_widths=output_widths,
+                        reducer_assignment_cursors=reducer_assignment_cursors,
+                        image=image,
+                    )
+                    trimmed_outputs.append(paired_output)
+                    trimmed_grads.append(paired_grad)
 
                 torch.autograd.backward(trimmed_outputs, trimmed_grads)
 
@@ -1048,6 +993,91 @@ class StreamingCNN(torch.nn.Module):
         assert last_sides is not None and last_sides.right and last_sides.bottom, (
             "It seems like we could not reconstruct all output"
         )
+
+    def _build_head_backward_pair(
+        self,
+        idx,
+        head_output,
+        head_grad,
+        input_y,
+        input_x,
+        sides,
+        output_heights,
+        output_widths,
+        reducer_assignment_cursors,
+        image,
+    ):
+        is_reducer_head = idx in self._reducer_head_map
+        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+        head_output_height = self._tile_output_shapes[idx][H_DIM]
+        head_output_width = self._tile_output_shapes[idx][W_DIM]
+
+        head_stride = self._output_stride_per_output[idx]
+        head_output_y = input_y // int(head_stride[1])
+        head_output_x = input_x // int(head_stride[2])
+
+        if sides.bottom:
+            if is_reducer_head:
+                head_output_y = max(output_heights[idx] - head_output_height, 0)
+            else:
+                head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
+        if sides.right:
+            if is_reducer_head:
+                head_output_x = max(output_widths[idx] - head_output_width, 0)
+            else:
+                head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+
+        if is_reducer_head:
+            gradient = head_grad.to(self.device, non_blocking=True)
+            if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+                raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
+        else:
+            gradient = head_grad[
+                :,
+                :,
+                head_output_y : head_output_y + head_output_height,
+                head_output_x : head_output_x + head_output_width,
+            ]
+
+        trimmed_output = head_output[
+            :,
+            :,
+            head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
+            head_lost.left : head_output.shape[W_DIM] - head_lost.right,
+        ]
+        trimmed_output = trimmed_output.to(self.device, non_blocking=True)
+
+        if is_reducer_head:
+            return self._build_reducer_backward_pair(
+                idx=idx,
+                trimmed_output=trimmed_output,
+                gradient=gradient,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                reducer_assignment_cursors=reducer_assignment_cursors,
+            )
+
+        return self._build_non_reducer_backward_pair(
+            trimmed_output=trimmed_output,
+            gradient=gradient,
+            head_lost=head_lost,
+            image=image,
+        )
+
+    def _build_non_reducer_backward_pair(self, trimmed_output, gradient, head_lost, image):
+        trimmed_grad = gradient[
+            :,
+            :,
+            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
+            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
+        ]
+
+        if trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM] or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]:
+            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
+            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
+
+        return trimmed_output, trimmed_grad
 
     def _build_reducer_backward_pair(
         self,
