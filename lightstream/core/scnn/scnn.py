@@ -1050,16 +1050,16 @@ class StreamingCNN(torch.nn.Module):
                                 )
 
                         reducer = self._reducer_head_map[idx]
-                        per_pixel_grad = gradient
+                        normalization = None
                         if reducer.mode == "mean":
-                            denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
-                            per_pixel_grad = per_pixel_grad / denom
-                        trimmed_grad = per_pixel_grad.expand(
-                            -1,
-                            -1,
-                            expected_h,
-                            expected_w,
+                            normalization = reducer.running_count
+                        reduced_output = reducer.reduce_tile(
+                            trimmed_output,
+                            normalization=normalization,
                         )
+                        trimmed_outputs.append(reduced_output)
+                        trimmed_grads.append(gradient)
+                        continue
                     else:
                         trimmed_grad = gradient[
                             :,
