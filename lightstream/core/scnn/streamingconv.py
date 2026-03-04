@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.utils import _pair
@@ -215,6 +216,47 @@ class StreamingConv2d(_ConvNd):
         )
         self.grad_lost = Lost(0, 0, 0, 0)
         self.reset()
+
+    @classmethod
+    def from_torch_conv2d(cls, module: nn.Conv2d) -> "StreamingConv2d":
+        mod = cls(
+            module.in_channels,
+            module.out_channels,
+            module.kernel_size,
+            module.stride,
+            module.padding,
+            module.dilation,
+            module.groups,
+            module.bias is not None,
+            module.padding_mode,
+        )
+        mod = mod.to(module.weight.device, non_blocking=True)
+        mod = mod.to(module.weight.dtype)
+        mod.load_state_dict(module.state_dict())
+        mod.weight.requires_grad = module.weight.requires_grad
+        if module.bias is not None:
+            mod.bias.requires_grad = module.bias.requires_grad
+        return mod
+
+    def to_torch_conv2d(self) -> nn.Conv2d:
+        mod = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+            self.bias is not None,
+            self.padding_mode,
+        )
+        mod = mod.to(self.weight.device, non_blocking=True)
+        mod = mod.to(self.weight.dtype)
+        mod.load_state_dict(self.state_dict())
+        mod.weight.requires_grad = self.weight.requires_grad
+        if self.bias is not None:
+            mod.bias.requires_grad = self.bias.requires_grad
+        return mod
 
     def reset(self):
         self.seen_indices = Box(0, 0, 0, 0, None)

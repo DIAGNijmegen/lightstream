@@ -152,7 +152,8 @@ class StreamingCNN(torch.nn.Module):
         self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
-        self._convert_modules_for_streaming(self.stream_module)
+        self._streaming_reducers = []
+        self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
 
         # Remove temporary data
@@ -356,24 +357,7 @@ class StreamingCNN(torch.nn.Module):
         mod = module
         if isinstance(module, torch.nn.Conv2d):
             if module in self._module_stats:
-                mod = StreamingConv2d(
-                    module.in_channels,
-                    module.out_channels,
-                    module.kernel_size,
-                    module.stride,
-                    module.padding,
-                    module.dilation,
-                    module.groups,
-                    module.bias is not None,
-                )
-                mod = mod.to(module.weight.device, non_blocking=True)
-                mod = mod.to(module.weight.dtype)
-
-                mod.weight.requires_grad = module.weight.requires_grad
-                if module.bias is not None:
-                    mod.bias.requires_grad = module.bias.requires_grad
-
-                mod.load_state_dict(module.state_dict())  # copy params
+                mod = StreamingConv2d.from_torch_conv2d(module)
                 mod.grad_lost = self._module_stats[module]["grad_lost"]
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
@@ -396,24 +380,7 @@ class StreamingCNN(torch.nn.Module):
     def _reset_converted_modules(self, module):
         mod = module
         if isinstance(module, StreamingConv2d):
-            mod = torch.nn.Conv2d(
-                module.in_channels,
-                module.out_channels,
-                module.kernel_size,
-                module.stride,
-                module.padding,
-                module.dilation,
-                module.groups,
-                module.bias is not None,
-            )
-            mod = mod.to(module.weight.device, non_blocking=True)
-            mod = mod.to(module.weight.dtype)
-
-            mod.weight.requires_grad = module.weight.requires_grad
-            if module.bias is not None:
-                mod.bias.requires_grad = module.bias.requires_grad
-
-            mod.load_state_dict(module.state_dict())  # copy params
+            mod = module.to_torch_conv2d()
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -1136,12 +1103,13 @@ class StreamingCNN(torch.nn.Module):
     def disable(self):
         """Disable the streaming hooks"""
         self._remove_hooks()
-        self._reset_converted_modules(self.stream_module)
+        self.stream_module = self._reset_converted_modules(self.stream_module)
 
     def enable(self):
         """Enable the streaming hooks"""
         self._remove_hooks()
-        self._convert_modules_for_streaming(self.stream_module)
+        self._streaming_reducers = []
+        self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
