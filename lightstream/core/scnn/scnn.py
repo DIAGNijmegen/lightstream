@@ -98,7 +98,6 @@ class StreamingCNN(torch.nn.Module):
         self._output_stride_per_output = None
         self._output_spec = None
         self._module_stats = {}
-        self._backward_seen_indices = {}
         self._saved_tensors = {}
         self.debug_reducer_replay = False
         self._hooks = []
@@ -574,9 +573,6 @@ class StreamingCNN(torch.nn.Module):
                     sides_right = True if tile_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
                     sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
-                    # These values are used to crop invalid output values
-                    lost = self._get_tile_lost_for_sides(sides)
-
                     # Since we need to stay at multiples of output stride we
                     # need to keep that into account when we are at the bottom
                     # and right side of the output.
@@ -777,9 +773,6 @@ class StreamingCNN(torch.nn.Module):
             n_cols = 1
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
-
-        self._inputs = {}
-        self._backward_seen_indices = {}
 
         # if self.verbose:
         #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
