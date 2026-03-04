@@ -104,7 +104,11 @@ class StreamingReducer(nn.Module):
         self._streaming_passthrough = False
         self.register_buffer("running_sum", torch.zeros(0), persistent=False)
         self.register_buffer("running_count", torch.zeros(0), persistent=False)
+        self.register_buffer("_stream_seen_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
         self._last_output = None
+        self._debug_replay_enabled = False
+        self._replay_assignments: list[tuple] | None = None
+        self._replay_cursor: int | None = None
 
     @classmethod
     def from_reducer(cls, module: Reducer) -> "StreamingReducer":
@@ -116,6 +120,73 @@ class StreamingReducer(nn.Module):
     def reset_stream_state(self, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype):
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
         self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=dtype)
+
+    def start_stream(
+        self,
+        output_height: int,
+        output_width: int,
+        batch_size: int,
+        channels: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        debug_replay: bool = False,
+    ):
+        self.reset_stream_state(batch_size=batch_size, channels=channels, device=device, dtype=dtype)
+        self._stream_seen_mask = torch.zeros((output_height, output_width), dtype=torch.bool, device=device)
+        self._debug_replay_enabled = debug_replay
+        self._replay_assignments = [] if debug_replay else None
+        self._replay_cursor = None
+
+    def accumulate_stream_tile(self, trimmed_output: torch.Tensor, tile_y: int, tile_x: int, sides, dst_box):
+        dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
+        seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
+        new_mask = ~seen_slice
+
+        if self._debug_replay_enabled:
+            if self._replay_assignments is None:
+                raise RuntimeError("Reducer replay assignments are not initialized.")
+            self._replay_assignments.append(
+                (
+                    int(tile_y),
+                    int(tile_x),
+                    bool(sides.top),
+                    bool(sides.left),
+                    bool(sides.right),
+                    bool(sides.bottom),
+                    int(trimmed_output.shape[-2]),
+                    int(trimmed_output.shape[-1]),
+                    int(dst_y0),
+                    int(dst_y1),
+                    int(dst_x0),
+                    int(dst_x1),
+                )
+            )
+
+        if torch.any(new_mask):
+            self.accumulate_tile(trimmed_output, valid_mask=new_mask)
+            seen_slice |= new_mask
+
+    def finish_stream(self) -> torch.Tensor:
+        return self.finalize_stream()
+
+    def start_backward_replay(self):
+        if self._debug_replay_enabled:
+            if self._replay_assignments is None:
+                raise RuntimeError("Reducer replay assignments are not available for backward replay.")
+            self._replay_cursor = 0
+        else:
+            self._replay_cursor = None
+
+    def validate_backward_replay_consumed(self, *, head_idx: int):
+        if not self._debug_replay_enabled:
+            return
+        if self._replay_assignments is None or self._replay_cursor is None:
+            raise RuntimeError("Reducer replay state is not initialized.")
+        if self._replay_cursor != len(self._replay_assignments):
+            raise RuntimeError(
+                f"Reducer assignment replay incomplete for head {head_idx}: "
+                f"consumed={self._replay_cursor}, expected={len(self._replay_assignments)}"
+            )
 
     def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
         if self.running_sum.numel() == 0:
@@ -161,9 +232,7 @@ class StreamingReducer(nn.Module):
         input_y: int,
         input_x: int,
         sides,
-        assignments: list[tuple] | None = None,
-        cursor: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build reducer-backed backward pair for a single tile output.
 
         SCNN provides orchestration metadata (tile location/sides) and optional
@@ -173,13 +242,12 @@ class StreamingReducer(nn.Module):
         expected_h = int(trimmed_output.shape[-2])
         expected_w = int(trimmed_output.shape[-1])
 
-        next_cursor = cursor
-        if assignments is not None:
-            if cursor is None:
-                raise RuntimeError("Reducer replay cursor is required when assignments are provided.")
-            next_cursor = self._validate_replay_assignment(
-                assignments=assignments,
-                cursor=cursor,
+        if self._debug_replay_enabled:
+            if self._replay_assignments is None or self._replay_cursor is None:
+                raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
+            self._replay_cursor = self._validate_replay_assignment(
+                assignments=self._replay_assignments,
+                cursor=self._replay_cursor,
                 input_y=input_y,
                 input_x=input_x,
                 sides=sides,
@@ -189,7 +257,7 @@ class StreamingReducer(nn.Module):
 
         normalization = self.running_count if self.mode == "mean" else None
         reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
-        return reduced_output, gradient, next_cursor
+        return reduced_output, gradient
 
     def _validate_replay_assignment(
         self,
@@ -247,18 +315,6 @@ class StreamingReducer(nn.Module):
             )
 
         return cursor + 1
-
-    @staticmethod
-    def validate_replay_consumed(
-        assignments_map: dict[int, list[tuple]],
-        assignment_cursors: dict[int, int],
-    ) -> None:
-        for idx, assignments in assignments_map.items():
-            consumed = assignment_cursors.get(idx, 0)
-            if consumed != len(assignments):
-                raise RuntimeError(
-                    f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
-                )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.

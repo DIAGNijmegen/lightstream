@@ -100,7 +100,6 @@ class StreamingCNN(torch.nn.Module):
         self._module_stats = {}
         self._backward_seen_indices = {}
         self._saved_tensors = {}
-        self._reducer_forward_assignments = {}
         self.debug_reducer_replay = False
         self._hooks = []
         self._last_forward_tiles = []
@@ -517,8 +516,6 @@ class StreamingCNN(torch.nn.Module):
                     device=device,
                 ).fill_(999)
         self._reducer_head_map = {}
-        self._reducer_forward_assignments = {}
-        reducer_seen_masks = {}
         reducers_initialized = False
 
         if len(self._tile_output_shapes) > 1:
@@ -610,19 +607,15 @@ class StreamingCNN(torch.nn.Module):
 
                     if self._reducer_head_map and not reducers_initialized:
                         for head_idx, reducer in self._reducer_head_map.items():
-                            reducer.reset_stream_state(
+                            reducer.start_stream(
+                                output_height=output_heights[head_idx],
+                                output_width=output_widths[head_idx],
                                 batch_size=image.shape[B_DIM],
                                 channels=self._tile_output_shapes[head_idx][C_DIM],
                                 device=self.device,
                                 dtype=self.dtype,
+                                debug_replay=self.debug_reducer_replay,
                             )
-                            reducer_seen_masks[head_idx] = torch.zeros(
-                                (output_heights[head_idx], output_widths[head_idx]),
-                                dtype=torch.bool,
-                                device=self.device,
-                            )
-                            if self.debug_reducer_replay:
-                                self._reducer_forward_assignments[head_idx] = []
                         reducers_initialized = True
 
 
@@ -648,28 +641,13 @@ class StreamingCNN(torch.nn.Module):
                             dst_x0 = int(output_loc.x)
                             dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
 
-                            seen_slice = reducer_seen_masks[idx][dst_y0:dst_y1, dst_x0:dst_x1]
-                            new_mask = ~seen_slice
-                            if self.debug_reducer_replay:
-                                self._reducer_forward_assignments[idx].append(
-                                    (
-                                        int(tile_y),
-                                        int(tile_x),
-                                        bool(sides.top),
-                                        bool(sides.left),
-                                        bool(sides.right),
-                                        bool(sides.bottom),
-                                        int(trimmed_output.shape[H_DIM]),
-                                        int(trimmed_output.shape[W_DIM]),
-                                        dst_y0,
-                                        dst_y1,
-                                        dst_x0,
-                                        dst_x1,
-                                    )
-                                )
-                            if torch.any(new_mask):
-                                self._reducer_head_map[idx].accumulate_tile(trimmed_output, valid_mask=new_mask)
-                                seen_slice |= new_mask
+                            self._reducer_head_map[idx].accumulate_stream_tile(
+                                trimmed_output=trimmed_output,
+                                tile_y=int(tile_y),
+                                tile_x=int(tile_x),
+                                sides=sides,
+                                dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
+                            )
                             continue
 
                         src_y0 = 0
@@ -724,7 +702,7 @@ class StreamingCNN(torch.nn.Module):
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
-            outputs[idx] = reducer.finalize_stream().to(device)
+            outputs[idx] = reducer.finish_stream().to(device)
         for idx, output in enumerate(outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
@@ -869,7 +847,9 @@ class StreamingCNN(torch.nn.Module):
                     tile_x = tile_x if not sides_left else 0
                     tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
-        reducer_assignment_cursors = {idx: 0 for idx in self._reducer_head_map} if self.debug_reducer_replay else {}
+        if self.debug_reducer_replay:
+            for reducer in self._reducer_head_map.values():
+                reducer.start_backward_replay()
 
         last_sides = None
         for input_y, input_x, sides in tile_iter:
@@ -914,7 +894,6 @@ class StreamingCNN(torch.nn.Module):
                         sides=sides,
                         output_heights=output_heights,
                         output_widths=output_widths,
-                        reducer_assignment_cursors=reducer_assignment_cursors,
                         image=image,
                     )
                     trimmed_outputs.append(paired_output)
@@ -928,11 +907,11 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_outputs
 
         if self.debug_reducer_replay:
-            StreamingReducer.validate_replay_consumed(self._reducer_forward_assignments, reducer_assignment_cursors)
+            for idx, reducer in self._reducer_head_map.items():
+                reducer.validate_backward_replay_consumed(head_idx=idx)
 
         # Memory management
         self._saved_tensors = {}
-        self._reducer_forward_assignments = {}
 
         for mod in self.stream_module.modules():
             if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
@@ -953,7 +932,6 @@ class StreamingCNN(torch.nn.Module):
         sides,
         output_heights,
         output_widths,
-        reducer_assignment_cursors,
         image,
     ):
         is_reducer_head = idx in self._reducer_head_map
@@ -1004,7 +982,6 @@ class StreamingCNN(torch.nn.Module):
                 input_y=input_y,
                 input_x=input_x,
                 sides=sides,
-                reducer_assignment_cursors=reducer_assignment_cursors,
             )
 
         return self._build_non_reducer_backward_pair(
@@ -1036,30 +1013,16 @@ class StreamingCNN(torch.nn.Module):
         input_y,
         input_x,
         sides,
-        reducer_assignment_cursors,
     ):
         reducer = self._reducer_head_map[idx]
 
-        assignments = None
-        cursor = None
-        if self.debug_reducer_replay:
-            assignments = self._reducer_forward_assignments.get(idx)
-            if assignments is None:
-                raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
-            cursor = reducer_assignment_cursors[idx]
-
-        reduced_output, reduced_grad, next_cursor = reducer.build_backward_pair(
+        reduced_output, reduced_grad = reducer.build_backward_pair(
             trimmed_output,
             gradient,
             input_y=int(input_y),
             input_x=int(input_x),
             sides=sides,
-            assignments=assignments,
-            cursor=cursor,
         )
-
-        if next_cursor is not None:
-            reducer_assignment_cursors[idx] = next_cursor
 
         return reduced_output, reduced_grad
 
