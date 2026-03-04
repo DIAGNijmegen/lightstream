@@ -956,126 +956,20 @@ class StreamingCNN(torch.nn.Module):
                 trimmed_outputs = []
                 trimmed_grads = []
                 for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
-                    head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-                    head_output_height = self._tile_output_shapes[idx][H_DIM]
-                    head_output_width = self._tile_output_shapes[idx][W_DIM]
-                    head_stride = self._output_stride_per_output[idx]
-                    head_output_y = input_y // int(head_stride[1])
-                    head_output_x = input_x // int(head_stride[2])
-
-                    if sides.bottom:
-                        if idx in self._reducer_head_map:
-                            head_output_y = max(output_heights[idx] - head_output_height, 0)
-                        else:
-                            head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-                    if sides.right:
-                        if idx in self._reducer_head_map:
-                            head_output_x = max(output_widths[idx] - head_output_width, 0)
-                        else:
-                            head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
-
-                    if idx in self._reducer_head_map:
-                        gradient = head_grad.to(self.device, non_blocking=True)
-                        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
-                            raise ValueError(
-                                f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}"
-                            )
-                    else:
-                        gradient = head_grad[
-                            :,
-                            :,
-                            head_output_y : head_output_y + head_output_height,
-                            head_output_x : head_output_x + head_output_width,
-                        ]
-                    trimmed_output = head_output[
-                        :,
-                        :,
-                        head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
-                        head_lost.left : head_output.shape[W_DIM] - head_lost.right,
-                    ]
-
-                    trimmed_output = trimmed_output.to(self.device, non_blocking=True)
-
-                    if idx in self._reducer_head_map:
-                        expected_h = int(trimmed_output.shape[H_DIM])
-                        expected_w = int(trimmed_output.shape[W_DIM])
-
-                        if self.debug_reducer_replay:
-                            assignments = self._reducer_forward_assignments.get(idx)
-                            if assignments is None:
-                                raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
-                            cursor = reducer_assignment_cursors[idx]
-                            if cursor >= len(assignments):
-                                raise RuntimeError(f"Reducer assignment cursor out of range for head {idx}")
-                            (
-                                f_tile_y,
-                                f_tile_x,
-                                f_top,
-                                f_left,
-                                f_right,
-                                f_bottom,
-                                f_h,
-                                f_w,
-                                dst_y0,
-                                dst_y1,
-                                dst_x0,
-                                dst_x1,
-                            ) = assignments[cursor]
-                            reducer_assignment_cursors[idx] = cursor + 1
-
-                            if (
-                                int(input_y) != int(f_tile_y)
-                                or int(input_x) != int(f_tile_x)
-                                or bool(sides.top) != bool(f_top)
-                                or bool(sides.left) != bool(f_left)
-                                or bool(sides.right) != bool(f_right)
-                                or bool(sides.bottom) != bool(f_bottom)
-                            ):
-                                raise RuntimeError(
-                                    f"Reducer tile replay mismatch for head {idx}: "
-                                    f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
-                                    f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
-                                )
-
-                            if expected_h != int(f_h) or expected_w != int(f_w):
-                                raise RuntimeError(
-                                    f"Reducer trimmed shape mismatch for head {idx}: forward=({f_h},{f_w}) "
-                                    f"backward=({expected_h},{expected_w})"
-                                )
-
-                            if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
-                                raise RuntimeError(
-                                    f"Reducer assignment mismatch for head {idx}: "
-                                    f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
-                                )
-
-                        reducer = self._reducer_head_map[idx]
-                        per_pixel_grad = gradient
-                        if reducer.mode == "mean":
-                            denom = reducer.running_count.to(per_pixel_grad.device, dtype=per_pixel_grad.dtype).clamp_min(1)
-                            per_pixel_grad = per_pixel_grad / denom
-                        trimmed_grad = per_pixel_grad.expand(
-                            -1,
-                            -1,
-                            expected_h,
-                            expected_w,
-                        )
-                    else:
-                        trimmed_grad = gradient[
-                            :,
-                            :,
-                            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
-                            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
-                        ]
-
-                        if (
-                            trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
-                            or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
-                        ):
-                            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
-                            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
-                    trimmed_outputs.append(trimmed_output)
-                    trimmed_grads.append(trimmed_grad)
+                    paired_output, paired_grad = self._build_head_backward_pair(
+                        idx=idx,
+                        head_output=head_output,
+                        head_grad=head_grad,
+                        input_y=input_y,
+                        input_x=input_x,
+                        sides=sides,
+                        output_heights=output_heights,
+                        output_widths=output_widths,
+                        reducer_assignment_cursors=reducer_assignment_cursors,
+                        image=image,
+                    )
+                    trimmed_outputs.append(paired_output)
+                    trimmed_grads.append(paired_grad)
 
                 torch.autograd.backward(trimmed_outputs, trimmed_grads)
 
@@ -1085,12 +979,7 @@ class StreamingCNN(torch.nn.Module):
                 del trimmed_outputs
 
         if self.debug_reducer_replay:
-            for idx, assignments in self._reducer_forward_assignments.items():
-                consumed = reducer_assignment_cursors.get(idx, 0)
-                if consumed != len(assignments):
-                    raise RuntimeError(
-                        f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
-                    )
+            StreamingReducer.validate_replay_consumed(self._reducer_forward_assignments, reducer_assignment_cursors)
 
         # Memory management
         self._saved_tensors = {}
@@ -1105,6 +994,126 @@ class StreamingCNN(torch.nn.Module):
         assert last_sides is not None and last_sides.right and last_sides.bottom, (
             "It seems like we could not reconstruct all output"
         )
+
+    def _build_head_backward_pair(
+        self,
+        idx,
+        head_output,
+        head_grad,
+        input_y,
+        input_x,
+        sides,
+        output_heights,
+        output_widths,
+        reducer_assignment_cursors,
+        image,
+    ):
+        is_reducer_head = idx in self._reducer_head_map
+        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+        head_output_height = self._tile_output_shapes[idx][H_DIM]
+        head_output_width = self._tile_output_shapes[idx][W_DIM]
+
+        head_stride = self._output_stride_per_output[idx]
+        head_output_y = input_y // int(head_stride[1])
+        head_output_x = input_x // int(head_stride[2])
+
+        if sides.bottom:
+            if is_reducer_head:
+                head_output_y = max(output_heights[idx] - head_output_height, 0)
+            else:
+                head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
+        if sides.right:
+            if is_reducer_head:
+                head_output_x = max(output_widths[idx] - head_output_width, 0)
+            else:
+                head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+
+        if is_reducer_head:
+            gradient = head_grad.to(self.device, non_blocking=True)
+            if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+                raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
+        else:
+            gradient = head_grad[
+                :,
+                :,
+                head_output_y : head_output_y + head_output_height,
+                head_output_x : head_output_x + head_output_width,
+            ]
+
+        trimmed_output = head_output[
+            :,
+            :,
+            head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
+            head_lost.left : head_output.shape[W_DIM] - head_lost.right,
+        ]
+        trimmed_output = trimmed_output.to(self.device, non_blocking=True)
+
+        if is_reducer_head:
+            return self._build_reducer_backward_pair(
+                idx=idx,
+                trimmed_output=trimmed_output,
+                gradient=gradient,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                reducer_assignment_cursors=reducer_assignment_cursors,
+            )
+
+        return self._build_non_reducer_backward_pair(
+            trimmed_output=trimmed_output,
+            gradient=gradient,
+            head_lost=head_lost,
+            image=image,
+        )
+
+    def _build_non_reducer_backward_pair(self, trimmed_output, gradient, head_lost, image):
+        trimmed_grad = gradient[
+            :,
+            :,
+            head_lost.top : gradient.shape[H_DIM] - head_lost.bottom,
+            head_lost.left : gradient.shape[W_DIM] - head_lost.right,
+        ]
+
+        if trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM] or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]:
+            assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
+            trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
+
+        return trimmed_output, trimmed_grad
+
+    def _build_reducer_backward_pair(
+        self,
+        idx,
+        trimmed_output,
+        gradient,
+        input_y,
+        input_x,
+        sides,
+        reducer_assignment_cursors,
+    ):
+        reducer = self._reducer_head_map[idx]
+
+        assignments = None
+        cursor = None
+        if self.debug_reducer_replay:
+            assignments = self._reducer_forward_assignments.get(idx)
+            if assignments is None:
+                raise RuntimeError(f"Missing forward reducer assignments for head {idx}")
+            cursor = reducer_assignment_cursors[idx]
+
+        reduced_output, reduced_grad, next_cursor = reducer.build_backward_pair(
+            trimmed_output,
+            gradient,
+            input_y=int(input_y),
+            input_x=int(input_x),
+            sides=sides,
+            assignments=assignments,
+            cursor=cursor,
+        )
+
+        if next_cursor is not None:
+            reducer_assignment_cursors[idx] = next_cursor
+
+        return reduced_output, reduced_grad
 
     def _get_tile_lost_for_sides(self, sides, output_lost=None):
         output_lost = self.tile_output_lost if output_lost is None else output_lost

@@ -2,6 +2,70 @@ import torch
 import torch.nn as nn
 
 
+class StreamingReducerTileF(torch.autograd.Function):
+    """Tile-local reducer op used by :class:`StreamingReducer`.
+
+    The op supports an optional 2D valid mask and optional normalization factor.
+    This lets SCNN keep tile orchestration while reducer math (forward/backward)
+    lives in reducer logic.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        tile_output: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        normalization: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if tile_output.ndim != 4:
+            raise ValueError(f"StreamingReducer expects NCHW tile, got shape={tuple(tile_output.shape)}")
+
+        if valid_mask is not None:
+            if valid_mask.ndim != 2:
+                raise ValueError(f"valid_mask must be 2D (H,W), got shape={tuple(valid_mask.shape)}")
+            mask_4d = valid_mask.to(dtype=tile_output.dtype, device=tile_output.device)[None, None]
+            masked = tile_output * mask_4d
+            ctx.save_for_backward(mask_4d)
+            ctx.has_mask = True
+        else:
+            masked = tile_output
+            ctx.save_for_backward(torch.zeros(0, device=tile_output.device, dtype=tile_output.dtype))
+            ctx.has_mask = False
+
+        ctx.input_height = tile_output.shape[-2]
+        ctx.input_width = tile_output.shape[-1]
+
+        if normalization is not None:
+            norm = normalization.to(device=tile_output.device, dtype=tile_output.dtype).clamp_min(1)
+            reduced = masked.sum(dim=(-2, -1), keepdim=True) / norm
+            ctx.normalization = norm
+            ctx.has_normalization = True
+        else:
+            reduced = masked.sum(dim=(-2, -1), keepdim=True)
+            ctx.normalization = None
+            ctx.has_normalization = False
+
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (mask_4d,) = ctx.saved_tensors
+
+        grad_input = grad_output
+        if ctx.has_normalization:
+            grad_input = grad_input / ctx.normalization
+
+        grad_input = grad_input.expand(-1, -1, ctx.input_height, ctx.input_width)
+
+        if ctx.has_mask:
+            grad_input = grad_input * mask_4d.to(dtype=grad_input.dtype, device=grad_input.device)
+
+        return grad_input, None, None
+
+
+streaming_reduce_tile = StreamingReducerTileF.apply
+
+
 class Reducer(nn.Module):
     """Global spatial reducer for NCHW tensors."""
 
@@ -25,8 +89,11 @@ class Reducer(nn.Module):
 class StreamingReducer(nn.Module):
     """Streaming counterpart of :class:`Reducer`.
 
-    In streaming mode this module acts as a marker and keeps accumulation state
-    managed from SCNN's tile loop.
+    Responsibility split:
+    - SCNN orchestrates tile traversal/placement and decides which tile pixels
+      are valid contributors.
+    - StreamingReducer owns tile-local reducer math via ``reduce_tile``
+      (custom autograd op) and keeps stream accumulation state.
     """
 
     def __init__(self, mode: str = "mean"):
@@ -50,16 +117,7 @@ class StreamingReducer(nn.Module):
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
         self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=dtype)
 
-    def reduce_full_output(self, full_output: torch.Tensor) -> torch.Tensor:
-        if full_output.ndim != 4:
-            raise ValueError(f"StreamingReducer expects NCHW tensor, got shape={tuple(full_output.shape)}")
-        if self.mode == "sum":
-            return full_output.sum(dim=(-2, -1), keepdim=True)
-        return full_output.mean(dim=(-2, -1), keepdim=True)
-
     def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
-        if tile_valid_output.ndim != 4:
-            raise ValueError(f"StreamingReducer expects NCHW tile, got shape={tuple(tile_valid_output.shape)}")
         if self.running_sum.numel() == 0:
             self.reset_stream_state(
                 batch_size=tile_valid_output.shape[0],
@@ -68,14 +126,12 @@ class StreamingReducer(nn.Module):
                 dtype=tile_valid_output.dtype,
             )
 
+        tile_contribution = self.reduce_tile(tile_valid_output, valid_mask=valid_mask)
+        self.running_sum = self.running_sum + tile_contribution
+
         if valid_mask is None:
-            self.running_sum = self.running_sum + tile_valid_output.sum(dim=(-2, -1), keepdim=True)
             n_pixels = tile_valid_output.shape[-1] * tile_valid_output.shape[-2]
         else:
-            if valid_mask.ndim != 2:
-                raise ValueError(f"valid_mask must be 2D (H,W), got shape={tuple(valid_mask.shape)}")
-            mask = valid_mask.to(tile_valid_output.dtype)[None, None]
-            self.running_sum = self.running_sum + (tile_valid_output * mask).sum(dim=(-2, -1), keepdim=True)
             n_pixels = int(valid_mask.sum().item())
 
         if self.mode == "mean":
@@ -88,6 +144,121 @@ class StreamingReducer(nn.Module):
             return self.running_sum
         denom = self.running_count.clamp_min(1)
         return self.running_sum / denom
+
+    def reduce_tile(
+        self,
+        tile_output: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        normalization: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return streaming_reduce_tile(tile_output, valid_mask, normalization)
+
+    def build_backward_pair(
+        self,
+        trimmed_output: torch.Tensor,
+        gradient: torch.Tensor,
+        *,
+        input_y: int,
+        input_x: int,
+        sides,
+        assignments: list[tuple] | None = None,
+        cursor: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+        """Build reducer-backed backward pair for a single tile output.
+
+        SCNN provides orchestration metadata (tile location/sides) and optional
+        replay assignment entries; reducer applies reducer-specific checks and
+        tile-local reduction math.
+        """
+        expected_h = int(trimmed_output.shape[-2])
+        expected_w = int(trimmed_output.shape[-1])
+
+        next_cursor = cursor
+        if assignments is not None:
+            if cursor is None:
+                raise RuntimeError("Reducer replay cursor is required when assignments are provided.")
+            next_cursor = self._validate_replay_assignment(
+                assignments=assignments,
+                cursor=cursor,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                expected_h=expected_h,
+                expected_w=expected_w,
+            )
+
+        normalization = self.running_count if self.mode == "mean" else None
+        reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
+        return reduced_output, gradient, next_cursor
+
+    def _validate_replay_assignment(
+        self,
+        *,
+        assignments: list[tuple],
+        cursor: int,
+        input_y: int,
+        input_x: int,
+        sides,
+        expected_h: int,
+        expected_w: int,
+    ) -> int:
+        if cursor >= len(assignments):
+            raise RuntimeError("Reducer assignment cursor out of range.")
+
+        (
+            f_tile_y,
+            f_tile_x,
+            f_top,
+            f_left,
+            f_right,
+            f_bottom,
+            f_h,
+            f_w,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+        ) = assignments[cursor]
+
+        if (
+            int(input_y) != int(f_tile_y)
+            or int(input_x) != int(f_tile_x)
+            or bool(sides.top) != bool(f_top)
+            or bool(sides.left) != bool(f_left)
+            or bool(sides.right) != bool(f_right)
+            or bool(sides.bottom) != bool(f_bottom)
+        ):
+            raise RuntimeError(
+                "Reducer tile replay mismatch: "
+                f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
+                f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
+            )
+
+        if expected_h != int(f_h) or expected_w != int(f_w):
+            raise RuntimeError(
+                "Reducer trimmed shape mismatch: "
+                f"forward=({f_h},{f_w}) backward=({expected_h},{expected_w})"
+            )
+
+        if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
+            raise RuntimeError(
+                "Reducer assignment mismatch: "
+                f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
+            )
+
+        return cursor + 1
+
+    @staticmethod
+    def validate_replay_consumed(
+        assignments_map: dict[int, list[tuple]],
+        assignment_cursors: dict[int, int],
+    ) -> None:
+        for idx, assignments in assignments_map.items():
+            consumed = assignment_cursors.get(idx, 0)
+            if consumed != len(assignments):
+                raise RuntimeError(
+                    f"Reducer assignment replay incomplete for head {idx}: consumed={consumed}, expected={len(assignments)}"
+                )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.
