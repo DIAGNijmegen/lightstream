@@ -464,21 +464,8 @@ class StreamingCNN(torch.nn.Module):
         )
         return Lost(int(top), int(left), int(bottom), int(right))
 
-    def forward(self, image, result_on_cpu=False):
-        """Perform forward pass with lightstream.
-
-        Parameters:
-            image (torch.Tensor): CHW the image to lightstream
-        """
-        # The input image is likely quite small in terms of channels, for
-        # performance reasons it is beneficial to copy to the GPU as a whole
-        # instead of tile-by-tile.
-        if self.copy_to_gpu:
-            image = image.to(self.device, non_blocking=True)
-
-        tile_width, tile_height = self.tile_shape[W_DIM], self.tile_shape[H_DIM]
-
-        # Size of valid output of a tile
+    def _compute_valid_output_sizes(self):
+        """Return per-head valid output sizes after removing border loss."""
         valid_output_heights = [
             self._tile_output_shapes[idx][H_DIM] - self._tile_output_lost[idx].top - self._tile_output_lost[idx].bottom
             for idx in range(len(self._tile_output_shapes))
@@ -487,9 +474,10 @@ class StreamingCNN(torch.nn.Module):
             self._tile_output_shapes[idx][W_DIM] - self._tile_output_lost[idx].left - self._tile_output_lost[idx].right
             for idx in range(len(self._tile_output_shapes))
         ]
+        return valid_output_heights, valid_output_widths
 
-        # Calculate size of output that we would get by inferencing the
-        # whole image.
+    def _compute_full_output_sizes(self, image):
+        """Return per-head output sizes for the fully stitched image output."""
         output_heights = [
             (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
             for idx, tile_shape in enumerate(self._tile_output_shapes)
@@ -498,347 +486,390 @@ class StreamingCNN(torch.nn.Module):
             (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
             for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
+        return output_heights, output_widths
 
-        if result_on_cpu:
-            device = torch.device("cpu")
-        else:
-            device = self.device
+    def _compute_valid_input_step(self, valid_output_heights, valid_output_widths):
+        """Return input-space stride between neighboring streaming tiles."""
+        if len(self._tile_output_shapes) > 1:
+            return self._compute_multi_output_input_step(
+                valid_output_heights,
+                valid_output_widths,
+                include_grad_safe=True,
+            )
+
+        valid_input_height = max(
+            1,
+            valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
+        )
+        valid_input_width = max(
+            1,
+            valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
+        )
+        return valid_input_height, valid_input_width
+
+    def _compute_tile_grid(self, image_height, image_width, tile_height, tile_width, valid_input_height, valid_input_width):
+        """Compute tiling grid shape for a given image and tile step."""
+        n_rows = math.ceil(float(max(1, image_height - tile_height)) / float(valid_input_height)) + 1
+        n_cols = math.ceil(float(max(1, image_width - tile_width)) / float(valid_input_width)) + 1
+
+        if image_width <= tile_width:
+            n_cols = 1
+        if image_height <= tile_height:
+            n_rows = 1
+        return n_rows, n_cols
+
+    def _iter_input_tiles(self, image, n_rows, n_cols, valid_input_height, valid_input_width, tile_height, tile_width):
+        """Yield input-space tile coordinates with border-aware side markers."""
+        for row in range(n_rows):
+            for col in range(n_cols):
+                input_y = row * valid_input_height
+                input_x = col * valid_input_width
+
+                sides_top = row == 0
+                sides_left = col == 0
+                sides_bottom = input_y + tile_height >= image.shape[H_DIM]
+                sides_right = input_x + tile_width >= image.shape[W_DIM]
+                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
+
+                if sides_bottom:
+                    input_y = max(image.shape[H_DIM] - tile_height, 0)
+                if sides_right:
+                    input_x = max(image.shape[W_DIM] - tile_width, 0)
+
+                input_y = input_y if not sides.top else 0
+                input_x = input_x if not sides.left else 0
+                yield int(input_y), int(input_x), sides
+
+    def _prepare_forward_outputs(self, image, output_heights, output_widths, result_device):
         outputs = [None] * len(self._tile_output_shapes)
 
-        def _allocate_non_reducer_outputs():
+        def allocate_non_reducer_outputs():
             for idx in range(len(self._tile_output_shapes)):
                 if idx in self._reducer_head_map or outputs[idx] is not None:
                     continue
                 outputs[idx] = torch.empty(
                     (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
                     dtype=self.dtype,
-                    device=device,
+                    device=result_device,
                 ).fill_(999)
-        self._reducer_head_map = {}
-        reducers_initialized = False
 
-        if len(self._tile_output_shapes) > 1:
-            valid_input_height, valid_input_width = self._compute_multi_output_input_step(
-                valid_output_heights,
-                valid_output_widths,
-                include_grad_safe=True,
-            )
-        else:
-            valid_input_height = max(
-                1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
-            )
-            valid_input_width = max(
-                1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
-            )
-        n_rows = math.ceil(float(max(1, image.shape[H_DIM] - self.tile_shape[H_DIM])) / float(valid_input_height)) + 1
-        n_cols = math.ceil(float(max(1, image.shape[W_DIM] - self.tile_shape[W_DIM])) / float(valid_input_width)) + 1
+        return outputs, allocate_non_reducer_outputs
+
+    def _run_forward_tile(self, image, input_y, input_x, tile_height, tile_width):
+        tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
+
+        if not self.copy_to_gpu:
+            tile = tile.to(self.device, non_blocking=True)
+
+        if self.should_normalize:
+            tile = self._normalize_on_gpu(tile)
+
+        tile_output = self.stream_module(tile)
+        tile_outputs, _ = self._flatten_output_structure(tile_output)
+        return tile, tile_outputs
+
+    def _stitch_non_reducer_output(self, outputs, idx, trimmed_output, output_loc):
+        src_y0 = 0
+        src_y1 = int(trimmed_output.shape[H_DIM])
+        src_x0 = 0
+        src_x1 = int(trimmed_output.shape[W_DIM])
+
+        dst_y0 = int(output_loc.y)
+        dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
+        dst_x0 = int(output_loc.x)
+        dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+
+        clip_top = max(0, -dst_y0)
+        clip_left = max(0, -dst_x0)
+        clip_bottom = max(0, dst_y1 - outputs[idx].shape[H_DIM])
+        clip_right = max(0, dst_x1 - outputs[idx].shape[W_DIM])
+
+        if clip_top or clip_left or clip_bottom or clip_right:
+            src_y0 += clip_top
+            src_x0 += clip_left
+            src_y1 -= clip_bottom
+            src_x1 -= clip_right
+            dst_y0 += clip_top
+            dst_x0 += clip_left
+            dst_y1 -= clip_bottom
+            dst_x1 -= clip_right
+
+        if dst_y1 <= dst_y0 or dst_x1 <= dst_x0:
+            return
+
+        assert (dst_y1 - dst_y0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM], (
+            f"Y-shape mismatch while stitching output head {idx}: "
+            f"dst=({dst_y0}:{dst_y1}) src_h={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM]}"
+        )
+        assert (dst_x1 - dst_x0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM], (
+            f"X-shape mismatch while stitching output head {idx}: "
+            f"dst=({dst_x0}:{dst_x1}) src_w={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM]}"
+        )
+
+        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
+
+    def _stitch_forward_outputs(self, outputs, tile_outputs, input_y, input_x, sides):
+        for idx, head_output in enumerate(tile_outputs):
+            lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
+            head_stride = self._output_stride_per_output[idx]
+            output_y = input_y // int(head_stride[1])
+            output_x = input_x // int(head_stride[2])
+            output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
+            trimmed_output = head_output[
+                :,
+                :,
+                lost.top : head_output.shape[H_DIM] - lost.bottom,
+                lost.left : head_output.shape[W_DIM] - lost.right,
+            ]
+
+            if idx in self._reducer_head_map:
+                dst_y0 = int(output_loc.y)
+                dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
+                dst_x0 = int(output_loc.x)
+                dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+                self._reducer_head_map[idx].accumulate_stream_tile(
+                    trimmed_output=trimmed_output,
+                    tile_y=int(input_y),
+                    tile_x=int(input_x),
+                    sides=sides,
+                    dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
+                )
+                continue
+
+            self._stitch_non_reducer_output(outputs, idx, trimmed_output, output_loc)
+
+    def _prepare_backward_tile_iter_single_head(self, image, grad_tensors, tile_height, tile_width):
+        grad_lost = self.tile_gradient_lost
+        output_height = self._tile_output_shape[H_DIM]
+        output_width = self._tile_output_shape[W_DIM]
+        valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // int(self.output_stride[1])
+        valid_grad_height *= int(self.output_stride[1])
+        valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // int(self.output_stride[2])
+        valid_grad_width *= int(self.output_stride[2])
+
+        n_rows = math.ceil(float(image.shape[H_DIM] - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
+        n_cols = math.ceil(float(image.shape[W_DIM] - grad_lost.left - grad_lost.right) / float(valid_grad_width))
 
         if image.shape[W_DIM] <= tile_width:
             n_cols = 1
         if image.shape[H_DIM] <= tile_height:
             n_rows = 1
 
+        base_grad = grad_tensors[0]
+        tile_iter = []
+        for row in range(n_rows):
+            for col in range(n_cols):
+                output_y = row * valid_grad_height // int(self.output_stride[1])
+                output_x = col * valid_grad_width // int(self.output_stride[2])
+
+                sides_top = row == 0
+                sides_left = col == 0
+                sides_bottom = output_y + output_height >= base_grad.shape[H_DIM]
+                sides_right = output_x + output_width >= base_grad.shape[W_DIM]
+
+                if sides_bottom:
+                    output_y = max(base_grad.shape[H_DIM] - output_height, 0)
+                if sides_right:
+                    output_x = max(base_grad.shape[W_DIM] - output_width, 0)
+
+                input_y = output_y * int(self.output_stride[1])
+                input_x = output_x * int(self.output_stride[2])
+                tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+
+        return tile_iter
+
+    def _prepare_backward_tile_iter_multi_head(self, image, n_rows, n_cols, valid_input_height, valid_input_width, tile_height, tile_width):
+        return list(
+            self._iter_input_tiles(
+                image=image,
+                n_rows=n_rows,
+                n_cols=n_cols,
+                valid_input_height=valid_input_height,
+                valid_input_width=valid_input_width,
+                tile_height=tile_height,
+                tile_width=tile_width,
+            )
+        )
+
+    def _run_backward_tile(self, image, grad_tensors, input_y, input_x, sides, tile_height, tile_width, output_heights, output_widths):
+        input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
+        tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
+
+        self._saved_tensors = {}
+
+        if not self.copy_to_gpu:
+            tile = tile.to(self.device, non_blocking=True)
+
+        for mod in self.stream_module.modules():
+            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+                mod.input_loc = input_loc
+
+        if self.should_normalize:
+            tile = self._normalize_on_gpu(tile)
+
+        if self.gather_input_gradient:
+            tile.requires_grad = True
+            self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
+
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
+            tile_output = self.stream_module(tile)
+        tile_outputs, _ = self._flatten_output_structure(tile_output)
+
+        del tile
+
+        trimmed_outputs = []
+        trimmed_grads = []
+        for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
+            paired_output, paired_grad = self._build_head_backward_pair(
+                idx=idx,
+                head_output=head_output,
+                head_grad=head_grad,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                output_heights=output_heights,
+                output_widths=output_widths,
+                image=image,
+            )
+            trimmed_outputs.append(paired_output)
+            trimmed_grads.append(paired_grad)
+
+        torch.autograd.backward(trimmed_outputs, trimmed_grads)
+
+        del tile_output
+        del trimmed_grads
+        del trimmed_outputs
+
+    def forward(self, image, result_on_cpu=False):
+        """Perform forward pass with lightstream."""
+        if self.copy_to_gpu:
+            image = image.to(self.device, non_blocking=True)
+
+        tile_height = self.tile_shape[H_DIM]
+        tile_width = self.tile_shape[W_DIM]
+
+        valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
+        output_heights, output_widths = self._compute_full_output_sizes(image)
+        valid_input_height, valid_input_width = self._compute_valid_input_step(valid_output_heights, valid_output_widths)
+        n_rows, n_cols = self._compute_tile_grid(
+            image_height=image.shape[H_DIM],
+            image_width=image.shape[W_DIM],
+            tile_height=tile_height,
+            tile_width=tile_width,
+            valid_input_height=valid_input_height,
+            valid_input_width=valid_input_width,
+        )
+
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
-        # if self.verbose:
-        #    print("Number of tiles in forward:", n_rows * n_cols)
-        # if self.verbose:
-        #    iterator = tqdm(range(n_rows))
-        # else:
-        iterator = range(n_rows)
         self._last_forward_tiles = []
-
         if self.verbose:
             print(
                 f"Forward tiling step: valid_input_height={valid_input_height}, "
                 f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
             )
 
+        result_device = torch.device("cpu") if result_on_cpu else self.device
+        self._reducer_head_map = {}
+        reducers_initialized = False
+        outputs, allocate_non_reducer_outputs = self._prepare_forward_outputs(
+            image=image,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            result_device=result_device,
+        )
+
+        last_sides = None
         with torch.no_grad():
-            for row in iterator:
-                for col in range(n_cols):
-                    # Coordinates of the output w.r.t. the output of full image
-                    tile_y = row * valid_input_height
-                    tile_x = col * valid_input_width
+            for input_y, input_x, sides in self._iter_input_tiles(
+                image=image,
+                n_rows=n_rows,
+                n_cols=n_cols,
+                valid_input_height=valid_input_height,
+                valid_input_width=valid_input_width,
+                tile_height=tile_height,
+                tile_width=tile_width,
+            ):
+                last_sides = sides
+                self._last_forward_tiles.append((input_y, input_x, sides))
+                tile, tile_outputs = self._run_forward_tile(image, input_y, input_x, tile_height, tile_width)
 
-                    # Check if we are at borders, since we can not create
-                    # overlap here and should not crop values.
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
+                self._resolve_reducer_head_map(tile_outputs)
+                allocate_non_reducer_outputs()
 
-                    sides_bottom = True if tile_y + self.tile_shape[H_DIM] >= image.shape[H_DIM] else False
-                    sides_right = True if tile_x + self.tile_shape[W_DIM] >= image.shape[W_DIM] else False
-                    sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
-
-                    # Since we need to stay at multiples of output stride we
-                    # need to keep that into account when we are at the bottom
-                    # and right side of the output.
-                    if sides_bottom:
-                        tile_y = max(image.shape[H_DIM] - self.tile_shape[H_DIM], 0)
-                    if sides_right:
-                        tile_x = max(image.shape[W_DIM] - self.tile_shape[W_DIM], 0)
-
-                    tile_y = tile_y if not sides.top else 0
-                    tile_x = tile_x if not sides.left else 0
-                    self._last_forward_tiles.append((int(tile_y), int(tile_x), sides))
-
-                    # Extract tile and perform forward pass
-                    tile = image[:, :, tile_y : tile_y + tile_height, tile_x : tile_x + tile_width]
-
-                    # normalize on gpu for speed in dataloader
-                    # does this reduce speed significantly?
-                    if not self.copy_to_gpu:
-                        tile = tile.to(self.device, non_blocking=True)
-
-                    if self.should_normalize:
-                        tile = self._normalize_on_gpu(tile)
-
-                    tile_output = self.stream_module(tile)
-                    tile_outputs, _ = self._flatten_output_structure(tile_output)
-                    self._resolve_reducer_head_map(tile_outputs)
-                    _allocate_non_reducer_outputs()
-
-                    if self._reducer_head_map and not reducers_initialized:
-                        for head_idx, reducer in self._reducer_head_map.items():
-                            reducer.start_stream(
-                                output_height=output_heights[head_idx],
-                                output_width=output_widths[head_idx],
-                                batch_size=image.shape[B_DIM],
-                                channels=self._tile_output_shapes[head_idx][C_DIM],
-                                device=self.device,
-                                dtype=self.dtype,
-                                debug_replay=self.debug_reducer_replay,
-                            )
-                        reducers_initialized = True
-
-
-                    if torch.backends.cudnn.benchmark:
-                        torch.cuda.empty_cache()
-
-                    for idx, head_output in enumerate(tile_outputs):
-                        lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-                        head_stride = self._output_stride_per_output[idx]
-                        output_y = tile_y // int(head_stride[1])
-                        output_x = tile_x // int(head_stride[2])
-                        output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
-                        trimmed_output = head_output[
-                            :,
-                            :,
-                            lost.top : head_output.shape[H_DIM] - lost.bottom,
-                            lost.left : head_output.shape[W_DIM] - lost.right,
-                        ]
-
-                        if idx in self._reducer_head_map:
-                            dst_y0 = int(output_loc.y)
-                            dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
-                            dst_x0 = int(output_loc.x)
-                            dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
-
-                            self._reducer_head_map[idx].accumulate_stream_tile(
-                                trimmed_output=trimmed_output,
-                                tile_y=int(tile_y),
-                                tile_x=int(tile_x),
-                                sides=sides,
-                                dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
-                            )
-                            continue
-
-                        src_y0 = 0
-                        src_y1 = int(trimmed_output.shape[H_DIM])
-                        src_x0 = 0
-                        src_x1 = int(trimmed_output.shape[W_DIM])
-
-                        dst_y0 = int(output_loc.y)
-                        dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
-                        dst_x0 = int(output_loc.x)
-                        dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
-
-                        # Clip to output bounds (safety near borders)
-                        clip_top = max(0, -dst_y0)
-                        clip_left = max(0, -dst_x0)
-                        clip_bottom = max(0, dst_y1 - outputs[idx].shape[H_DIM])
-                        clip_right = max(0, dst_x1 - outputs[idx].shape[W_DIM])
-
-                        if clip_top or clip_left or clip_bottom or clip_right:
-                            src_y0 += clip_top
-                            src_x0 += clip_left
-                            src_y1 -= clip_bottom
-                            src_x1 -= clip_right
-                            dst_y0 += clip_top
-                            dst_x0 += clip_left
-                            dst_y1 -= clip_bottom
-                            dst_x1 -= clip_right
-
-                        if dst_y1 <= dst_y0 or dst_x1 <= dst_x0:
-                            continue
-
-                        assert (dst_y1 - dst_y0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM], (
-                            f"Y-shape mismatch while stitching output head {idx}: "
-                            f"dst=({dst_y0}:{dst_y1}) src_h={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[H_DIM]}"
+                if self._reducer_head_map and not reducers_initialized:
+                    for head_idx, reducer in self._reducer_head_map.items():
+                        reducer.start_stream(
+                            output_height=output_heights[head_idx],
+                            output_width=output_widths[head_idx],
+                            batch_size=image.shape[B_DIM],
+                            channels=self._tile_output_shapes[head_idx][C_DIM],
+                            device=self.device,
+                            dtype=self.dtype,
+                            debug_replay=self.debug_reducer_replay,
                         )
-                        assert (dst_x1 - dst_x0) == trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM], (
-                            f"X-shape mismatch while stitching output head {idx}: "
-                            f"dst=({dst_x0}:{dst_x1}) src_w={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM]}"
-                        )
+                    reducers_initialized = True
 
-                        # Overlapping regions are intentionally overwritten by later tiles
-                        # (right/bottom preference), which is more robust for border tiles.
-                        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[
-                            :, :, src_y0:src_y1, src_x0:src_x1
-                        ]
+                if torch.backends.cudnn.benchmark:
+                    torch.cuda.empty_cache()
 
-                    del tile
+                self._stitch_forward_outputs(outputs, tile_outputs, input_y, input_x, sides)
+                del tile
 
-            assert sides_bottom and sides_right, "It seems like we could not reconstruct all output"  # type:ignore
+        assert last_sides is not None and last_sides.bottom and last_sides.right, (
+            "It seems like we could not reconstruct all output"
+        )
 
-        # mem management
         del image
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
-            outputs[idx] = reducer.finish_stream().to(device)
+            outputs[idx] = reducer.finish_stream().to(result_device)
+
         for idx, output in enumerate(outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
+
         output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
         assert final_idx == len(outputs)
         return output
 
     def backward(self, image, grad):
-        """Perform backward pass with lightstream.
-
-        Parameters:
-            image (torch.Tensor): the image (expects NCHW) that was used in the forward pass
-            grad (torch.Tensor): this should be the gradient of the output of
-                the stream_layers.
-        """
-        # The input image is likely quite small in terms of channels, for
-        # performance reasons it is beneficial to copy to the GPU as a whole
-        # instead of tile-by-tile.
+        """Perform backward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
-
-
-        height = image.shape[H_DIM]
-        width = image.shape[W_DIM]
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
 
-        valid_output_heights = [
-            self._tile_output_shapes[idx][H_DIM] - self._tile_output_lost[idx].top - self._tile_output_lost[idx].bottom
-            for idx in range(len(self._tile_output_shapes))
-        ]
-        valid_output_widths = [
-            self._tile_output_shapes[idx][W_DIM] - self._tile_output_lost[idx].left - self._tile_output_lost[idx].right
-            for idx in range(len(self._tile_output_shapes))
-        ]
-
-        output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-        output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-
-        if len(self._tile_output_shapes) > 1:
-            valid_input_height, valid_input_width = self._compute_multi_output_input_step(
-                valid_output_heights,
-                valid_output_widths,
-                include_grad_safe=True,
-            )
-        else:
-            valid_input_height = max(
-                1,
-                valid_output_heights[0] * int(self._output_stride_per_output[0][1]),
-            )
-            valid_input_width = max(
-                1,
-                valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
-            )
-
-        n_rows = math.ceil(float(max(1, height - tile_height)) / float(valid_input_height)) + 1
-        n_cols = math.ceil(float(max(1, width - tile_width)) / float(valid_input_width)) + 1
-
-        # if self.verbose:
-        #    ideal_tile_size = height / float(n_rows) + grad_lost.top + grad_lost.bottom
-        #    next_ideal_tile_size = height / float(n_rows - 1) + grad_lost.top + grad_lost.bottom
-        #    print(ideal_tile_size, n_rows * n_cols, next_ideal_tile_size)
-
-        if image.shape[W_DIM] <= tile_width:
-            n_cols = 1
-        if image.shape[H_DIM] <= tile_height:
-            n_rows = 1
-
-        # if self.verbose:
-        #    print("Number of tiles in backprop:", n_rows, n_cols, n_rows * n_cols)
-        # if self.verbose:
-        #    iterator = tqdm(range(n_rows))
-        # else:
-        iterator = range(n_rows)
+        valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
+        output_heights, output_widths = self._compute_full_output_sizes(image)
+        valid_input_height, valid_input_width = self._compute_valid_input_step(valid_output_heights, valid_output_widths)
+        n_rows, n_cols = self._compute_tile_grid(
+            image_height=image.shape[H_DIM],
+            image_width=image.shape[W_DIM],
+            tile_height=tile_height,
+            tile_width=tile_width,
+            valid_input_height=valid_input_height,
+            valid_input_width=valid_input_width,
+        )
 
         grad_tensors, grad_spec = self._flatten_output_structure(grad)
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
         if len(self._tile_output_shapes) == 1:
-            grad_lost = self.tile_gradient_lost
-            output_height = self._tile_output_shape[H_DIM]
-            output_width = self._tile_output_shape[W_DIM]
-            valid_grad_height = (tile_height - grad_lost.top - grad_lost.bottom) // int(self.output_stride[1])
-            valid_grad_height *= int(self.output_stride[1])
-            valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // int(self.output_stride[2])
-            valid_grad_width *= int(self.output_stride[2])
-
-            n_rows = math.ceil(float(height - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
-            n_cols = math.ceil(float(width - grad_lost.left - grad_lost.right) / float(valid_grad_width))
-
-            if image.shape[W_DIM] <= tile_width:
-                n_cols = 1
-            if image.shape[H_DIM] <= tile_height:
-                n_rows = 1
-
-            base_grad = grad_tensors[0]
-            tile_iter = []
-            for row in range(n_rows):
-                for col in range(n_cols):
-                    output_y = row * valid_grad_height // int(self.output_stride[1])
-                    output_x = col * valid_grad_width // int(self.output_stride[2])
-
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
-                    sides_bottom = True if output_y + output_height >= base_grad.shape[H_DIM] else False
-                    sides_right = True if output_x + output_width >= base_grad.shape[W_DIM] else False
-
-                    if sides_bottom:
-                        output_y = max(base_grad.shape[H_DIM] - output_height, 0)
-                    if sides_right:
-                        output_x = max(base_grad.shape[W_DIM] - output_width, 0)
-
-                    input_y = output_y * int(self.output_stride[1])
-                    input_x = output_x * int(self.output_stride[2])
-                    tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+            tile_iter = self._prepare_backward_tile_iter_single_head(image, grad_tensors, tile_height, tile_width)
         else:
-            tile_iter = []
-            for row in iterator:
-                for col in range(n_cols):
-                    tile_y = row * valid_input_height
-                    tile_x = col * valid_input_width
-                    sides_top = True if row == 0 else False
-                    sides_left = True if col == 0 else False
-                    sides_bottom = True if tile_y + tile_height >= image.shape[H_DIM] else False
-                    sides_right = True if tile_x + tile_width >= image.shape[W_DIM] else False
-                    if sides_bottom:
-                        tile_y = max(image.shape[H_DIM] - tile_height, 0)
-                    if sides_right:
-                        tile_x = max(image.shape[W_DIM] - tile_width, 0)
-                    tile_y = tile_y if not sides_top else 0
-                    tile_x = tile_x if not sides_left else 0
-                    tile_iter.append((int(tile_y), int(tile_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+            tile_iter = self._prepare_backward_tile_iter_multi_head(
+                image=image,
+                n_rows=n_rows,
+                n_cols=n_cols,
+                valid_input_height=valid_input_height,
+                valid_input_width=valid_input_width,
+                tile_height=tile_height,
+                tile_width=tile_width,
+            )
 
         if self.debug_reducer_replay:
             for reducer in self._reducer_head_map.values():
@@ -846,64 +877,23 @@ class StreamingCNN(torch.nn.Module):
 
         last_sides = None
         for input_y, input_x, sides in tile_iter:
-                last_sides = sides
-                input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
-
-                tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
-
-                self._saved_tensors = {}
-
-                if not self.copy_to_gpu:
-                    tile = tile.to(self.device, non_blocking=True)
-
-                for mod in self.stream_module.modules():
-                    if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
-                        mod.input_loc = input_loc
-
-                # normalize on gpu for speed in dataloader
-                # does this reduce speed significantly?
-                if self.should_normalize:
-                    tile = self._normalize_on_gpu(tile)
-
-                if self.gather_input_gradient:
-                    tile.requires_grad = True
-                    self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
-
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
-                    tile_output = self.stream_module(tile)
-                tile_outputs, _ = self._flatten_output_structure(tile_output)
-
-                del tile  # memory management
-
-                trimmed_outputs = []
-                trimmed_grads = []
-                for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
-                    paired_output, paired_grad = self._build_head_backward_pair(
-                        idx=idx,
-                        head_output=head_output,
-                        head_grad=head_grad,
-                        input_y=input_y,
-                        input_x=input_x,
-                        sides=sides,
-                        output_heights=output_heights,
-                        output_widths=output_widths,
-                        image=image,
-                    )
-                    trimmed_outputs.append(paired_output)
-                    trimmed_grads.append(paired_grad)
-
-                torch.autograd.backward(trimmed_outputs, trimmed_grads)
-
-                # Memory management
-                del tile_output
-                del trimmed_grads
-                del trimmed_outputs
+            last_sides = sides
+            self._run_backward_tile(
+                image=image,
+                grad_tensors=grad_tensors,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                tile_height=tile_height,
+                tile_width=tile_width,
+                output_heights=output_heights,
+                output_widths=output_widths,
+            )
 
         if self.debug_reducer_replay:
             for idx, reducer in self._reducer_head_map.items():
                 reducer.validate_backward_replay_consumed(head_idx=idx)
 
-        # Memory management
         self._saved_tensors = {}
 
         for mod in self.stream_module.modules():
