@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.modules.reducer import Reducer
@@ -82,3 +83,66 @@ def test_scnn_forward_mixed_reducer_non_reducer_heads_parity():
     assert streamed["reduced"].shape == expected["reduced"].shape
     assert torch.allclose(streamed["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(streamed["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_forward_border_tiles_parity_small_image_large_tile():
+    torch.manual_seed(3)
+    model = MixedHeadsNet().eval()
+    image = torch.randn(1, 3, 3, 4)
+
+    with torch.no_grad():
+        expected = model(image)
+
+    scnn = _make_streaming(model, tile_size=8)
+    with torch.no_grad():
+        streamed = scnn.forward(image)
+
+    assert torch.allclose(streamed["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
+    assert torch.allclose(streamed["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_backward_reducer_replay_consumed_debug_mode():
+    torch.manual_seed(23)
+    model = AllReducerHeadsNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+
+    scnn = _make_streaming(model, tile_size=4)
+    scnn.debug_reducer_replay = True
+
+    with torch.no_grad():
+        streamed_output = scnn.forward(image)
+
+    grad = tuple(torch.ones_like(head) for head in streamed_output)
+    # no exception means replay assignments were consumed and validated
+    scnn.backward(image, grad)
+
+
+def test_scnn_backward_structure_mismatch_error():
+    torch.manual_seed(29)
+    model = MixedHeadsNet().eval()
+    image = torch.randn(1, 3, 6, 7)
+
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        streamed = scnn.forward(image)
+
+    wrong_grad = (torch.ones_like(streamed["raw"]), torch.ones_like(streamed["reduced"]))
+    with pytest.raises(ValueError, match="Gradient output structure does not match"):
+        scnn.backward(image, wrong_grad)
+
+
+def test_scnn_backward_reducer_head_gradient_shape_mismatch_error():
+    torch.manual_seed(31)
+    model = MixedHeadsNet().eval()
+    image = torch.randn(1, 3, 8, 9)
+
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        streamed = scnn.forward(image)
+
+    wrong_grad = {
+        "raw": torch.ones_like(streamed["raw"]),
+        "reduced": torch.ones((streamed["reduced"].shape[0], streamed["reduced"].shape[1], 2, 1)),
+    }
+    with pytest.raises(ValueError, match="Reducer-backed head expects gradient"):
+        scnn.backward(image, wrong_grad)

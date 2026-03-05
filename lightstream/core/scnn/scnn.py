@@ -39,6 +39,18 @@ class StreamingCNN(torch.nn.Module):
     lightstream you can disable StreamingCNN with the disable() function.
     Subsequently, enable() enables it again. Streaming gets enabled by default
     after initialization.
+
+    Pipeline overview:
+      1. Collect per-layer forward/backward tile statistics during configuration.
+      2. Convert supported layers to streaming variants and run tiled forward.
+      3. Stitch non-reducer heads directly while reducer heads accumulate stream state.
+      4. Replay the same tile traversal for backward and build per-head backward pairs.
+
+    Invariants:
+      - Flattened output structure from backward gradients must match forward output spec.
+      - Reducer replay (when debug enabled) must consume exactly the recorded forward
+        assignments in identical order.
+      - Every output head must be populated after forward stream completion.
     """
 
     def __init__(
@@ -404,6 +416,8 @@ class StreamingCNN(torch.nn.Module):
         return mod
 
     def _resolve_reducer_head_map(self, flat_outputs):
+        # Invariant: reducer-head resolution happens once per forward stream and remains stable
+        # for the paired backward replay traversal.
         if self._reducer_head_map or not self._streaming_reducers:
             return
 
@@ -608,35 +622,94 @@ class StreamingCNN(torch.nn.Module):
 
         outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
-    def _stitch_forward_outputs(self, outputs, tile_outputs, input_y, input_x, sides):
-        for idx, head_output in enumerate(tile_outputs):
-            lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-            head_stride = self._output_stride_per_output[idx]
-            output_y = input_y // int(head_stride[1])
-            output_x = input_x // int(head_stride[2])
-            output_loc = Box(output_y + lost.top, -1, output_x + lost.left, -1, sides)
-            trimmed_output = head_output[
-                :,
-                :,
-                lost.top : head_output.shape[H_DIM] - lost.bottom,
-                lost.left : head_output.shape[W_DIM] - lost.right,
-            ]
+    def _build_head_output_window(self, head_idx, tile_input_y, tile_input_x, sides, output_heights, output_widths, head_grad):
+        head_stride = self._output_stride_per_output[head_idx]
+        head_tile_height = self._tile_output_shapes[head_idx][H_DIM]
+        head_tile_width = self._tile_output_shapes[head_idx][W_DIM]
+        is_reducer_head = head_idx in self._reducer_head_map
 
-            if idx in self._reducer_head_map:
-                dst_y0 = int(output_loc.y)
-                dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
-                dst_x0 = int(output_loc.x)
-                dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
-                self._reducer_head_map[idx].accumulate_stream_tile(
+        head_output_y = tile_input_y // int(head_stride[1])
+        head_output_x = tile_input_x // int(head_stride[2])
+
+        if sides.bottom:
+            if is_reducer_head:
+                head_output_y = max(output_heights[head_idx] - head_tile_height, 0)
+            else:
+                head_output_y = max(head_grad.shape[H_DIM] - head_tile_height, 0)
+        if sides.right:
+            if is_reducer_head:
+                head_output_x = max(output_widths[head_idx] - head_tile_width, 0)
+            else:
+                head_output_x = max(head_grad.shape[W_DIM] - head_tile_width, 0)
+
+        return int(head_output_y), int(head_output_x), bool(is_reducer_head)
+
+    def _slice_non_reducer_gradient(self, head_grad, head_output_y, head_output_x, head_tile_height, head_tile_width):
+        return head_grad[
+            :,
+            :,
+            head_output_y : head_output_y + head_tile_height,
+            head_output_x : head_output_x + head_tile_width,
+        ]
+
+    def _build_reducer_gradient(self, head_grad):
+        gradient = head_grad.to(self.device, non_blocking=True)
+        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+            raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
+        return gradient
+
+    def _trim_head_output(self, head_output, head_lost):
+        return head_output[
+            :,
+            :,
+            head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
+            head_lost.left : head_output.shape[W_DIM] - head_lost.right,
+        ]
+
+    def _build_stitched_tile_output(self, head_idx, head_output, tile_input_y, tile_input_x, sides):
+        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[head_idx])
+        head_stride = self._output_stride_per_output[head_idx]
+        head_output_y = tile_input_y // int(head_stride[1])
+        head_output_x = tile_input_x // int(head_stride[2])
+        output_loc = Box(head_output_y + head_lost.top, -1, head_output_x + head_lost.left, -1, sides)
+        trimmed_output = self._trim_head_output(head_output, head_lost)
+        return head_lost, output_loc, trimmed_output
+
+    def _accumulate_reducer_forward_tile(self, head_idx, trimmed_output, output_loc, tile_input_y, tile_input_x, sides):
+        dst_y0 = int(output_loc.y)
+        dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
+        dst_x0 = int(output_loc.x)
+        dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+        self._reducer_head_map[head_idx].accumulate_stream_tile(
+            trimmed_output=trimmed_output,
+            tile_y=int(tile_input_y),
+            tile_x=int(tile_input_x),
+            sides=sides,
+            dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
+        )
+
+    def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides):
+        for head_idx, head_output in enumerate(tile_outputs):
+            _, output_loc, trimmed_output = self._build_stitched_tile_output(
+                head_idx=head_idx,
+                head_output=head_output,
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
+                sides=sides,
+            )
+
+            if head_idx in self._reducer_head_map:
+                self._accumulate_reducer_forward_tile(
+                    head_idx=head_idx,
                     trimmed_output=trimmed_output,
-                    tile_y=int(input_y),
-                    tile_x=int(input_x),
+                    output_loc=output_loc,
+                    tile_input_y=tile_input_y,
+                    tile_input_x=tile_input_x,
                     sides=sides,
-                    dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
                 )
                 continue
 
-            self._stitch_non_reducer_output(outputs, idx, trimmed_output, output_loc)
+            self._stitch_non_reducer_output(outputs, head_idx, trimmed_output, output_loc)
 
     def _prepare_backward_tile_iter_single_head(self, image, grad_tensors, tile_height, tile_width):
         grad_lost = self.tile_gradient_lost
@@ -711,7 +784,11 @@ class StreamingCNN(torch.nn.Module):
             tile.requires_grad = True
             self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
+        use_cuda_autocast = self.device.type == "cuda" and torch.cuda.is_available()
+        if use_cuda_autocast:
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                tile_output = self.stream_module(tile)
+        else:
             tile_output = self.stream_module(tile)
         tile_outputs, _ = self._flatten_output_structure(tile_output)
 
@@ -721,11 +798,11 @@ class StreamingCNN(torch.nn.Module):
         trimmed_grads = []
         for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
             paired_output, paired_grad = self._build_head_backward_pair(
-                idx=idx,
+                head_idx=idx,
                 head_output=head_output,
                 head_grad=head_grad,
-                input_y=input_y,
-                input_x=input_x,
+                tile_input_y=input_y,
+                tile_input_x=input_x,
                 sides=sides,
                 output_heights=output_heights,
                 output_widths=output_widths,
@@ -907,63 +984,50 @@ class StreamingCNN(torch.nn.Module):
 
     def _build_head_backward_pair(
         self,
-        idx,
+        head_idx,
         head_output,
         head_grad,
-        input_y,
-        input_x,
+        tile_input_y,
+        tile_input_x,
         sides,
         output_heights,
         output_widths,
         image,
     ):
-        is_reducer_head = idx in self._reducer_head_map
-        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[idx])
-        head_output_height = self._tile_output_shapes[idx][H_DIM]
-        head_output_width = self._tile_output_shapes[idx][W_DIM]
-
-        head_stride = self._output_stride_per_output[idx]
-        head_output_y = input_y // int(head_stride[1])
-        head_output_x = input_x // int(head_stride[2])
-
-        if sides.bottom:
-            if is_reducer_head:
-                head_output_y = max(output_heights[idx] - head_output_height, 0)
-            else:
-                head_output_y = max(head_grad.shape[H_DIM] - head_output_height, 0)
-        if sides.right:
-            if is_reducer_head:
-                head_output_x = max(output_widths[idx] - head_output_width, 0)
-            else:
-                head_output_x = max(head_grad.shape[W_DIM] - head_output_width, 0)
+        head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[head_idx])
+        head_tile_height = self._tile_output_shapes[head_idx][H_DIM]
+        head_tile_width = self._tile_output_shapes[head_idx][W_DIM]
+        head_output_y, head_output_x, is_reducer_head = self._build_head_output_window(
+            head_idx=head_idx,
+            tile_input_y=tile_input_y,
+            tile_input_x=tile_input_x,
+            sides=sides,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            head_grad=head_grad,
+        )
 
         if is_reducer_head:
-            gradient = head_grad.to(self.device, non_blocking=True)
-            if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
-                raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
+            gradient = self._build_reducer_gradient(head_grad)
         else:
-            gradient = head_grad[
-                :,
-                :,
-                head_output_y : head_output_y + head_output_height,
-                head_output_x : head_output_x + head_output_width,
-            ]
+            gradient = self._slice_non_reducer_gradient(
+                head_grad=head_grad,
+                head_output_y=head_output_y,
+                head_output_x=head_output_x,
+                head_tile_height=head_tile_height,
+                head_tile_width=head_tile_width,
+            )
 
-        trimmed_output = head_output[
-            :,
-            :,
-            head_lost.top : head_output.shape[H_DIM] - head_lost.bottom,
-            head_lost.left : head_output.shape[W_DIM] - head_lost.right,
-        ]
+        trimmed_output = self._trim_head_output(head_output, head_lost)
         trimmed_output = trimmed_output.to(self.device, non_blocking=True)
 
         if is_reducer_head:
             return self._build_reducer_backward_pair(
-                idx=idx,
+                head_idx=head_idx,
                 trimmed_output=trimmed_output,
                 gradient=gradient,
-                input_y=input_y,
-                input_x=input_x,
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
                 sides=sides,
             )
 
@@ -990,20 +1054,20 @@ class StreamingCNN(torch.nn.Module):
 
     def _build_reducer_backward_pair(
         self,
-        idx,
+        head_idx,
         trimmed_output,
         gradient,
-        input_y,
-        input_x,
+        tile_input_y,
+        tile_input_x,
         sides,
     ):
-        reducer = self._reducer_head_map[idx]
+        reducer = self._reducer_head_map[head_idx]
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
             trimmed_output,
             gradient,
-            input_y=int(input_y),
-            input_x=int(input_x),
+            input_y=int(tile_input_y),
+            input_x=int(tile_input_x),
             sides=sides,
         )
 
