@@ -146,3 +146,18 @@ def test_scnn_backward_reducer_head_gradient_shape_mismatch_error():
     }
     with pytest.raises(ValueError, match="Reducer-backed head expects gradient"):
         scnn.backward(image, wrong_grad)
+
+
+def test_scnn_backward_requires_forward_for_reducer_heads():
+    torch.manual_seed(41)
+    model = AllReducerHeadsNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+
+    scnn = _make_streaming(model, tile_size=4)
+
+    with torch.no_grad():
+        expected_output = model(image)
+
+    grad = tuple(torch.ones_like(head) for head in expected_output)
+    with pytest.raises(RuntimeError, match="requires prior streaming forward pass"):
+        scnn.backward(image, grad)

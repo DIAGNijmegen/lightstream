@@ -4,6 +4,7 @@ MIT License
 """
 import math
 import copy
+from dataclasses import dataclass
 from typing import List
 
 import numpy as np
@@ -19,6 +20,29 @@ from lightstream.modules.reducer import Reducer, StreamingReducer
 
 
 _triple = _ntuple(3)
+
+@dataclass(frozen=True)
+class ForwardContext:
+    image: torch.Tensor
+    tile_height: int
+    tile_width: int
+    output_heights: list
+    output_widths: list
+    valid_input_height: int
+    valid_input_width: int
+    n_rows: int
+    n_cols: int
+    result_device: torch.device
+
+
+@dataclass(frozen=True)
+class BackwardContext:
+    image: torch.Tensor
+    grad_tensors: list
+    tile_height: int
+    tile_width: int
+    output_heights: list
+    output_widths: list
 
 
 class StreamingCNN(torch.nn.Module):
@@ -415,6 +439,27 @@ class StreamingCNN(torch.nn.Module):
         del module
         return mod
 
+
+    def _validate_reducer_head_map_resolved(self):
+        if not self._streaming_reducers:
+            return
+
+        resolved_reducers = set(self._reducer_head_map.values())
+        unresolved = [reducer for reducer in self._streaming_reducers if reducer not in resolved_reducers]
+        if unresolved:
+            raise RuntimeError(
+                "Reducer head mapping incomplete after forward tile sampling: "
+                f"resolved={len(resolved_reducers)}, expected={len(self._streaming_reducers)}"
+            )
+
+    def _validate_reducer_lifecycle_for_backward(self):
+        if not self._streaming_reducers:
+            return
+        if not self._reducer_head_map:
+            raise RuntimeError(
+                "Reducer backward replay requires prior streaming forward pass to resolve reducer heads."
+            )
+
     def _resolve_reducer_head_map(self, flat_outputs):
         # Invariant: reducer-head resolution happens once per forward stream and remains stable
         # for the paired backward replay traversal.
@@ -764,9 +809,9 @@ class StreamingCNN(torch.nn.Module):
             )
         )
 
-    def _run_backward_tile(self, image, grad_tensors, input_y, input_x, sides, tile_height, tile_width, output_heights, output_widths):
-        input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
-        tile = image[:, :, input_y : input_y + tile_height, input_x : input_x + tile_width]
+    def _run_backward_tile(self, backward_ctx, input_y, input_x, sides):
+        input_loc = Box(input_y, backward_ctx.tile_height, input_x, backward_ctx.tile_width, sides)
+        tile = backward_ctx.image[:, :, input_y : input_y + backward_ctx.tile_height, input_x : input_x + backward_ctx.tile_width]
 
         self._saved_tensors = {}
 
@@ -796,7 +841,7 @@ class StreamingCNN(torch.nn.Module):
 
         trimmed_outputs = []
         trimmed_grads = []
-        for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, grad_tensors)):
+        for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, backward_ctx.grad_tensors)):
             paired_output, paired_grad = self._build_head_backward_pair(
                 head_idx=idx,
                 head_output=head_output,
@@ -804,9 +849,7 @@ class StreamingCNN(torch.nn.Module):
                 tile_input_y=input_y,
                 tile_input_x=input_x,
                 sides=sides,
-                output_heights=output_heights,
-                output_widths=output_widths,
-                image=image,
+                backward_ctx=backward_ctx,
             )
             trimmed_outputs.append(paired_output)
             trimmed_grads.append(paired_grad)
@@ -848,29 +891,41 @@ class StreamingCNN(torch.nn.Module):
             )
 
         result_device = torch.device("cpu") if result_on_cpu else self.device
+        forward_ctx = ForwardContext(
+            image=image,
+            tile_height=tile_height,
+            tile_width=tile_width,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            valid_input_height=valid_input_height,
+            valid_input_width=valid_input_width,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            result_device=result_device,
+        )
         self._reducer_head_map = {}
         reducers_initialized = False
         outputs, allocate_non_reducer_outputs = self._prepare_forward_outputs(
-            image=image,
-            output_heights=output_heights,
-            output_widths=output_widths,
-            result_device=result_device,
+            image=forward_ctx.image,
+            output_heights=forward_ctx.output_heights,
+            output_widths=forward_ctx.output_widths,
+            result_device=forward_ctx.result_device,
         )
 
         last_sides = None
         with torch.no_grad():
             for input_y, input_x, sides in self._iter_input_tiles(
-                image=image,
-                n_rows=n_rows,
-                n_cols=n_cols,
-                valid_input_height=valid_input_height,
-                valid_input_width=valid_input_width,
-                tile_height=tile_height,
-                tile_width=tile_width,
+                image=forward_ctx.image,
+                n_rows=forward_ctx.n_rows,
+                n_cols=forward_ctx.n_cols,
+                valid_input_height=forward_ctx.valid_input_height,
+                valid_input_width=forward_ctx.valid_input_width,
+                tile_height=forward_ctx.tile_height,
+                tile_width=forward_ctx.tile_width,
             ):
                 last_sides = sides
                 self._last_forward_tiles.append((input_y, input_x, sides))
-                tile, tile_outputs = self._run_forward_tile(image, input_y, input_x, tile_height, tile_width)
+                tile, tile_outputs = self._run_forward_tile(forward_ctx.image, input_y, input_x, forward_ctx.tile_height, forward_ctx.tile_width)
 
                 self._resolve_reducer_head_map(tile_outputs)
                 allocate_non_reducer_outputs()
@@ -878,9 +933,9 @@ class StreamingCNN(torch.nn.Module):
                 if self._reducer_head_map and not reducers_initialized:
                     for head_idx, reducer in self._reducer_head_map.items():
                         reducer.start_stream(
-                            output_height=output_heights[head_idx],
-                            output_width=output_widths[head_idx],
-                            batch_size=image.shape[B_DIM],
+                            output_height=forward_ctx.output_heights[head_idx],
+                            output_width=forward_ctx.output_widths[head_idx],
+                            batch_size=forward_ctx.image.shape[B_DIM],
                             channels=self._tile_output_shapes[head_idx][C_DIM],
                             device=self.device,
                             dtype=self.dtype,
@@ -897,6 +952,8 @@ class StreamingCNN(torch.nn.Module):
         assert last_sides is not None and last_sides.bottom and last_sides.right, (
             "It seems like we could not reconstruct all output"
         )
+
+        self._validate_reducer_head_map_resolved()
 
         del image
         self._saved_tensors = {}
@@ -948,6 +1005,17 @@ class StreamingCNN(torch.nn.Module):
                 tile_width=tile_width,
             )
 
+        self._validate_reducer_lifecycle_for_backward()
+
+        backward_ctx = BackwardContext(
+            image=image,
+            grad_tensors=grad_tensors,
+            tile_height=tile_height,
+            tile_width=tile_width,
+            output_heights=output_heights,
+            output_widths=output_widths,
+        )
+
         if self.debug_reducer_replay:
             for reducer in self._reducer_head_map.values():
                 reducer.start_backward_replay()
@@ -956,15 +1024,10 @@ class StreamingCNN(torch.nn.Module):
         for input_y, input_x, sides in tile_iter:
             last_sides = sides
             self._run_backward_tile(
-                image=image,
-                grad_tensors=grad_tensors,
+                backward_ctx=backward_ctx,
                 input_y=input_y,
                 input_x=input_x,
                 sides=sides,
-                tile_height=tile_height,
-                tile_width=tile_width,
-                output_heights=output_heights,
-                output_widths=output_widths,
             )
 
         if self.debug_reducer_replay:
@@ -990,9 +1053,7 @@ class StreamingCNN(torch.nn.Module):
         tile_input_y,
         tile_input_x,
         sides,
-        output_heights,
-        output_widths,
-        image,
+        backward_ctx,
     ):
         head_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[head_idx])
         head_tile_height = self._tile_output_shapes[head_idx][H_DIM]
@@ -1002,8 +1063,8 @@ class StreamingCNN(torch.nn.Module):
             tile_input_y=tile_input_y,
             tile_input_x=tile_input_x,
             sides=sides,
-            output_heights=output_heights,
-            output_widths=output_widths,
+            output_heights=backward_ctx.output_heights,
+            output_widths=backward_ctx.output_widths,
             head_grad=head_grad,
         )
 
@@ -1035,7 +1096,7 @@ class StreamingCNN(torch.nn.Module):
             trimmed_output=trimmed_output,
             gradient=gradient,
             head_lost=head_lost,
-            image=image,
+            image=backward_ctx.image,
         )
 
     def _build_non_reducer_backward_pair(self, trimmed_output, gradient, head_lost, image):
