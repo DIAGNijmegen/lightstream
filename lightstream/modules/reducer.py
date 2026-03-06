@@ -117,9 +117,16 @@ class StreamingReducer(nn.Module):
     def to_reducer(self) -> Reducer:
         return Reducer(mode=self.mode)
 
-    def reset_stream_state(self, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype):
+    def reset_stream_state(
+        self,
+        batch_size: int,
+        channels: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        accumulator_dtype: torch.dtype = torch.float32,
+    ):
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
-        self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=dtype)
+        self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
 
     def start_stream(
         self,
@@ -206,14 +213,17 @@ class StreamingReducer(nn.Module):
             n_pixels = int(valid_mask.sum().item())
 
         if self.mode == "mean":
-            self.running_count = self.running_count + n_pixels
+            pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
+            self.running_count = self.running_count + pixel_increment
 
     def finalize_stream(self) -> torch.Tensor:
         if self.running_sum.numel() == 0:
             raise RuntimeError("StreamingReducer state is empty, accumulate_tile() was not called.")
         if self.mode == "sum":
             return self.running_sum
-        denom = self.running_count.clamp_min(1)
+        denom = self.running_count.to(dtype=torch.float32).clamp_min(1)
+        if denom.dtype != self.running_sum.dtype:
+            denom = denom.to(dtype=self.running_sum.dtype)
         return self.running_sum / denom
 
     def reduce_tile(

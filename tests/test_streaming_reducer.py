@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.modules.reducer import Reducer
+from lightstream.modules.reducer import Reducer, StreamingReducer
 
 
 class MixedReducerNet(nn.Module):
@@ -136,3 +136,17 @@ def test_streaming_reducer_backward_parity_tiny_odd_image():
     for name, ref_grad in ref_grads.items():
         assert name in stream_grads
         assert torch.allclose(stream_grads[name], ref_grad, atol=1e-5, rtol=1e-4), name
+
+
+def test_streaming_reducer_running_count_uses_fp32_accumulator():
+    reducer = StreamingReducer(mode="mean")
+    tile = torch.ones((1, 2, 2, 3), dtype=torch.float16)
+
+    reducer.accumulate_tile(tile)
+
+    assert reducer.running_sum.dtype == torch.float16
+    assert reducer.running_count.dtype == torch.float32
+
+    output = reducer.finalize_stream()
+    assert output.dtype == tile.dtype
+    assert torch.allclose(output, torch.ones((1, 2, 1, 1), dtype=tile.dtype))
