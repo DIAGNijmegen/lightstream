@@ -36,8 +36,9 @@ class StreamingReducerTileF(torch.autograd.Function):
         ctx.input_width = tile_output.shape[-1]
 
         if normalization is not None:
-            norm = normalization.to(device=tile_output.device, dtype=tile_output.dtype).clamp_min(1)
-            reduced = masked.sum(dim=(-2, -1), keepdim=True) / norm
+            norm = normalization.to(device=tile_output.device, dtype=torch.float32).clamp_min(1)
+            reduced_fp32 = masked.sum(dim=(-2, -1), keepdim=True, dtype=torch.float32) / norm
+            reduced = reduced_fp32.to(dtype=tile_output.dtype)
             ctx.normalization = norm
             ctx.has_normalization = True
         else:
@@ -53,7 +54,7 @@ class StreamingReducerTileF(torch.autograd.Function):
 
         grad_input = grad_output
         if ctx.has_normalization:
-            grad_input = grad_input / ctx.normalization
+            grad_input = (grad_input.to(dtype=torch.float32) / ctx.normalization).to(dtype=grad_output.dtype)
 
         grad_input = grad_input.expand(-1, -1, ctx.input_height, ctx.input_width)
 
