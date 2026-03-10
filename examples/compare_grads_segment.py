@@ -88,7 +88,7 @@ def _freeze_batchnorm(module: nn.Module) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=1920)
+    parser.add_argument("--tile-size", type=int, default=3200)
     parser.add_argument("--input-size", type=int, default=6400)
     args = parser.parse_args()
 
@@ -99,7 +99,7 @@ def main() -> None:
     tile_size = args.tile_size
     input_size = args.input_size
 
-    img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    img = torch.rand((1, 3, input_size, input_size), device='cpu', dtype=dtype)
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
@@ -110,7 +110,7 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        saliency=True,
+        saliency=False,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
