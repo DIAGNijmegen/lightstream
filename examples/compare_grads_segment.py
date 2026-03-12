@@ -99,9 +99,11 @@ def main() -> None:
     tile_size = args.tile_size
     input_size = args.input_size
 
-    img = torch.rand((1, 3, input_size, input_size), device='cpu', dtype=dtype)
+    img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
+
+    dummy_mask = (torch.rand((input_size, input_size), device=device) > 0.2)
 
     network = StreamingWSS(
         "resnet18",
@@ -110,7 +112,7 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        saliency=False,
+        saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
@@ -127,7 +129,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img)
+    stream_outputs = network(img, mask=dummy_mask)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
