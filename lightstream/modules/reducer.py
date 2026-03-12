@@ -77,11 +77,41 @@ class Reducer(nn.Module):
         self.mode = mode
         self._streaming_passthrough = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _expand_mask(mask: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if mask.ndim == 2:
+            mask_4d = mask[None, None]
+        elif mask.ndim == 3:
+            mask_4d = mask[:, None]
+        elif mask.ndim == 4:
+            mask_4d = mask
+        else:
+            raise ValueError(f"mask must be 2D, 3D, or 4D, got shape={tuple(mask.shape)}")
+
+        if mask_4d.shape[-2:] != x.shape[-2:]:
+            raise ValueError(
+                f"mask spatial shape {tuple(mask_4d.shape[-2:])} does not match input {tuple(x.shape[-2:])}"
+            )
+
+        if mask_4d.shape[0] not in {1, x.shape[0]}:
+            raise ValueError(f"mask batch dim must be 1 or {x.shape[0]}, got {mask_4d.shape[0]}")
+        if mask_4d.shape[1] not in {1, x.shape[1]}:
+            raise ValueError(f"mask channel dim must be 1 or {x.shape[1]}, got {mask_4d.shape[1]}")
+
+        return mask_4d.to(dtype=torch.bool, device=x.device)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
         if self._streaming_passthrough:
             return x
+        if mask is not None:
+            mask_4d = self._expand_mask(mask, x)
+            masked = x * mask_4d.to(dtype=x.dtype)
+            if self.mode == "sum":
+                return masked.sum(dim=(-2, -1), keepdim=True)
+            denom = mask_4d.sum(dim=(-2, -1), keepdim=True).clamp_min(1).to(dtype=x.dtype)
+            return masked.sum(dim=(-2, -1), keepdim=True) / denom
         if self.mode == "sum":
             return x.sum(dim=(-2, -1), keepdim=True)
         return x.mean(dim=(-2, -1), keepdim=True)
@@ -106,6 +136,10 @@ class StreamingReducer(nn.Module):
         self.register_buffer("running_sum", torch.zeros(0), persistent=False)
         self.register_buffer("running_count", torch.zeros(0), persistent=False)
         self.register_buffer("_stream_seen_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
+        self.register_buffer("_backward_seen_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
+        self.register_buffer("_stream_user_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
+        self._output_height: int | None = None
+        self._output_width: int | None = None
         self._last_output = None
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
@@ -138,17 +172,46 @@ class StreamingReducer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         debug_replay: bool = False,
+        user_mask: torch.Tensor | None = None,
     ):
         self.reset_stream_state(batch_size=batch_size, channels=channels, device=device, dtype=dtype)
         self._stream_seen_mask = torch.zeros((output_height, output_width), dtype=torch.bool, device=device)
+        self._backward_seen_mask = torch.zeros((output_height, output_width), dtype=torch.bool, device=device)
+        self._output_height = int(output_height)
+        self._output_width = int(output_width)
+        if user_mask is not None:
+            if user_mask.ndim != 2:
+                raise ValueError(f"user_mask must be 2D (H,W), got shape={tuple(user_mask.shape)}")
+            if tuple(user_mask.shape) != (output_height, output_width):
+                raise ValueError(
+                    f"user_mask shape {tuple(user_mask.shape)} must match output shape {(output_height, output_width)}"
+                )
+            self._stream_user_mask = user_mask.to(device=device, dtype=torch.bool)
+        else:
+            self._stream_user_mask = torch.zeros(0, dtype=torch.bool, device=device)
         self._debug_replay_enabled = debug_replay
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
 
-    def accumulate_stream_tile(self, trimmed_output: torch.Tensor, tile_y: int, tile_x: int, sides, dst_box):
+    def accumulate_stream_tile(
+        self,
+        trimmed_output: torch.Tensor,
+        tile_y: int,
+        tile_x: int,
+        sides,
+        dst_box,
+        mask_tile: torch.Tensor | None = None,
+    ):
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
+        effective_mask = new_mask
+        if mask_tile is not None:
+            if mask_tile.ndim != 2 or mask_tile.shape != new_mask.shape:
+                raise ValueError(
+                    f"mask_tile must be 2D with shape {tuple(new_mask.shape)}, got shape={tuple(mask_tile.shape)}"
+                )
+            effective_mask = effective_mask & mask_tile.to(device=new_mask.device, dtype=torch.bool)
 
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
@@ -170,14 +233,21 @@ class StreamingReducer(nn.Module):
                 )
             )
 
-        if torch.any(new_mask):
-            self.accumulate_tile(trimmed_output, valid_mask=new_mask)
+        if torch.any(effective_mask):
+            self.accumulate_tile(trimmed_output, valid_mask=effective_mask)
             seen_slice |= new_mask
 
     def finish_stream(self) -> torch.Tensor:
         return self.finalize_stream()
 
     def start_backward_replay(self):
+        if self._output_height is None or self._output_width is None:
+            raise RuntimeError("Reducer output shape is unknown. Call start_stream() first.")
+        self._backward_seen_mask = torch.zeros(
+            (self._output_height, self._output_width),
+            dtype=torch.bool,
+            device=self.running_sum.device,
+        )
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not available for backward replay.")
@@ -243,6 +313,7 @@ class StreamingReducer(nn.Module):
         input_y: int,
         input_x: int,
         sides,
+        dst_box: tuple[int, int, int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build reducer-backed backward pair for a single tile output.
 
@@ -264,10 +335,20 @@ class StreamingReducer(nn.Module):
                 sides=sides,
                 expected_h=expected_h,
                 expected_w=expected_w,
+                dst_box=dst_box,
             )
 
+        dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
+        seen_slice = self._backward_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
+        new_mask = ~seen_slice
+        effective_mask = new_mask
+        if self._stream_user_mask.numel() > 0:
+            user_mask_slice = self._stream_user_mask[dst_y0:dst_y1, dst_x0:dst_x1]
+            effective_mask = effective_mask & user_mask_slice
+        seen_slice |= new_mask
+
         normalization = self.running_count if self.mode == "mean" else None
-        reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
+        reduced_output = self.reduce_tile(trimmed_output, valid_mask=effective_mask, normalization=normalization)
         return reduced_output, gradient
 
     def _validate_replay_assignment(
@@ -280,6 +361,7 @@ class StreamingReducer(nn.Module):
         sides,
         expected_h: int,
         expected_w: int,
+        dst_box: tuple[int, int, int, int],
     ) -> int:
         if cursor >= len(assignments):
             raise RuntimeError("Reducer assignment cursor out of range.")
@@ -323,6 +405,12 @@ class StreamingReducer(nn.Module):
             raise RuntimeError(
                 "Reducer assignment mismatch: "
                 f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
+            )
+
+        if tuple(dst_box) != (dst_y0, dst_y1, dst_x0, dst_x1):
+            raise RuntimeError(
+                "Reducer destination box mismatch: "
+                f"forward=({dst_y0},{dst_y1},{dst_x0},{dst_x1}) backward={tuple(dst_box)}"
             )
 
         return cursor + 1
