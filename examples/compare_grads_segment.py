@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable
 import argparse
+import inspect
 
 import torch
 import torch.nn as nn
@@ -85,6 +86,18 @@ def _freeze_batchnorm(module: nn.Module) -> None:
                 param.requires_grad = False
 
 
+def _forward_with_optional_mask(model: nn.Module, x: torch.Tensor, mask: torch.Tensor | None = None):
+    if mask is None:
+        return model(x)
+    try:
+        params = inspect.signature(model.forward).parameters
+        if "mask" in params:
+            return model(x, mask=mask)
+    except (TypeError, ValueError):
+        pass
+    return model(x)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
@@ -99,7 +112,8 @@ def main() -> None:
     tile_size = args.tile_size
     input_size = args.input_size
 
-    img = torch.rand((1, 3, input_size, input_size), device='cpu', dtype=dtype)
+    img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    dummy_mask = torch.rand((input_size, input_size), device=device) > 0.25
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
@@ -110,7 +124,7 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        saliency=False,
+        saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
@@ -127,7 +141,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img)
+    stream_outputs = _forward_with_optional_mask(network, img, mask=dummy_mask)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
@@ -146,7 +160,7 @@ def main() -> None:
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
-    normal_outputs = normal_net(img_normal)
+    normal_outputs = _forward_with_optional_mask(normal_net, img_normal, mask=dummy_mask)
 
     for stream_out, normal_out in zip(stream_outputs, normal_outputs):
         diff = (stream_out - normal_out).abs()
@@ -159,7 +173,9 @@ def main() -> None:
     normal_param_grads = _gather_param_grads(normal_net)
 
     if img_normal.grad is not None:
-        input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
+        input_grad_diff = (
+            img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].detach().cpu().numpy()
+        )
         print(f"Input gradient max diff: {input_grad_diff.max()}")
 
     _compare_grads(streaming_param_grads, normal_param_grads)
