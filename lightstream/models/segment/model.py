@@ -14,12 +14,18 @@ from torchinfo import summary
 
 
 class WSS(nn.Module):
-    def __init__(self, encoder: str, weights: str="default", remove_last_block: bool =True):
+    def __init__(
+        self,
+        encoder: str,
+        weights: str = "default",
+        remove_last_block: bool = True,
+        reducer_accumulator_dtype: torch.dtype | None = None,
+    ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = Reducer(mode="mean")
-        self.red2 = Reducer(mode="mean")
-        self.red3 = Reducer(mode="mean")
+        self.red1 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
+        self.red2 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
+        self.red3 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
 
 
         self.decoder1 = nn.Sequential(
