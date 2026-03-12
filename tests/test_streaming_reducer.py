@@ -35,6 +35,23 @@ class MultiReducerNet(nn.Module):
         return self.sum_head(feat), self.mean_head(feat)
 
 
+class MaskedMultiReducerNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(),
+        )
+        self.sum_conv = nn.Conv2d(5, 2, kernel_size=1, bias=False)
+        self.mean_conv = nn.Conv2d(5, 2, kernel_size=1, bias=False)
+        self.sum_reducer = Reducer(mode="sum")
+        self.mean_reducer = Reducer(mode="mean")
+
+    def forward(self, x, mask=None):
+        feat = self.backbone(x)
+        return self.sum_reducer(self.sum_conv(feat), mask=mask), self.mean_reducer(self.mean_conv(feat), mask=mask)
+
+
 def _make_streaming(model: nn.Module, tile_size: int = 4):
     constructor = StreamingConstructor(
         model,
@@ -150,3 +167,52 @@ def test_streaming_reducer_running_count_uses_fp32_accumulator():
     output = reducer.finalize_stream()
     assert output.dtype == tile.dtype
     assert torch.allclose(output, torch.ones((1, 2, 1, 1), dtype=tile.dtype))
+
+
+def test_streaming_reducer_masked_forward_parity():
+    torch.manual_seed(7)
+    model = MaskedMultiReducerNet().eval()
+    image = torch.randn(1, 3, 9, 13)
+    mask = torch.zeros((9, 13), dtype=torch.bool)
+    mask[1:8, 2:11] = True
+    mask[::2, ::3] = False
+
+    with torch.no_grad():
+        expected_sum, expected_mean = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=5)
+    with torch.no_grad():
+        streamed_sum, streamed_mean = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed_sum, expected_sum, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(streamed_mean, expected_mean, atol=1e-5, rtol=1e-4)
+
+
+def test_streaming_reducer_masked_backward_parity():
+    torch.manual_seed(11)
+    model = MaskedMultiReducerNet().eval()
+    image = torch.randn(1, 3, 10, 9)
+    mask = torch.zeros((10, 9), dtype=torch.bool)
+    mask[1:9, 1:8] = True
+    mask[3:5, 2:4] = False
+
+    reference = MaskedMultiReducerNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    ref_image = image.clone().requires_grad_(True)
+    ref_sum, ref_mean = reference(ref_image, mask=mask)
+    ref_loss = (0.9 * ref_sum).sum() + (-1.1 * ref_mean).sum()
+    ref_loss.backward()
+
+    scnn = _make_streaming(model, tile_size=4)
+    streamed_sum, streamed_mean = scnn.forward(image.clone(), mask=mask)
+    grad_sum = torch.full_like(streamed_sum, 0.9)
+    grad_mean = torch.full_like(streamed_mean, -1.1)
+    scnn.backward(image.clone(), (grad_sum, grad_mean))
+
+    ref_grads = {name: p.grad for name, p in reference.named_parameters() if p.grad is not None}
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+
+    for name, ref_grad in ref_grads.items():
+        assert name in stream_grads
+        assert torch.allclose(stream_grads[name], ref_grad, atol=1e-5, rtol=1e-4), name

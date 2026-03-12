@@ -77,14 +77,42 @@ class Reducer(nn.Module):
         self.mode = mode
         self._streaming_passthrough = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _normalize_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if mask.ndim == 2:
+            if mask.shape != x.shape[-2:]:
+                raise ValueError(f"2D mask shape must match (H,W)={tuple(x.shape[-2:])}, got {tuple(mask.shape)}")
+            return mask[None, None]
+
+        if mask.ndim == 4:
+            if mask.shape[-2:] != x.shape[-2:]:
+                raise ValueError(f"4D mask shape must match spatial dims (H,W)={tuple(x.shape[-2:])}, got {tuple(mask.shape)}")
+            if mask.shape[0] not in {1, x.shape[0]}:
+                raise ValueError(f"4D mask batch dimension must be 1 or N={x.shape[0]}, got {mask.shape[0]}")
+            if mask.shape[1] not in {1, x.shape[1]}:
+                raise ValueError(f"4D mask channel dimension must be 1 or C={x.shape[1]}, got {mask.shape[1]}")
+            return mask
+
+        raise ValueError(f"mask must be 2D (H,W) or 4D (N,C,H,W)/(N,1,H,W), got shape={tuple(mask.shape)}")
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
         if self._streaming_passthrough:
             return x
+        if mask is None:
+            if self.mode == "sum":
+                return x.sum(dim=(-2, -1), keepdim=True)
+            return x.mean(dim=(-2, -1), keepdim=True)
+
+        mask_4d = self._normalize_mask(x, mask).to(dtype=x.dtype, device=x.device)
+        masked = x * mask_4d
+
         if self.mode == "sum":
-            return x.sum(dim=(-2, -1), keepdim=True)
-        return x.mean(dim=(-2, -1), keepdim=True)
+            return masked.sum(dim=(-2, -1), keepdim=True)
+
+        numerator = masked.sum(dim=(-2, -1), keepdim=True, dtype=torch.float32)
+        denominator = mask_4d.sum(dim=(-2, -1), keepdim=True, dtype=torch.float32).clamp_min(1)
+        return (numerator / denominator).to(dtype=x.dtype)
 
 
 class StreamingReducer(nn.Module):
@@ -110,6 +138,8 @@ class StreamingReducer(nn.Module):
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
         self._replay_cursor: int | None = None
+        self._forward_tile_masks: list[torch.Tensor] = []
+        self._backward_mask_cursor: int = 0
 
     @classmethod
     def from_reducer(cls, module: Reducer) -> "StreamingReducer":
@@ -144,11 +174,24 @@ class StreamingReducer(nn.Module):
         self._debug_replay_enabled = debug_replay
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
+        self._forward_tile_masks = []
+        self._backward_mask_cursor = 0
 
-    def accumulate_stream_tile(self, trimmed_output: torch.Tensor, tile_y: int, tile_x: int, sides, dst_box):
+    def accumulate_stream_tile(
+        self,
+        trimmed_output: torch.Tensor,
+        tile_y: int,
+        tile_x: int,
+        sides,
+        dst_box,
+        user_mask: torch.Tensor | None = None,
+    ):
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
+        valid_mask = new_mask if user_mask is None else (new_mask & user_mask.to(dtype=torch.bool, device=new_mask.device))
+
+        self._forward_tile_masks.append(valid_mask.detach().clone())
 
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
@@ -170,9 +213,9 @@ class StreamingReducer(nn.Module):
                 )
             )
 
-        if torch.any(new_mask):
-            self.accumulate_tile(trimmed_output, valid_mask=new_mask)
-            seen_slice |= new_mask
+        if torch.any(valid_mask):
+            self.accumulate_tile(trimmed_output, valid_mask=valid_mask)
+            seen_slice |= valid_mask
 
     def finish_stream(self) -> torch.Tensor:
         return self.finalize_stream()
@@ -253,6 +296,8 @@ class StreamingReducer(nn.Module):
         expected_h = int(trimmed_output.shape[-2])
         expected_w = int(trimmed_output.shape[-1])
 
+        replay_valid_mask = self._next_backward_mask(trimmed_output)
+
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
@@ -267,8 +312,20 @@ class StreamingReducer(nn.Module):
             )
 
         normalization = self.running_count if self.mode == "mean" else None
-        reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
+        reduced_output = self.reduce_tile(trimmed_output, valid_mask=replay_valid_mask, normalization=normalization)
         return reduced_output, gradient
+
+    def _next_backward_mask(self, trimmed_output: torch.Tensor) -> torch.Tensor | None:
+        if self._backward_mask_cursor >= len(self._forward_tile_masks):
+            raise RuntimeError("Reducer mask replay cursor out of range.")
+        mask = self._forward_tile_masks[self._backward_mask_cursor]
+        self._backward_mask_cursor += 1
+        if mask.shape != trimmed_output.shape[-2:]:
+            raise RuntimeError(
+                "Reducer mask replay shape mismatch: "
+                f"forward={tuple(mask.shape)} backward={tuple(trimmed_output.shape[-2:])}"
+            )
+        return mask
 
     def _validate_replay_assignment(
         self,
@@ -327,7 +384,7 @@ class StreamingReducer(nn.Module):
 
         return cursor + 1
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.
         self._last_output = x
         return x

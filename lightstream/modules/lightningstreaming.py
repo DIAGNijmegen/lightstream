@@ -85,7 +85,7 @@ class LightningStreamingModule(L.LightningModule):
         """
         self._prepare_start_for_streaming()
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
 
         Parameters
@@ -99,7 +99,7 @@ class LightningStreamingModule(L.LightningModule):
         The output of the streaming model
 
         """
-        return self.stream_network.forward(x)
+        return self.stream_network.forward(x, mask=mask)
 
     def backward_streaming(self, image, grad):
         self.stream_network.backward(image, grad)

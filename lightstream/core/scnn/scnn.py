@@ -720,20 +720,22 @@ class StreamingCNN(torch.nn.Module):
         trimmed_output = self._trim_head_output(head_output, head_lost)
         return head_lost, output_loc, trimmed_output
 
-    def _accumulate_reducer_forward_tile(self, head_idx, trimmed_output, output_loc, tile_input_y, tile_input_x, sides):
+    def _accumulate_reducer_forward_tile(self, head_idx, trimmed_output, output_loc, tile_input_y, tile_input_x, sides, mask):
         dst_y0 = int(output_loc.y)
         dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
         dst_x0 = int(output_loc.x)
         dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+        tile_user_mask = None if mask is None else mask[dst_y0:dst_y1, dst_x0:dst_x1]
         self._reducer_head_map[head_idx].accumulate_stream_tile(
             trimmed_output=trimmed_output,
             tile_y=int(tile_input_y),
             tile_x=int(tile_input_x),
             sides=sides,
             dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
+            user_mask=tile_user_mask,
         )
 
-    def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides):
+    def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, mask):
         for head_idx, head_output in enumerate(tile_outputs):
             _, output_loc, trimmed_output = self._build_stitched_tile_output(
                 head_idx=head_idx,
@@ -751,6 +753,7 @@ class StreamingCNN(torch.nn.Module):
                     tile_input_y=tile_input_y,
                     tile_input_x=tile_input_x,
                     sides=sides,
+                    mask=mask,
                 )
                 continue
 
@@ -860,10 +863,19 @@ class StreamingCNN(torch.nn.Module):
         del trimmed_grads
         del trimmed_outputs
 
-    def forward(self, image, result_on_cpu=False):
+    def forward(self, image, result_on_cpu=False, mask=None):
         """Perform forward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
+
+        if mask is not None:
+            if not torch.is_tensor(mask):
+                raise ValueError("mask must be a torch.Tensor")
+            if mask.ndim != 2:
+                raise ValueError(f"Streaming mask must be 2D (H,W), got shape={tuple(mask.shape)}")
+            if mask.shape != image.shape[-2:]:
+                raise ValueError(f"Streaming mask shape must match image (H,W)={tuple(image.shape[-2:])}, got {tuple(mask.shape)}")
+            mask = mask.to(self.device, dtype=torch.bool, non_blocking=True)
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
@@ -946,7 +958,7 @@ class StreamingCNN(torch.nn.Module):
                 if torch.backends.cudnn.benchmark:
                     torch.cuda.empty_cache()
 
-                self._stitch_forward_outputs(outputs, tile_outputs, input_y, input_x, sides)
+                self._stitch_forward_outputs(outputs, tile_outputs, input_y, input_x, sides, mask)
                 del tile
 
         assert last_sides is not None and last_sides.bottom and last_sides.right, (
