@@ -1545,4 +1545,4 @@ class StreamingCNN(torch.nn.Module):
 
     def __call__(self, image, **kwargs):
         result_on_cpu = kwargs.pop("result_on_cpu", False)
-        return self.forward(image, result_on_cpu)
+        return self.forward(image, result_on_cpu=result_on_cpu, **kwargs)

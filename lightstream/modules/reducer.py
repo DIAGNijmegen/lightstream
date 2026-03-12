@@ -377,7 +377,8 @@ class StreamingReducer(nn.Module):
 
         return cursor + 1
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.
+        # Accept optional mask kwarg for API parity with Reducer and model codepaths.
         self._last_output = x
         return x
