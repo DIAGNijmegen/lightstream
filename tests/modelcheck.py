@@ -13,6 +13,7 @@ Only models with a 'simple' design are supported, primarily aimed at torchvision
 """
 
 import torch
+import inspect
 from lightstream.modules.lightningstreaming import StreamingModule
 from core.scnn.scnn import StreamingConv2d
 from torchvision.models import resnet18, resnet34, resnet50
@@ -52,17 +53,32 @@ class ModelCheck(StreamingModule):
         del self.stream_network
         self.stream_network = temp
 
-    def forward(self, x):
-        if self.use_streaming:
-            return self.forward_streaming(x)
+    def _forward_with_optional_mask(self, model, x, mask=None):
+        if mask is None:
+            return model(x)
+        try:
+            params = inspect.signature(model.forward).parameters
+            if "mask" in params:
+                return model(x, mask=mask)
+        except (TypeError, ValueError):
+            pass
+        return model(x)
 
-        return self.stream_network(x)
+    def _build_dummy_mask(self, image: torch.Tensor) -> torch.Tensor:
+        h, w = image.shape[-2], image.shape[-1]
+        return (torch.rand((h, w), device=image.device) > 0.25)
+
+    def forward(self, x, mask=None):
+        if self.use_streaming:
+            return self._forward_with_optional_mask(self.forward_streaming, x, mask=mask)
+
+        return self._forward_with_optional_mask(self.stream_network, x, mask=mask)
 
     def training_step(self, batch, batch_idx, *args, **kwargs):
-        image, target = batch
+        image, target, mask = batch
         self.image = image
 
-        self.str_output = self.forward(image)
+        self.str_output = self.forward(image, mask=mask)
 
         if self.use_streaming:
             self.str_output.requires_grad = True
@@ -113,6 +129,11 @@ class ModelCheck(StreamingModule):
         self.stream_network.dtype = self.dtype
 
     def run(self, batch):
+        if len(batch) == 2:
+            image, target = batch
+            mask = self._build_dummy_mask(image)
+            batch = (image, target, mask)
+
         # run once with streaming and gather output
         self.to_device()
         streaming_step_results = self.step_once(batch)
@@ -206,17 +227,32 @@ class ModelCheckConvNext(StreamingModule):
         del self.stream_network
         self.stream_network = temp
 
-    def forward(self, x):
-        if self.use_streaming:
-            return self.forward_streaming(x)
+    def _forward_with_optional_mask(self, model, x, mask=None):
+        if mask is None:
+            return model(x)
+        try:
+            params = inspect.signature(model.forward).parameters
+            if "mask" in params:
+                return model(x, mask=mask)
+        except (TypeError, ValueError):
+            pass
+        return model(x)
 
-        return self.stream_network(x)
+    def _build_dummy_mask(self, image: torch.Tensor) -> torch.Tensor:
+        h, w = image.shape[-2], image.shape[-1]
+        return (torch.rand((h, w), device=image.device) > 0.25)
+
+    def forward(self, x, mask=None):
+        if self.use_streaming:
+            return self._forward_with_optional_mask(self.forward_streaming, x, mask=mask)
+
+        return self._forward_with_optional_mask(self.stream_network, x, mask=mask)
 
     def training_step(self, batch, batch_idx, *args, **kwargs):
-        image, target = batch
+        image, target, mask = batch
         self.image = image
 
-        self.str_output = self.forward(image)
+        self.str_output = self.forward(image, mask=mask)
 
         if self.use_streaming:
             self.str_output.requires_grad = True
@@ -270,6 +306,11 @@ class ModelCheckConvNext(StreamingModule):
         self.stream_network.dtype = self.dtype
 
     def run(self, batch):
+        if len(batch) == 2:
+            image, target = batch
+            mask = self._build_dummy_mask(image)
+            batch = (image, target, mask)
+
         # run once with streaming and gather output
         self.to_device()
         streaming_step_results = self.step_once(batch)
