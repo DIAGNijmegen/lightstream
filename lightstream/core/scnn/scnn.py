@@ -902,7 +902,7 @@ class StreamingCNN(torch.nn.Module):
         )
 
         if self.gather_input_gradient:
-            self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+            self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device=self.device)
 
         self._last_forward_tiles = []
         if self.verbose:

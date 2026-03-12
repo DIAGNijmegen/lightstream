@@ -43,6 +43,7 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
     constructor = StreamingConstructor(
         model,
         tile_size=tile_size,
+        saliency=True,
         verbose=False,
         deterministic=True,
         copy_to_gpu=False,
@@ -112,17 +113,18 @@ def test_streaming_reducer_backward_parity():
     torch.manual_seed(3)
     model = MultiReducerNet().eval()
     image = torch.randn(1, 3, 11, 9)
+    mask = torch.rand((11, 9)) > 0.35
 
     reference = MultiReducerNet().eval()
     reference.load_state_dict(model.state_dict())
 
     ref_image = image.clone().requires_grad_(True)
-    ref_sum, ref_mean = reference(ref_image, mask=None)
+    ref_sum, ref_mean = reference(ref_image, mask=mask)
     ref_loss = (0.7 * ref_sum).sum() + (1.3 * ref_mean).sum()
     ref_loss.backward()
 
     scnn = _make_streaming(model, tile_size=4)
-    streamed_sum, streamed_mean = scnn.forward(image.clone(), mask=None)
+    streamed_sum, streamed_mean = scnn.forward(image.clone(), mask=mask)
     grad_sum = torch.full_like(streamed_sum, 0.7)
     grad_mean = torch.full_like(streamed_mean, 1.3)
     scnn.backward(image.clone(), (grad_sum, grad_mean))

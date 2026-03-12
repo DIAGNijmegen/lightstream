@@ -40,6 +40,7 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
     constructor = StreamingConstructor(
         model,
         tile_size=tile_size,
+        saliency=True,
         verbose=False,
         deterministic=True,
         copy_to_gpu=False,
