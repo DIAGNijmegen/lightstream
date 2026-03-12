@@ -41,14 +41,14 @@ class WSS(nn.Module):
         self.w = [0.3, 0.4, 0.3]
 
 
-    def forward(self, x):
+    def forward(self, x, mask: torch.Tensor | None = None):
         x1, x2, x3 = self.backbone(x)
 
         y1 = self.decoder1(x1)
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
         y = 0.3 * y1 + 0.3*y2 + 0.3*y3
-        return self.red1(y1), self.red2(y2), self.red3(y3), y
+        return self.red1(y1, mask=mask), self.red2(y2, mask=mask), self.red3(y3, mask=mask), y
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
