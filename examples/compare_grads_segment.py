@@ -77,6 +77,22 @@ def _parse_dtype(value: str) -> torch.dtype:
     return mapping[key]
 
 
+
+
+def _masked_output_mean(output: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 4:
+        raise ValueError(f"Expected 4D output tensor (N,C,H,W), got shape={tuple(output.shape)}")
+
+    if mask_2d.shape != output.shape[-2:]:
+        mask_4d = mask_2d.to(dtype=output.dtype)[None, None]
+        mask_4d = torch.nn.functional.interpolate(mask_4d, size=output.shape[-2:], mode="nearest")
+        mask_2d = mask_4d[0, 0] > 0.5
+
+    mask = mask_2d.to(device=output.device, dtype=output.dtype)[None, None]
+    denom = mask.sum(dtype=torch.float32).clamp_min(1)
+    numer = (output * mask).sum(dtype=torch.float32)
+    return (numer / denom).to(dtype=output.dtype)
+
 def _freeze_batchnorm(module: nn.Module) -> None:
     for submodule in module.modules():
         if isinstance(submodule, nn.BatchNorm2d):
@@ -134,7 +150,7 @@ def main() -> None:
         out.requires_grad = True
         out.retain_grad()
 
-    y_pred_streaming = [torch.sigmoid(torch.mean(x)) for x in stream_outputs]
+    y_pred_streaming = [torch.sigmoid(_masked_output_mean(x, dummy_mask)) for x in stream_outputs]
     loss = [criterion(x, target) for x in y_pred_streaming]
     total_loss = sum(loss)
     total_loss.backward()
@@ -154,7 +170,7 @@ def main() -> None:
         diff = (stream_out - normal_out).abs()
         print(f"Forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
-    y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
+    y_pred_normal = [torch.sigmoid(_masked_output_mean(x, dummy_mask)) for x in normal_outputs]
     normal_loss = [criterion(x, target) for x in y_pred_normal]
     total_loss = sum(normal_loss)
     total_loss.backward()
