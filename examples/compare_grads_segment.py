@@ -149,7 +149,13 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img, mask=dummy_mask) if dummy_mask is not None else network(img)
+    if dummy_mask is None:
+        print("Mask disabled: running legacy unmasked comparison.")
+        stream_outputs = network(img)
+    else:
+        mask_ratio = dummy_mask.to(dtype=torch.float32).mean().item()
+        print(f"Mask enabled: valid ratio={mask_ratio:.4f}")
+        stream_outputs = network(img, mask=dummy_mask)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
@@ -168,7 +174,8 @@ def main() -> None:
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
-    normal_outputs = normal_net(img_normal)
+    normal_outputs = normal_net(img_normal, mask=dummy_mask) if dummy_mask is not None else normal_net(img_normal)
+    print(f"Normal path mask active: {dummy_mask is not None}")
 
     for stream_out, normal_out in zip(stream_outputs, normal_outputs):
         diff = (stream_out - normal_out).abs()
