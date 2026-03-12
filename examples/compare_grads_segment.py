@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 import argparse
 
 import torch
@@ -79,9 +79,12 @@ def _parse_dtype(value: str) -> torch.dtype:
 
 
 
-def _masked_output_mean(output: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+def _masked_output_mean(output: torch.Tensor, mask_2d: Optional[torch.Tensor]) -> torch.Tensor:
     if output.ndim != 4:
         raise ValueError(f"Expected 4D output tensor (N,C,H,W), got shape={tuple(output.shape)}")
+
+    if mask_2d is None:
+        return output.mean()
 
     if mask_2d.shape != output.shape[-2:]:
         mask_4d = mask_2d.to(dtype=output.dtype)[None, None]
@@ -106,6 +109,7 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=3200)
     parser.add_argument("--input-size", type=int, default=6400)
+    parser.add_argument("--disable-mask", action="store_true", help="Disable dummy mask to compare legacy behavior")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -119,7 +123,7 @@ def main() -> None:
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
-    dummy_mask = (torch.rand((input_size, input_size), device=device) > 0.2)
+    dummy_mask = None if args.disable_mask else (torch.rand((input_size, input_size), device=device) > 0.2)
 
     network = StreamingWSS(
         "resnet18",
@@ -145,7 +149,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img, mask=dummy_mask)
+    stream_outputs = network(img, mask=dummy_mask) if dummy_mask is not None else network(img)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
