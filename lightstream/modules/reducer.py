@@ -138,8 +138,9 @@ class StreamingReducer(nn.Module):
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
         self._replay_cursor: int | None = None
-        self._forward_tile_masks: list[torch.Tensor] = []
-        self._backward_mask_cursor: int = 0
+        self._forward_tile_masks: dict[tuple[int, int, bool, bool, bool, bool, int, int], torch.Tensor] = {}
+        self._consumed_backward_mask_keys: set[tuple[int, int, bool, bool, bool, bool, int, int]] = set()
+        self._masking_active = False
 
     @classmethod
     def from_reducer(cls, module: Reducer) -> "StreamingReducer":
@@ -174,8 +175,21 @@ class StreamingReducer(nn.Module):
         self._debug_replay_enabled = debug_replay
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
-        self._forward_tile_masks = []
-        self._backward_mask_cursor = 0
+        self._forward_tile_masks = {}
+        self._consumed_backward_mask_keys = set()
+        self._masking_active = False
+
+    def _tile_mask_key(self, tile_y: int, tile_x: int, sides, trimmed_h: int, trimmed_w: int):
+        return (
+            int(tile_y),
+            int(tile_x),
+            bool(sides.top),
+            bool(sides.left),
+            bool(sides.right),
+            bool(sides.bottom),
+            int(trimmed_h),
+            int(trimmed_w),
+        )
 
     def accumulate_stream_tile(
         self,
@@ -190,8 +204,16 @@ class StreamingReducer(nn.Module):
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
         valid_mask = new_mask if user_mask is None else (new_mask & user_mask.to(dtype=torch.bool, device=new_mask.device))
-
-        self._forward_tile_masks.append(valid_mask.detach().clone())
+        if user_mask is not None:
+            self._masking_active = True
+            mask_key = self._tile_mask_key(
+                tile_y=tile_y,
+                tile_x=tile_x,
+                sides=sides,
+                trimmed_h=trimmed_output.shape[-2],
+                trimmed_w=trimmed_output.shape[-1],
+            )
+            self._forward_tile_masks[mask_key] = valid_mask.detach().clone()
 
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
@@ -227,16 +249,31 @@ class StreamingReducer(nn.Module):
             self._replay_cursor = 0
         else:
             self._replay_cursor = None
+        if self._masking_active:
+            self._consumed_backward_mask_keys = set()
+
+    def requires_backward_replay(self) -> bool:
+        return self._debug_replay_enabled or self._masking_active
 
     def validate_backward_replay_consumed(self, *, head_idx: int):
-        if not self._debug_replay_enabled:
+        if self._debug_replay_enabled:
+            if self._replay_assignments is None or self._replay_cursor is None:
+                raise RuntimeError("Reducer replay state is not initialized.")
+            if self._replay_cursor != len(self._replay_assignments):
+                raise RuntimeError(
+                    f"Reducer assignment replay incomplete for head {head_idx}: "
+                    f"consumed={self._replay_cursor}, expected={len(self._replay_assignments)}"
+                )
+
+        if not self._masking_active:
             return
-        if self._replay_assignments is None or self._replay_cursor is None:
-            raise RuntimeError("Reducer replay state is not initialized.")
-        if self._replay_cursor != len(self._replay_assignments):
+
+        expected = set(self._forward_tile_masks.keys())
+        missing = expected - self._consumed_backward_mask_keys
+        if missing:
             raise RuntimeError(
-                f"Reducer assignment replay incomplete for head {head_idx}: "
-                f"consumed={self._replay_cursor}, expected={len(self._replay_assignments)}"
+                f"Reducer mask replay incomplete for head {head_idx}: "
+                f"consumed={len(self._consumed_backward_mask_keys)}, expected={len(expected)}"
             )
 
     def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
@@ -296,7 +333,14 @@ class StreamingReducer(nn.Module):
         expected_h = int(trimmed_output.shape[-2])
         expected_w = int(trimmed_output.shape[-1])
 
-        replay_valid_mask = self._next_backward_mask(trimmed_output)
+        replay_valid_mask = None
+        if self._masking_active:
+            replay_valid_mask = self._backward_mask_for_tile(
+                trimmed_output=trimmed_output,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+            )
 
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
@@ -315,16 +359,33 @@ class StreamingReducer(nn.Module):
         reduced_output = self.reduce_tile(trimmed_output, valid_mask=replay_valid_mask, normalization=normalization)
         return reduced_output, gradient
 
-    def _next_backward_mask(self, trimmed_output: torch.Tensor) -> torch.Tensor | None:
-        if self._backward_mask_cursor >= len(self._forward_tile_masks):
-            raise RuntimeError("Reducer mask replay cursor out of range.")
-        mask = self._forward_tile_masks[self._backward_mask_cursor]
-        self._backward_mask_cursor += 1
+    def _backward_mask_for_tile(
+        self,
+        *,
+        trimmed_output: torch.Tensor,
+        input_y: int,
+        input_x: int,
+        sides,
+    ) -> torch.Tensor:
+        key = self._tile_mask_key(
+            tile_y=input_y,
+            tile_x=input_x,
+            sides=sides,
+            trimmed_h=trimmed_output.shape[-2],
+            trimmed_w=trimmed_output.shape[-1],
+        )
+        if key not in self._forward_tile_masks:
+            raise RuntimeError(f"Reducer mask replay key not found for key={key}.")
+        if key in self._consumed_backward_mask_keys:
+            raise RuntimeError(f"Reducer mask replay key consumed more than once for key={key}.")
+
+        mask = self._forward_tile_masks[key]
         if mask.shape != trimmed_output.shape[-2:]:
             raise RuntimeError(
                 "Reducer mask replay shape mismatch: "
                 f"forward={tuple(mask.shape)} backward={tuple(trimmed_output.shape[-2:])}"
             )
+        self._consumed_backward_mask_keys.add(key)
         return mask
 
     def _validate_replay_assignment(

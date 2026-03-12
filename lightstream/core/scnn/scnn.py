@@ -1028,8 +1028,8 @@ class StreamingCNN(torch.nn.Module):
             output_widths=output_widths,
         )
 
-        if self.debug_reducer_replay:
-            for reducer in self._reducer_head_map.values():
+        for reducer in self._reducer_head_map.values():
+            if reducer.requires_backward_replay():
                 reducer.start_backward_replay()
 
         last_sides = None
@@ -1042,8 +1042,8 @@ class StreamingCNN(torch.nn.Module):
                 sides=sides,
             )
 
-        if self.debug_reducer_replay:
-            for idx, reducer in self._reducer_head_map.items():
+        for idx, reducer in self._reducer_head_map.items():
+            if reducer.requires_backward_replay():
                 reducer.validate_backward_replay_consumed(head_idx=idx)
 
         self._saved_tensors = {}
