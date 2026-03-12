@@ -99,7 +99,7 @@ def main() -> None:
     tile_size = args.tile_size
     input_size = args.input_size
 
-    img = torch.rand((1, 3, input_size, input_size), device='cpu', dtype=dtype)
+    img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
@@ -110,7 +110,7 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        saliency=False,
+        saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
