@@ -2,6 +2,50 @@ import torch
 import torch.nn as nn
 
 
+def _normalize_spatial_mask(mask: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Normalize user-provided mask to [N,1,H,W] bool format."""
+    if mask.ndim == 2:
+        if mask.shape != x.shape[-2:]:
+            raise ValueError(f"mask shape {tuple(mask.shape)} must match input spatial shape {tuple(x.shape[-2:])}")
+        return mask[None, None].to(device=x.device, dtype=torch.bool)
+
+    if mask.ndim == 3:
+        if mask.shape[0] != x.shape[0] or mask.shape[-2:] != x.shape[-2:]:
+            raise ValueError(
+                f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={x.shape[0]}, H/W={tuple(x.shape[-2:])}"
+            )
+        return mask[:, None].to(device=x.device, dtype=torch.bool)
+
+    if mask.ndim == 4:
+        if mask.shape[0] != x.shape[0] or mask.shape[-2:] != x.shape[-2:]:
+            raise ValueError(
+                f"4D mask shape {tuple(mask.shape)} must be [N,1,H,W] with N={x.shape[0]}, H/W={tuple(x.shape[-2:])}"
+            )
+        if mask.shape[1] not in (1, x.shape[1]):
+            raise ValueError(
+                f"4D mask channel dim must be 1 or C={x.shape[1]}, got {mask.shape[1]}"
+            )
+        mask_bool = mask.to(device=x.device, dtype=torch.bool)
+        if mask_bool.shape[1] == x.shape[1]:
+            # collapse channel-wise masks into a single spatial mask to match reducer counting semantics
+            mask_bool = torch.any(mask_bool, dim=1, keepdim=True)
+        return mask_bool
+
+    raise ValueError(f"mask must be 2D/3D/4D spatial mask, got shape={tuple(mask.shape)}")
+
+def _resolve_accumulator_dtype(accumulator_dtype: torch.dtype | None, reference_dtype: torch.dtype) -> torch.dtype:
+    """Resolve reduction accumulator dtype with a minimum precision of float32."""
+    if accumulator_dtype is None:
+        resolved = reference_dtype if reference_dtype in (torch.float32, torch.float64) else torch.float32
+    else:
+        resolved = accumulator_dtype
+    if resolved not in (torch.float32, torch.float64):
+        raise ValueError(
+            f"Unsupported accumulator_dtype '{resolved}'. Use torch.float32 or torch.float64."
+        )
+    return resolved
+
+
 class StreamingReducerTileF(torch.autograd.Function):
     """Tile-local reducer op used by :class:`StreamingReducer`.
 
@@ -36,13 +80,16 @@ class StreamingReducerTileF(torch.autograd.Function):
         ctx.input_width = tile_output.shape[-1]
 
         if normalization is not None:
-            norm = normalization.to(device=tile_output.device, dtype=torch.float32).clamp_min(1)
-            reduced_fp32 = masked.sum(dim=(-2, -1), keepdim=True, dtype=torch.float32) / norm
-            reduced = reduced_fp32.to(dtype=tile_output.dtype)
+            norm = normalization.to(device=tile_output.device)
+            acc_dtype = _resolve_accumulator_dtype(norm.dtype, tile_output.dtype)
+            norm = norm.to(dtype=acc_dtype).clamp_min(1)
+            reduced_acc = masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / norm
+            reduced = reduced_acc.to(dtype=tile_output.dtype)
             ctx.normalization = norm
             ctx.has_normalization = True
         else:
-            reduced = masked.sum(dim=(-2, -1), keepdim=True)
+            acc_dtype = _resolve_accumulator_dtype(None, tile_output.dtype)
+            reduced = masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=tile_output.dtype)
             ctx.normalization = None
             ctx.has_normalization = False
 
@@ -54,7 +101,7 @@ class StreamingReducerTileF(torch.autograd.Function):
 
         grad_input = grad_output
         if ctx.has_normalization:
-            grad_input = (grad_input.to(dtype=torch.float32) / ctx.normalization).to(dtype=grad_output.dtype)
+            grad_input = (grad_input.to(dtype=ctx.normalization.dtype) / ctx.normalization).to(dtype=grad_output.dtype)
 
         grad_input = grad_input.expand(-1, -1, ctx.input_height, ctx.input_width)
 
@@ -70,21 +117,32 @@ streaming_reduce_tile = StreamingReducerTileF.apply
 class Reducer(nn.Module):
     """Global spatial reducer for NCHW tensors."""
 
-    def __init__(self, mode: str = "mean"):
+    def __init__(self, mode: str = "mean", accumulator_dtype: torch.dtype | None = None):
         super().__init__()
         if mode not in {"sum", "mean"}:
             raise ValueError(f"Unsupported reducer mode '{mode}', expected 'sum' or 'mean'.")
         self.mode = mode
+        self.accumulator_dtype = accumulator_dtype
         self._streaming_passthrough = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
         if self._streaming_passthrough:
             return x
+        if mask is not None:
+            mask_nchw = _normalize_spatial_mask(mask, x)
+            masked = x * mask_nchw.to(dtype=x.dtype)
+            acc_dtype = _resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
+            if self.mode == "sum":
+                return masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
+            denom = mask_nchw.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
+            mean = masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
+            return mean.to(dtype=x.dtype)
+        acc_dtype = _resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         if self.mode == "sum":
-            return x.sum(dim=(-2, -1), keepdim=True)
-        return x.mean(dim=(-2, -1), keepdim=True)
+            return x.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
+        return x.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
 
 
 class StreamingReducer(nn.Module):
@@ -97,11 +155,12 @@ class StreamingReducer(nn.Module):
       (custom autograd op) and keeps stream accumulation state.
     """
 
-    def __init__(self, mode: str = "mean"):
+    def __init__(self, mode: str = "mean", accumulator_dtype: torch.dtype | None = None):
         super().__init__()
         if mode not in {"sum", "mean"}:
             raise ValueError(f"Unsupported reducer mode '{mode}', expected 'sum' or 'mean'.")
         self.mode = mode
+        self.accumulator_dtype = accumulator_dtype
         self._streaming_passthrough = False
         self.register_buffer("running_sum", torch.zeros(0), persistent=False)
         self.register_buffer("running_count", torch.zeros(0), persistent=False)
@@ -113,10 +172,10 @@ class StreamingReducer(nn.Module):
 
     @classmethod
     def from_reducer(cls, module: Reducer) -> "StreamingReducer":
-        return cls(mode=module.mode)
+        return cls(mode=module.mode, accumulator_dtype=module.accumulator_dtype)
 
     def to_reducer(self) -> Reducer:
-        return Reducer(mode=self.mode)
+        return Reducer(mode=self.mode, accumulator_dtype=self.accumulator_dtype)
 
     def reset_stream_state(
         self,
@@ -124,10 +183,11 @@ class StreamingReducer(nn.Module):
         channels: int,
         device: torch.device,
         dtype: torch.dtype,
-        accumulator_dtype: torch.dtype = torch.float32,
+        accumulator_dtype: torch.dtype | None = None,
     ):
+        resolved_acc_dtype = _resolve_accumulator_dtype(accumulator_dtype or self.accumulator_dtype, dtype)
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
-        self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=resolved_acc_dtype)
 
     def start_stream(
         self,
@@ -145,10 +205,19 @@ class StreamingReducer(nn.Module):
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
 
-    def accumulate_stream_tile(self, trimmed_output: torch.Tensor, tile_y: int, tile_x: int, sides, dst_box):
+    def accumulate_stream_tile(
+        self,
+        trimmed_output: torch.Tensor,
+        tile_y: int,
+        tile_x: int,
+        sides,
+        dst_box,
+        user_mask: torch.Tensor | None = None,
+    ):
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
+        effective_mask = new_mask if user_mask is None else (new_mask & user_mask.to(dtype=torch.bool, device=new_mask.device))
 
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
@@ -170,9 +239,9 @@ class StreamingReducer(nn.Module):
                 )
             )
 
-        if torch.any(new_mask):
-            self.accumulate_tile(trimmed_output, valid_mask=new_mask)
-            seen_slice |= new_mask
+        if torch.any(effective_mask):
+            self.accumulate_tile(trimmed_output, valid_mask=effective_mask)
+        seen_slice |= new_mask
 
     def finish_stream(self) -> torch.Tensor:
         return self.finalize_stream()
@@ -222,7 +291,8 @@ class StreamingReducer(nn.Module):
             raise RuntimeError("StreamingReducer state is empty, accumulate_tile() was not called.")
         if self.mode == "sum":
             return self.running_sum
-        denom = self.running_count.to(dtype=torch.float32).clamp_min(1)
+        acc_dtype = _resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
+        denom = self.running_count.to(dtype=acc_dtype).clamp_min(1)
         if denom.dtype != self.running_sum.dtype:
             denom = denom.to(dtype=self.running_sum.dtype)
         return self.running_sum / denom
@@ -243,6 +313,7 @@ class StreamingReducer(nn.Module):
         input_y: int,
         input_x: int,
         sides,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build reducer-backed backward pair for a single tile output.
 
@@ -267,7 +338,7 @@ class StreamingReducer(nn.Module):
             )
 
         normalization = self.running_count if self.mode == "mean" else None
-        reduced_output = self.reduce_tile(trimmed_output, normalization=normalization)
+        reduced_output = self.reduce_tile(trimmed_output, valid_mask=valid_mask, normalization=normalization)
         return reduced_output, gradient
 
     def _validate_replay_assignment(
@@ -327,7 +398,8 @@ class StreamingReducer(nn.Module):
 
         return cursor + 1
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         # Marker behavior for streaming path; SCNN performs accumulation.
+        # Accept optional mask kwarg for API parity with Reducer and model codepaths.
         self._last_output = x
         return x

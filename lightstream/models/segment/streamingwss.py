@@ -26,6 +26,7 @@ class StreamingWSS(StreamingModule):
         mean: list | None = None,
         std: list | None = None,
         tile_cache_path=None,
+        reducer_accumulator_dtype: torch.dtype | None = None,
     ):
         model_choices = self.get_model_choices()
 
@@ -34,11 +35,21 @@ class StreamingWSS(StreamingModule):
 
         if additional_modules is not None:
             stream_network = Sequential(
-                WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block),
+                WSS(
+                    encoder=encoder,
+                    weights="default",
+                    remove_last_block=remove_last_block,
+                    reducer_accumulator_dtype=reducer_accumulator_dtype,
+                ),
                 additional_modules,
             )
         else:
-            stream_network = WSS(encoder=encoder, weights="default", remove_last_block=remove_last_block)
+            stream_network = WSS(
+                encoder=encoder,
+                weights="default",
+                remove_last_block=remove_last_block,
+                reducer_accumulator_dtype=reducer_accumulator_dtype,
+            )
 
         if mean is None:
             mean = [0.485, 0.456, 0.406]

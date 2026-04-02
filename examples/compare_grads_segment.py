@@ -85,6 +85,17 @@ def _freeze_batchnorm(module: nn.Module) -> None:
                 param.requires_grad = False
 
 
+def _build_dummy_mask(size: int, device: torch.device) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.arange(size, device=device),
+        torch.arange(size, device=device),
+        indexing="ij",
+    )
+    center = size // 2
+    radius = max(8, size // 3)
+    return ((yy - center).abs() + (xx - center).abs()) <= radius
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
@@ -100,6 +111,7 @@ def main() -> None:
     input_size = args.input_size
 
     img = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    mask = _build_dummy_mask(input_size, device=device)
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
@@ -127,7 +139,7 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_outputs = network(img)
+    stream_outputs = network(img, mask=mask)
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
@@ -137,7 +149,7 @@ def main() -> None:
     total_loss = sum(loss)
     total_loss.backward()
     output_grads = tuple(out.grad for out in stream_outputs)
-    network.stream_network.backward(img, output_grads)
+    network.stream_network.backward(img, output_grads, mask=mask)
 
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
@@ -146,7 +158,7 @@ def main() -> None:
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
-    normal_outputs = normal_net(img_normal)
+    normal_outputs = normal_net(img_normal, mask=mask)
 
     for stream_out, normal_out in zip(stream_outputs, normal_outputs):
         diff = (stream_out - normal_out).abs()

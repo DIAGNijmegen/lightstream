@@ -87,8 +87,8 @@ class StreamingModule(nn.Module):
 
         return state_dict
 
-    def forward(self, x):
-        return self.stream_network(x)
+    def forward(self, x, mask=None):
+        return self.stream_network(x, mask=mask)
 
-    def backward_streaming(self, image, grad):
-        self.stream_network.backward(image, grad)
+    def backward_streaming(self, image, grad, mask=None):
+        self.stream_network.backward(image, grad, mask=mask)
