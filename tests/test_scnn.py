@@ -3,7 +3,7 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.modules.reducer import Reducer
+from lightstream.core.reducer import Reducer
 
 
 class AllReducerHeadsNet(nn.Module):

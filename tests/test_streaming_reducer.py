@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.modules.reducer import Reducer, StreamingReducer
+from lightstream.core.reducer import Reducer, StreamingReducer
 
 
 class MixedReducerNet(nn.Module):

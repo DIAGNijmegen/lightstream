@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.modules.reducer import Reducer
+from lightstream.core.reducer import Reducer
 from torchinfo import summary
 
 

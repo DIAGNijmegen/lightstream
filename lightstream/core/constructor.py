@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.modules.reducer import Reducer
+from lightstream.core.reducer import Reducer
 from typing import Callable, Optional, Any
 
 
