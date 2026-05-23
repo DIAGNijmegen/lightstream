@@ -16,7 +16,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.modules.reducer import Reducer, StreamingReducer
+from lightstream.core.reducer import Reducer, StreamingReducer
 
 
 _triple = _ntuple(3)
