@@ -1,3 +1,5 @@
+"""Shared reducer helper utilities for mask and dtype handling."""
+
 import torch
 
 

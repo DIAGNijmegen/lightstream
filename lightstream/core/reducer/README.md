@@ -76,18 +76,98 @@ Why this works well in Lightstream:
 - The same semantic mode (`mean`) maps naturally to `StreamingMeanReducer` in tiled
   execution, so offline and streaming behaviors stay aligned.
 
-## How to add a new reducer module
+## Tutorial: create and extend a reducer (mean example)
 
-Use this pattern for any new reducer variant (for example `max.py` or a true GeM implementation):
+This tutorial shows the intended extension path using **mean** as the reference.
 
-1. Add a new module in this package (e.g. `lightstream/core/reducer/myreducer.py`).
-2. If the reducer is streaming-compatible, subclass `StreamingReducer` and override only reducer-specific math:
-   - `reduce_tile(...)` for tile-local transform + reduction semantics.
-   - `finalize_stream(...)` if final normalization/transformation differs from base behavior.
-3. For non-streaming behavior, create a dedicated `nn.Module` (similar to `Reducer` in `mean.py`).
-4. Reuse helpers from `utils.py` for mask and dtype handling.
-5. Export the new public class in `lightstream/core/reducer/__init__.py`.
-6. Keep backward compatibility in `lightstream/modules/reducer.py` if the class should be available from legacy import paths.
+### 1) Non-streaming reducer: define plain reduction behavior
+
+Create a module like `lightstream/core/reducer/mean.py` with an `nn.Module` that
+accepts `x: [N, C, H, W]` and returns `[N, C, 1, 1]`.
+
+```python
+class Reducer(nn.Module):
+    def __init__(self, mode: str = "mean", accumulator_dtype=None):
+        ...
+
+    def forward(self, x, mask=None):
+        # validate x
+        # optional: normalize/validate mask
+        # mode == "sum": sum over H/W
+        # mode == "mean": sum / count
+        return y  # [N, C, 1, 1]
+```
+
+Why: this is the canonical non-streaming API used by regular model execution.
+
+### 2) Streaming reducer: reuse shared lifecycle, customize math only if needed
+
+For mean semantics, use the provided specialization:
+
+```python
+class StreamingMeanReducer(StreamingReducer):
+    def __init__(self, accumulator_dtype=None):
+        super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
+```
+
+For a new reducer type, subclass `StreamingReducer` and override:
+- `reduce_tile(...)` for tile-local reduction math
+- `finalize_stream(...)` if final stream aggregation differs from sum/mean behavior
+
+Why: SCNN handles tile orchestration; reducer classes should focus on reducer math and
+state transitions.
+
+### 3) Export it through package API
+
+Add your class in `lightstream/core/reducer/__init__.py`:
+
+```python
+from .myreducer import StreamingMyReducer
+
+__all__ = [
+    ...
+    "StreamingMyReducer",
+]
+```
+
+Why: users and internal modules should import only from `lightstream.core.reducer`.
+
+### 4) Keep behavior aligned between offline and streaming paths
+
+For mean, alignment means:
+- non-streaming: spatial mean over the full feature map
+- streaming: per-tile contributions + pixel-count normalization at `finalize_stream()`
+
+Use the same mode names/semantics (`"mean"`, `"sum"`) so conversion logic remains
+predictable.
+
+### 5) Minimal usage snippets
+
+**Offline mean reduction**
+
+```python
+from lightstream.core.reducer import Reducer
+
+reducer = Reducer(mode="mean")
+out = reducer(x)  # [N, C, 1, 1]
+```
+
+**Streaming mean reduction class selection**
+
+```python
+from lightstream.core.reducer import StreamingMeanReducer
+
+streaming_reducer = StreamingMeanReducer()
+# SCNN/constructor orchestration will call stream lifecycle methods.
+```
+
+### 6) Checklist for contributors
+
+- Validate tensor shapes early (`NCHW` expected).
+- Reuse `normalize_spatial_mask` and `resolve_accumulator_dtype` from `utils.py`.
+- Ensure counting semantics are explicit (what contributes to denominator?).
+- Document differences between non-streaming and streaming behavior.
+- Add/adjust tests for both direct reducer calls and SCNN-integrated execution paths.
 
 ## Limitations / keep in mind
 

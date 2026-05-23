@@ -1,3 +1,5 @@
+"""Mean/sum reducer implementations for offline and streaming execution."""
+
 import torch
 import torch.nn as nn
 

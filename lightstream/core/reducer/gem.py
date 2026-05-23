@@ -1,3 +1,5 @@
+"""GeM reducer API entry points for streaming integration."""
+
 import torch
 
 from .base import StreamingReducer
