@@ -161,3 +161,80 @@ def test_streaming_sum_reducer_does_not_normalize():
     output = reducer.finalize_stream()
     assert output.dtype == tile.dtype
     assert torch.allclose(output, torch.full((1, 2, 1, 1), 6.0, dtype=tile.dtype))
+
+from lightstream.core.reducer import StreamingGeMReducer
+
+
+def _gem_reference(x: torch.Tensor, mask: torch.Tensor, r: torch.Tensor, eps: float):
+    x_clamped = x.clamp_min(eps)
+    mask4 = mask.to(dtype=x.dtype, device=x.device)[None, None]
+    n = mask4.sum(dim=(-2, -1), keepdim=True).clamp_min(1)
+    m = (x_clamped.pow(r) * mask4).sum(dim=(-2, -1), keepdim=True) / n
+    return m.clamp_min(eps).pow(1.0 / r)
+
+
+def test_streaming_gem_default_r_init():
+    reducer = StreamingGeMReducer()
+    assert reducer.learnable_r is False
+    assert torch.isclose(reducer.current_r, torch.tensor(4.0), atol=1e-6)
+
+
+def test_streaming_gem_learnable_r_matches_init():
+    reducer = StreamingGeMReducer(r_init=16.0, learnable_r=True)
+    assert isinstance(reducer.r, torch.nn.Parameter)
+    assert torch.isclose(reducer.current_r.detach(), torch.tensor(16.0), atol=1e-6)
+
+
+def test_streaming_gem_forward_parity_masked_tiny_odd_shape():
+    torch.manual_seed(7)
+    reducer = StreamingGeMReducer(r_init=3.5, learnable_r=False, eps=1e-6)
+    x = torch.rand(1, 2, 3, 5) + 0.01
+    mask = torch.tensor([[1, 0, 1, 0, 1], [1, 1, 0, 1, 0], [0, 1, 1, 0, 1]], dtype=torch.bool)
+
+    reducer.start_stream(output_height=3, output_width=5, batch_size=1, channels=2, device=x.device, dtype=x.dtype)
+    reducer.accumulate_stream_tile(x[:, :, :2, :3], 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,2,0,3), user_mask=mask[:2,:3])
+    reducer.accumulate_stream_tile(x[:, :, :2, 3:], 0, 1, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,2,3,5), user_mask=mask[:2,3:])
+    reducer.accumulate_stream_tile(x[:, :, 2:, :], 1, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (2,3,0,5), user_mask=mask[2:,:])
+    y_stream = reducer.finish_stream()
+
+    y_ref = _gem_reference(x, mask, reducer.current_r.to(dtype=x.dtype), reducer.eps)
+    assert torch.allclose(y_stream, y_ref, atol=1e-5, rtol=1e-4)
+
+
+def test_streaming_gem_backward_input_and_r_grad_parity():
+    torch.manual_seed(9)
+    x = (torch.rand(1, 3, 5, 7) + 0.05).requires_grad_(True)
+    mask = (torch.rand(5, 7) > 0.3)
+
+    reducer = StreamingGeMReducer(r_init=2.3, learnable_r=True, eps=1e-6)
+    reducer.start_stream(output_height=5, output_width=7, batch_size=1, channels=3, device=x.device, dtype=x.dtype)
+    reducer.accumulate_stream_tile(x[:, :, :, :4], 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,5,0,4), user_mask=mask[:, :4])
+    reducer.accumulate_stream_tile(x[:, :, :, 4:], 0, 1, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,5,4,7), user_mask=mask[:, 4:])
+    y_stream = reducer.finish_stream()
+    loss_stream = y_stream.sum()
+    loss_stream.backward()
+    grad_x_stream = x.grad.detach().clone()
+    grad_r_stream = reducer.r.grad.detach().clone()
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    r_ref = torch.nn.Parameter(reducer.r.detach().clone())
+    y_ref = _gem_reference(x_ref, mask, r_ref.to(dtype=x_ref.dtype), reducer.eps)
+    y_ref.sum().backward()
+
+    assert torch.allclose(grad_x_stream, x_ref.grad, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(grad_r_stream, r_ref.grad, atol=1e-5, rtol=1e-4)
+
+
+def test_streaming_gem_fp16_stability_accumulator_fp32():
+    torch.manual_seed(11)
+    reducer = StreamingGeMReducer(r_init=4.0, learnable_r=False)
+    x = (torch.rand(1, 2, 4, 4, dtype=torch.float16) + 0.01)
+    mask = torch.ones((4, 4), dtype=torch.bool)
+
+    reducer.start_stream(output_height=4, output_width=4, batch_size=1, channels=2, device=x.device, dtype=x.dtype)
+    reducer.accumulate_stream_tile(x, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,4,0,4), user_mask=mask)
+    y = reducer.finish_stream()
+
+    assert reducer.running_count.dtype == torch.float32
+    assert y.dtype == torch.float16
+    assert torch.isfinite(y).all()
