@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.reducer import Reducer, StreamingReducer
+from lightstream.core.reducer import Reducer, StreamingMeanReducer, StreamingSumReducer
 
 
 class MixedReducerNet(nn.Module):
@@ -138,11 +138,11 @@ def test_streaming_reducer_backward_parity_tiny_odd_image():
         assert torch.allclose(stream_grads[name], ref_grad, atol=1e-5, rtol=1e-4), name
 
 
-def test_streaming_reducer_running_count_uses_fp32_accumulator():
-    reducer = StreamingReducer(mode="mean")
+def test_streaming_mean_reducer_running_count_uses_fp32_accumulator():
+    reducer = StreamingMeanReducer()
     tile = torch.ones((1, 2, 2, 3), dtype=torch.float16)
 
-    reducer.accumulate_tile(tile)
+    reducer.accumulate_valid_tile(tile, valid_mask=torch.ones((2, 3), dtype=torch.bool))
 
     assert reducer.running_sum.dtype == torch.float16
     assert reducer.running_count.dtype == torch.float32
@@ -150,3 +150,14 @@ def test_streaming_reducer_running_count_uses_fp32_accumulator():
     output = reducer.finalize_stream()
     assert output.dtype == tile.dtype
     assert torch.allclose(output, torch.ones((1, 2, 1, 1), dtype=tile.dtype))
+
+
+def test_streaming_sum_reducer_does_not_normalize():
+    reducer = StreamingSumReducer()
+    tile = torch.ones((1, 2, 2, 3), dtype=torch.float16)
+
+    reducer.accumulate_valid_tile(tile, valid_mask=torch.ones((2, 3), dtype=torch.bool))
+
+    output = reducer.finalize_stream()
+    assert output.dtype == tile.dtype
+    assert torch.allclose(output, torch.full((1, 2, 1, 1), 6.0, dtype=tile.dtype))
