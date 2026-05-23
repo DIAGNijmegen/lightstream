@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from abc import ABC, abstractmethod
 
 from .utils import resolve_accumulator_dtype
 
@@ -100,8 +101,33 @@ class StreamingReducerTileF(torch.autograd.Function):
 streaming_reduce_tile = StreamingReducerTileF.apply
 
 
-class StreamingReducer(nn.Module):
-    """Streaming spatial reducer base class.
+class BaseStreamingGlobalReducer(nn.Module, ABC):
+    """Abstract base class for streaming global reducers.
+
+    This base class owns:
+    - stream lifecycle setup/reset (`start_stream`, `reset_stream_state`)
+    - overlap-safe tile orchestration (`accumulate_stream_tile`)
+    - stream finalization (`finish_stream`/`finalize_stream`)
+    - debug backward replay bookkeeping (`start_backward_replay`,
+      `build_backward_pair`, replay validation).
+
+    Subclasses must implement:
+    - `init_reduction_state(...)`
+    - `accumulate_valid_tile(tile, valid_mask)`
+    - `finalize_from_state()`
+    - `reduce_tile_for_backward(trimmed_output, valid_mask, global_context)`
+
+    Subclasses may override:
+    - `extra_state_for_backward()` to expose global tensors/scalars needed during
+      backward replay tile reduction.
+
+    Base guarantees:
+    - non-overlapping accounting across streamed tiles via `_stream_seen_mask`
+      semantics (parity with previous mean reducer behavior)
+    - centralized accumulator dtype policy helpers (minimum fp32 when unresolved
+      by caller/subclass through `resolve_accumulator_dtype`)
+    - consistent replay metadata validation between forward tile traversal and
+      backward replay traversal.
 
     This class owns stream lifecycle, tile accumulation state, optional replay
     bookkeeping, and final reduction output assembly.
@@ -152,9 +178,10 @@ class StreamingReducer(nn.Module):
         accumulator_dtype : torch.dtype | None, default=None
             Optional dtype override for ``running_count``.
         """
-        resolved_acc_dtype = resolve_accumulator_dtype(accumulator_dtype or self.accumulator_dtype, dtype)
         self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
+        resolved_acc_dtype = resolve_accumulator_dtype(accumulator_dtype or self.accumulator_dtype, dtype)
         self.running_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=resolved_acc_dtype)
+        self.init_reduction_state(batch_size=batch_size, channels=channels, device=device, dtype=dtype, accumulator_dtype=resolved_acc_dtype)
 
     def start_stream(
         self,
@@ -184,7 +211,7 @@ class StreamingReducer(nn.Module):
                 raise RuntimeError("Reducer replay assignments are not initialized.")
             self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(trimmed_output.shape[-2]), int(trimmed_output.shape[-1]), int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1)))
         if torch.any(effective_mask):
-            self.accumulate_tile(trimmed_output, valid_mask=effective_mask)
+            self.accumulate_valid_tile(trimmed_output, valid_mask=effective_mask)
         seen_slice |= new_mask
 
     def finish_stream(self) -> torch.Tensor:
@@ -209,32 +236,9 @@ class StreamingReducer(nn.Module):
         if self._replay_cursor != len(self._replay_assignments):
             raise RuntimeError(f"Reducer assignment replay incomplete for head {head_idx}: consumed={self._replay_cursor}, expected={len(self._replay_assignments)}")
 
-    def accumulate_tile(self, tile_valid_output: torch.Tensor, valid_mask: torch.Tensor | None = None):
-        """Reduce one tile and add it to stream totals."""
-        if self.running_sum.numel() == 0:
-            self.reset_stream_state(batch_size=tile_valid_output.shape[0], channels=tile_valid_output.shape[1], device=tile_valid_output.device, dtype=tile_valid_output.dtype)
-        tile_contribution = self.reduce_tile(tile_valid_output, valid_mask=valid_mask)
-        self.running_sum = self.running_sum + tile_contribution
-        n_pixels = tile_valid_output.shape[-1] * tile_valid_output.shape[-2] if valid_mask is None else int(valid_mask.sum().item())
-        if self.mode == "mean":
-            pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
-            self.running_count = self.running_count + pixel_increment
-
     def finalize_stream(self) -> torch.Tensor:
-        """Compute final output from running state."""
-        if self.running_sum.numel() == 0:
-            raise RuntimeError("StreamingReducer state is empty, accumulate_tile() was not called.")
-        if self.mode == "sum":
-            return self.running_sum
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
-        denom = self.running_count.to(dtype=acc_dtype).clamp_min(1)
-        if denom.dtype != self.running_sum.dtype:
-            denom = denom.to(dtype=self.running_sum.dtype)
-        return self.running_sum / denom
-
-    def reduce_tile(self, tile_output: torch.Tensor, valid_mask: torch.Tensor | None = None, normalization: torch.Tensor | None = None) -> torch.Tensor:
-        """Reduce one tile using shared autograd implementation."""
-        return streaming_reduce_tile(tile_output, valid_mask, normalization)
+        """Compute final output from reducer state."""
+        return self.finalize_from_state()
 
     def build_backward_pair(self, trimmed_output: torch.Tensor, gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Build reducer output / upstream gradient pair for backward orchestration."""
@@ -244,9 +248,29 @@ class StreamingReducer(nn.Module):
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
             self._replay_cursor = self._validate_replay_assignment(assignments=self._replay_assignments, cursor=self._replay_cursor, input_y=input_y, input_x=input_x, sides=sides, expected_h=expected_h, expected_w=expected_w)
-        normalization = self.running_count if self.mode == "mean" else None
-        reduced_output = self.reduce_tile(trimmed_output, valid_mask=valid_mask, normalization=normalization)
+        global_context = self.extra_state_for_backward()
+        reduced_output = self.reduce_tile_for_backward(trimmed_output, valid_mask=valid_mask, global_context=global_context)
         return reduced_output, gradient
+
+    @abstractmethod
+    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
+        """Initialize subclass-owned state for a stream."""
+
+    @abstractmethod
+    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
+        """Accumulate one valid tile contribution into subclass state."""
+
+    @abstractmethod
+    def finalize_from_state(self) -> torch.Tensor:
+        """Finalize and return stream output from subclass state."""
+
+    @abstractmethod
+    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        """Build tile-local reduced output used for backward replay."""
+
+    def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
+        """Optional global state to feed `reduce_tile_for_backward`."""
+        return {}
 
     def _validate_replay_assignment(self, *, assignments: list[tuple], cursor: int, input_y: int, input_x: int, sides, expected_h: int, expected_w: int) -> int:
         """Check backward tile metadata against recorded forward metadata."""
@@ -278,3 +302,38 @@ class StreamingReducer(nn.Module):
         """
         self._last_output = x
         return x
+
+
+class StreamingReducer(BaseStreamingGlobalReducer):
+    """Default streaming global reducer implementing sum/mean math."""
+
+    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
+        # Base buffers already initialized in reset_stream_state.
+        _ = (batch_size, channels, device, dtype, accumulator_dtype)
+
+    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
+        if self.running_sum.numel() == 0:
+            self.reset_stream_state(batch_size=tile.shape[0], channels=tile.shape[1], device=tile.device, dtype=tile.dtype)
+        tile_contribution = streaming_reduce_tile(tile, valid_mask, None)
+        self.running_sum = self.running_sum + tile_contribution
+        if self.mode == "mean":
+            n_pixels = int(valid_mask.sum().item())
+            pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
+            self.running_count = self.running_count + pixel_increment
+
+    def finalize_from_state(self) -> torch.Tensor:
+        if self.running_sum.numel() == 0:
+            raise RuntimeError("StreamingReducer state is empty, accumulate_stream_tile() was not called.")
+        if self.mode == "sum":
+            return self.running_sum
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
+        denom = self.running_count.to(dtype=acc_dtype).clamp_min(1)
+        if denom.dtype != self.running_sum.dtype:
+            denom = denom.to(dtype=self.running_sum.dtype)
+        return self.running_sum / denom
+
+    def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
+        return {"normalization": self.running_count if self.mode == "mean" else None}
+
+    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
