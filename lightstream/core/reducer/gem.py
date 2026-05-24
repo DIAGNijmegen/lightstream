@@ -1,29 +1,78 @@
-"""GeM reducer implementation for streaming integration."""
+"""GeM reducer implementations for offline and streaming execution."""
 
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .utils import resolve_accumulator_dtype
+from .reducer_base import BaseReducer
+from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
-class StreamingGeMReducer(BaseStreamingGlobalReducer):
-    """Streaming global GeM reducer with optional learnable exponent ``r``."""
+class GeMReducer(BaseReducer):
+    """Apply global generalized-mean (GeM) reduction on NCHW tensors."""
 
     def __init__(
         self,
         r_init: float = 4.0,
-        learnable_r: bool = False,
+        eps: float = 1e-6,
+        accumulator_dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.eps = float(eps)
+        self.accumulator_dtype = accumulator_dtype
+
+        init_r = torch.tensor(float(r_init), dtype=torch.float32)
+        self.register_buffer("r", init_r)
+
+    @property
+    def current_r(self) -> torch.Tensor:
+        return self.r
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
+        if self._streaming_passthrough:
+            return x
+
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
+        x_acc = x.to(dtype=acc_dtype)
+        x_clamped = x_acc.clamp_min(self.eps)
+        r = self.current_r.to(device=x.device, dtype=acc_dtype)
+        x_pow = x_clamped.pow(r)
+
+        if mask is not None:
+            mask_nchw = normalize_spatial_mask(mask, x)
+            mask_acc = mask_nchw.to(dtype=acc_dtype)
+            denom = mask_acc.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
+            mean_pow = (x_pow * mask_acc).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
+        else:
+            mean_pow = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+
+        y = mean_pow.clamp_min(self.eps).pow(1.0 / r)
+        return y.to(dtype=x.dtype)
+
+    def to_streaming(self) -> BaseStreamingGlobalReducer:
+        reducer = StreamingGeMReducer(
+            r_init=float(self.current_r.detach().item()),
+            eps=self.eps,
+            accumulator_dtype=self.accumulator_dtype,
+        )
+        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        return reducer
+
+
+class StreamingGeMReducer(BaseStreamingGlobalReducer):
+    """Streaming global GeM reducer."""
+
+    def __init__(
+        self,
+        r_init: float = 4.0,
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
-        self.learnable_r = bool(learnable_r)
         self.eps = float(eps)
         init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        if self.learnable_r:
-            self.r = torch.nn.Parameter(init_r)
-        else:
-            self.register_buffer("r", init_r)
+        self.register_buffer("r", init_r)
 
         self.register_buffer("running_q", torch.zeros(0), persistent=False)
 
