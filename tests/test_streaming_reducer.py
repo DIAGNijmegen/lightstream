@@ -175,19 +175,17 @@ def _gem_reference(x: torch.Tensor, mask: torch.Tensor, r: torch.Tensor, eps: fl
 
 def test_streaming_gem_default_r_init():
     reducer = StreamingGeMReducer()
-    assert reducer.learnable_r is False
     assert torch.isclose(reducer.current_r, torch.tensor(4.0), atol=1e-6)
 
 
-def test_streaming_gem_learnable_r_matches_init():
-    reducer = StreamingGeMReducer(r_init=16.0, learnable_r=True)
-    assert isinstance(reducer.r, torch.nn.Parameter)
-    assert torch.isclose(reducer.current_r.detach(), torch.tensor(16.0), atol=1e-6)
+def test_streaming_gem_r_init_matches_init():
+    reducer = StreamingGeMReducer(r_init=16.0)
+    assert torch.isclose(reducer.current_r, torch.tensor(16.0), atol=1e-6)
 
 
 def test_streaming_gem_forward_parity_masked_tiny_odd_shape():
     torch.manual_seed(7)
-    reducer = StreamingGeMReducer(r_init=3.5, learnable_r=False, eps=1e-6)
+    reducer = StreamingGeMReducer(r_init=3.5, eps=1e-6)
     x = torch.rand(1, 2, 3, 5) + 0.01
     mask = torch.tensor([[1, 0, 1, 0, 1], [1, 1, 0, 1, 0], [0, 1, 1, 0, 1]], dtype=torch.bool)
 
@@ -201,12 +199,12 @@ def test_streaming_gem_forward_parity_masked_tiny_odd_shape():
     assert torch.allclose(y_stream, y_ref, atol=1e-5, rtol=1e-4)
 
 
-def test_streaming_gem_backward_input_and_r_grad_parity():
+def test_streaming_gem_backward_input_grad_parity():
     torch.manual_seed(9)
     x = (torch.rand(1, 3, 5, 7) + 0.05).requires_grad_(True)
     mask = (torch.rand(5, 7) > 0.3)
 
-    reducer = StreamingGeMReducer(r_init=2.3, learnable_r=True, eps=1e-6)
+    reducer = StreamingGeMReducer(r_init=2.3, eps=1e-6)
     reducer.start_stream(output_height=5, output_width=7, batch_size=1, channels=3, device=x.device, dtype=x.dtype)
     reducer.accumulate_stream_tile(x[:, :, :, :4], 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,5,0,4), user_mask=mask[:, :4])
     reducer.accumulate_stream_tile(x[:, :, :, 4:], 0, 1, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), (0,5,4,7), user_mask=mask[:, 4:])
@@ -214,20 +212,17 @@ def test_streaming_gem_backward_input_and_r_grad_parity():
     loss_stream = y_stream.sum()
     loss_stream.backward()
     grad_x_stream = x.grad.detach().clone()
-    grad_r_stream = reducer.r.grad.detach().clone()
-
     x_ref = x.detach().clone().requires_grad_(True)
-    r_ref = torch.nn.Parameter(reducer.r.detach().clone())
+    r_ref = reducer.r.detach().clone()
     y_ref = _gem_reference(x_ref, mask, r_ref.to(dtype=x_ref.dtype), reducer.eps)
     y_ref.sum().backward()
 
     assert torch.allclose(grad_x_stream, x_ref.grad, atol=1e-5, rtol=1e-4)
-    assert torch.allclose(grad_r_stream, r_ref.grad, atol=1e-5, rtol=1e-4)
 
 
 def test_streaming_gem_fp16_stability_accumulator_fp32():
     torch.manual_seed(11)
-    reducer = StreamingGeMReducer(r_init=4.0, learnable_r=False)
+    reducer = StreamingGeMReducer(r_init=4.0)
     x = (torch.rand(1, 2, 4, 4, dtype=torch.float16) + 0.01)
     mask = torch.ones((4, 4), dtype=torch.bool)
 

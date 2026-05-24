@@ -141,3 +141,12 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         x_pow = x_clamped.pow(r)
         m_tile = streaming_reduce_tile(x_pow, valid_mask, n)
         return m_tile.clamp_min(self.eps).pow(1.0 / r).to(dtype=trimmed_output.dtype)
+
+    def to_reducer(self) -> GeMReducer:
+        reducer = GeMReducer(
+            r_init=float(self.current_r.detach().item()),
+            eps=self.eps,
+            accumulator_dtype=self.accumulator_dtype,
+        )
+        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        return reducer

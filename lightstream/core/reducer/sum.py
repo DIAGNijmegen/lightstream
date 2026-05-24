@@ -55,3 +55,6 @@ class StreamingSumReducer(BaseStreamingGlobalReducer):
 
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
         return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
+
+    def to_reducer(self) -> SumReducer:
+        return SumReducer(accumulator_dtype=self.accumulator_dtype)
