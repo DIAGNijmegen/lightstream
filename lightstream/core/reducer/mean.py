@@ -1,13 +1,13 @@
 """Mean/sum reducer implementations for offline and streaming execution."""
 
 import torch
-import torch.nn as nn
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
+from .reducer_base import BaseReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
-class Reducer(nn.Module):
+class Reducer(BaseReducer):
     """Apply global spatial sum or mean reduction on NCHW tensors.
 
     Parameters
@@ -24,7 +24,7 @@ class Reducer(nn.Module):
             raise ValueError(f"Unsupported reducer mode '{mode}', expected 'sum' or 'mean'.")
         self.mode = mode
         self.accumulator_dtype = accumulator_dtype
-        self._streaming_passthrough = False
+
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """Reduce spatial dimensions for a batch of feature maps.
@@ -58,6 +58,12 @@ class Reducer(nn.Module):
         if self.mode == "sum":
             return x.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
         return x.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
+
+    def to_streaming(self) -> BaseStreamingGlobalReducer:
+        """Create streaming reducer with equivalent sum/mean semantics."""
+        if self.mode == "sum":
+            return StreamingSumReducer(accumulator_dtype=self.accumulator_dtype)
+        return StreamingMeanReducer(accumulator_dtype=self.accumulator_dtype)
 
 
 class _StreamingSumMeanReducer(BaseStreamingGlobalReducer):
