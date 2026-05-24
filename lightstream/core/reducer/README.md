@@ -2,6 +2,14 @@
 
 This package contains the spatial reduction logic used by Lightstream in both non-streaming and streaming paths.
 
+## Quick usage contract (important)
+
+- Use `*Reducer` classes (for example, `MeanReducer`, `GeMReducer`) in model definitions.
+- SCNN converts reducers for tiled execution via `to_streaming()`.
+- `Streaming*Reducer` classes are execution implementations, **not** the primary user entrypoint.
+
+In practice: define your model with non-streaming reducer modules, then let SCNN/runtime conversion handle the streaming class swap.
+
 ## Package structure
 
 - `__init__.py`
@@ -28,8 +36,18 @@ This package contains the spatial reduction logic used by Lightstream in both no
   - `StreamingMeanReducer`: convenience specialization of `StreamingReducer` for mean behavior.
 
 - `gem.py`
-  - `StreamingGeMReducer` API entry point.
-  - Currently implemented as a compatibility alias over mean-style streaming behavior.
+  - `GeMReducer`: non-streaming GeM API entry point.
+  - `StreamingGeMReducer`: streaming GeM execution implementation.
+
+## `use_streaming=True` passthrough behavior
+
+When a model (or conversion entrypoint) is configured with `use_streaming=True`, reducer handling is:
+
+1. Your model still instantiates non-streaming `*Reducer` modules.
+2. SCNN conversion walks modules and calls reducer `to_streaming()` hooks.
+3. The returned `Streaming*Reducer` classes are used only in streaming execution.
+
+This passthrough keeps your model code stable while switching execution strategy.
 
 ## Logic and design notes
 
@@ -49,7 +67,6 @@ This package contains the spatial reduction logic used by Lightstream in both no
    - Tile-level backward expands `[N, C, 1, 1]` gradients back to tile shape and reapplies masks.
    - Mean mode uses normalization from stream counts.
 
-
 ## Example: global mean pooling
 
 A common use-case is converting spatial feature maps into one vector per channel before
@@ -59,7 +76,7 @@ input `H x W`.
 
 ```python
 import torch
-from lightstream.core.reducer import MeanReducer, SumReducer
+from lightstream.core.reducer import MeanReducer
 
 # N=2, C=64, H=W=32
 x = torch.randn(2, 64, 32, 32)
@@ -70,109 +87,84 @@ y = reducer(x)
 print(y.shape)  # torch.Size([2, 64, 1, 1])
 ```
 
-Why this works well in Lightstream:
-- It matches the expected contract of downstream linear/classification heads.
-- It is robust to varying spatial sizes because reduction is normalized by pixel count.
-- The same semantic mode (`mean`) maps naturally to `StreamingMeanReducer` in tiled
-  execution, so offline and streaming behaviors stay aligned.
+## Example: GeM with `r_init` and `learnable_r`
 
-## Tutorial: create and extend a reducer (mean example)
-
-This tutorial shows the intended extension path using **mean** as the reference.
-
-### 1) Non-streaming reducer: define plain reduction behavior
-
-Create a module like `lightstream/core/reducer/mean.py` with an `nn.Module` that
-accepts `x: [N, C, H, W]` and returns `[N, C, 1, 1]`.
+Use GeM when you want tunable pooling sharpness between average-like and max-like behavior.
 
 ```python
-class MeanReducer(nn.Module):
-    def __init__(self, mode: str = "mean", accumulator_dtype=None):
+import torch
+from lightstream.core.reducer import GeMReducer
+
+# N=2, C=256, H=W=20
+x = torch.randn(2, 256, 20, 20)
+
+reducer = GeMReducer(
+    r_init=3.0,
+    learnable_r=True,
+)
+
+y = reducer(x)
+print(y.shape)  # torch.Size([2, 256, 1, 1])
+```
+
+Under `use_streaming=True`, SCNN will call `reducer.to_streaming()` so tiled execution uses the corresponding `StreamingGeMReducer` implementation.
+
+## Extension guide: custom reducers
+
+If you add a new reducer family, provide both non-streaming and streaming pieces.
+
+### 1) Implement non-streaming `*Reducer`
+
+Create `MyReducer(nn.Module)` for regular model definitions.
+
+Expected responsibilities:
+- Validate input shape (`NCHW`).
+- Perform full-frame reduction semantics.
+- Expose constructor args needed by users.
+- Implement `to_streaming()`.
+
+```python
+class MyReducer(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
         ...
 
     def forward(self, x, mask=None):
-        # validate x
-        # optional: normalize/validate mask
-        # mode == "sum": sum over H/W
-        # mode == "mean": sum / count
-        return y  # [N, C, 1, 1]
+        ...
+
+    def to_streaming(self):
+        return StreamingMyReducer(...)
 ```
 
-Why: this is the canonical non-streaming API used by regular model execution.
+### 2) Implement corresponding `Streaming*Reducer`
 
-### 2) Streaming reducer: reuse shared lifecycle, customize math only if needed
+Create `StreamingMyReducer(StreamingReducer)` and implement streaming hooks required by your math.
 
-For mean semantics, use the provided specialization:
+Typical hooks:
+- `reduce_tile(...)` for tile-local contribution logic.
+- `finalize_stream(...)` for final aggregation/normalization.
+- Any extra state init/reset needed by your reducer semantics.
 
-```python
-class StreamingMeanReducer(StreamingReducer):
-    def __init__(self, accumulator_dtype=None):
-        super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
-```
+### 3) Keep constructor/state parity
 
-For a new reducer type, subclass `StreamingReducer` and override:
-- `reduce_tile(...)` for tile-local reduction math
-- `finalize_stream(...)` if final stream aggregation differs from sum/mean behavior
+`to_streaming()` should pass all semantically relevant fields (for example exponents, eps values, dtype policy) into the streaming class so offline and streaming behavior stay aligned.
 
-Why: SCNN handles tile orchestration; reducer classes should focus on reducer math and
-state transitions.
+### 4) Export both classes
 
-### 3) Export it through package API
+Re-export `MyReducer` and `StreamingMyReducer` via `lightstream.core.reducer.__init__` so conversion and imports remain consistent.
 
-Add your class in `lightstream/core/reducer/__init__.py`:
+### 5) Contributor checklist
 
-```python
-from .myreducer import StreamingMyReducer
-
-__all__ = [
-    ...
-    "StreamingMyReducer",
-]
-```
-
-Why: users and internal modules should import only from `lightstream.core.reducer`.
-
-### 4) Keep behavior aligned between offline and streaming paths
-
-For mean, alignment means:
-- non-streaming: spatial mean over the full feature map
-- streaming: per-tile contributions + pixel-count normalization at `finalize_stream()`
-
-Use the same mode names/semantics (`"mean"`, `"sum"`) so conversion logic remains
-predictable.
-
-### 5) Minimal usage snippets
-
-**Offline mean reduction**
-
-```python
-from lightstream.core.reducer import MeanReducer, SumReducer
-
-reducer = MeanReducer()
-out = reducer(x)  # [N, C, 1, 1]
-```
-
-**Streaming mean reduction class selection**
-
-```python
-from lightstream.core.reducer import StreamingMeanReducer
-
-streaming_reducer = StreamingMeanReducer()
-# SCNN/constructor orchestration will call stream lifecycle methods.
-```
-
-### 6) Checklist for contributors
-
-- Validate tensor shapes early (`NCHW` expected).
-- Reuse `normalize_spatial_mask` and `resolve_accumulator_dtype` from `utils.py`.
-- Ensure counting semantics are explicit (what contributes to denominator?).
-- Document differences between non-streaming and streaming behavior.
-- Add/adjust tests for both direct reducer calls and SCNN-integrated execution paths.
+- Reuse `normalize_spatial_mask` and `resolve_accumulator_dtype` when applicable.
+- Document denominator/counting semantics explicitly.
+- Add tests for:
+  - non-streaming reducer forward
+  - `to_streaming()` conversion
+  - streaming execution equivalence/acceptance within SCNN paths
 
 ## Limitations / keep in mind
 
 - `StreamingReducerTileF` currently expects NCHW tensors and (when provided) a **2D** `valid_mask` for a tile.
 - `normalize_spatial_mask` supports 2D/3D/4D masks only.
 - Streaming count tracking is shared across channels (`[N, 1, 1, 1]`), so per-channel normalization behavior is not modeled.
-- `StreamingGeMReducer` is currently a placeholder alias over mean-style accumulation; it is **not** a full GeM power-mean implementation yet.
 - The deprecated compatibility path `lightstream.modules.reducer` remains available but should not be used for new code.
