@@ -303,37 +303,10 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self._last_output = x
         return x
 
+class StreamingReducer(BaseStreamingGlobalReducer, ABC):
+    """Backward-compatible abstract alias for custom streaming reducers.
 
-class StreamingReducer(BaseStreamingGlobalReducer):
-    """Default streaming global reducer implementing sum/mean math."""
-
-    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
-        # Base buffers already initialized in reset_stream_state.
-        _ = (batch_size, channels, device, dtype, accumulator_dtype)
-
-    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
-        if self.running_sum.numel() == 0:
-            self.reset_stream_state(batch_size=tile.shape[0], channels=tile.shape[1], device=tile.device, dtype=tile.dtype)
-        tile_contribution = streaming_reduce_tile(tile, valid_mask, None)
-        self.running_sum = self.running_sum + tile_contribution
-        if self.mode == "mean":
-            n_pixels = int(valid_mask.sum().item())
-            pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
-            self.running_count = self.running_count + pixel_increment
-
-    def finalize_from_state(self) -> torch.Tensor:
-        if self.running_sum.numel() == 0:
-            raise RuntimeError("StreamingReducer state is empty, accumulate_stream_tile() was not called.")
-        if self.mode == "sum":
-            return self.running_sum
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
-        denom = self.running_count.to(dtype=acc_dtype).clamp_min(1)
-        if denom.dtype != self.running_sum.dtype:
-            denom = denom.to(dtype=self.running_sum.dtype)
-        return self.running_sum / denom
-
-    def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
-        return {"normalization": self.running_count if self.mode == "mean" else None}
-
-    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
+    This class intentionally does not implement a concrete reduction strategy.
+    Subclassers should implement the abstract methods from
+    :class:`BaseStreamingGlobalReducer` directly.
+    """
