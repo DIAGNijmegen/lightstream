@@ -16,7 +16,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.reducer import BaseReducer, StreamingReducer
+from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
 _triple = _ntuple(3)
@@ -427,7 +427,7 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, BaseReducer):
-            mod = StreamingReducer.from_reducer(module)
+            mod = module.to_streaming()
             self._streaming_reducers.append(mod)
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
@@ -456,7 +456,7 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif isinstance(module, StreamingReducer):
+        elif isinstance(module, BaseStreamingGlobalReducer):
             mod = module.to_reducer()
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
