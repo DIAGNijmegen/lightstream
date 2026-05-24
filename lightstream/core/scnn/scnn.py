@@ -16,7 +16,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.reducer import Reducer, StreamingReducer
+from lightstream.core.reducer import BaseReducer, StreamingReducer
 
 
 _triple = _ntuple(3)
@@ -227,7 +227,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _set_reducer_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
-            if isinstance(mod, Reducer):
+            if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
@@ -426,7 +426,7 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif isinstance(module, Reducer):
+        elif isinstance(module, BaseReducer):
             mod = StreamingReducer.from_reducer(module)
             self._streaming_reducers.append(mod)
         for name, child in module.named_children():

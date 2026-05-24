@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.reducer import Reducer, StreamingMeanReducer, StreamingSumReducer
+from lightstream.core.reducer import MeanReducer, StreamingMeanReducer, StreamingSumReducer, SumReducer
 
 
 class MixedReducerNet(nn.Module):
@@ -13,7 +13,7 @@ class MixedReducerNet(nn.Module):
             nn.ReLU(),
         )
         self.raw_head = nn.Conv2d(4, 2, kernel_size=1, bias=False)
-        self.mean_head = nn.Sequential(nn.Conv2d(4, 2, kernel_size=1, bias=False), Reducer(mode="mean"))
+        self.mean_head = nn.Sequential(nn.Conv2d(4, 2, kernel_size=1, bias=False), MeanReducer())
 
     def forward(self, x):
         feat = self.backbone(x)
@@ -27,8 +27,8 @@ class MultiReducerNet(nn.Module):
             nn.Conv2d(3, 5, kernel_size=3, padding=1, bias=False),
             nn.ReLU(),
         )
-        self.sum_head = nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=False), Reducer(mode="sum"))
-        self.mean_head = nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=False), Reducer(mode="mean"))
+        self.sum_head = nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=False), SumReducer())
+        self.mean_head = nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=False), MeanReducer())
 
     def forward(self, x):
         feat = self.backbone(x)

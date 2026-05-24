@@ -15,7 +15,7 @@ import torch.nn as nn
 
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.core.reducer import Reducer
+from lightstream.core.reducer import BaseReducer
 from typing import Callable, Optional, Any
 
 
@@ -66,7 +66,7 @@ class StreamingConstructor:
             torch.nn.MaxPool2d,
             torch.nn.MaxPool3d,
             torch.nn.Upsample,
-            Reducer,
+            BaseReducer,
         ]
 
         if add_keep_modules is not None:

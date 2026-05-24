@@ -7,10 +7,12 @@ warnings.warn(
 )
 
 from lightstream.core.reducer import (  # noqa: E402
-    Reducer,
+    MeanReducer,
+    SumReducer,
     StreamingGeMReducer,
     StreamingMeanReducer,
     StreamingReducer,
+    StreamingSumReducer,
 )
 
-__all__ = ["Reducer", "StreamingReducer", "StreamingMeanReducer", "StreamingGeMReducer"]
+__all__ = ["MeanReducer", "SumReducer", "StreamingReducer", "StreamingMeanReducer", "StreamingSumReducer", "StreamingGeMReducer"]
