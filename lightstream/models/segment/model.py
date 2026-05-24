@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.reducer import Reducer
+from lightstream.core.reducer import MeanReducer
 from torchinfo import summary
 
 
@@ -23,9 +23,9 @@ class WSS(nn.Module):
     ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
-        self.red2 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
-        self.red3 = Reducer(mode="mean", accumulator_dtype=reducer_accumulator_dtype)
+        self.red1 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red2 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red3 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
 
 
         self.decoder1 = nn.Sequential(

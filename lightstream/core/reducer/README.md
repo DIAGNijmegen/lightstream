@@ -59,12 +59,12 @@ input `H x W`.
 
 ```python
 import torch
-from lightstream.core.reducer import Reducer
+from lightstream.core.reducer import MeanReducer, SumReducer
 
 # N=2, C=64, H=W=32
 x = torch.randn(2, 64, 32, 32)
 
-reducer = Reducer(mode="mean")
+reducer = MeanReducer()
 y = reducer(x)
 
 print(y.shape)  # torch.Size([2, 64, 1, 1])
@@ -86,7 +86,7 @@ Create a module like `lightstream/core/reducer/mean.py` with an `nn.Module` that
 accepts `x: [N, C, H, W]` and returns `[N, C, 1, 1]`.
 
 ```python
-class Reducer(nn.Module):
+class MeanReducer(nn.Module):
     def __init__(self, mode: str = "mean", accumulator_dtype=None):
         ...
 
@@ -146,9 +146,9 @@ predictable.
 **Offline mean reduction**
 
 ```python
-from lightstream.core.reducer import Reducer
+from lightstream.core.reducer import MeanReducer, SumReducer
 
-reducer = Reducer(mode="mean")
+reducer = MeanReducer()
 out = reducer(x)  # [N, C, 1, 1]
 ```
 
