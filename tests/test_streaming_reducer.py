@@ -2,7 +2,14 @@ import torch
 import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.reducer import MeanReducer, StreamingMeanReducer, StreamingSumReducer, SumReducer
+from lightstream.core.reducer import (
+    AttentionGeMReducer,
+    MeanReducer,
+    StreamingAttentionGeMReducer,
+    StreamingMeanReducer,
+    StreamingSumReducer,
+    SumReducer,
+)
 
 
 class MixedReducerNet(nn.Module):
@@ -233,3 +240,45 @@ def test_streaming_gem_fp16_stability_accumulator_fp32():
     assert reducer.running_count.dtype == torch.float32
     assert y.dtype == torch.float16
     assert torch.isfinite(y).all()
+
+
+class AttentionGeMHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False), nn.ReLU())
+        self.feat_head = nn.Conv2d(4, 3, kernel_size=1, bias=False)
+        self.logit_head = nn.Conv2d(4, 1, kernel_size=1, bias=False)
+        self.reducer = AttentionGeMReducer(r_init=2.7, eps=1e-6)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        return self.reducer(self.feat_head(feat), self.logit_head(feat))
+
+
+def test_streaming_attention_gem_backward_parity_x_and_logits():
+    torch.manual_seed(13)
+    model = AttentionGeMHeadNet().eval()
+    reference = AttentionGeMHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = (torch.rand(1, 3, 9, 11) + 0.05).requires_grad_(True)
+    ref_image = image.detach().clone().requires_grad_(True)
+    grad_out = torch.full((1, 3, 1, 1), 0.41, dtype=image.dtype)
+
+    ref_out = reference(ref_image)
+    torch.autograd.backward(ref_out, grad_out)
+
+    scnn = _make_streaming(model, tile_size=4)
+    scnn.debug_reducer_replay = True
+    assert isinstance(scnn.stream_module.reducer, StreamingAttentionGeMReducer)
+    stream_out = scnn.forward(image.detach().clone())
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.detach().clone(), grad_out.detach().clone())
+
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    ref_grads = {name: p.grad for name, p in reference.named_parameters() if p.grad is not None}
+
+    for name in ("feat_head.weight", "logit_head.weight"):
+        assert name in stream_grads
+        assert name in ref_grads
+        assert torch.allclose(stream_grads[name], ref_grads[name], atol=2e-5, rtol=2e-4), name
