@@ -30,10 +30,18 @@ class BaseReducer(nn.Module, ABC):
         self._streaming_passthrough = bool(streaming_passthrough)
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run non-streaming reduction on ``x`` (or passthrough when enabled)."""
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Run non-streaming reduction over positional ``inputs``.
+
+        Conventions
+        -----------
+        - Legacy reducers consume exactly one tensor input (``inputs[0]``).
+        - Multi-input reducers must define and validate expected arity and
+          per-input shape contracts.
+        - ``mask`` is always a keyword-only auxiliary argument and is not part
+          of ``*inputs``.
+        """
 
     @abstractmethod
     def to_streaming(self) -> BaseStreamingGlobalReducer:
         """Create the equivalent streaming reducer implementation."""
-

@@ -15,7 +15,10 @@ class MeanReducer(BaseReducer):
         super().__init__()
         self.accumulator_dtype = accumulator_dtype
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if len(inputs) != 1:
+            raise ValueError(f"MeanReducer expects exactly one tensor input, got {len(inputs)}.")
+        x = inputs[0]
         if x.ndim != 4:
             raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
         if self._streaming_passthrough:
