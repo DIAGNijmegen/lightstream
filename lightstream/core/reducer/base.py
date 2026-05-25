@@ -285,21 +285,32 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
             raise RuntimeError("Reducer assignment mismatch: " f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})")
         return cursor + 1
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Streaming forward passthrough.
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Streaming forward passthrough for reducer tile payloads.
 
         Parameters
         ----------
-        x : torch.Tensor
-            Tile output tensor.
+        *inputs : torch.Tensor
+            Positional tile payload.
+            Legacy reducers pass exactly one tile tensor. Multi-input reducers
+            may pass multiple tensors, and should document expected arity and
+            per-input shapes. This base implementation preserves only the legacy
+            one-input passthrough behavior.
         mask : torch.Tensor | None, default=None
             Unused placeholder for API parity with non-streaming reducers.
+            Behaves as keyword-only metadata and is not part of ``*inputs``.
 
         Returns
         -------
         torch.Tensor
-            Input tensor unchanged.
+            Input tensor unchanged for one-input legacy reducers.
         """
+        if len(inputs) != 1:
+            raise ValueError(
+                "BaseStreamingGlobalReducer legacy passthrough expects exactly one tensor input; "
+                f"got {len(inputs)}."
+            )
+        x = inputs[0]
         self._last_output = x
         return x
 
