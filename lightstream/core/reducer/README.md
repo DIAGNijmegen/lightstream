@@ -10,6 +10,33 @@ This package contains the spatial reduction logic used by Lightstream in both no
 
 In practice: define your model with non-streaming reducer modules, then let SCNN/runtime conversion handle the streaming class swap.
 
+## Generalized reducer input contract
+
+All reducer families now follow:
+
+```python
+forward(*inputs, mask=None)
+```
+
+- `*inputs` is ordered and reducer-defined.
+  - Single-input reducers (for example `MeanReducer`, `GeMReducer`) still use one positional tensor.
+  - Multi-input reducers must document exact positional meaning and validate it at runtime.
+- `mask` remains optional and must align with the reduced spatial domain.
+- Reducers should reject invalid input arity/shape early with clear errors.
+
+### Streaming payload and replay requirements
+
+For SCNN streaming support, reducers must preserve non-streaming semantics:
+
+1. `to_streaming()` must pass all reducer parameters/state needed to reproduce `forward(*inputs, mask=None)` behavior.
+2. Streaming replay/validation must consume inputs in identical order and apply mask semantics identically.
+3. Multi-input streaming reducers must track enough state to deterministically reproduce full-frame behavior from tile contributions.
+
+### Reducer-specific expected input ordering
+
+- `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
+- Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
+
 ## Package structure
 
 - `__init__.py`
@@ -109,6 +136,43 @@ print(y.shape)  # torch.Size([2, 256, 1, 1])
 
 Under `use_streaming=True`, SCNN will call `reducer.to_streaming()` so tiled execution uses the corresponding `StreamingGeMReducer` implementation.
 
+## AttentionGeM examples
+
+These examples show generalized ordered inputs in both offline and SCNN-streaming contexts.
+
+### Non-streaming AttentionGeM
+
+```python
+import torch
+from lightstream.core.reducer import AttentionGeMReducer
+
+x = torch.randn(2, 256, 20, 20)
+attn = torch.sigmoid(torch.randn(2, 1, 20, 20))
+
+reducer = AttentionGeMReducer(r_init=3.0, learnable_r=True)
+y = reducer(x, attn)  # forward(*inputs, mask=None), ordered as (x, attn)
+
+print(y.shape)  # torch.Size([2, 256, 1, 1])
+```
+
+### SCNN-streaming AttentionGeM
+
+```python
+from lightstream.core.reducer import AttentionGeMReducer
+
+reducer = AttentionGeMReducer(r_init=3.0, learnable_r=True)
+streaming_reducer = reducer.to_streaming()
+
+# Runtime/tile orchestration must preserve ordered inputs: (x_tile, attn_tile)
+streaming_reducer.reduce_tile(
+    x_tile,
+    attn_tile,
+    valid_mask=tile_valid_mask,
+)
+```
+
+If AttentionGeM tracks extra attention-denominator state, that state must be accumulated/finalized and replayed exactly as in full-frame mode.
+
 ## Extension guide: custom reducers
 
 If you add a new reducer family, provide both non-streaming and streaming pieces.
@@ -118,7 +182,7 @@ If you add a new reducer family, provide both non-streaming and streaming pieces
 Create `MyReducer(nn.Module)` for regular model definitions.
 
 Expected responsibilities:
-- Validate input shape (`NCHW`).
+- Validate input arity and per-input shape constraints (`NCHW` + any reducer-specific companions).
 - Perform full-frame reduction semantics.
 - Expose constructor args needed by users.
 - Implement `to_streaming()`.
@@ -129,7 +193,7 @@ class MyReducer(nn.Module):
         super().__init__()
         ...
 
-    def forward(self, x, mask=None):
+    def forward(self, *inputs, mask=None):
         ...
 
     def to_streaming(self):
@@ -144,6 +208,7 @@ Typical hooks:
 - `reduce_tile(...)` for tile-local contribution logic.
 - `finalize_stream(...)` for final aggregation/normalization.
 - Any extra state init/reset needed by your reducer semantics.
+- Replay behavior that preserves ordered-input and mask semantics from non-streaming `forward(*inputs, mask=None)`.
 
 ### 3) Keep constructor/state parity
 
@@ -156,11 +221,27 @@ Re-export `MyReducer` and `StreamingMyReducer` via `lightstream.core.reducer.__i
 ### 5) Contributor checklist
 
 - Reuse `normalize_spatial_mask` and `resolve_accumulator_dtype` when applicable.
+- Define/document input ordering for reducer arguments.
+- Validate arity in non-streaming and streaming paths.
 - Document denominator/counting semantics explicitly.
 - Add tests for:
   - non-streaming reducer forward
   - `to_streaming()` conversion
   - streaming execution equivalence/acceptance within SCNN paths
+
+## Migration notes for existing custom reducers
+
+### Single-input custom reducers
+
+- No behavior change is required if your reducer already behaves like `forward(x, mask=None)`.
+- Optional cleanup: migrate signature style to `forward(*inputs, mask=None)` and unpack one positional input internally.
+
+### Multi-input custom reducers
+
+- Add explicit arity validation in both non-streaming and streaming entrypoints.
+- Document and enforce positional input ordering.
+- Implement streaming replay logic that reproduces full-frame multi-input behavior with identical input ordering and mask handling.
+- Add/update tests for invalid arity, offline correctness, and streaming equivalence under replay.
 
 ## Limitations / keep in mind
 
