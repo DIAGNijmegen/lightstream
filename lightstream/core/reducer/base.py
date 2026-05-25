@@ -249,7 +249,23 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
-            self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(tile_payload.shape[-2]), int(tile_payload.shape[-1]), int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1)))
+            self._replay_assignments.append(
+                (
+                    int(tile_y),
+                    int(tile_x),
+                    bool(sides.top),
+                    bool(sides.left),
+                    bool(sides.right),
+                    bool(sides.bottom),
+                    int(tile_payload.shape[-2]),
+                    int(tile_payload.shape[-1]),
+                    int(dst_y0),
+                    int(dst_y1),
+                    int(dst_x0),
+                    int(dst_x1),
+                    1,
+                )
+            )
         if torch.any(effective_mask):
             self.accumulate_valid_tile(tile_payload, valid_mask=effective_mask)
         seen_slice |= new_mask
@@ -295,7 +311,16 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
-            self._replay_cursor = self._validate_replay_assignment(assignments=self._replay_assignments, cursor=self._replay_cursor, input_y=input_y, input_x=input_x, sides=sides, expected_h=expected_h, expected_w=expected_w)
+            self._replay_cursor = self._validate_replay_assignment(
+                assignments=self._replay_assignments,
+                cursor=self._replay_cursor,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                expected_h=expected_h,
+                expected_w=expected_w,
+                expected_arity=1,
+            )
         global_context = self.extra_state_for_backward()
         reduced_output = self.reduce_tile_for_backward(tile_payload, valid_mask=valid_mask, global_context=global_context)
         return reduced_output, gradient
@@ -326,17 +351,30 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         """Optional global state to feed `reduce_tile_for_backward`."""
         return {}
 
-    def _validate_replay_assignment(self, *, assignments: list[tuple], cursor: int, input_y: int, input_x: int, sides, expected_h: int, expected_w: int) -> int:
+    def _validate_replay_assignment(
+        self,
+        *,
+        assignments: list[tuple],
+        cursor: int,
+        input_y: int,
+        input_x: int,
+        sides,
+        expected_h: int,
+        expected_w: int,
+        expected_arity: int,
+    ) -> int:
         """Check backward tile metadata against recorded forward metadata."""
         if cursor >= len(assignments):
             raise RuntimeError("Reducer assignment cursor out of range.")
-        (f_tile_y, f_tile_x, f_top, f_left, f_right, f_bottom, f_h, f_w, dst_y0, dst_y1, dst_x0, dst_x1) = assignments[cursor]
+        (f_tile_y, f_tile_x, f_top, f_left, f_right, f_bottom, f_h, f_w, dst_y0, dst_y1, dst_x0, dst_x1, f_arity) = assignments[cursor]
         if (int(input_y) != int(f_tile_y) or int(input_x) != int(f_tile_x) or bool(sides.top) != bool(f_top) or bool(sides.left) != bool(f_left) or bool(sides.right) != bool(f_right) or bool(sides.bottom) != bool(f_bottom)):
             raise RuntimeError("Reducer tile replay mismatch: " f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) " f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})")
         if expected_h != int(f_h) or expected_w != int(f_w):
             raise RuntimeError("Reducer trimmed shape mismatch: " f"forward=({f_h},{f_w}) backward=({expected_h},{expected_w})")
         if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
             raise RuntimeError("Reducer assignment mismatch: " f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})")
+        if int(f_arity) != int(expected_arity):
+            raise RuntimeError(f"Reducer input arity mismatch: forward={int(f_arity)} backward={int(expected_arity)}")
         return cursor + 1
 
     def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:

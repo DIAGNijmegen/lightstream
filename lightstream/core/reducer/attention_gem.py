@@ -126,7 +126,23 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
-            self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(x_tile.shape[-2]), int(x_tile.shape[-1]), int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1)))
+            self._replay_assignments.append(
+                (
+                    int(tile_y),
+                    int(tile_x),
+                    bool(sides.top),
+                    bool(sides.left),
+                    bool(sides.right),
+                    bool(sides.bottom),
+                    int(x_tile.shape[-2]),
+                    int(x_tile.shape[-1]),
+                    int(dst_y0),
+                    int(dst_y1),
+                    int(dst_x0),
+                    int(dst_x1),
+                    len(payload),
+                )
+            )
         if torch.any(effective_mask):
             self.accumulate_valid_tile(payload, valid_mask=effective_mask)
         seen_slice |= new_mask
@@ -138,7 +154,16 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
-            self._replay_cursor = self._validate_replay_assignment(assignments=self._replay_assignments, cursor=self._replay_cursor, input_y=input_y, input_x=input_x, sides=sides, expected_h=expected_h, expected_w=expected_w)
+            self._replay_cursor = self._validate_replay_assignment(
+                assignments=self._replay_assignments,
+                cursor=self._replay_cursor,
+                input_y=input_y,
+                input_x=input_x,
+                sides=sides,
+                expected_h=expected_h,
+                expected_w=expected_w,
+                expected_arity=len(payload),
+            )
         reduced_output = self.reduce_tile_for_backward(payload, valid_mask=valid_mask, global_context=self.extra_state_for_backward())
         return reduced_output, gradient
 
