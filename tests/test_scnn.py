@@ -4,6 +4,8 @@ import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.reducer import (
+    BaseReducer,
+    BaseStreamingGlobalReducer,
     GeMReducer,
     MeanReducer,
     StreamingGeMReducer,
@@ -58,6 +60,70 @@ class GeMHeadNet(nn.Module):
     def forward(self, x):
         feat = self.backbone(x)
         return self.gem_head(feat)
+
+
+class ValueLogitsReducer(BaseReducer):
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if len(inputs) != 2:
+            raise ValueError(f"ValueLogitsReducer expects exactly two inputs, got {len(inputs)}")
+        value, logits = inputs
+        if value.ndim != 4 or logits.ndim != 4:
+            raise ValueError("ValueLogitsReducer expects NCHW inputs")
+        if value.shape != logits.shape:
+            raise ValueError(f"ValueLogitsReducer shape mismatch value={tuple(value.shape)} logits={tuple(logits.shape)}")
+        if self._streaming_passthrough:
+            self._last_inputs = inputs
+            self._last_output = value
+            return value
+        weights = torch.softmax(logits, dim=-1)
+        if mask is not None:
+            mask = mask.to(device=value.device, dtype=value.dtype)[None, None]
+            weights = weights * mask
+        return (value * weights).sum(dim=(-2, -1), keepdim=True)
+
+    def to_streaming(self) -> BaseStreamingGlobalReducer:
+        return StreamingValueLogitsReducer()
+
+
+class StreamingValueLogitsReducer(BaseStreamingGlobalReducer):
+    def __init__(self):
+        super().__init__(mode="sum")
+
+    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
+        self.running_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=dtype)
+
+    def accumulate_valid_tile(self, tile: torch.Tensor | tuple[torch.Tensor, ...], valid_mask: torch.Tensor) -> None:
+        value, logits = self._parse_multi_input_payload(tile)
+        weights = torch.softmax(logits, dim=-1)
+        mask4 = valid_mask.to(device=value.device, dtype=value.dtype)[None, None]
+        self.running_sum = self.running_sum + (value * weights * mask4).sum(dim=(-2, -1), keepdim=True)
+
+    def finalize_from_state(self) -> torch.Tensor:
+        return self.running_sum
+
+    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor | tuple[torch.Tensor, ...], valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        value, logits = self._parse_multi_input_payload(trimmed_output)
+        weights = torch.softmax(logits, dim=-1)
+        if valid_mask is not None:
+            mask4 = valid_mask.to(device=value.device, dtype=value.dtype)[None, None]
+            return (value * weights * mask4).sum(dim=(-2, -1), keepdim=True)
+        return (value * weights).sum(dim=(-2, -1), keepdim=True)
+
+
+class ValueLogitsHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(nn.Conv2d(3, 6, kernel_size=3, padding=1, bias=False), nn.ReLU())
+        self.value_head = nn.Conv2d(6, 3, kernel_size=1, bias=False)
+        self.logit_head = nn.Conv2d(6, 3, kernel_size=1, bias=False)
+        self.reducer = ValueLogitsReducer()
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.backbone(x)
+        value = self.value_head(feat)
+        logits = self.logit_head(feat)
+        reduced = self.reducer(value, logits, mask=mask)
+        return reduced, value, logits
 
 
 def _make_streaming(model: nn.Module, tile_size: int = 4):
@@ -262,3 +328,89 @@ def test_scnn_mixed_head_reducer_mapping_stable():
     assert torch.allclose(stream_first["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(stream_second["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(stream_second["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_multi_input_reducer_forward_odd_borders_with_mask_parity():
+    torch.manual_seed(101)
+    model = ValueLogitsHeadNet().eval()
+    image = torch.randn(1, 3, 9, 13)
+    mask = (torch.arange(9)[:, None] + torch.arange(13)[None, :]) % 3 != 0
+
+    with torch.no_grad():
+        expected, _, _ = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        streamed, _, _ = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_multi_input_reducer_backward_positional_input_parity_streaming_vs_nonstreaming():
+    torch.manual_seed(103)
+    model = ValueLogitsHeadNet().eval()
+    reference = ValueLogitsHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+    image = torch.randn(1, 3, 11, 9)
+    mask = (torch.rand(11, 9) > 0.25)
+
+    ref_image = image.clone().requires_grad_(True)
+    ref_reduced, ref_value, ref_logits = reference(ref_image, mask=mask)
+    grad_reduced = torch.full_like(ref_reduced, 0.21)
+    grad_value = torch.zeros_like(ref_value)
+    grad_logits = torch.zeros_like(ref_logits)
+    torch.autograd.backward((ref_reduced, ref_value, ref_logits), (grad_reduced, grad_value, grad_logits))
+    ref_grads = {name: p.grad.detach().clone() for name, p in reference.named_parameters() if p.grad is not None}
+
+    scnn = _make_streaming(model, tile_size=5)
+    stream_reduced, stream_value, stream_logits = scnn.forward(image.clone(), mask=mask)
+    assert torch.allclose(stream_reduced, ref_reduced.detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.clone(), (grad_reduced, grad_value, grad_logits), mask=mask)
+
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    for name, ref_grad in ref_grads.items():
+        assert name in stream_grads
+        assert torch.allclose(stream_grads[name], ref_grad, atol=1e-5, rtol=1e-4), name
+
+
+def test_scnn_single_input_reducers_compatibility_unchanged():
+    torch.manual_seed(107)
+    model = AllReducerHeadsNet().eval()
+    image = torch.randn(1, 3, 7, 15)
+    mask = (torch.rand(7, 15) > 0.4)
+
+    with torch.no_grad():
+        feat = model.backbone(image)
+        expected_sum = model.sum_head[1](model.sum_head[0](feat), mask=mask)
+        expected_mean = model.mean_head[1](model.mean_head[0](feat), mask=mask)
+
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        streamed_sum, streamed_mean = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed_sum, expected_sum, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(streamed_mean, expected_mean, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_multi_input_reducer_failure_on_shape_mismatch():
+    torch.manual_seed(109)
+    model = ValueLogitsHeadNet().eval()
+    image = torch.randn(1, 3, 9, 9)
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        _ = scnn.forward(image)
+
+    scnn._reducer_input_indices = {0: (0, 1)}
+    bad_outputs = (torch.randn(1, 3, 3, 3), torch.randn(1, 3, 2, 3), torch.randn(1, 3, 3, 3))
+    with pytest.raises(RuntimeError, match="tile input spatial mismatch"):
+        scnn._stitch_forward_outputs([None, None, None], bad_outputs, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), None)
+
+
+def test_scnn_multi_input_reducer_failure_on_input_order_mismatch():
+    torch.manual_seed(113)
+    model = ValueLogitsHeadNet().eval()
+    scnn = _make_streaming(model, tile_size=4)
+    scnn._reducer_head_map = {0: scnn.stream_module.reducer}
+    scnn._reducer_input_indices = {0: (0, 2, 1)}
+    with pytest.raises(RuntimeError, match="input index order mismatch"):
+        scnn._stitch_forward_outputs([None, None, None], (torch.randn(1, 3, 3, 3),) * 3, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), None)
