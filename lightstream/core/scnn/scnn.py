@@ -140,6 +140,7 @@ class StreamingCNN(torch.nn.Module):
         self._last_forward_tiles = []
         self._streaming_reducers = []
         self._reducer_head_map = {}
+        self._reducer_input_indices = {}
         self._active_reducer_mask = None
 
         if state_dict is None:
@@ -492,11 +493,31 @@ class StreamingCNN(torch.nn.Module):
 
         output_id_to_index = {id(tensor): idx for idx, tensor in enumerate(flat_outputs)}
         for reducer in self._streaming_reducers:
+            reducer_inputs = getattr(reducer, "_last_inputs", None)
+            if reducer_inputs is not None:
+                if not isinstance(reducer_inputs, (tuple, list)):
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}")
+                input_indices = []
+                for input_pos, inp in enumerate(reducer_inputs):
+                    idx = output_id_to_index.get(id(inp))
+                    if idx is None:
+                        raise RuntimeError(
+                            f"Reducer {type(reducer).__name__} input {input_pos} is not present in flattened outputs; cannot resolve reducer head inputs."
+                        )
+                    input_indices.append(idx)
+                output_index = output_id_to_index.get(id(reducer._last_output))
+                if output_index is None:
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} output is not present in flattened outputs.")
+                self._reducer_head_map[output_index] = reducer
+                self._reducer_input_indices[output_index] = tuple(input_indices)
+                continue
+
             if reducer._last_output is None:
                 continue
             output_index = output_id_to_index.get(id(reducer._last_output))
             if output_index is not None:
                 self._reducer_head_map[output_index] = reducer
+                self._reducer_input_indices[output_index] = (output_index,)
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -747,19 +768,31 @@ class StreamingCNN(torch.nn.Module):
     def _accumulate_reducer_forward_tile(
         self,
         head_idx,
-        trimmed_output,
+        trimmed_payload,
         output_loc,
         tile_input_y,
         tile_input_x,
         sides,
         user_mask,
     ):
+        if not isinstance(trimmed_payload, (tuple, list)) or len(trimmed_payload) == 0:
+            raise RuntimeError(f"Reducer head {head_idx} expects non-empty tuple/list payload, got {type(trimmed_payload)}")
+        ref = trimmed_payload[0]
+        for i, t in enumerate(trimmed_payload):
+            if t.ndim != 4:
+                raise RuntimeError(f"Reducer head {head_idx} tile input {i} must be NCHW, got {tuple(t.shape)}")
+            if t.shape[0] != ref.shape[0] or t.shape[H_DIM] != ref.shape[H_DIM] or t.shape[W_DIM] != ref.shape[W_DIM]:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input spatial mismatch after trimming: "
+                    f"input0={tuple(ref.shape)} input{i}={tuple(t.shape)}; expected same [N,*,H,W]."
+                )
         dst_y0 = int(output_loc.y)
-        dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
+        dst_y1 = int(output_loc.y + ref.shape[H_DIM])
         dst_x0 = int(output_loc.x)
-        dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+        dst_x1 = int(output_loc.x + ref.shape[W_DIM])
+        payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
         self._reducer_head_map[head_idx].accumulate_stream_tile(
-            trimmed_output=trimmed_output,
+            trimmed_output=payload,
             tile_y=int(tile_input_y),
             tile_x=int(tile_input_x),
             sides=sides,
@@ -778,9 +811,30 @@ class StreamingCNN(torch.nn.Module):
             )
 
             if head_idx in self._reducer_head_map:
+                expected_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+                if expected_indices[0] != head_idx:
+                    continue
+                reducer_payload = [trimmed_output]
+                for extra_idx in expected_indices[1:]:
+                    if extra_idx <= head_idx or extra_idx >= len(tile_outputs):
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} input index order mismatch: indices={expected_indices} over outputs={len(tile_outputs)}"
+                        )
+                    _, extra_loc, extra_trimmed = self._build_stitched_tile_output(
+                        head_idx=extra_idx,
+                        head_output=tile_outputs[extra_idx],
+                        tile_input_y=tile_input_y,
+                        tile_input_x=tile_input_x,
+                        sides=sides,
+                    )
+                    if extra_loc.y != output_loc.y or extra_loc.x != output_loc.x:
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} input alignment mismatch: base=({output_loc.y},{output_loc.x}) vs input[{extra_idx}]=({extra_loc.y},{extra_loc.x})"
+                        )
+                    reducer_payload.append(extra_trimmed)
                 self._accumulate_reducer_forward_tile(
                     head_idx=head_idx,
-                    trimmed_output=trimmed_output,
+                    trimmed_payload=reducer_payload,
                     output_loc=output_loc,
                     tile_input_y=tile_input_y,
                     tile_input_x=tile_input_x,
@@ -880,6 +934,7 @@ class StreamingCNN(torch.nn.Module):
             paired_output, paired_grad = self._build_head_backward_pair(
                 head_idx=idx,
                 head_output=head_output,
+                tile_outputs=tile_outputs,
                 head_grad=head_grad,
                 tile_input_y=input_y,
                 tile_input_x=input_x,
@@ -940,6 +995,7 @@ class StreamingCNN(torch.nn.Module):
             result_device=result_device,
         )
         self._reducer_head_map = {}
+        self._reducer_input_indices = {}
         reducers_initialized = False
         outputs, allocate_non_reducer_outputs = self._prepare_forward_outputs(
             image=forward_ctx.image,
@@ -1094,6 +1150,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         head_idx,
         head_output,
+        tile_outputs,
         head_grad,
         tile_input_y,
         tile_input_x,
@@ -1131,6 +1188,7 @@ class StreamingCNN(torch.nn.Module):
             return self._build_reducer_backward_pair(
                 head_idx=head_idx,
                 trimmed_output=trimmed_output,
+                tile_outputs=tile_outputs,
                 gradient=gradient,
                 tile_input_y=tile_input_y,
                 tile_input_x=tile_input_x,
@@ -1164,6 +1222,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         head_idx,
         trimmed_output,
+        tile_outputs,
         gradient,
         tile_input_y,
         tile_input_x,
@@ -1179,8 +1238,24 @@ class StreamingCNN(torch.nn.Module):
                 output_x : output_x + trimmed_output.shape[W_DIM],
             ]
 
+        ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+        payload = trimmed_output
+        if len(ordered_indices) > 1:
+            trimmed_payload = []
+            for pos, reducer_input_idx in enumerate(ordered_indices):
+                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[reducer_input_idx])
+                in_trimmed = self._trim_head_output(tile_outputs[reducer_input_idx], in_lost).to(self.device, non_blocking=True)
+                if pos == 0:
+                    ref_shape = (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM])
+                elif (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM]) != ref_shape:
+                    raise RuntimeError(
+                        f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
+                        f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
+                    )
+                trimmed_payload.append(in_trimmed)
+            payload = tuple(trimmed_payload)
         reduced_output, reduced_grad = reducer.build_backward_pair(
-            trimmed_output,
+            payload,
             gradient,
             input_y=int(tile_input_y),
             input_x=int(tile_input_x),
