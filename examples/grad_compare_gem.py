@@ -18,7 +18,7 @@ class TinyAttentionGeMNet(nn.Module):
             nn.Conv2d(32, 1, kernel_size=1, bias=False),
             nn.Sigmoid(),
         )
-        self.reducer = AttentionGeMReducer(r_init=3.0, learnable_r=False)
+        self.reducer = AttentionGeMReducer(r_init=3.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.trunk(x)
@@ -45,13 +45,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float64
 
-    input_tensor = torch.rand((1, 3, 8, 8), device=device, dtype=dtype)
+    input_tensor = torch.rand((1, 3, 320, 320), device=device, dtype=dtype)
 
     base_model = TinyAttentionGeMNet().to(device=device, dtype=dtype)
     normal_model = copy.deepcopy(base_model).to(device=device, dtype=dtype)
     streamed_model = copy.deepcopy(base_model).to(device=device, dtype=dtype)
 
-    tile_size = 4
+    tile_size = 32
     stream_network = StreamingCNN(
         streamed_model,
         tile_shape=(1, 3, tile_size, tile_size),
