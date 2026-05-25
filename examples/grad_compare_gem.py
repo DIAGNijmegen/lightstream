@@ -24,7 +24,7 @@ class TinyAttentionGeMNet(nn.Module):
         feat = self.trunk(x)
         logits = self.attn_logits(feat)
         value = self.value(feat)
-        return self.reducer(value, logits)
+        return value, self.reducer(value, logits)
 
 
 def _zero_grads(model: nn.Module) -> None:
@@ -72,14 +72,16 @@ def main() -> None:
 
     print("===== forward =====")
     _zero_grads(stream_network.stream_module)
-    stream_output = stream_network(input_tensor)
+    stream_value_map, stream_output = stream_network(input_tensor)
     stream_output.requires_grad = True
     stream_prob = torch.sigmoid(stream_output)
 
     _zero_grads(normal_model)
-    normal_output = normal_model(input_tensor)
+    normal_value_map, normal_output = normal_model(input_tensor)
     normal_prob = torch.sigmoid(normal_output)
 
+    print(f"stream_value_map shape: {tuple(stream_value_map.shape)}")
+    print(f"normal_value_map shape: {tuple(normal_value_map.shape)}")
     print(f"stream_output: {stream_output.detach().cpu().flatten().tolist()}")
     print(f"normal_output: {normal_output.detach().cpu().flatten().tolist()}")
     print(f"stream_prob:   {stream_prob.detach().cpu().flatten().tolist()}")
@@ -101,7 +103,7 @@ def main() -> None:
     print("===== backward =====")
     _zero_grads(stream_network.stream_module)
     stream_loss.backward()
-    stream_network.backward(input_tensor, stream_output.grad)
+    stream_network.backward(input_tensor, (torch.zeros_like(stream_value_map), stream_output.grad))
 
     _zero_grads(normal_model)
     normal_loss.backward()
