@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
+from typing import Sequence
 
 from .utils import resolve_accumulator_dtype
 
@@ -140,6 +141,37 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         Optional accumulator dtype for numerically stable reduction.
     """
 
+    @staticmethod
+    def _parse_single_input_payload(payload: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
+        """Normalize reducer payload for legacy single-input reducers."""
+        if isinstance(payload, torch.Tensor):
+            return payload
+        if isinstance(payload, (tuple, list)):
+            if len(payload) != 1:
+                raise ValueError(
+                    "Legacy reducers expect a single tile tensor payload; "
+                    f"got structured payload with arity={len(payload)}."
+                )
+            tile = payload[0]
+            if not isinstance(tile, torch.Tensor):
+                raise TypeError(f"Expected tensor payload element, got {type(tile)!r}.")
+            return tile
+        raise TypeError(f"Expected tile payload to be tensor/tuple/list, got {type(payload)!r}.")
+
+    @staticmethod
+    def _parse_multi_input_payload(payload: torch.Tensor | Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Normalize reducer payload into a tuple of tile tensors."""
+        if isinstance(payload, torch.Tensor):
+            return (payload,)
+        if not isinstance(payload, (tuple, list)):
+            raise TypeError(f"Expected tile payload to be tensor/tuple/list, got {type(payload)!r}.")
+        if len(payload) == 0:
+            raise ValueError("Structured tile payload must contain at least one tensor.")
+        if not all(isinstance(t, torch.Tensor) for t in payload):
+            bad_type = next(type(t) for t in payload if not isinstance(t, torch.Tensor))
+            raise TypeError(f"Structured tile payload elements must be tensors; got {bad_type!r}.")
+        return tuple(payload)
+
     def __init__(self, mode: str = "mean", accumulator_dtype: torch.dtype | None = None):
         super().__init__()
         if mode not in {"sum", "mean"}:
@@ -200,8 +232,16 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
 
-    def accumulate_stream_tile(self, trimmed_output: torch.Tensor, tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
-        """Accumulate one tile while enforcing non-overlapping pixel counting."""
+    def accumulate_stream_tile(self, trimmed_output: torch.Tensor | Sequence[torch.Tensor], tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
+        """Accumulate one tile while enforcing non-overlapping pixel counting.
+
+        Parameters
+        ----------
+        trimmed_output : torch.Tensor | Sequence[torch.Tensor]
+            Tile payload. A single tensor uses the legacy single-input path.
+            Tuple/list payloads represent structured multi-input tiles.
+        """
+        tile_payload = self._parse_single_input_payload(trimmed_output)
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
@@ -209,9 +249,9 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
-            self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(trimmed_output.shape[-2]), int(trimmed_output.shape[-1]), int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1)))
+            self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(tile_payload.shape[-2]), int(tile_payload.shape[-1]), int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1)))
         if torch.any(effective_mask):
-            self.accumulate_valid_tile(trimmed_output, valid_mask=effective_mask)
+            self.accumulate_valid_tile(tile_payload, valid_mask=effective_mask)
         seen_slice |= new_mask
 
     def finish_stream(self) -> torch.Tensor:
@@ -240,16 +280,24 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         """Compute final output from reducer state."""
         return self.finalize_from_state()
 
-    def build_backward_pair(self, trimmed_output: torch.Tensor, gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build reducer output / upstream gradient pair for backward orchestration."""
-        expected_h = int(trimmed_output.shape[-2])
-        expected_w = int(trimmed_output.shape[-1])
+    def build_backward_pair(self, trimmed_output: torch.Tensor | Sequence[torch.Tensor], gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build reducer output / upstream gradient pair for backward orchestration.
+
+        Parameters
+        ----------
+        trimmed_output : torch.Tensor | Sequence[torch.Tensor]
+            Tile payload for backward replay. Accepts legacy single-input tensor
+            or structured tuple/list for multi-input reducers.
+        """
+        tile_payload = self._parse_single_input_payload(trimmed_output)
+        expected_h = int(tile_payload.shape[-2])
+        expected_w = int(tile_payload.shape[-1])
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
             self._replay_cursor = self._validate_replay_assignment(assignments=self._replay_assignments, cursor=self._replay_cursor, input_y=input_y, input_x=input_x, sides=sides, expected_h=expected_h, expected_w=expected_w)
         global_context = self.extra_state_for_backward()
-        reduced_output = self.reduce_tile_for_backward(trimmed_output, valid_mask=valid_mask, global_context=global_context)
+        reduced_output = self.reduce_tile_for_backward(tile_payload, valid_mask=valid_mask, global_context=global_context)
         return reduced_output, gradient
 
     @abstractmethod
@@ -257,16 +305,22 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         """Initialize subclass-owned state for a stream."""
 
     @abstractmethod
-    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
-        """Accumulate one valid tile contribution into subclass state."""
+    def accumulate_valid_tile(self, tile: torch.Tensor | Sequence[torch.Tensor], valid_mask: torch.Tensor) -> None:
+        """Accumulate one valid tile contribution into subclass state.
+
+        ``tile`` may be a single tensor or structured tuple/list payload.
+        """
 
     @abstractmethod
     def finalize_from_state(self) -> torch.Tensor:
         """Finalize and return stream output from subclass state."""
 
     @abstractmethod
-    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        """Build tile-local reduced output used for backward replay."""
+    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor | Sequence[torch.Tensor], valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        """Build tile-local reduced output used for backward replay.
+
+        ``trimmed_output`` may be a single tensor or structured tuple/list payload.
+        """
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         """Optional global state to feed `reduce_tile_for_backward`."""
