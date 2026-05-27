@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.reducer import (
@@ -168,6 +169,20 @@ def test_streaming_sum_reducer_does_not_normalize():
     output = reducer.finalize_stream()
     assert output.dtype == tile.dtype
     assert torch.allclose(output, torch.full((1, 2, 1, 1), 6.0, dtype=tile.dtype))
+
+
+def test_single_input_reducer_contract_remains_unchanged():
+    reducer = MeanReducer()
+    x = torch.randn(1, 2, 3, 5)
+    y = reducer(x)
+    assert torch.allclose(y, x.mean(dim=(-2, -1), keepdim=True))
+
+
+def test_single_input_reducer_rejects_multi_input_arity():
+    reducer = MeanReducer()
+    x = torch.randn(1, 2, 3, 5)
+    with pytest.raises(ValueError, match="expects exactly one tensor input"):
+        reducer(x, x)
 
 from lightstream.core.reducer import StreamingGeMReducer
 
