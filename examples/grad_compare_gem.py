@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 
 import torch
@@ -90,14 +89,18 @@ def main() -> None:
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
-        saliency=False,
+        saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
 
-    normal_model = copy.deepcopy(network.stream_network.stream_module).to(device=device, dtype=dtype)
+    print("output_spec:", network.stream_network._output_spec)
+    print(
+        "output_stride_per_output:",
+        [tuple(int(x) for x in s.tolist()) for s in network.stream_network._output_stride_per_output],
+    )
 
     criterion = nn.BCELoss()
     target = torch.ones((1, 1, 1, 1), device=device, dtype=dtype)
@@ -108,8 +111,11 @@ def main() -> None:
     stream_output.requires_grad = True
     stream_prob = torch.sigmoid(stream_output)
 
-    _zero_grads(normal_model.parameters())
-    normal_output = normal_model(input_tensor)
+    network.stream_network.disable()
+    normal_net = network.stream_network.stream_module
+    _zero_grads(normal_net.parameters())
+    img_normal = input_tensor.detach().clone().requires_grad_(True)
+    normal_output = normal_net(img_normal)
     normal_prob = torch.sigmoid(normal_output)
 
     print(f"stream_output: {stream_output.detach().cpu().flatten().tolist()}")
@@ -135,12 +141,12 @@ def main() -> None:
     stream_loss.backward()
     network.stream_network.backward(input_tensor, stream_output.grad)
 
-    _zero_grads(normal_model.parameters())
+    _zero_grads(normal_net.parameters())
     normal_loss.backward()
 
     print("===== grad compare =====")
     stream_params = dict(network.stream_network.stream_module.named_parameters())
-    normal_params = dict(normal_model.named_parameters())
+    normal_params = dict(normal_net.named_parameters())
 
     _compare_grad("trunk.weight", stream_params["trunk.weight"].grad, normal_params["trunk.weight"].grad)
     _compare_grad(
