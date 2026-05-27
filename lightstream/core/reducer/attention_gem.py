@@ -53,7 +53,8 @@ class AttentionGeMReducer(BaseReducer):
             raise ValueError(f"Reducer expects NCHW x tensor, got shape={tuple(x.shape)}")
         logits = _normalize_logits(attn_logits, x)
         if self._streaming_passthrough:
-            return x
+            zero_from_logits = logits.to(dtype=x.dtype).sum(dim=(-2, -1), keepdim=True) * 0.0
+            return x + zero_from_logits
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
