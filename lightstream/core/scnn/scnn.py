@@ -1465,6 +1465,11 @@ class StreamingCNN(torch.nn.Module):
                 f_grad = torch.from_numpy(grad)
                 f_grad = f_grad.to(self.device)
 
+            if grad_out[0].numel() == 0 or torch.count_nonzero(grad_out[0]) == 0:
+                # Some connected branches (e.g. zero-scaled passthrough links for graph connectivity)
+                # produce valid but all-zero gradients during stats gathering; skip border inference.
+                return grad_in
+
             grad_lost = self._non_max_border_amount(grad_out[0])
 
             if self.verbose:
