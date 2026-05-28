@@ -83,6 +83,7 @@ def main() -> None:
 
     tile_size = 32
     input_tensor = torch.rand((1, 3, 320, 320), device=device, dtype=dtype)
+    reducer_mask = torch.ones((1, input_tensor.shape[-2], input_tensor.shape[-1]), device=device, dtype=torch.bool)
 
     network = StreamingTinyAttentionGeM(
         tile_size,
@@ -107,7 +108,7 @@ def main() -> None:
 
     print("===== forward =====")
     _zero_grads(network.stream_network.stream_module.parameters())
-    stream_output = network(input_tensor)
+    stream_output = network(input_tensor, mask=reducer_mask)
     stream_output.requires_grad = True
     stream_prob = torch.sigmoid(stream_output)
 
@@ -139,7 +140,7 @@ def main() -> None:
     print("===== backward =====")
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_loss.backward()
-    network.stream_network.backward(input_tensor, stream_output.grad)
+    network.stream_network.backward(input_tensor, stream_output.grad, mask=reducer_mask)
 
     _zero_grads(normal_net.parameters())
     normal_loss.backward()
