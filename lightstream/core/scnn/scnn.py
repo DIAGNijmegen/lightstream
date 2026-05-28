@@ -210,6 +210,7 @@ class StreamingCNN(torch.nn.Module):
         self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
+        self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
@@ -225,6 +226,14 @@ class StreamingCNN(torch.nn.Module):
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
+
+    def _capture_public_output_spec(self) -> None:
+        """Capture user-facing output structure with reducers in normal (non-passthrough) mode."""
+        spec_tile = torch.ones(self.tile_shape, dtype=self.dtype, device=self.device)
+        with torch.no_grad():
+            output = self.stream_module(spec_tile)
+        _, output_spec = self._flatten_output_structure(output)
+        self._output_spec = output_spec
 
     def _set_reducer_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
@@ -801,7 +810,15 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
+        reducer_aux_indices = {
+            idx
+            for reducer_head, indices in self._reducer_input_indices.items()
+            for idx in indices[1:]
+            if reducer_head in self._reducer_head_map
+        }
         for head_idx, head_output in enumerate(tile_outputs):
+            if head_idx in reducer_aux_indices:
+                continue
             _, output_loc, trimmed_output = self._build_stitched_tile_output(
                 head_idx=head_idx,
                 head_output=head_output,
