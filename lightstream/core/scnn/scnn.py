@@ -1272,8 +1272,20 @@ class StreamingCNN(torch.nn.Module):
         if len(ordered_indices) > 1:
             trimmed_payload = []
             for pos, reducer_input_idx in enumerate(ordered_indices):
-                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[reducer_input_idx])
-                in_trimmed = self._trim_head_output(tile_outputs[reducer_input_idx], in_lost).to(self.device, non_blocking=True)
+                if reducer_input_idx < len(tile_outputs):
+                    source = tile_outputs[reducer_input_idx]
+                    lost_idx = reducer_input_idx
+                else:
+                    reducer_last_inputs = getattr(reducer, "_last_inputs", None)
+                    if not isinstance(reducer_last_inputs, (tuple, list)) or pos >= len(reducer_last_inputs):
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} backward payload index {reducer_input_idx} is unavailable "
+                            f"(tile_outputs={len(tile_outputs)}; has_last_inputs={isinstance(reducer_last_inputs, (tuple, list))})."
+                        )
+                    source = reducer_last_inputs[pos]
+                    lost_idx = ordered_indices[0]
+                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[lost_idx])
+                in_trimmed = self._trim_head_output(source, in_lost).to(self.device, non_blocking=True)
                 if pos == 0:
                     ref_shape = (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM])
                 elif (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM]) != ref_shape:
