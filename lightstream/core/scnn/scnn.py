@@ -210,6 +210,7 @@ class StreamingCNN(torch.nn.Module):
         self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
+        self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
@@ -225,6 +226,14 @@ class StreamingCNN(torch.nn.Module):
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
+
+    def _capture_public_output_spec(self) -> None:
+        """Capture user-facing output structure with reducers in normal (non-passthrough) mode."""
+        spec_tile = torch.ones(self.tile_shape, dtype=self.dtype, device=self.device)
+        with torch.no_grad():
+            output = self.stream_module(spec_tile)
+        _, output_spec = self._flatten_output_structure(output)
+        self._output_spec = output_spec
 
     def _set_reducer_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
@@ -331,6 +340,16 @@ class StreamingCNN(torch.nn.Module):
                 value, index = self._unflatten_output_structure(flat, child, index)
                 values[key] = value
             return values, index
+        raise TypeError(f"Unsupported output spec kind: {kind}")
+
+    def _count_tensors_in_spec(self, spec) -> int:
+        kind, payload = spec
+        if kind == "tensor":
+            return 1
+        if kind in {"tuple", "list"}:
+            return sum(self._count_tensors_in_spec(child) for child in payload)
+        if kind == "dict":
+            return sum(self._count_tensors_in_spec(child) for _, child in payload)
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
     def _compute_internal_safe_input_step(self):
@@ -801,7 +820,15 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
+        reducer_aux_indices = {
+            idx
+            for reducer_head, indices in self._reducer_input_indices.items()
+            for idx in indices[1:]
+            if reducer_head in self._reducer_head_map
+        }
         for head_idx, head_output in enumerate(tile_outputs):
+            if head_idx in reducer_aux_indices:
+                continue
             _, output_loc, trimmed_output = self._build_stitched_tile_output(
                 head_idx=head_idx,
                 head_output=head_output,
@@ -1059,12 +1086,14 @@ class StreamingCNN(torch.nn.Module):
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
 
-        for idx, output in enumerate(outputs):
+        expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
+        materialized_outputs = outputs[:expected_flat_outputs]
+        for idx, output in enumerate(materialized_outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
 
-        output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
-        assert final_idx == len(outputs)
+        output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
+        assert final_idx == len(materialized_outputs)
         return output
 
     def backward(self, image, grad, mask=None):
@@ -1243,15 +1272,30 @@ class StreamingCNN(torch.nn.Module):
         if len(ordered_indices) > 1:
             trimmed_payload = []
             for pos, reducer_input_idx in enumerate(ordered_indices):
-                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[reducer_input_idx])
-                in_trimmed = self._trim_head_output(tile_outputs[reducer_input_idx], in_lost).to(self.device, non_blocking=True)
+                if reducer_input_idx < len(tile_outputs):
+                    source = tile_outputs[reducer_input_idx]
+                    lost_idx = reducer_input_idx
+                else:
+                    reducer_last_inputs = getattr(reducer, "_last_inputs", None)
+                    if not isinstance(reducer_last_inputs, (tuple, list)) or pos >= len(reducer_last_inputs):
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} backward payload index {reducer_input_idx} is unavailable "
+                            f"(tile_outputs={len(tile_outputs)}; has_last_inputs={isinstance(reducer_last_inputs, (tuple, list))})."
+                        )
+                    source = reducer_last_inputs[pos]
+                    lost_idx = ordered_indices[0]
+                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[lost_idx])
+                in_trimmed = self._trim_head_output(source, in_lost).to(self.device, non_blocking=True)
                 if pos == 0:
                     ref_shape = (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM])
                 elif (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM]) != ref_shape:
-                    raise RuntimeError(
-                        f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
-                        f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
-                    )
+                    if in_trimmed.shape[0] == ref_shape[0] and in_trimmed.shape[H_DIM] >= ref_shape[1] and in_trimmed.shape[W_DIM] >= ref_shape[2]:
+                        in_trimmed = in_trimmed[:, :, : ref_shape[1], : ref_shape[2]]
+                    else:
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
+                            f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
+                        )
                 trimmed_payload.append(in_trimmed)
             payload = tuple(trimmed_payload)
         reduced_output, reduced_grad = reducer.build_backward_pair(
