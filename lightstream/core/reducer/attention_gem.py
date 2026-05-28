@@ -53,7 +53,9 @@ class AttentionGeMReducer(BaseReducer):
             raise ValueError(f"Reducer expects NCHW x tensor, got shape={tuple(x.shape)}")
         logits = _normalize_logits(attn_logits, x)
         if self._streaming_passthrough:
-            return x
+            logits_term = logits.to(dtype=x.dtype).sum(dim=(-2, -1), keepdim=True)
+            graph_passthrough = logits_term - logits_term.detach()
+            return x + graph_passthrough
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
@@ -111,6 +113,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if len(inputs) != 2:
             raise ValueError(f"StreamingAttentionGeMReducer expects exactly two inputs (x_tile, logits_tile), got {len(inputs)}.")
         x_tile, logits_tile = inputs
+        self._last_inputs = (x_tile, logits_tile)
         self._last_output = x_tile
         return x_tile, logits_tile
 
