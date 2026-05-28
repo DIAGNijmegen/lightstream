@@ -342,6 +342,16 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
+    def _count_tensors_in_spec(self, spec) -> int:
+        kind, payload = spec
+        if kind == "tensor":
+            return 1
+        if kind in {"tuple", "list"}:
+            return sum(self._count_tensors_in_spec(child) for child in payload)
+        if kind == "dict":
+            return sum(self._count_tensors_in_spec(child) for _, child in payload)
+        raise TypeError(f"Unsupported output spec kind: {kind}")
+
     def _compute_internal_safe_input_step(self):
         """Compute conservative input-step bounds from per-layer backward stats."""
         candidates_h = []
@@ -1076,12 +1086,14 @@ class StreamingCNN(torch.nn.Module):
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
 
-        for idx, output in enumerate(outputs):
+        expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
+        materialized_outputs = outputs[:expected_flat_outputs]
+        for idx, output in enumerate(materialized_outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
 
-        output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
-        assert final_idx == len(outputs)
+        output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
+        assert final_idx == len(materialized_outputs)
         return output
 
     def backward(self, image, grad, mask=None):
