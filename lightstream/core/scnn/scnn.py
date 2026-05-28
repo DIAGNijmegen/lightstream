@@ -210,7 +210,7 @@ class StreamingCNN(torch.nn.Module):
         self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
-        self._capture_public_output_spec(tile.detach())
+        self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
@@ -227,10 +227,11 @@ class StreamingCNN(torch.nn.Module):
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
 
-    def _capture_public_output_spec(self, tile: torch.Tensor) -> None:
+    def _capture_public_output_spec(self) -> None:
         """Capture user-facing output structure with reducers in normal (non-passthrough) mode."""
+        spec_tile = torch.ones(self.tile_shape, dtype=self.dtype, device=self.device)
         with torch.no_grad():
-            output = self.stream_module(tile)
+            output = self.stream_module(spec_tile)
         _, output_spec = self._flatten_output_structure(output)
         self._output_spec = output_spec
 
