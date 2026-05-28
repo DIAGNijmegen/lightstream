@@ -113,6 +113,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if len(inputs) != 2:
             raise ValueError(f"StreamingAttentionGeMReducer expects exactly two inputs (x_tile, logits_tile), got {len(inputs)}.")
         x_tile, logits_tile = inputs
+        self._last_inputs = (x_tile, logits_tile)
         self._last_output = x_tile
         return x_tile, logits_tile
 
