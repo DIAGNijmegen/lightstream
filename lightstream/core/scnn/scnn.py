@@ -1289,10 +1289,13 @@ class StreamingCNN(torch.nn.Module):
                 if pos == 0:
                     ref_shape = (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM])
                 elif (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM]) != ref_shape:
-                    raise RuntimeError(
-                        f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
-                        f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
-                    )
+                    if in_trimmed.shape[0] == ref_shape[0] and in_trimmed.shape[H_DIM] >= ref_shape[1] and in_trimmed.shape[W_DIM] >= ref_shape[2]:
+                        in_trimmed = in_trimmed[:, :, : ref_shape[1], : ref_shape[2]]
+                    else:
+                        raise RuntimeError(
+                            f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
+                            f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
+                        )
                 trimmed_payload.append(in_trimmed)
             payload = tuple(trimmed_payload)
         reduced_output, reduced_grad = reducer.build_backward_pair(
