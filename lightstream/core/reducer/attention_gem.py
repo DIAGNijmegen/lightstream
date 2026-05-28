@@ -45,7 +45,7 @@ class AttentionGeMReducer(BaseReducer):
     def current_r(self) -> torch.Tensor:
         return self.r
 
-    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if len(inputs) != 2:
             raise ValueError(f"AttentionGeMReducer expects exactly two inputs (x, attn_logits), got {len(inputs)}.")
         x, attn_logits = inputs
@@ -53,7 +53,10 @@ class AttentionGeMReducer(BaseReducer):
             raise ValueError(f"Reducer expects NCHW x tensor, got shape={tuple(x.shape)}")
         logits = _normalize_logits(attn_logits, x)
         if self._streaming_passthrough:
-            return x
+            logits_term = logits.to(dtype=x.dtype).sum(dim=(-2, -1), keepdim=True)
+            graph_passthrough = logits_term - logits_term.detach()
+            x_passthrough = x + graph_passthrough
+            return x_passthrough, logits
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
@@ -111,6 +114,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if len(inputs) != 2:
             raise ValueError(f"StreamingAttentionGeMReducer expects exactly two inputs (x_tile, logits_tile), got {len(inputs)}.")
         x_tile, logits_tile = inputs
+        self._last_inputs = (x_tile, logits_tile)
         self._last_output = x_tile
         return x_tile, logits_tile
 

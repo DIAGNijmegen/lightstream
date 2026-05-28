@@ -801,7 +801,15 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
+        reducer_aux_indices = {
+            idx
+            for reducer_head, indices in self._reducer_input_indices.items()
+            for idx in indices[1:]
+            if reducer_head in self._reducer_head_map
+        }
         for head_idx, head_output in enumerate(tile_outputs):
+            if head_idx in reducer_aux_indices:
+                continue
             _, output_loc, trimmed_output = self._build_stitched_tile_output(
                 head_idx=head_idx,
                 head_output=head_output,
