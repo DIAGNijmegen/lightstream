@@ -4,6 +4,8 @@ import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.models.segment.streamingwss import StreamingWSS
+
 from lightstream.core.reducer import (
     AttentionGeMReducer,
     MeanReducer,
@@ -372,6 +374,52 @@ def test_public_forward_output_sentinel_check_is_debug_only():
     assert "public_indices=[0]" in message
     assert "reducer_auxiliary_indices=[]" in message
     assert "self._reducer_input_indices={}" in message
+
+
+def test_streaming_wss_attention_gem_public_outputs_skip_aux_maps(tmp_path):
+    torch.manual_seed(17)
+    image = torch.rand(1, 3, 80, 80)
+    network = StreamingWSS(
+        "resnet18",
+        tile_size=64,
+        weights=None,
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        tile_cache_path=tmp_path / "resnet18_wss_attention_gem_tile_cache",
+    ).eval()
+    scnn = network.stream_network
+    scnn.debug_forward_sentinel_check = True
+
+    with torch.no_grad():
+        streamed = network(image)
+        public_indices = scnn._public_output_indices()
+        auxiliary_indices = scnn._reducer_aux_indices()
+
+        scnn.disable()
+        expected = scnn.stream_module(image)
+
+    assert isinstance(streamed, tuple)
+    assert len(streamed) == 4
+    assert len(public_indices) == 4
+    assert set(public_indices).isdisjoint(auxiliary_indices)
+    assert sorted(auxiliary_indices) == [1, 3, 5]
+
+    for streamed_reduced, expected_reduced in zip(streamed[:3], expected[:3]):
+        assert streamed_reduced.shape == expected_reduced.shape
+        assert list(streamed_reduced.shape) == [image.shape[0], expected_reduced.shape[1], 1, 1]
+
+    assert streamed[3].shape == expected[3].shape
+
+    for output in streamed:
+        assert not torch.all(output == 999)
+
+    for streamed_output, expected_output in zip(streamed, expected):
+        assert torch.allclose(streamed_output, expected_output, atol=2e-4, rtol=2e-3)
 
 
 def test_streaming_attention_gem_backward_parity_x_and_logits():
