@@ -973,7 +973,9 @@ class StreamingCNN(torch.nn.Module):
 
         trimmed_outputs = []
         trimmed_grads = []
-        for head_idx, head_grad in zip(self._public_output_indices(), backward_ctx.grad_tensors):
+        for head_idx, head_grad in enumerate(backward_ctx.grad_tensors):
+            if head_grad is None:
+                continue
             paired_output, paired_grad = self._build_head_backward_pair(
                 head_idx=head_idx,
                 head_output=tile_outputs[head_idx],
@@ -1144,8 +1146,19 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
+        public_indices = self._public_output_indices()
+        if len(grad_tensors) != len(public_indices):
+            raise ValueError(
+                f"Gradient tensor count mismatch: expected={len(public_indices)}, "
+                f"actual={len(grad_tensors)}, public_indices={public_indices}"
+            )
+
+        internal_grad_tensors = [None] * len(self._tile_output_shapes)
+        for public_grad, internal_idx in zip(grad_tensors, public_indices):
+            internal_grad_tensors[internal_idx] = public_grad
+
         if len(self._tile_output_shapes) == 1:
-            tile_iter = self._prepare_backward_tile_iter_single_head(image, grad_tensors, tile_height, tile_width)
+            tile_iter = self._prepare_backward_tile_iter_single_head(image, internal_grad_tensors, tile_height, tile_width)
         else:
             tile_iter = self._prepare_backward_tile_iter_multi_head(
                 image=image,
@@ -1161,7 +1174,7 @@ class StreamingCNN(torch.nn.Module):
 
         backward_ctx = BackwardContext(
             image=image,
-            grad_tensors=grad_tensors,
+            grad_tensors=internal_grad_tensors,
             tile_height=tile_height,
             tile_width=tile_width,
             output_heights=output_heights,
