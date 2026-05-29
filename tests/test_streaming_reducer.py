@@ -271,6 +271,27 @@ class AttentionGeMHeadNet(nn.Module):
         return self.reducer(self.feat_head(feat), self.logit_head(feat))
 
 
+def test_public_output_indices_skip_attention_gem_aux_payloads():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._tile_output_shapes = [torch.Size((1, 1, 1, 1)) for _ in range(8)]
+    scnn._reducer_head_map = {0: object(), 2: object(), 4: object(), 6: object()}
+    scnn._reducer_input_indices = {0: (0, 1), 2: (2, 3), 4: (4, 5), 6: (6, 7)}
+    scnn._output_spec = ("tuple", [("tensor", None) for _ in range(4)])
+
+    public_indices = scnn._public_output_indices()
+    expected_flat_outputs = scnn._count_tensors_in_spec(scnn._output_spec)
+    outputs = [f"output_{idx}" for idx in range(8)]
+
+    assert public_indices == [0, 2, 4, 6]
+    assert len(public_indices) == expected_flat_outputs
+    assert [outputs[idx] for idx in public_indices] == [
+        "output_0",
+        "output_2",
+        "output_4",
+        "output_6",
+    ]
+
+
 def test_prepare_forward_outputs_skips_reducer_aux_payloads():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn._tile_output_shapes = [
