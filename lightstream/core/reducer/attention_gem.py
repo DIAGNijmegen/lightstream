@@ -246,6 +246,10 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         local_s_over_z = streaming_reduce_tile(weights_unnorm * x_pow, valid_mask, zhat)
         local_z_over_z = streaming_reduce_tile(weights_unnorm, valid_mask, zhat)
 
+        # Backward replay uses this as a surrogate for the derivative of the
+        # finalized global reducer output y = (global_S / global_Z) ** (1/r).
+        # Do not finalize each tile independently; the summed tile gradients must
+        # match the gradient of that single global expression.
         scale = (1.0 / r) * global_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
         surrogate = scale.detach() * (local_s_over_z - global_mean.detach() * local_z_over_z)
         return surrogate.to(dtype=x_tile.dtype)
