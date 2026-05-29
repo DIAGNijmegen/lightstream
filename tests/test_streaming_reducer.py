@@ -386,6 +386,97 @@ class AttentionGeMBiasHeadNet(nn.Module):
         return self.reducer(self.feat_head(feat), self.logit_head(feat))
 
 
+def test_streaming_attention_gem_masked_forward_and_backward_replay_match_non_streaming():
+    torch.manual_seed(43)
+    image = torch.randn(1, 3, 4, 6, dtype=torch.float32)
+    x_weight = torch.randn(2, 3, 1, 1, dtype=torch.float32) * 0.2
+    logit_weight = torch.randn(1, 3, 1, 1, dtype=torch.float32) * 0.3
+    logit_bias = torch.tensor([0.17], dtype=torch.float32)
+    mask = torch.tensor(
+        [
+            [1, 0, 1, 1, 0, 1],
+            [0, 1, 1, 0, 1, 1],
+            [1, 1, 0, 1, 1, 0],
+            [1, 0, 1, 0, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    invalid_logit_boost = (~mask).to(dtype=image.dtype)[None, None] * 8.0
+    upstream = torch.tensor([[[[0.23]], [[-0.37]]]], dtype=image.dtype)
+    sides = type("S", (), dict(top=False, left=False, right=False, bottom=False))()
+    tiles = (
+        (slice(0, 2), slice(0, 3), (0, 2, 0, 3)),
+        (slice(0, 2), slice(3, 6), (0, 2, 3, 6)),
+        (slice(2, 4), slice(0, 3), (2, 4, 0, 3)),
+        (slice(2, 4), slice(3, 6), (2, 4, 3, 6)),
+    )
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_x_weight = x_weight.detach().clone().requires_grad_(True)
+    ref_logit_weight = logit_weight.detach().clone().requires_grad_(True)
+    ref_logit_bias = logit_bias.detach().clone().requires_grad_(True)
+    ref_x = torch.nn.functional.conv2d(ref_image, ref_x_weight).sigmoid() + 0.05
+    ref_x.retain_grad()
+    ref_logits = torch.nn.functional.conv2d(ref_image, ref_logit_weight, ref_logit_bias) + invalid_logit_boost
+    ref_logits.retain_grad()
+    ref_reducer = AttentionGeMReducer(r_init=2.4, eps=1e-6)
+    ref_out = ref_reducer(ref_x, ref_logits, mask=mask)
+    torch.autograd.backward(ref_out, upstream)
+
+    stream_image = image.detach().clone().requires_grad_(True)
+    stream_x_weight = x_weight.detach().clone().requires_grad_(True)
+    stream_logit_weight = logit_weight.detach().clone().requires_grad_(True)
+    stream_logit_bias = logit_bias.detach().clone().requires_grad_(True)
+    stream_x = torch.nn.functional.conv2d(stream_image, stream_x_weight).sigmoid() + 0.05
+    stream_x.retain_grad()
+    stream_logits = torch.nn.functional.conv2d(stream_image, stream_logit_weight, stream_logit_bias) + invalid_logit_boost
+    stream_logits.retain_grad()
+    stream_reducer = StreamingAttentionGeMReducer(r_init=2.4, eps=1e-6)
+    stream_reducer.start_stream(
+        output_height=image.shape[-2],
+        output_width=image.shape[-1],
+        batch_size=image.shape[0],
+        channels=stream_x.shape[1],
+        device=image.device,
+        dtype=image.dtype,
+    )
+
+    with torch.no_grad():
+        for tile_idx, (ys, xs, dst_box) in enumerate(tiles):
+            stream_reducer.accumulate_stream_tile(
+                (stream_x.detach()[:, :, ys, xs], stream_logits.detach()[:, :, ys, xs]),
+                tile_idx // 2,
+                tile_idx % 2,
+                sides,
+                dst_box,
+                user_mask=mask[ys, xs],
+            )
+        stream_out = stream_reducer.finish_stream()
+
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-6, rtol=1e-5)
+
+    global_context = stream_reducer.extra_state_for_backward()
+    replay_outputs = []
+    replay_grads = []
+    for ys, xs, _dst_box in tiles:
+        replay_outputs.append(
+            stream_reducer.reduce_tile_for_backward(
+                (stream_x[:, :, ys, xs], stream_logits[:, :, ys, xs]),
+                mask[ys, xs],
+                global_context,
+            )
+        )
+        replay_grads.append(upstream)
+    torch.autograd.backward(tuple(replay_outputs), tuple(replay_grads))
+
+    assert torch.allclose(stream_image.grad, ref_image.grad, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(stream_logits.grad, ref_logits.grad, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(stream_x.grad, ref_x.grad, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(stream_x_weight.grad, ref_x_weight.grad, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(stream_logit_weight.grad, ref_logit_weight.grad, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(stream_logit_bias.grad, ref_logit_bias.grad, atol=2e-5, rtol=2e-4)
+
+
 def test_streaming_attention_gem_uniform_bias_backward_replay_matches_non_streaming():
     torch.manual_seed(41)
     x = torch.tensor(
