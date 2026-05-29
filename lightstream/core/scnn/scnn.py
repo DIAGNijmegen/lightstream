@@ -1102,15 +1102,15 @@ class StreamingCNN(torch.nn.Module):
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
 
+        public_indices = self._public_output_indices()
         expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
-        public_output_indices = self._public_output_indices()
-        if len(public_output_indices) != expected_flat_outputs:
+        if len(public_indices) != expected_flat_outputs:
             raise RuntimeError(
                 f"Public output index count mismatch: expected={expected_flat_outputs}, "
-                f"actual={len(public_output_indices)}, indices={public_output_indices}"
+                f"actual={len(public_indices)}, indices={public_indices}"
             )
-        materialized_outputs = [outputs[idx] for idx in public_output_indices]
-        for idx, output in zip(public_output_indices, materialized_outputs):
+        materialized_outputs = [outputs[idx] for idx in public_indices]
+        for idx, output in zip(public_indices, materialized_outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
 
