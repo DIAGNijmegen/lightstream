@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 import pytest
@@ -44,6 +46,28 @@ class MultiReducerNet(nn.Module):
     def forward(self, x):
         feat = self.backbone(x)
         return self.sum_head(feat), self.mean_head(feat)
+
+
+def _require_and_retain_output_grads(outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    for output in outputs:
+        output.requires_grad_(True)
+        output.retain_grad()
+    return outputs
+
+
+def _assert_grad_matches(
+    stream_grads: dict[str, torch.Tensor],
+    ref_grads: dict[str, torch.Tensor],
+    name: str,
+    *,
+    atol: float = 3e-4,
+    rtol: float = 3e-3,
+) -> None:
+    assert name in stream_grads, name
+    assert name in ref_grads, name
+    assert torch.isfinite(stream_grads[name]).all(), name
+    assert torch.isfinite(ref_grads[name]).all(), name
+    assert torch.allclose(stream_grads[name], ref_grads[name], atol=atol, rtol=rtol), name
 
 
 def _make_streaming(model: nn.Module, tile_size: int = 4):
@@ -420,6 +444,70 @@ def test_streaming_wss_attention_gem_public_outputs_skip_aux_maps(tmp_path):
 
     for streamed_output, expected_output in zip(streamed, expected):
         assert torch.allclose(streamed_output, expected_output, atol=2e-4, rtol=2e-3)
+
+
+def test_streaming_wss_attention_gem_backward_public_outputs_drive_aux_attention_grads(tmp_path):
+    torch.manual_seed(19)
+    image = torch.rand(1, 3, 80, 80)
+    network = StreamingWSS(
+        "resnet18",
+        tile_size=64,
+        weights=None,
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        tile_cache_path=tmp_path / "resnet18_wss_attention_gem_backward_tile_cache",
+    ).eval()
+    scnn = network.stream_network
+    reference = copy.deepcopy(scnn.stream_module).eval()
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_outputs = reference(ref_image)
+    ref_loss = (
+        0.17 * ref_outputs[0].sum()
+        - 0.23 * ref_outputs[1].mean()
+        + 0.31 * ref_outputs[2].sum()
+        + 0.07 * ref_outputs[3].mean()
+    )
+    ref_loss.backward()
+
+    streamed = _require_and_retain_output_grads(network(image.detach().clone()))
+    assert isinstance(streamed, tuple)
+    assert len(streamed) == 4
+
+    stream_loss = (
+        0.17 * streamed[0].sum()
+        - 0.23 * streamed[1].mean()
+        + 0.31 * streamed[2].sum()
+        + 0.07 * streamed[3].mean()
+    )
+    stream_loss.backward()
+    assert all(output.grad is not None for output in streamed)
+    public_grads = tuple(output.grad.detach().clone() for output in streamed)
+
+    scnn.backward(image.detach().clone(), public_grads)
+
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    ref_grads = {name: p.grad for name, p in reference.named_parameters() if p.grad is not None}
+
+    selected_names = (
+        "decoder1.0.weight",
+        "decoder2.0.weight",
+        "decoder3.0.weight",
+        "att1.0.weight",
+        "att2.0.weight",
+        "att3.0.weight",
+        "backbone.m.conv1.weight",
+    )
+    for name in selected_names:
+        _assert_grad_matches(stream_grads, ref_grads, name)
+
+    for name in ("att1.0.weight", "att2.0.weight", "att3.0.weight"):
+        assert stream_grads[name].abs().sum() > 0, name
 
 
 def test_streaming_attention_gem_backward_parity_x_and_logits():
