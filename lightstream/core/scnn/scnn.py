@@ -342,6 +342,22 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
+
+    def _reducer_aux_indices(self) -> set[int]:
+        aux_indices = set()
+        for reducer_head, indices in self._reducer_input_indices.items():
+            if reducer_head in self._reducer_head_map:
+                aux_indices.update(indices[1:])
+        return aux_indices
+
+    def _public_output_indices(self) -> list[int]:
+        reducer_aux_indices = self._reducer_aux_indices()
+        return [
+            idx
+            for idx in range(len(self._tile_output_shapes))
+            if idx not in reducer_aux_indices
+        ]
+
     def _count_tensors_in_spec(self, spec) -> int:
         kind, payload = spec
         if kind == "tensor":
@@ -667,8 +683,9 @@ class StreamingCNN(torch.nn.Module):
         outputs = [None] * len(self._tile_output_shapes)
 
         def allocate_non_reducer_outputs():
+            reducer_aux_indices = self._reducer_aux_indices()
             for idx in range(len(self._tile_output_shapes)):
-                if idx in self._reducer_head_map or outputs[idx] is not None:
+                if idx in self._reducer_head_map or idx in reducer_aux_indices or outputs[idx] is not None:
                     continue
                 outputs[idx] = torch.empty(
                     (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
@@ -820,12 +837,7 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
-        reducer_aux_indices = {
-            idx
-            for reducer_head, indices in self._reducer_input_indices.items()
-            for idx in indices[1:]
-            if reducer_head in self._reducer_head_map
-        }
+        reducer_aux_indices = self._reducer_aux_indices()
         for head_idx, head_output in enumerate(tile_outputs):
             if head_idx in reducer_aux_indices:
                 continue
@@ -957,10 +969,10 @@ class StreamingCNN(torch.nn.Module):
 
         trimmed_outputs = []
         trimmed_grads = []
-        for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, backward_ctx.grad_tensors)):
+        for head_idx, head_grad in zip(self._public_output_indices(), backward_ctx.grad_tensors):
             paired_output, paired_grad = self._build_head_backward_pair(
-                head_idx=idx,
-                head_output=head_output,
+                head_idx=head_idx,
+                head_output=tile_outputs[head_idx],
                 tile_outputs=tile_outputs,
                 head_grad=head_grad,
                 tile_input_y=input_y,
@@ -1087,8 +1099,14 @@ class StreamingCNN(torch.nn.Module):
             outputs[idx] = reducer.finish_stream().to(result_device)
 
         expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
-        materialized_outputs = outputs[:expected_flat_outputs]
-        for idx, output in enumerate(materialized_outputs):
+        public_output_indices = self._public_output_indices()
+        if len(public_output_indices) != expected_flat_outputs:
+            raise RuntimeError(
+                f"Public output index count mismatch: expected={expected_flat_outputs}, "
+                f"actual={len(public_output_indices)}, indices={public_output_indices}"
+            )
+        materialized_outputs = [outputs[idx] for idx in public_output_indices]
+        for idx, output in zip(public_output_indices, materialized_outputs):
             if output is None:
                 raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
 
