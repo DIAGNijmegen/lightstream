@@ -10,6 +10,7 @@ from lightstream.models.segment.streamingwss import StreamingWSS
 
 from lightstream.core.reducer import (
     AttentionGeMReducer,
+    GeMReducer,
     MeanReducer,
     StreamingAttentionGeMReducer,
     StreamingMeanReducer,
@@ -301,6 +302,34 @@ def test_streaming_gem_backward_replay_surrogate_matches_global_gradient():
     assert torch.allclose(x.grad, x_ref.grad, atol=1e-5, rtol=1e-4)
 
 
+def test_streaming_gem_reducer_backward_parity_with_non_streaming_gradients():
+    torch.manual_seed(37)
+    model = GeMHeadNet().eval()
+    reference = GeMHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = torch.rand(1, 3, 9, 11) + 0.05
+    ref_image = image.detach().clone().requires_grad_(True)
+    grad_out = torch.tensor([[[[0.17]], [[-0.29]], [[0.43]]]], dtype=image.dtype)
+
+    ref_out = reference(ref_image)
+    torch.autograd.backward(ref_out, grad_out)
+
+    scnn = _make_streaming(model, tile_size=4)
+    scnn.debug_reducer_replay = True
+    stream_out = scnn.forward(image.detach().clone())
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.detach().clone(), grad_out.detach().clone())
+
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    ref_grads = {name: p.grad for name, p in reference.named_parameters() if p.grad is not None}
+
+    for name in ("backbone.0.weight", "head.weight"):
+        assert name in stream_grads
+        assert name in ref_grads
+        assert torch.allclose(stream_grads[name], ref_grads[name], atol=2e-5, rtol=2e-4), name
+
+
 def test_streaming_gem_fp16_stability_accumulator_fp32():
     torch.manual_seed(11)
     reducer = StreamingGeMReducer(r_init=4.0)
@@ -314,6 +343,21 @@ def test_streaming_gem_fp16_stability_accumulator_fp32():
     assert reducer.running_count.dtype == torch.float32
     assert y.dtype == torch.float16
     assert torch.isfinite(y).all()
+
+
+class GeMHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(),
+        )
+        self.head = nn.Conv2d(4, 3, kernel_size=1, bias=False)
+        self.reducer = GeMReducer(r_init=2.7, eps=1e-6)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        return self.reducer(self.head(feat))
 
 
 class AttentionGeMHeadNet(nn.Module):
