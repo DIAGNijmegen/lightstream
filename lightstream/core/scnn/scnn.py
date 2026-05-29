@@ -136,6 +136,7 @@ class StreamingCNN(torch.nn.Module):
         self._module_stats = {}
         self._saved_tensors = {}
         self.debug_reducer_replay = False
+        self.debug_forward_sentinel_check = False
         self._hooks = []
         self._last_forward_tiles = []
         self._streaming_reducers = []
@@ -357,6 +358,38 @@ class StreamingCNN(torch.nn.Module):
             for idx in range(len(self._tile_output_shapes))
             if idx not in reducer_aux_indices
         ]
+
+    def _public_output_debug_context(self, public_indices, reducer_aux_indices=None) -> str:
+        if reducer_aux_indices is None:
+            reducer_aux_indices = self._reducer_aux_indices()
+        return (
+            f"public_indices={list(public_indices)}, "
+            f"reducer_auxiliary_indices={sorted(reducer_aux_indices)}, "
+            f"self._reducer_input_indices={self._reducer_input_indices}"
+        )
+
+    def _validate_public_output_indices(self, public_indices) -> None:
+        reducer_aux_indices = self._reducer_aux_indices()
+        leaked_aux_indices = sorted(set(public_indices) & reducer_aux_indices)
+        if leaked_aux_indices:
+            raise RuntimeError(
+                "Public output indices include reducer auxiliary indices; "
+                f"leaked_auxiliary_indices={leaked_aux_indices}; "
+                f"{self._public_output_debug_context(public_indices, reducer_aux_indices)}"
+            )
+
+    def _validate_public_forward_outputs(self, outputs, public_indices) -> None:
+        context = self._public_output_debug_context(public_indices)
+        for idx in public_indices:
+            output = outputs[idx]
+            if output is None:
+                raise RuntimeError(
+                    f"Public output head {idx} was not populated during streaming forward; {context}"
+                )
+            if getattr(self, "debug_forward_sentinel_check", False) and torch.all(output == 999):
+                raise RuntimeError(
+                    f"Public output head {idx} still contains only the unstitched sentinel value 999; {context}"
+                )
 
     def _count_tensors_in_spec(self, spec) -> int:
         kind, payload = spec
@@ -1106,16 +1139,15 @@ class StreamingCNN(torch.nn.Module):
             outputs[idx] = reducer.finish_stream().to(result_device)
 
         public_indices = self._public_output_indices()
+        self._validate_public_output_indices(public_indices)
         expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
         if len(public_indices) != expected_flat_outputs:
             raise RuntimeError(
                 f"Public output index count mismatch: expected={expected_flat_outputs}, "
-                f"actual={len(public_indices)}, indices={public_indices}"
+                f"actual={len(public_indices)}; {self._public_output_debug_context(public_indices)}"
             )
+        self._validate_public_forward_outputs(outputs, public_indices)
         materialized_outputs = [outputs[idx] for idx in public_indices]
-        for idx, output in zip(public_indices, materialized_outputs):
-            if output is None:
-                raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
 
         output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
         assert final_idx == len(materialized_outputs)

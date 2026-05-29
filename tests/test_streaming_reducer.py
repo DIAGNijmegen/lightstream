@@ -325,6 +325,55 @@ def test_prepare_forward_outputs_skips_reducer_aux_payloads():
     assert outputs[2] is existing_output
 
 
+def test_public_output_index_validation_rejects_reducer_aux_leak():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._reducer_head_map = {0: object()}
+    scnn._reducer_input_indices = {0: (0, 1)}
+
+    with pytest.raises(RuntimeError) as exc_info:
+        scnn._validate_public_output_indices([0, 1])
+
+    message = str(exc_info.value)
+    assert "public_indices=[0, 1]" in message
+    assert "reducer_auxiliary_indices=[1]" in message
+    assert "self._reducer_input_indices={0: (0, 1)}" in message
+
+
+def test_public_forward_output_validation_reports_none_with_reducer_context():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._reducer_head_map = {0: object()}
+    scnn._reducer_input_indices = {0: (0, 1)}
+    outputs = [torch.ones((1, 1, 1, 1)), None]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        scnn._validate_public_forward_outputs(outputs, [0, 1])
+
+    message = str(exc_info.value)
+    assert "Public output head 1 was not populated" in message
+    assert "public_indices=[0, 1]" in message
+    assert "reducer_auxiliary_indices=[1]" in message
+    assert "self._reducer_input_indices={0: (0, 1)}" in message
+
+
+def test_public_forward_output_sentinel_check_is_debug_only():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._reducer_head_map = {}
+    scnn._reducer_input_indices = {}
+    outputs = [torch.full((1, 1, 1, 1), 999.0)]
+
+    scnn._validate_public_forward_outputs(outputs, [0])
+
+    scnn.debug_forward_sentinel_check = True
+    with pytest.raises(RuntimeError) as exc_info:
+        scnn._validate_public_forward_outputs(outputs, [0])
+
+    message = str(exc_info.value)
+    assert "unstitched sentinel value 999" in message
+    assert "public_indices=[0]" in message
+    assert "reducer_auxiliary_indices=[]" in message
+    assert "self._reducer_input_indices={}" in message
+
+
 def test_streaming_attention_gem_backward_parity_x_and_logits():
     torch.manual_seed(13)
     model = AttentionGeMHeadNet().eval()
