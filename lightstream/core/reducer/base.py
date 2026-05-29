@@ -342,9 +342,24 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
 
     @abstractmethod
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor | Sequence[torch.Tensor], valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        """Build tile-local reduced output used for backward replay.
+        """Build a tile-local replay expression for reducer backward.
 
         ``trimmed_output`` may be a single tensor or structured tuple/list payload.
+
+        The returned tensor is consumed only by backward replay and is allowed to be
+        a derivative surrogate. It does not need to numerically equal the tile's
+        final forward contribution, and for nonlinear global reducers such as GeM
+        it generally should not finalize each tile independently. Instead, the
+        implementation contract is gradient equivalence: when the same upstream
+        reducer gradient is applied to every replay tile and those per-tile input
+        gradients are summed over all tiles, the result must match the gradient of
+        the finalized global reducer output with respect to the original full
+        input(s).
+
+        Avoid applying nonlinear finalization (for example, ``pow(1.0 / r)``) to
+        each tile contribution unless the math has been derived to be equivalent
+        under this gradient-summing contract. Use ``global_context`` for finalized
+        global state needed to build an equivalent replay expression.
         """
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:

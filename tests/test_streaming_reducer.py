@@ -269,6 +269,38 @@ def test_streaming_gem_backward_input_grad_parity():
     assert torch.allclose(grad_x_stream, x_ref.grad, atol=1e-5, rtol=1e-4)
 
 
+def test_streaming_gem_backward_replay_surrogate_matches_global_gradient():
+    torch.manual_seed(31)
+    x = (torch.rand(1, 2, 4, 6) + 0.05).requires_grad_(True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    mask = torch.tensor(
+        [
+            [1, 0, 1, 1, 0, 1],
+            [1, 1, 0, 1, 1, 0],
+            [0, 1, 1, 0, 1, 1],
+            [1, 0, 1, 1, 0, 1],
+        ],
+        dtype=torch.bool,
+    )
+    upstream = torch.tensor([[[[0.17]], [[-0.29]]]], dtype=x.dtype)
+    sides = type("S", (), dict(top=False, left=False, right=False, bottom=False))()
+
+    reducer = StreamingGeMReducer(r_init=3.2, eps=1e-6)
+    reducer.start_stream(output_height=4, output_width=6, batch_size=1, channels=2, device=x.device, dtype=x.dtype)
+    reducer.accumulate_stream_tile(x[:, :, :, :3], 0, 0, sides, (0, 4, 0, 3), user_mask=mask[:, :3])
+    reducer.accumulate_stream_tile(x[:, :, :, 3:], 0, 1, sides, (0, 4, 3, 6), user_mask=mask[:, 3:])
+
+    global_context = reducer.extra_state_for_backward()
+    replay_left = reducer.reduce_tile_for_backward(x[:, :, :, :3], mask[:, :3], global_context)
+    replay_right = reducer.reduce_tile_for_backward(x[:, :, :, 3:], mask[:, 3:], global_context)
+    torch.autograd.backward((replay_left, replay_right), (upstream, upstream))
+
+    y_ref = _gem_reference(x_ref, mask, reducer.current_r.to(dtype=x_ref.dtype), reducer.eps)
+    torch.autograd.backward(y_ref, upstream)
+
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-5, rtol=1e-4)
+
+
 def test_streaming_gem_fp16_stability_accumulator_fp32():
     torch.manual_seed(11)
     reducer = StreamingGeMReducer(r_init=4.0)
