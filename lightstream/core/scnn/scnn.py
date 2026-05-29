@@ -973,12 +973,13 @@ class StreamingCNN(torch.nn.Module):
 
         trimmed_outputs = []
         trimmed_grads = []
-        for head_idx, head_grad in enumerate(backward_ctx.grad_tensors):
+        for idx, head_output in enumerate(tile_outputs):
+            head_grad = backward_ctx.grad_tensors[idx]
             if head_grad is None:
                 continue
             paired_output, paired_grad = self._build_head_backward_pair(
-                head_idx=head_idx,
-                head_output=tile_outputs[head_idx],
+                head_idx=idx,
+                head_output=head_output,
                 tile_outputs=tile_outputs,
                 head_grad=head_grad,
                 tile_input_y=input_y,
