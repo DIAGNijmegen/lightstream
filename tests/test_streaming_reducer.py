@@ -386,6 +386,79 @@ class AttentionGeMBiasHeadNet(nn.Module):
         return self.reducer(self.feat_head(feat), self.logit_head(feat))
 
 
+def test_streaming_attention_gem_uniform_bias_backward_replay_matches_non_streaming():
+    torch.manual_seed(41)
+    x = torch.tensor(
+        [
+            [
+                [
+                    [0.11, 0.23, 0.37, 0.53],
+                    [0.71, 0.89, 1.07, 1.31],
+                    [1.47, 1.61, 1.79, 1.97],
+                ],
+                [
+                    [0.29, 0.43, 0.59, 0.73],
+                    [0.97, 1.13, 1.29, 1.43],
+                    [1.67, 1.83, 2.03, 2.19],
+                ],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    upstream = torch.tensor([[[[0.17]], [[-0.31]]]], dtype=x.dtype)
+    sides = type("S", (), dict(top=False, left=False, right=False, bottom=False))()
+
+    ref_bias = nn.Parameter(torch.tensor(0.37, dtype=x.dtype))
+    ref_reducer = AttentionGeMReducer(r_init=2.5, eps=1e-6)
+    ref_logits = torch.zeros((x.shape[0], 1, x.shape[2], x.shape[3]), dtype=x.dtype) + ref_bias
+    ref_out = ref_reducer(x, ref_logits)
+    torch.autograd.backward(ref_out, upstream)
+
+    stream_bias = nn.Parameter(ref_bias.detach().clone())
+    stream_reducer = StreamingAttentionGeMReducer(r_init=2.5, eps=1e-6)
+    stream_reducer.start_stream(
+        output_height=x.shape[-2],
+        output_width=x.shape[-1],
+        batch_size=x.shape[0],
+        channels=x.shape[1],
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    with torch.no_grad():
+        left_x = x[:, :, :, :3]
+        right_x = x[:, :, :, 1:]
+        left_logits = torch.zeros((x.shape[0], 1, x.shape[2], 3), dtype=x.dtype) + stream_bias
+        right_logits = torch.zeros((x.shape[0], 1, x.shape[2], 3), dtype=x.dtype) + stream_bias
+        stream_reducer.accumulate_stream_tile((left_x, left_logits), 0, 0, sides, (0, 3, 0, 3))
+        stream_reducer.accumulate_stream_tile((right_x, right_logits), 0, 1, sides, (0, 3, 1, 4))
+        stream_out = stream_reducer.finish_stream()
+
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-6, rtol=1e-5)
+
+    left_logits = torch.zeros((x.shape[0], 1, x.shape[2], 3), dtype=x.dtype) + stream_bias
+    right_logits = torch.zeros((x.shape[0], 1, x.shape[2], 3), dtype=x.dtype) + stream_bias
+    left_valid = torch.ones((x.shape[2], 3), dtype=torch.bool)
+    right_valid = torch.tensor([[0, 0, 1], [0, 0, 1], [0, 0, 1]], dtype=torch.bool)
+    global_context = stream_reducer.extra_state_for_backward()
+    replay_left = stream_reducer.reduce_tile_for_backward(
+        (x[:, :, :, :3], left_logits),
+        left_valid,
+        global_context,
+    )
+    replay_right = stream_reducer.reduce_tile_for_backward(
+        (x[:, :, :, 1:], right_logits),
+        right_valid,
+        global_context,
+    )
+    torch.autograd.backward((replay_left, replay_right), (upstream, upstream))
+
+    assert ref_bias.grad is not None
+    assert stream_bias.grad is not None
+    assert torch.allclose(stream_bias.grad, ref_bias.grad, atol=2e-6, rtol=2e-5)
+    assert stream_bias.grad.abs().max() < 2e-6
+
+
 def test_public_output_indices_skip_attention_gem_aux_payloads():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn._tile_output_shapes = [torch.Size((1, 1, 1, 1)) for _ in range(8)]
