@@ -3,6 +3,7 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.reducer import (
     AttentionGeMReducer,
     MeanReducer,
@@ -268,6 +269,39 @@ class AttentionGeMHeadNet(nn.Module):
     def forward(self, x):
         feat = self.backbone(x)
         return self.reducer(self.feat_head(feat), self.logit_head(feat))
+
+
+def test_prepare_forward_outputs_skips_reducer_aux_payloads():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._tile_output_shapes = [
+        torch.Size((1, 3, 2, 2)),
+        torch.Size((1, 1, 2, 2)),
+        torch.Size((1, 2, 2, 2)),
+    ]
+    scnn._reducer_head_map = {0: object()}
+    scnn._reducer_input_indices = {0: (0, 1)}
+    scnn.dtype = torch.float32
+
+    image = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+    outputs, allocate_non_reducer_outputs = StreamingCNN._prepare_forward_outputs(
+        scnn,
+        image=image,
+        output_heights=[1, 1, 1],
+        output_widths=[1, 1, 1],
+        result_device=torch.device("cpu"),
+    )
+
+    allocate_non_reducer_outputs()
+
+    assert outputs[0] is None
+    assert outputs[1] is None
+    assert outputs[2] is not None
+    assert outputs[2].shape == (1, 2, 1, 1)
+    assert torch.equal(outputs[2], torch.full((1, 2, 1, 1), 999.0))
+
+    existing_output = outputs[2]
+    allocate_non_reducer_outputs()
+    assert outputs[2] is existing_output
 
 
 def test_streaming_attention_gem_backward_parity_x_and_logits():

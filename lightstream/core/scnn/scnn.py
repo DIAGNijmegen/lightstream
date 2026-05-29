@@ -683,9 +683,13 @@ class StreamingCNN(torch.nn.Module):
         outputs = [None] * len(self._tile_output_shapes)
 
         def allocate_non_reducer_outputs():
-            reducer_aux_indices = self._reducer_aux_indices()
+            aux_indices = self._reducer_aux_indices()
             for idx in range(len(self._tile_output_shapes)):
-                if idx in self._reducer_head_map or idx in reducer_aux_indices or outputs[idx] is not None:
+                if idx in self._reducer_head_map:
+                    continue
+                if idx in aux_indices:
+                    continue
+                if outputs[idx] is not None:
                     continue
                 outputs[idx] = torch.empty(
                     (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
