@@ -215,10 +215,15 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
+        zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
+        mean = self.running_shat.to(dtype=acc_dtype) / zhat
+        r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
             "m": self.running_m.to(dtype=acc_dtype),
-            "zhat": self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps),
-            "r": self.current_r.to(device=self.running_shat.device, dtype=acc_dtype),
+            "zhat": zhat,
+            "mean": mean,
+            "y": mean.clamp_min(self.eps).pow(1.0 / r),
+            "r": r,
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
@@ -232,11 +237,18 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         m = global_context["m"].to(device=x_tile.device, dtype=acc_dtype)
         zhat = global_context["zhat"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
 
+        global_mean = global_context["mean"].to(device=x_tile.device, dtype=acc_dtype)
+
         valid4d = valid_mask[None, None].to(device=x_tile.device, dtype=torch.bool)
+        x_pow = x.pow(r)
         weights_unnorm = torch.exp(logits - m)
         weights_unnorm = torch.where(valid4d, weights_unnorm, torch.zeros_like(weights_unnorm))
-        weighted = streaming_reduce_tile(weights_unnorm * x.pow(r), valid_mask, zhat)
-        return weighted.clamp_min(self.eps).pow(1.0 / r).to(dtype=x_tile.dtype)
+        local_s_over_z = streaming_reduce_tile(weights_unnorm * x_pow, valid_mask, zhat)
+        local_z_over_z = streaming_reduce_tile(weights_unnorm, valid_mask, zhat)
+
+        scale = (1.0 / r) * global_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+        surrogate = scale.detach() * (local_s_over_z - global_mean.detach() * local_z_over_z)
+        return surrogate.to(dtype=x_tile.dtype)
 
     def to_reducer(self) -> AttentionGeMReducer:
         reducer = AttentionGeMReducer(

@@ -297,6 +297,19 @@ class AttentionGeMHeadNet(nn.Module):
         return self.reducer(self.feat_head(feat), self.logit_head(feat))
 
 
+class AttentionGeMBiasHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False), nn.ReLU())
+        self.feat_head = nn.Conv2d(4, 3, kernel_size=1, bias=False)
+        self.logit_head = nn.Conv2d(4, 1, kernel_size=1, bias=True)
+        self.reducer = AttentionGeMReducer(r_init=2.7, eps=1e-6)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        return self.reducer(self.feat_head(feat), self.logit_head(feat))
+
+
 def test_public_output_indices_skip_attention_gem_aux_payloads():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn._tile_output_shapes = [torch.Size((1, 1, 1, 1)) for _ in range(8)]
@@ -537,3 +550,31 @@ def test_streaming_attention_gem_backward_parity_x_and_logits():
         assert name in stream_grads
         assert name in ref_grads
         assert torch.allclose(stream_grads[name], ref_grads[name], atol=2e-5, rtol=2e-4), name
+
+
+def test_streaming_attention_gem_logit_bias_gradient_matches_reference():
+    torch.manual_seed(23)
+    model = AttentionGeMBiasHeadNet().eval()
+    reference = AttentionGeMBiasHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = (torch.rand(1, 3, 9, 11) + 0.05).requires_grad_(True)
+    ref_image = image.detach().clone().requires_grad_(True)
+    grad_out = torch.tensor([[[[0.19]], [[-0.31]], [[0.43]]]], dtype=image.dtype)
+
+    ref_out = reference(ref_image)
+    torch.autograd.backward(ref_out, grad_out)
+
+    scnn = _make_streaming(model, tile_size=4)
+    scnn.debug_reducer_replay = True
+    stream_out = scnn.forward(image.detach().clone())
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.detach().clone(), grad_out.detach().clone())
+
+    stream_bias_grad = scnn.stream_module.logit_head.bias.grad
+    ref_bias_grad = reference.logit_head.bias.grad
+
+    assert stream_bias_grad is not None
+    assert ref_bias_grad is not None
+    assert torch.allclose(stream_bias_grad, ref_bias_grad, atol=2e-6, rtol=2e-5)
+    assert stream_bias_grad.abs().max() < 2e-6
