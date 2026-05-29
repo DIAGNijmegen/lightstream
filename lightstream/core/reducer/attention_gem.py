@@ -241,6 +241,8 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
 
         valid4d = valid_mask[None, None].to(device=x_tile.device, dtype=torch.bool)
         x_pow = x.pow(r)
+        neg_inf = torch.finfo(acc_dtype).min
+        logits = torch.where(valid4d, logits, torch.full_like(logits, neg_inf))
         weights_unnorm = torch.exp(logits - m)
         weights_unnorm = torch.where(valid4d, weights_unnorm, torch.zeros_like(weights_unnorm))
         local_s_over_z = streaming_reduce_tile(weights_unnorm * x_pow, valid_mask, zhat)
