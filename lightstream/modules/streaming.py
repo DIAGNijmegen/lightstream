@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -83,8 +85,13 @@ class StreamingModule(nn.Module):
         elif self._distributed_is_initialized() and self._distributed_world_size() > 1:
             rank = self._distributed_rank()
             if rank == 0:
-                self._prepare_streaming_model(stream_network, tile_cache=None, **kwargs)
-                self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
+                with self._exclusive_tile_cache_lock():
+                    tile_cache = self.load_tile_cache_if_needed()
+                    if tile_cache is not None:
+                        self._prepare_streaming_model(stream_network, tile_cache, **kwargs)
+                    else:
+                        self._prepare_streaming_model(stream_network, tile_cache=None, **kwargs)
+                        self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
 
             self._distributed_barrier()
 
@@ -147,6 +154,21 @@ class StreamingModule(nn.Module):
         if self.tile_cache_fname is None:
             self.tile_cache_fname = self._default_tile_cache_fname()
         return Path(self.tile_cache_dir) / Path(self.tile_cache_fname)
+
+    def _tile_cache_lock_location(self) -> Path:
+        """Return the filesystem lock path associated with the tile cache file."""
+        return Path(str(self._tile_cache_location()) + ".lock")
+
+    @contextmanager
+    def _exclusive_tile_cache_lock(self):
+        """Hold an exclusive filesystem lock for cache generation."""
+        lock_path = self._tile_cache_lock_location()
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def _default_tile_cache_fname(self) -> str:
         """Return the default cache file name for the configured tile size.

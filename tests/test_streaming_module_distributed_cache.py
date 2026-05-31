@@ -149,6 +149,51 @@ def test_distributed_rank_zero_overwrites_stale_cache(monkeypatch, tmp_path):
     assert barriers == ["barrier"]
 
 
+def test_distributed_rank_zero_reloads_cache_after_lock(monkeypatch, tmp_path):
+    loads = iter([None, {"cached": True}])
+    saves = []
+    barriers = []
+    lock_events = []
+
+    class RecordingLock:
+        def __enter__(self):
+            lock_events.append("acquire")
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_events.append("release")
+
+    monkeypatch.setattr(StreamingModule, "load_tile_cache_if_needed", lambda self: next(loads))
+    monkeypatch.setattr(
+        StreamingModule,
+        "save_tile_cache_if_needed",
+        lambda self, overwrite=False: saves.append(overwrite),
+    )
+    monkeypatch.setattr(StreamingModule, "_exclusive_tile_cache_lock", lambda self: RecordingLock())
+    monkeypatch.setattr(StreamingModule, "_distributed_is_initialized", staticmethod(lambda: True))
+    monkeypatch.setattr(StreamingModule, "_distributed_world_size", staticmethod(lambda: 2))
+    monkeypatch.setattr(StreamingModule, "_distributed_rank", staticmethod(lambda: 0))
+    monkeypatch.setattr(
+        StreamingModule,
+        "_distributed_barrier",
+        staticmethod(lambda: barriers.append("barrier")),
+    )
+
+    StreamingModule(nn.Identity(), 8, tile_cache_path=tmp_path / "cache")
+
+    assert [call["tile_cache"] for call in DummyConstructor.calls] == [{"cached": True}]
+    assert saves == []
+    assert lock_events == ["acquire", "release"]
+    assert barriers == ["barrier"]
+
+
+def test_tile_cache_lock_path_is_next_to_cache_file(tmp_path):
+    module = StreamingModule.__new__(StreamingModule)
+    module.tile_cache_dir = tmp_path
+    module.tile_cache_fname = "cache"
+
+    assert module._tile_cache_lock_location() == tmp_path / "cache.lock"
+
+
 def test_distributed_nonzero_rank_waits_then_loads_cache(monkeypatch, tmp_path):
     loads = iter([None, {"cached": True}])
     saves = []
