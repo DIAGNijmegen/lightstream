@@ -150,27 +150,66 @@ class StreamingCNN(torch.nn.Module):
             self.load_tile_cache(state_dict)
 
     def _normalize_reducer_mask(self, mask: torch.Tensor | None, image: torch.Tensor) -> torch.Tensor | None:
+        """Normalize reducer masks for rank, device, and dtype.
+
+        Spatial compatibility is intentionally deferred until a concrete
+        reducer tile is sliced because reducer heads may operate in a reduced
+        feature-space instead of the original input-image space. 3D [N,H,W]
+        and 4D [N,C,H,W] masks keep the existing streaming behavior: all batch
+        and channel planes are collapsed to one 2D reducer-domain mask with
+        ``torch.any(...)``. Per-sample masks would require keeping these axes
+        and extending the reducer APIs.
+        """
         if mask is None:
             return None
         if mask.ndim == 2:
-            if mask.shape != image.shape[-2:]:
-                raise ValueError(
-                    f"2D mask shape {tuple(mask.shape)} must match image spatial shape {tuple(image.shape[-2:])}"
-                )
             return mask.to(device=self.device, dtype=torch.bool)
         if mask.ndim == 3:
-            if mask.shape[0] != image.shape[0] or mask.shape[-2:] != image.shape[-2:]:
+            if mask.shape[0] != image.shape[0]:
                 raise ValueError(
-                    f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]} and H/W={tuple(image.shape[-2:])}"
+                    f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]}; "
+                    "H/W must align with the reducer/reduced feature spatial domain."
                 )
             return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=0)
         if mask.ndim == 4:
-            if mask.shape[0] != image.shape[0] or mask.shape[-2:] != image.shape[-2:]:
+            if mask.shape[0] != image.shape[0]:
                 raise ValueError(
-                    f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]} and H/W={tuple(image.shape[-2:])}"
+                    f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
+                    "H/W must align with the reducer/reduced feature spatial domain."
                 )
             return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
-        raise ValueError(f"mask must be 2D/3D/4D tensor, got shape={tuple(mask.shape)}")
+        raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
+
+    def _slice_reducer_mask(
+        self,
+        mask: torch.Tensor | None,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        *,
+        context: str,
+        expected_shape: tuple[int, int],
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+
+        y0, y1, x0, x1 = int(y0), int(y1), int(x0), int(x1)
+        mask_h, mask_w = int(mask.shape[-2]), int(mask.shape[-1])
+        if y0 < 0 or x0 < 0 or y1 > mask_h or x1 > mask_w or y1 < y0 or x1 < x0:
+            raise ValueError(
+                f"Reducer mask slice {context} ({y0}:{y1}, {x0}:{x1}) is outside mask bounds "
+                f"{tuple(mask.shape[-2:])}. The mask must align with the reducer/reduced feature spatial domain, "
+                "not necessarily the original input image."
+            )
+
+        sliced = mask[y0:y1, x0:x1]
+        if tuple(sliced.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"Reducer mask slice {context} produced shape {tuple(sliced.shape)}, expected {tuple(expected_shape)}. "
+                "The mask must align with the reducer/reduced feature spatial domain, not necessarily the original input image."
+            )
+        return sliced
 
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
@@ -864,13 +903,22 @@ class StreamingCNN(torch.nn.Module):
         dst_x0 = int(output_loc.x)
         dst_x1 = int(output_loc.x + ref.shape[W_DIM])
         payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
+        tile_mask = self._slice_reducer_mask(
+            user_mask,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+            context=f"forward reducer head {head_idx}",
+            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
+        )
         self._reducer_head_map[head_idx].accumulate_stream_tile(
             trimmed_output=payload,
             tile_y=int(tile_input_y),
             tile_x=int(tile_input_x),
             sides=sides,
             dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
-            user_mask=None if user_mask is None else user_mask[dst_y0:dst_y1, dst_x0:dst_x1],
+            user_mask=tile_mask,
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
@@ -1328,12 +1376,15 @@ class StreamingCNN(torch.nn.Module):
         output_x,
     ):
         reducer = self._reducer_head_map[head_idx]
-        valid_mask = None
-        if self._active_reducer_mask is not None:
-            valid_mask = self._active_reducer_mask[
-                output_y : output_y + trimmed_output.shape[H_DIM],
-                output_x : output_x + trimmed_output.shape[W_DIM],
-            ]
+        valid_mask = self._slice_reducer_mask(
+            self._active_reducer_mask,
+            output_y,
+            output_y + trimmed_output.shape[H_DIM],
+            output_x,
+            output_x + trimmed_output.shape[W_DIM],
+            context=f"backward reducer head {head_idx}",
+            expected_shape=(trimmed_output.shape[H_DIM], trimmed_output.shape[W_DIM]),
+        )
 
         ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
         payload = trimmed_output

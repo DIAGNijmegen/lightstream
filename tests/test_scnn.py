@@ -30,6 +30,17 @@ class AllReducerHeadsNet(nn.Module):
         return self.sum_head(feat), self.mean_head(feat)
 
 
+class DownsampledReducerNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.down = nn.Conv2d(3, 4, kernel_size=3, stride=2, padding=1, bias=False)
+        self.reducer = MeanReducer()
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.down(x)
+        return self.reducer(feat, mask=mask)
+
+
 class MixedHeadsNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -390,6 +401,53 @@ def test_scnn_single_input_reducers_compatibility_unchanged():
 
     assert torch.allclose(streamed_sum, expected_sum, atol=1e-5, rtol=1e-4)
     assert torch.allclose(streamed_mean, expected_mean, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_input_resolution_mask_for_input_resolution_reducer():
+    torch.manual_seed(115)
+    model = AllReducerHeadsNet().eval()
+    image = torch.randn(1, 3, 8, 10)
+    mask = ((torch.arange(8)[:, None] + 2 * torch.arange(10)[None, :]) % 4 != 0).to(torch.float32)
+
+    with torch.no_grad():
+        feat = model.backbone(image)
+        expected_sum = model.sum_head[1](model.sum_head[0](feat), mask=mask.to(torch.bool))
+        expected_mean = model.mean_head[1](model.mean_head[0](feat), mask=mask.to(torch.bool))
+
+    scnn = _make_streaming(model, tile_size=4)
+    with torch.no_grad():
+        streamed_sum, streamed_mean = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed_sum, expected_sum, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(streamed_mean, expected_mean, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_downsampled_reducer_mask_matches_reduced_feature_map():
+    torch.manual_seed(117)
+    model = DownsampledReducerNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+    mask = (torch.arange(5)[:, None] + torch.arange(6)[None, :]) % 2 == 0
+
+    with torch.no_grad():
+        expected = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=5)
+    with torch.no_grad():
+        streamed = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_too_small_reducer_mask_fails_at_reducer_slice_site():
+    torch.manual_seed(119)
+    model = DownsampledReducerNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+    mask = torch.ones((4, 6), dtype=torch.bool)
+
+    scnn = _make_streaming(model, tile_size=5)
+    with pytest.raises(ValueError, match="reducer/reduced feature spatial domain"):
+        with torch.no_grad():
+            scnn.forward(image, mask=mask)
 
 
 def test_scnn_multi_input_reducer_failure_on_shape_mismatch():
