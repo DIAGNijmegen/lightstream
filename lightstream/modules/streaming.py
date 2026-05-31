@@ -74,7 +74,65 @@ class StreamingModule(nn.Module):
         self._tile_cache_was_ignored = False
         tile_cache = self.load_tile_cache_if_needed()  # Load tile cache if present
 
-        # Initialize the streaming network
+        # Initialize the streaming network. When a distributed job starts with no
+        # compatible cache, rank zero computes and saves it while the remaining
+        # ranks wait and then reload the freshly written cache.
+        if tile_cache is not None:
+            self._prepare_streaming_model(stream_network, tile_cache, **kwargs)
+            self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
+        elif self._distributed_is_initialized() and self._distributed_world_size() > 1:
+            rank = self._distributed_rank()
+            if rank == 0:
+                self._prepare_streaming_model(stream_network, tile_cache=None, **kwargs)
+                self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
+
+            self._distributed_barrier()
+
+            if rank != 0:
+                tile_cache = self.load_tile_cache_if_needed()
+                if tile_cache is None:
+                    raise RuntimeError(
+                        "Rank "
+                        f"{rank} could not load a compatible tile cache after waiting for rank 0. "
+                        f"Expected cache path: {self._tile_cache_location()}"
+                    )
+                self._prepare_streaming_model(stream_network, tile_cache, **kwargs)
+        else:
+            self._prepare_streaming_model(stream_network, tile_cache=None, **kwargs)
+            self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
+
+    @staticmethod
+    def _distributed_is_initialized() -> bool:
+        """Return whether ``torch.distributed`` is available and initialized."""
+        distributed = getattr(torch, "distributed", None)
+        return (
+            distributed is not None
+            and distributed.is_available()
+            and distributed.is_initialized()
+        )
+
+    @staticmethod
+    def _distributed_rank() -> int:
+        """Return the current distributed rank."""
+        return torch.distributed.get_rank()
+
+    @staticmethod
+    def _distributed_world_size() -> int:
+        """Return the current distributed world size."""
+        return torch.distributed.get_world_size()
+
+    @staticmethod
+    def _distributed_barrier() -> None:
+        """Synchronize all initialized distributed ranks."""
+        torch.distributed.barrier()
+
+    def _prepare_streaming_model(
+        self,
+        stream_network: torch.nn.Module,
+        tile_cache: dict | None,
+        **kwargs,
+    ) -> None:
+        """Construct and prepare the streaming network with an optional tile cache."""
         self.constructor = StreamingConstructor(
             stream_network,
             self.tile_size,
@@ -83,7 +141,12 @@ class StreamingModule(nn.Module):
         )
         self.copy_to_gpu = self.constructor.copy_to_gpu
         self.stream_network = self.constructor.prepare_streaming_model()
-        self.save_tile_cache_if_needed(overwrite=self._tile_cache_was_ignored)
+
+    def _tile_cache_location(self) -> Path:
+        """Return the configured cache path, assigning the default file name if needed."""
+        if self.tile_cache_fname is None:
+            self.tile_cache_fname = self._default_tile_cache_fname()
+        return Path(self.tile_cache_dir) / Path(self.tile_cache_fname)
 
     def _default_tile_cache_fname(self) -> str:
         """Return the default cache file name for the configured tile size.
@@ -332,9 +395,7 @@ class StreamingModule(nn.Module):
         method stores cache metadata alongside the streaming statistics so stale
         caches can be detected on future loads.
         """
-        if self.tile_cache_fname is None:
-            self.tile_cache_fname = self._default_tile_cache_fname()
-        write_path = Path(self.tile_cache_dir) / Path(self.tile_cache_fname)
+        write_path = self._tile_cache_location()
 
         if Path(self.tile_cache_dir).exists():
             if write_path.exists() and not overwrite:
@@ -371,10 +432,7 @@ class StreamingModule(nn.Module):
         recomputation.
         """
 
-        if self.tile_cache_fname is None:
-            self.tile_cache_fname = self._default_tile_cache_fname()
-
-        tile_cache_loc = Path(self.tile_cache_dir) / Path(self.tile_cache_fname)
+        tile_cache_loc = self._tile_cache_location()
 
         if tile_cache_loc.exists() and use_tile_cache:
             print("Loading tile cache from", tile_cache_loc)
