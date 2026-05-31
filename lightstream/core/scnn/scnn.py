@@ -4,6 +4,7 @@ MIT License
 """
 import math
 import copy
+import logging
 from dataclasses import dataclass
 from typing import List
 
@@ -18,6 +19,8 @@ from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
+
+logger = logging.getLogger(__name__)
 
 _triple = _ntuple(3)
 
@@ -97,7 +100,9 @@ class StreamingCNN(torch.nn.Module):
         Parameters:
             stream_module (torch.nn.Module): modules containing the to be streamed layers
             tile_shape (tuple, NCHW): size of the to be streamed tiles
-            verbose (bool): will log various debugging relevant information (default is False)
+            verbose (bool): if True, print setup-time tile statistics and progress output
+                during configuration. Per-forward tiling diagnostics are emitted through this
+                module's logger at DEBUG level (default is False).
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
             eps (float): epsilon error to compare floating values
@@ -149,6 +154,10 @@ class StreamingCNN(torch.nn.Module):
         else:
             self.load_tile_cache(state_dict)
 
+    def _print_verbose(self, *args: object, **kwargs: object) -> None:
+        if self.verbose:
+            print(*args, **kwargs)
+
     def _normalize_reducer_mask(self, mask: torch.Tensor | None, image: torch.Tensor) -> torch.Tensor | None:
         if mask is None:
             return None
@@ -196,8 +205,7 @@ class StreamingCNN(torch.nn.Module):
         tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
 
         self._gather_forward_statistics(tile)
-        if self.verbose:
-            print("")
+        self._print_verbose("")
         self._gather_backward_statistics(tile)
 
         # TODO; temp hack for tile sizes too big on gpu,
@@ -283,8 +291,7 @@ class StreamingCNN(torch.nn.Module):
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
 
         # lost statistics assume you're always in the middle of an image, so left,bottom,top,right lost can always happen
-        if self.verbose:
-            print("\n", "Input gradient lost", self.tile_gradient_lost)
+        self._print_verbose("\n", "Input gradient lost", self.tile_gradient_lost)
 
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
@@ -293,8 +300,7 @@ class StreamingCNN(torch.nn.Module):
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
-        if self.verbose:
-            print("\n", "Output lost", self._tile_output_lost)
+        self._print_verbose("\n", "Output lost", self._tile_output_lost)
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -1054,11 +1060,14 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         self._last_forward_tiles = []
-        if self.verbose:
-            print(
-                f"Forward tiling step: valid_input_height={valid_input_height}, "
-                f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
-            )
+        logger.debug(
+            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s",
+            valid_input_height,
+            valid_input_width,
+            n_rows,
+            n_cols,
+            n_rows * n_cols,
+        )
 
         result_device = torch.device("cpu") if result_on_cpu else self.device
         forward_ctx = ForwardContext(
@@ -1510,8 +1519,7 @@ class StreamingCNN(torch.nn.Module):
             ] = 1
 
             module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
-            if self.verbose:
-                print(module, "\n", module_stats["lost"])
+            self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt
             self._module_stats[module] = module_stats
@@ -1571,7 +1579,7 @@ class StreamingCNN(torch.nn.Module):
                 f_grad = np.repeat(f_grad, stride[2], axis=1)
                 grad = np.zeros(grad_in[0].shape[2:])
 
-                print("testing shape gradient fix")
+                self._print_verbose("testing shape gradient fix")
                 grad[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[: grad.shape[0], : grad.shape[1]]
 
                 f_grad = torch.from_numpy(grad)
@@ -1584,8 +1592,7 @@ class StreamingCNN(torch.nn.Module):
 
             grad_lost = self._non_max_border_amount(grad_out[0])
 
-            if self.verbose:
-                print(module, "\n", grad_lost)
+            self._print_verbose(module, "\n", grad_lost)
             self._module_stats[module]["grad_lost"] = grad_lost
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
