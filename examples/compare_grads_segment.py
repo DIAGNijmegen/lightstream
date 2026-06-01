@@ -99,7 +99,7 @@ def _build_dummy_mask(size: int, device: torch.device) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=1920)
+    parser.add_argument("--tile-size", type=int, default=3520)
     parser.add_argument("--input-size", type=int, default=5120)
     args = parser.parse_args()
 
