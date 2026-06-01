@@ -10,9 +10,11 @@ from lightstream.models.segment.streamingwss import StreamingWSS
 
 from lightstream.core.reducer import (
     AttentionGeMReducer,
+    FusedAttentionGeMReducer,
     GeMReducer,
     MeanReducer,
     StreamingAttentionGeMReducer,
+    StreamingFusedAttentionGeMReducer,
     StreamingMeanReducer,
     StreamingSumReducer,
     SumReducer,
@@ -818,3 +820,195 @@ def test_streaming_attention_gem_logit_bias_gradient_matches_reference():
     assert ref_bias_grad is not None
     assert torch.allclose(stream_bias_grad, ref_bias_grad, atol=2e-6, rtol=2e-5)
     assert stream_bias_grad.abs().max() < 2e-6
+
+
+class FusedAttentionGeMHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False), nn.ReLU())
+        self.value1 = nn.Conv2d(4, 2, kernel_size=1, bias=False)
+        self.value2 = nn.Conv2d(4, 2, kernel_size=1, bias=False)
+        self.value3 = nn.Conv2d(4, 2, kernel_size=1, bias=False)
+        self.logits1 = nn.Conv2d(4, 1, kernel_size=1, bias=False)
+        self.logits2 = nn.Conv2d(4, 1, kernel_size=1, bias=False)
+        self.logits3 = nn.Conv2d(4, 1, kernel_size=1, bias=False)
+        self.reducer = FusedAttentionGeMReducer(
+            r_init=2.6,
+            eps=1e-6,
+            value_weights=(0.2, 0.5, 0.3),
+            attention_weights=(0.6, 0.1, 0.3),
+        )
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.backbone(x)
+        y1 = self.value1(feat).sigmoid() + 0.05
+        y2 = self.value2(feat).sigmoid() + 0.05
+        y3 = self.value3(feat).sigmoid() + 0.05
+        l1 = self.logits1(feat)
+        l2 = self.logits2(feat)
+        l3 = self.logits3(feat)
+        return self.reducer(y1, y2, y3, l1, l2, l3, mask=mask), y1, y2, y3, l1, l2, l3
+
+
+def _fused_attention_gem_reference(
+    y1,
+    y2,
+    y3,
+    logits1,
+    logits2,
+    logits3,
+    *,
+    r=4.0,
+    eps=1e-6,
+    value_weights=(0.3, 0.4, 0.3),
+    attention_weights=(0.3, 0.4, 0.3),
+    mask=None,
+):
+    acc_dtype = torch.float64
+    values = [y.to(acc_dtype) for y in (y1, y2, y3)]
+    fused_y = sum(float(w) * y for w, y in zip(value_weights, values))
+    x_pow = fused_y.clamp_min(eps).pow(torch.tensor(float(r), dtype=acc_dtype, device=y1.device))
+    branch_means = []
+    for logits in (logits1, logits2, logits3):
+        logits = logits.to(acc_dtype)
+        if logits.ndim == 3:
+            logits = logits[:, None]
+        elif logits.shape[1] == y1.shape[1]:
+            logits = logits.mean(dim=1, keepdim=True)
+        if mask is not None:
+            mask4 = mask.to(device=y1.device, dtype=torch.bool)
+            if mask4.ndim == 2:
+                mask4 = mask4[None, None]
+            elif mask4.ndim == 3:
+                mask4 = mask4[:, None]
+            logits = torch.where(mask4, logits, torch.full_like(logits, torch.finfo(acc_dtype).min))
+        weights = torch.softmax(logits.flatten(-2), dim=-1).view_as(logits)
+        if mask is not None:
+            weights = torch.where(mask4, weights, torch.zeros_like(weights))
+        branch_means.append((weights * x_pow).sum(dim=(-2, -1), keepdim=True))
+    weighted_mean = sum(float(w) * mean for w, mean in zip(attention_weights, branch_means))
+    return weighted_mean.clamp_min(eps).pow(1.0 / float(r)).to(y1.dtype)
+
+
+def test_fused_attention_gem_forward_reference_unmasked_and_masked_custom_weights():
+    torch.manual_seed(201)
+    y1 = torch.rand(2, 3, 5, 7) + 0.05
+    y2 = torch.rand(2, 3, 5, 7) + 0.05
+    y3 = torch.rand(2, 3, 5, 7) + 0.05
+    logits = [torch.randn(2, 1, 5, 7), torch.randn(2, 3, 5, 7), torch.randn(2, 5, 7)]
+    reducer = FusedAttentionGeMReducer(
+        r_init=2.25,
+        eps=1e-6,
+        value_weights=(0.15, 0.55, 0.30),
+        attention_weights=(0.50, 0.20, 0.30),
+        accumulator_dtype=torch.float64,
+    )
+
+    actual = reducer(y1, y2, y3, *logits)
+    expected = _fused_attention_gem_reference(
+        y1,
+        y2,
+        y3,
+        *logits,
+        r=2.25,
+        value_weights=(0.15, 0.55, 0.30),
+        attention_weights=(0.50, 0.20, 0.30),
+    )
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+    mask = (torch.arange(5)[:, None] + torch.arange(7)[None, :]) % 4 != 0
+    actual_masked = reducer(y1, y2, y3, *logits, mask=mask)
+    expected_masked = _fused_attention_gem_reference(
+        y1,
+        y2,
+        y3,
+        *logits,
+        r=2.25,
+        value_weights=(0.15, 0.55, 0.30),
+        attention_weights=(0.50, 0.20, 0.30),
+        mask=mask,
+    )
+    assert torch.allclose(actual_masked, expected_masked, atol=1e-6, rtol=1e-5)
+
+
+def test_fused_attention_gem_to_streaming_copies_state():
+    reducer = FusedAttentionGeMReducer(
+        r_init=3.7,
+        eps=1e-5,
+        value_weights=(0.1, 0.2, 0.7),
+        attention_weights=(0.7, 0.2, 0.1),
+        accumulator_dtype=torch.float64,
+    )
+    streaming = reducer.to_streaming()
+    assert isinstance(streaming, StreamingFusedAttentionGeMReducer)
+    assert torch.equal(streaming.r, reducer.r)
+    assert streaming.eps == reducer.eps
+    assert torch.equal(streaming.value_weights, reducer.value_weights)
+    assert torch.equal(streaming.attention_weights, reducer.attention_weights)
+    assert streaming.accumulator_dtype == torch.float64
+
+
+def test_streaming_fused_attention_gem_forward_parity_odd_masked_tiles():
+    torch.manual_seed(203)
+    y1 = torch.rand(1, 2, 5, 7) + 0.05
+    y2 = torch.rand(1, 2, 5, 7) + 0.05
+    y3 = torch.rand(1, 2, 5, 7) + 0.05
+    logits = [torch.randn(1, 1, 5, 7), torch.randn(1, 1, 5, 7), torch.randn(1, 1, 5, 7)]
+    mask = (torch.arange(5)[:, None] * 2 + torch.arange(7)[None, :]) % 5 != 0
+    reducer = FusedAttentionGeMReducer(r_init=2.8, value_weights=(0.2, 0.3, 0.5), attention_weights=(0.5, 0.25, 0.25))
+    expected = reducer(y1, y2, y3, *logits, mask=mask)
+
+    stream = reducer.to_streaming()
+    stream.start_stream(output_height=5, output_width=7, batch_size=1, channels=2, device=y1.device, dtype=y1.dtype)
+    sides = type("S", (), dict(top=False, left=False, right=False, bottom=False))()
+    for y0, y1s in ((0, 3), (3, 5)):
+        for x0, x1s in ((0, 4), (4, 7)):
+            tile = tuple(t[:, :, y0:y1s, x0:x1s] for t in (y1, y2, y3, *logits))
+            stream.accumulate_stream_tile(tile, y0, x0, sides, (y0, y1s, x0, x1s), user_mask=mask[y0:y1s, x0:x1s])
+    actual = stream.finish_stream()
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_fused_attention_gem_conversion_and_public_outputs_skip_aux_payloads():
+    torch.manual_seed(205)
+    model = FusedAttentionGeMHeadNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+    scnn = _make_streaming(model, tile_size=4)
+    assert isinstance(scnn.stream_module.reducer, StreamingFusedAttentionGeMReducer)
+
+    with torch.no_grad():
+        streamed = scnn.forward(image)
+        expected = model(image)
+
+    assert isinstance(streamed, tuple)
+    assert len(streamed) == 7
+    assert sorted(scnn._reducer_aux_indices()) == [1, 2, 3, 4, 5]
+    assert torch.allclose(streamed[0], expected[0], atol=1e-5, rtol=1e-4)
+    for streamed_aux, expected_aux in zip(streamed[1:], expected[1:]):
+        assert torch.allclose(streamed_aux, expected_aux, atol=1e-5, rtol=1e-4)
+
+
+def test_streaming_fused_attention_gem_backward_parity_all_inputs():
+    torch.manual_seed(207)
+    model = FusedAttentionGeMHeadNet().eval()
+    reference = FusedAttentionGeMHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+    image = torch.randn(1, 3, 7, 9)
+    mask = (torch.rand(7, 9) > 0.2)
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_outputs = reference(ref_image, mask=mask)
+    grad_reduced = torch.tensor([[[[0.37]], [[-0.19]]]], dtype=image.dtype)
+    aux_grads = tuple(torch.zeros_like(output) for output in ref_outputs[1:])
+    torch.autograd.backward(ref_outputs, (grad_reduced, *aux_grads))
+    ref_grads = {name: p.grad.detach().clone() for name, p in reference.named_parameters() if p.grad is not None}
+
+    scnn = _make_streaming(model, tile_size=4)
+    scnn.debug_reducer_replay = True
+    stream_outputs = scnn.forward(image.detach().clone(), mask=mask)
+    assert torch.allclose(stream_outputs[0], ref_outputs[0].detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.detach().clone(), (grad_reduced, *(torch.zeros_like(output) for output in stream_outputs[1:])), mask=mask)
+    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    for name, ref_grad in ref_grads.items():
+        assert name in stream_grads
+        assert torch.allclose(stream_grads[name], ref_grad, atol=4e-5, rtol=4e-4), name
