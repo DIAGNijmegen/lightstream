@@ -604,7 +604,9 @@ class StreamingCNN(torch.nn.Module):
         if self._reducer_head_map or not self._streaming_reducers:
             return
 
-        output_id_to_index = {id(tensor): idx for idx, tensor in enumerate(flat_outputs)}
+        output_id_to_index = {}
+        for idx, tensor in enumerate(flat_outputs):
+            output_id_to_index.setdefault(id(tensor), idx)
         for reducer in self._streaming_reducers:
             reducer_inputs = getattr(reducer, "_last_inputs", None)
             if reducer_inputs is not None:
@@ -883,11 +885,85 @@ class StreamingCNN(torch.nn.Module):
         trimmed_output = self._trim_head_output(head_output, head_lost)
         return head_lost, output_loc, trimmed_output
 
+    def _build_common_aligned_reducer_payload(
+        self,
+        *,
+        head_idx,
+        tile_outputs,
+        ordered_indices,
+        tile_input_y,
+        tile_input_x,
+        sides,
+    ):
+        if not ordered_indices or ordered_indices[0] != head_idx:
+            raise RuntimeError(f"Reducer head {head_idx} input index order mismatch: indices={ordered_indices}")
+
+        payload_entries = []
+        previous_idx = -1
+        for reducer_input_idx in ordered_indices:
+            if reducer_input_idx <= previous_idx or reducer_input_idx >= len(tile_outputs):
+                raise RuntimeError(
+                    f"Reducer head {head_idx} input index order mismatch: "
+                    f"indices={ordered_indices} over outputs={len(tile_outputs)}"
+                )
+            previous_idx = reducer_input_idx
+            _, input_loc, input_trimmed = self._build_stitched_tile_output(
+                head_idx=reducer_input_idx,
+                head_output=tile_outputs[reducer_input_idx],
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
+                sides=sides,
+            )
+            if input_trimmed.ndim != 4:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input {reducer_input_idx} must be NCHW, "
+                    f"got {tuple(input_trimmed.shape)}"
+                )
+            payload_entries.append((reducer_input_idx, input_loc, input_trimmed))
+
+        common_y0 = max(int(loc.y) for _, loc, _ in payload_entries)
+        common_x0 = max(int(loc.x) for _, loc, _ in payload_entries)
+        common_y1 = min(int(loc.y) + int(tensor.shape[H_DIM]) for _, loc, tensor in payload_entries)
+        common_x1 = min(int(loc.x) + int(tensor.shape[W_DIM]) for _, loc, tensor in payload_entries)
+        if common_y1 <= common_y0 or common_x1 <= common_x0:
+            boxes = [
+                (idx, int(loc.y), int(loc.y) + int(tensor.shape[H_DIM]), int(loc.x), int(loc.x) + int(tensor.shape[W_DIM]))
+                for idx, loc, tensor in payload_entries
+            ]
+            raise RuntimeError(f"Reducer head {head_idx} inputs have no common valid intersection: boxes={boxes}")
+
+        cropped_payload = []
+        ref_batch = None
+        common_h = common_y1 - common_y0
+        common_w = common_x1 - common_x0
+        for input_pos, (reducer_input_idx, input_loc, input_trimmed) in enumerate(payload_entries):
+            if ref_batch is None:
+                ref_batch = input_trimmed.shape[B_DIM]
+            elif input_trimmed.shape[B_DIM] != ref_batch:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input batch mismatch at position {input_pos}: "
+                    f"expected N={ref_batch}, got shape={tuple(input_trimmed.shape)}"
+                )
+            src_y0 = common_y0 - int(input_loc.y)
+            src_y1 = src_y0 + common_h
+            src_x0 = common_x0 - int(input_loc.x)
+            src_x1 = src_x0 + common_w
+            cropped = input_trimmed[:, :, src_y0:src_y1, src_x0:src_x1]
+            if cropped.shape[H_DIM] != common_h or cropped.shape[W_DIM] != common_w:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} common crop failed for input {reducer_input_idx}: "
+                    f"crop={tuple(cropped.shape)} expected spatial=({common_h}, {common_w})"
+                )
+            cropped_payload.append(cropped)
+
+        common_loc = Box(common_y0, -1, common_x0, -1, sides)
+        return cropped_payload, common_loc, (common_y0, common_y1, common_x0, common_x1)
+
     def _accumulate_reducer_forward_tile(
         self,
         head_idx,
         trimmed_payload,
-        output_loc,
+        dst_box,
         tile_input_y,
         tile_input_x,
         sides,
@@ -901,13 +977,10 @@ class StreamingCNN(torch.nn.Module):
                 raise RuntimeError(f"Reducer head {head_idx} tile input {i} must be NCHW, got {tuple(t.shape)}")
             if t.shape[0] != ref.shape[0] or t.shape[H_DIM] != ref.shape[H_DIM] or t.shape[W_DIM] != ref.shape[W_DIM]:
                 raise RuntimeError(
-                    f"Reducer head {head_idx} tile input spatial mismatch after trimming: "
+                    f"Reducer head {head_idx} tile input spatial mismatch after common crop: "
                     f"input0={tuple(ref.shape)} input{i}={tuple(t.shape)}; expected same [N,*,H,W]."
                 )
-        dst_y0 = int(output_loc.y)
-        dst_y1 = int(output_loc.y + ref.shape[H_DIM])
-        dst_x0 = int(output_loc.x)
-        dst_x1 = int(output_loc.x + ref.shape[W_DIM])
+        dst_y0, dst_y1, dst_x0, dst_x1 = (int(v) for v in dst_box)
         payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
         tile_mask = self._slice_reducer_mask(
             user_mask,
@@ -944,28 +1017,18 @@ class StreamingCNN(torch.nn.Module):
                 expected_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
                 if expected_indices[0] != head_idx:
                     continue
-                reducer_payload = [trimmed_output]
-                for extra_idx in expected_indices[1:]:
-                    if extra_idx <= head_idx or extra_idx >= len(tile_outputs):
-                        raise RuntimeError(
-                            f"Reducer head {head_idx} input index order mismatch: indices={expected_indices} over outputs={len(tile_outputs)}"
-                        )
-                    _, extra_loc, extra_trimmed = self._build_stitched_tile_output(
-                        head_idx=extra_idx,
-                        head_output=tile_outputs[extra_idx],
-                        tile_input_y=tile_input_y,
-                        tile_input_x=tile_input_x,
-                        sides=sides,
-                    )
-                    if extra_loc.y != output_loc.y or extra_loc.x != output_loc.x:
-                        raise RuntimeError(
-                            f"Reducer head {head_idx} input alignment mismatch: base=({output_loc.y},{output_loc.x}) vs input[{extra_idx}]=({extra_loc.y},{extra_loc.x})"
-                        )
-                    reducer_payload.append(extra_trimmed)
+                reducer_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+                    head_idx=head_idx,
+                    tile_outputs=tile_outputs,
+                    ordered_indices=expected_indices,
+                    tile_input_y=tile_input_y,
+                    tile_input_x=tile_input_x,
+                    sides=sides,
+                )
                 self._accumulate_reducer_forward_tile(
                     head_idx=head_idx,
                     trimmed_payload=reducer_payload,
-                    output_loc=output_loc,
+                    dst_box=common_dst_box,
                     tile_input_y=tile_input_y,
                     tile_input_x=tile_input_x,
                     sides=sides,
@@ -1385,47 +1448,38 @@ class StreamingCNN(torch.nn.Module):
         output_x,
     ):
         reducer = self._reducer_head_map[head_idx]
+        ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+        if len(ordered_indices) == 1:
+            payload = trimmed_output
+            common_dst_box = (
+                int(output_y),
+                int(output_y + trimmed_output.shape[H_DIM]),
+                int(output_x),
+                int(output_x + trimmed_output.shape[W_DIM]),
+            )
+        else:
+            trimmed_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+                head_idx=head_idx,
+                tile_outputs=tile_outputs,
+                ordered_indices=ordered_indices,
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
+                sides=sides,
+            )
+            payload = tuple(t.to(self.device, non_blocking=True) for t in trimmed_payload)
+
+        dst_y0, dst_y1, dst_x0, dst_x1 = common_dst_box
+        ref = payload[0] if isinstance(payload, (tuple, list)) else payload
         valid_mask = self._slice_reducer_mask(
             self._active_reducer_mask,
-            output_y,
-            output_y + trimmed_output.shape[H_DIM],
-            output_x,
-            output_x + trimmed_output.shape[W_DIM],
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
             context=f"backward reducer head {head_idx}",
-            expected_shape=(trimmed_output.shape[H_DIM], trimmed_output.shape[W_DIM]),
+            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
         )
 
-        ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
-        payload = trimmed_output
-        if len(ordered_indices) > 1:
-            trimmed_payload = []
-            for pos, reducer_input_idx in enumerate(ordered_indices):
-                if reducer_input_idx < len(tile_outputs):
-                    source = tile_outputs[reducer_input_idx]
-                    lost_idx = reducer_input_idx
-                else:
-                    reducer_last_inputs = getattr(reducer, "_last_inputs", None)
-                    if not isinstance(reducer_last_inputs, (tuple, list)) or pos >= len(reducer_last_inputs):
-                        raise RuntimeError(
-                            f"Reducer head {head_idx} backward payload index {reducer_input_idx} is unavailable "
-                            f"(tile_outputs={len(tile_outputs)}; has_last_inputs={isinstance(reducer_last_inputs, (tuple, list))})."
-                        )
-                    source = reducer_last_inputs[pos]
-                    lost_idx = ordered_indices[0]
-                in_lost = self._get_tile_lost_for_sides(sides, self._tile_output_lost[lost_idx])
-                in_trimmed = self._trim_head_output(source, in_lost).to(self.device, non_blocking=True)
-                if pos == 0:
-                    ref_shape = (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM])
-                elif (in_trimmed.shape[0], in_trimmed.shape[H_DIM], in_trimmed.shape[W_DIM]) != ref_shape:
-                    if in_trimmed.shape[0] == ref_shape[0] and in_trimmed.shape[H_DIM] >= ref_shape[1] and in_trimmed.shape[W_DIM] >= ref_shape[2]:
-                        in_trimmed = in_trimmed[:, :, : ref_shape[1], : ref_shape[2]]
-                    else:
-                        raise RuntimeError(
-                            f"Reducer head {head_idx} backward payload shape mismatch at position {pos}: "
-                            f"expected [N,*,H,W]={ref_shape}, got {tuple(in_trimmed.shape)}"
-                        )
-                trimmed_payload.append(in_trimmed)
-            payload = tuple(trimmed_payload)
         reduced_output, reduced_grad = reducer.build_backward_pair(
             payload,
             gradient,
