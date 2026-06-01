@@ -81,9 +81,10 @@ class FusedAttentionGeMReducer(BaseReducer):
         logits = _normalize_three_logits(logits1, logits2, logits3, y1)
 
         if self._streaming_passthrough:
-            self._last_inputs = (y1, y2, y3, logits1, logits2, logits3)
-            self._last_output = y1
-            return (y1, y2, y3, logits1, logits2, logits3)
+            passthrough = tuple(t.view_as(t) for t in (y1, y2, y3, *logits))
+            self._last_inputs = passthrough
+            self._last_output = passthrough[0]
+            return passthrough
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, y1.dtype)
         vw = self.value_weights.to(device=y1.device, dtype=acc_dtype)
@@ -168,10 +169,11 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         _validate_value_maps(y1, y2, y3)
-        _normalize_three_logits(logits1, logits2, logits3, y1)
-        self._last_inputs = (y1, y2, y3, logits1, logits2, logits3)
-        self._last_output = y1
-        return (y1, y2, y3, logits1, logits2, logits3)
+        logits = _normalize_three_logits(logits1, logits2, logits3, y1)
+        passthrough = tuple(t.view_as(t) for t in (y1, y2, y3, *logits))
+        self._last_inputs = passthrough
+        self._last_output = passthrough[0]
+        return passthrough
 
     def accumulate_stream_tile(self, trimmed_output, tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
         payload = self._parse_multi_input_payload(trimmed_output)
@@ -278,6 +280,9 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
         branch_means = self.running_shat.to(dtype=acc_dtype) / self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
+        # Sum_j attention_weights[j] * E_{softmax(att_j)}[fused_y ** r],
+        # which is equivalent to GeM over fused_y weighted by
+        # fused_a = sum_j attention_weights[j] * softmax(att_j).
         weighted_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
         output_dtype = self._stream_output_dtype or self.running_shat.dtype
         return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=output_dtype)

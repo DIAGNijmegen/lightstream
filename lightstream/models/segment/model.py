@@ -75,7 +75,12 @@ class WSS(nn.Module):
         att2 = self.att2(x2)
         att3 = self.att3(x3)
 
-        return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), self.red4(y1,y2,y3,att1,att2,att3,mask=mask)
+        return (
+            self.red1(y1, att1, mask=mask),
+            self.red2(y2, att2, mask=mask),
+            self.red3(y3, att3, mask=mask),
+            self.red4(y1, y2, y3, att1, att2, att3, mask=mask),
+        )
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
