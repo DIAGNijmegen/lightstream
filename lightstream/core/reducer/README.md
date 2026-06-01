@@ -35,6 +35,8 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 ### Reducer-specific expected input ordering
 
 - `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
+- `AttentionGeMReducer`: `inputs == (x, att_logits)`, where `att_logits` is `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`.
+- `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
 
 ## Package structure
@@ -172,6 +174,21 @@ streaming_reducer.reduce_tile(
 ```
 
 If AttentionGeM tracks extra attention-denominator state, that state must be accumulated/finalized and replayed exactly as in full-frame mode.
+
+
+## FusedAttentionGeM
+
+`FusedAttentionGeMReducer` is a non-streaming reducer entrypoint for models that produce three value/probability maps and three attention-logit maps. Its exact input ordering is:
+
+```python
+(y1, y2, y3, att_logits1, att_logits2, att_logits3)
+```
+
+The reducer first fuses the three value maps with the constant `value_weights` buffer, then applies GeM to that fused value field. Each attention-logit map is independently converted into a full-frame, globally normalized softmax distribution (respecting any spatial mask). The three normalized attention-branch means are then fused with the constant `attention_weights` buffer. In other words, `attention_weights` combine already normalized attention distributions/contributions; they do **not** fuse raw logits before softmax.
+
+Both `value_weights` and `attention_weights` are registered as non-trainable buffers, alongside the non-trainable GeM exponent `r`. They are included in module state and copied by `to_streaming()`, but they are not optimized during training.
+
+SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which preserves the same ordered six-tensor payload for tiled accumulation and backward replay.
 
 ## Extension guide: custom reducers
 
