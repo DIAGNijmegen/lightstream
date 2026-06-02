@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.engine.api import StreamingConfig, StreamingEngine
 from lightstream.core.reducer import BaseReducer
 
 
@@ -140,14 +140,29 @@ class StreamingModule(nn.Module):
         **kwargs,
     ) -> None:
         """Construct and prepare the streaming network with an optional tile cache."""
-        self.constructor = StreamingConstructor(
-            stream_network,
-            self.tile_size,
-            tile_cache=tile_cache,
-            **kwargs,
+        config_kwargs = dict(kwargs)
+        config = StreamingConfig(
+            tile_shape=(1, 3, self.tile_size, self.tile_size),
+            verbose=config_kwargs.pop("verbose", True),
+            deterministic=config_kwargs.pop("deterministic", False),
+            saliency=config_kwargs.pop("saliency", False),
+            copy_to_gpu=config_kwargs.pop("copy_to_gpu", False),
+            statistics_on_cpu=config_kwargs.pop("statistics_on_cpu", True),
+            normalize_on_gpu=config_kwargs.pop("normalize_on_gpu", True),
+            mean=config_kwargs.pop("mean", None),
+            std=config_kwargs.pop("std", None),
+            add_keep_modules=config_kwargs.pop("add_keep_modules", None),
+            before_streaming_init_callbacks=config_kwargs.pop("before_streaming_init_callbacks", None),
+            after_streaming_init_callbacks=config_kwargs.pop("after_streaming_init_callbacks", None),
         )
-        self.copy_to_gpu = self.constructor.copy_to_gpu
-        self.stream_network = self.constructor.prepare_streaming_model()
+        if config_kwargs:
+            unexpected = ", ".join(sorted(config_kwargs))
+            raise TypeError(f"Unexpected StreamingModule option(s): {unexpected}")
+        self.engine = StreamingEngine(stream_network, config)
+        self.engine.compile(cache=tile_cache)
+        self.constructor = self.engine.constructor
+        self.copy_to_gpu = config.copy_to_gpu
+        self.stream_network = self.engine.stream_network
 
     def _tile_cache_location(self) -> Path:
         """Return the configured cache path, assigning the default file name if needed."""
@@ -492,7 +507,7 @@ class StreamingModule(nn.Module):
         torch.Tensor or tuple or list or dict
             Output produced by ``self.stream_network``.
         """
-        return self.stream_network(x, mask=mask)
+        return self.engine.forward(x, mask=mask)
 
     def backward_streaming(self, image, grad, mask=None):
         """Run the streaming backward pass for a previously computed gradient.
@@ -506,4 +521,4 @@ class StreamingModule(nn.Module):
         mask : torch.Tensor, optional
             Optional spatial mask forwarded to the streaming backward routine.
         """
-        self.stream_network.backward(image, grad, mask=mask)
+        self.engine.backward(image, grad, mask=mask)
