@@ -8,7 +8,9 @@ import torch.nn as nn
 
 from lightstream.core.constructor import StreamingConstructor
 
+from .adapters import AdapterRegistry, StreamableLayerAdapter
 from .config import CompiledPlan, StreamingConfig
+from .orchestration import BackwardExecutor, EngineCollaborators, ForwardExecutor, ReducerRuntime, TilePlanner
 
 
 class StreamingEngine:
@@ -23,9 +25,25 @@ class StreamingEngine:
     >>> engine.backward(image, grad, mask=mask)
     """
 
-    def __init__(self, model: nn.Module, config: StreamingConfig):
+    def __init__(
+        self,
+        model: nn.Module,
+        config: StreamingConfig,
+        *,
+        tile_planner: TilePlanner | None = None,
+        forward_executor: ForwardExecutor | None = None,
+        backward_executor: BackwardExecutor | None = None,
+        reducer_runtime: ReducerRuntime | None = None,
+        adapter_registry: AdapterRegistry | None = None,
+    ):
         self.model = model
         self.config = config
+        collaborators = EngineCollaborators.create_default()
+        self.tile_planner = tile_planner or collaborators.tile_planner
+        self.forward_executor = forward_executor or collaborators.forward_executor
+        self.backward_executor = backward_executor or collaborators.backward_executor
+        self.reducer_runtime = reducer_runtime or collaborators.reducer_runtime
+        self.adapter_registry = adapter_registry or collaborators.adapter_registry
         self.constructor: StreamingConstructor | None = None
         self.plan: CompiledPlan | None = None
 
@@ -47,31 +65,11 @@ class StreamingEngine:
             :meth:`state_dict`.
         """
         del input_spec
-        tile_shape = self.config.tile_shape
-        if len(tile_shape) != 4:
-            raise ValueError(f"StreamingConfig.tile_shape must be an NCHW tuple, got {tile_shape!r}")
-        if tile_shape[2] != tile_shape[3]:
-            raise ValueError("StreamingEngine currently requires square spatial tiles")
-
-        self.constructor = StreamingConstructor(
-            self.model,
-            tile_size=int(tile_shape[2]),
-            verbose=self.config.verbose,
-            deterministic=self.config.deterministic,
-            saliency=self.config.saliency,
-            copy_to_gpu=self.config.copy_to_gpu,
-            statistics_on_cpu=self.config.statistics_on_cpu,
-            normalize_on_gpu=self.config.normalize_on_gpu,
-            mean=self.config.mean,
-            std=self.config.std,
-            tile_cache=cache,
-            add_keep_modules=self.config.add_keep_modules,
-            before_streaming_init_callbacks=self.config.before_streaming_init_callbacks,
-            after_streaming_init_callbacks=self.config.after_streaming_init_callbacks,
-        )
+        self.constructor = self.tile_planner.build_constructor(self.model, self.config, cache=cache)
         stream_network = self.constructor.prepare_streaming_model()
         self.plan = stream_network.compiled_plan
         self.plan.stream_network = stream_network
+        self.reducer_runtime.bind_plan(self.plan)
         return self.plan
 
     def _require_stream_network(self) -> nn.Module:
@@ -82,16 +80,11 @@ class StreamingEngine:
 
     def forward(self, image: torch.Tensor, *, mask: torch.Tensor | None = None, result_device=None):
         """Run a streaming forward pass."""
-        stream_network = self._require_stream_network()
-        result_on_cpu = result_device is not None and torch.device(result_device).type == "cpu"
-        output = stream_network.forward(image, result_on_cpu=result_on_cpu, mask=mask)
-        if result_device is None or result_on_cpu:
-            return output
-        return self._move_output(output, torch.device(result_device))
+        return self.forward_executor.run(self, image, mask=mask, result_device=result_device)
 
     def backward(self, image: torch.Tensor, grad, *, mask: torch.Tensor | None = None) -> None:
         """Run a streaming backward pass."""
-        self._require_stream_network().backward(image, grad, mask=mask)
+        self.backward_executor.run(self, image, grad, mask=mask)
 
     def get_tile_cache(self) -> dict:
         """Return the compiled tile-cache state."""
@@ -122,4 +115,14 @@ class StreamingEngine:
         return output
 
 
-__all__ = ["CompiledPlan", "StreamingConfig", "StreamingEngine"]
+__all__ = [
+    "AdapterRegistry",
+    "BackwardExecutor",
+    "CompiledPlan",
+    "ForwardExecutor",
+    "ReducerRuntime",
+    "StreamableLayerAdapter",
+    "StreamingConfig",
+    "StreamingEngine",
+    "TilePlanner",
+]

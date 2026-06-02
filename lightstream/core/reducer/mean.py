@@ -3,12 +3,12 @@
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .reducer_base import BaseReducer
+from .reducer_base import SpatialReducer
 from .sum import StreamingSumReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
-class MeanReducer(BaseReducer):
+class MeanReducer(SpatialReducer):
     """Apply global spatial mean reduction on NCHW tensors."""
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None):

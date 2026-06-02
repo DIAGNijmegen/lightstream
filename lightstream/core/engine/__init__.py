@@ -1,14 +1,22 @@
 """Streaming engine package."""
+from .adapters import AdapterRegistry, StreamableLayerAdapter
 from .config import BackwardContext, CompiledPlan, ForwardContext, StreamingConfig, TileSpec
+from .orchestration import BackwardExecutor, ForwardExecutor, ReducerRuntime, TilePlanner
 from .scnn import StreamingCNN
 
 __all__ = [
+    "AdapterRegistry",
     "BackwardContext",
+    "BackwardExecutor",
     "CompiledPlan",
     "ForwardContext",
+    "ForwardExecutor",
     "StreamingCNN",
+    "ReducerRuntime",
+    "StreamableLayerAdapter",
     "StreamingConfig",
     "StreamingEngine",
+    "TilePlanner",
     "TileSpec",
 ]
 

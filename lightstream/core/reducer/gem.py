@@ -3,11 +3,11 @@
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .reducer_base import BaseReducer
+from .reducer_base import ManualVJPReducer, SpatialReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
-class GeMReducer(BaseReducer):
+class GeMReducer(SpatialReducer):
     """Apply global generalized-mean (GeM) reduction on NCHW tensors."""
 
     def __init__(
@@ -63,7 +63,7 @@ class GeMReducer(BaseReducer):
         return reducer
 
 
-class StreamingGeMReducer(BaseStreamingGlobalReducer):
+class StreamingGeMReducer(ManualVJPReducer):
     """Streaming global GeM reducer."""
 
     def __init__(

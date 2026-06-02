@@ -3,11 +3,11 @@
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .reducer_base import BaseReducer
+from .reducer_base import ManualVJPReducer, SpatialReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
-class SumReducer(BaseReducer):
+class SumReducer(SpatialReducer):
     """Apply global spatial sum reduction on NCHW tensors."""
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None):
@@ -33,7 +33,7 @@ class SumReducer(BaseReducer):
         return StreamingSumReducer(accumulator_dtype=self.accumulator_dtype)
 
 
-class StreamingSumReducer(BaseStreamingGlobalReducer):
+class StreamingSumReducer(ManualVJPReducer):
     """Streaming reducer configured for sum semantics."""
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None):
