@@ -1,5 +1,7 @@
 # Lightstream
 
+**Warning: This branch offers no formal support and should be regarded as experimental**
+
 Lightstream is a Pytorch library to train CNN's with large input images. Parsing large inputs is achieved through a combination of 
 gradient checkpointing and tiling the input image. For a full overview of the streaming algorithm, please read the article:
 

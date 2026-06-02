@@ -17,6 +17,7 @@ class StreamingWSS(StreamingModule):
         tile_size: int,
         additional_modules: nn.Module | None = None,
         remove_last_block=True,
+        weights: str | None = "default",
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
@@ -37,7 +38,7 @@ class StreamingWSS(StreamingModule):
             stream_network = Sequential(
                 WSS(
                     encoder=encoder,
-                    weights="default",
+                    weights=weights,
                     remove_last_block=remove_last_block,
                     reducer_accumulator_dtype=reducer_accumulator_dtype,
                 ),
@@ -46,7 +47,7 @@ class StreamingWSS(StreamingModule):
         else:
             stream_network = WSS(
                 encoder=encoder,
-                weights="default",
+                weights=weights,
                 remove_last_block=remove_last_block,
                 reducer_accumulator_dtype=reducer_accumulator_dtype,
             )

@@ -15,8 +15,8 @@ import torch.nn as nn
 
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.modules.reducer import Reducer
-from typing import Callable, Optional, Any
+from lightstream.core.reducer import BaseReducer
+from typing import Any, Callable, Optional
 
 
 class StreamingConstructor:
@@ -37,6 +37,23 @@ class StreamingConstructor:
         before_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
         after_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
     ):
+        """Initialize a streaming model constructor.
+
+        Parameters
+        ----------
+        model : nn.Module
+            Model to convert for streaming.
+        tile_size : int
+            Spatial height and width of square NCHW tiles.
+        verbose : bool
+            If True, print constructor progress and setup-time tile statistics.
+            Per-forward tiling diagnostics are emitted through the StreamingCNN
+            logger at DEBUG level. Defaults to True.
+        deterministic : bool
+            Whether to use deterministic cudnn algorithms during streaming setup.
+        saliency : bool
+            Whether to gather gradients for the input image.
+        """
         self.model = model
         self.model_copy = deepcopy(self.model)
         self.state_dict = self.save_parameters()
@@ -66,7 +83,7 @@ class StreamingConstructor:
             torch.nn.MaxPool2d,
             torch.nn.MaxPool3d,
             torch.nn.Upsample,
-            Reducer,
+            BaseReducer,
         ]
 
         if add_keep_modules is not None:
@@ -76,6 +93,11 @@ class StreamingConstructor:
             # Move to cuda manually if statistics are computed on gpu
             device = torch.device("cuda")
             self.model.to(device)
+
+
+    def _print_verbose(self, *args: object, **kwargs: object) -> None:
+        if self.verbose:
+            print(*args, **kwargs)
 
     def add_modules_to_keep(self, module_list: list) -> None:
         """Add extra layers to keep during streaming tile calculations
@@ -101,37 +123,37 @@ class StreamingConstructor:
         if self.tile_cache:
             return self.create_streaming_model()
 
-        print("")
+        self._print_verbose("")
         # Prepare for streaming tile statistics calculations
-        print("Converting modules to nn.Identity()")
+        self._print_verbose("Converting modules to nn.Identity()")
         self.convert_to_identity(self.model)
         # execute any callbacks that further preprocess the model
-        print("Executing pre-streaming initialization callbacks (if any):")
+        self._print_verbose("Executing pre-streaming initialization callbacks (if any):")
         self._execute_before_callbacks()
 
-        print("Initializing streaming model")
+        self._print_verbose("Initializing streaming model")
         sCNN = self.create_streaming_model()
 
         # check self.stream_network, and reload the proper weights
-        print("Restoring model weights")
+        self._print_verbose("Restoring model weights")
         self.restore_model_layers(self.model_copy, sCNN.stream_module)
         sCNN.stream_module.load_state_dict(self.state_dict)
 
-        print("Executing post-streaming initialization callbacks (if any):")
+        self._print_verbose("Executing post-streaming initialization callbacks (if any):")
         self._execute_after_callbacks()
         return sCNN
 
     def _execute_before_callbacks(self) -> None:
         for cb_func in self.before_streaming_init_callbacks:
-            print(f"Executing callback function {cb_func}")
+            self._print_verbose(f"Executing callback function {cb_func}")
             cb_func(self.model)
-        print("")
+        self._print_verbose("")
 
     def _execute_after_callbacks(self):
         for cb_func in self.after_streaming_init_callbacks:
-            print(f"Executing callback function {cb_func}")
+            self._print_verbose(f"Executing callback function {cb_func}")
             cb_func(self.model)
-        print("")
+        self._print_verbose("")
 
     def create_streaming_model(self) -> nn.Module:
         return StreamingCNN(

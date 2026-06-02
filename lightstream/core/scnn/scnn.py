@@ -4,6 +4,7 @@ MIT License
 """
 import math
 import copy
+import logging
 from dataclasses import dataclass
 from typing import List
 
@@ -16,8 +17,10 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.modules.reducer import Reducer, StreamingReducer
+from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
+
+logger = logging.getLogger(__name__)
 
 _triple = _ntuple(3)
 
@@ -97,7 +100,9 @@ class StreamingCNN(torch.nn.Module):
         Parameters:
             stream_module (torch.nn.Module): modules containing the to be streamed layers
             tile_shape (tuple, NCHW): size of the to be streamed tiles
-            verbose (bool): will log various debugging relevant information (default is False)
+            verbose (bool): if True, print setup-time tile statistics and progress output
+                during configuration. Per-forward tiling diagnostics are emitted through this
+                module's logger at DEBUG level (default is False).
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
             eps (float): epsilon error to compare floating values
@@ -136,10 +141,12 @@ class StreamingCNN(torch.nn.Module):
         self._module_stats = {}
         self._saved_tensors = {}
         self.debug_reducer_replay = False
+        self.debug_forward_sentinel_check = False
         self._hooks = []
         self._last_forward_tiles = []
         self._streaming_reducers = []
         self._reducer_head_map = {}
+        self._reducer_input_indices = {}
         self._active_reducer_mask = None
 
         if state_dict is None:
@@ -147,28 +154,71 @@ class StreamingCNN(torch.nn.Module):
         else:
             self.load_tile_cache(state_dict)
 
+    def _print_verbose(self, *args: object, **kwargs: object) -> None:
+        if self.verbose:
+            print(*args, **kwargs)
+
     def _normalize_reducer_mask(self, mask: torch.Tensor | None, image: torch.Tensor) -> torch.Tensor | None:
+        """Normalize reducer masks for rank, device, and dtype.
+
+        Spatial compatibility is intentionally deferred until a concrete
+        reducer tile is sliced because reducer heads may operate in a reduced
+        feature-space instead of the original input-image space. 3D [N,H,W]
+        and 4D [N,C,H,W] masks keep the existing streaming behavior: all batch
+        and channel planes are collapsed to one 2D reducer-domain mask with
+        ``torch.any(...)``. Per-sample masks would require keeping these axes
+        and extending the reducer APIs.
+        """
         if mask is None:
             return None
         if mask.ndim == 2:
-            if mask.shape != image.shape[-2:]:
-                raise ValueError(
-                    f"2D mask shape {tuple(mask.shape)} must match image spatial shape {tuple(image.shape[-2:])}"
-                )
             return mask.to(device=self.device, dtype=torch.bool)
         if mask.ndim == 3:
-            if mask.shape[0] != image.shape[0] or mask.shape[-2:] != image.shape[-2:]:
+            if mask.shape[0] != image.shape[0]:
                 raise ValueError(
-                    f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]} and H/W={tuple(image.shape[-2:])}"
+                    f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]}; "
+                    "H/W must align with the reducer/reduced feature spatial domain."
                 )
             return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=0)
         if mask.ndim == 4:
-            if mask.shape[0] != image.shape[0] or mask.shape[-2:] != image.shape[-2:]:
+            if mask.shape[0] != image.shape[0]:
                 raise ValueError(
-                    f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]} and H/W={tuple(image.shape[-2:])}"
+                    f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
+                    "H/W must align with the reducer/reduced feature spatial domain."
                 )
             return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
-        raise ValueError(f"mask must be 2D/3D/4D tensor, got shape={tuple(mask.shape)}")
+        raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
+
+    def _slice_reducer_mask(
+        self,
+        mask: torch.Tensor | None,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        *,
+        context: str,
+        expected_shape: tuple[int, int],
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+
+        y0, y1, x0, x1 = int(y0), int(y1), int(x0), int(x1)
+        mask_h, mask_w = int(mask.shape[-2]), int(mask.shape[-1])
+        if y0 < 0 or x0 < 0 or y1 > mask_h or x1 > mask_w or y1 < y0 or x1 < x0:
+            raise ValueError(
+                f"Reducer mask slice {context} ({y0}:{y1}, {x0}:{x1}) is outside mask bounds "
+                f"{tuple(mask.shape[-2:])}. The mask must align with the reducer/reduced feature spatial domain, "
+                "not necessarily the original input image."
+            )
+
+        sliced = mask[y0:y1, x0:x1]
+        if tuple(sliced.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"Reducer mask slice {context} produced shape {tuple(sliced.shape)}, expected {tuple(expected_shape)}. "
+                "The mask must align with the reducer/reduced feature spatial domain, not necessarily the original input image."
+            )
+        return sliced
 
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
@@ -194,8 +244,7 @@ class StreamingCNN(torch.nn.Module):
         tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
 
         self._gather_forward_statistics(tile)
-        if self.verbose:
-            print("")
+        self._print_verbose("")
         self._gather_backward_statistics(tile)
 
         # TODO; temp hack for tile sizes too big on gpu,
@@ -209,6 +258,7 @@ class StreamingCNN(torch.nn.Module):
         self._set_reducer_passthrough(False)
         #
         self._restore_parameters(state_dict)
+        self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
         self._add_hooks_for_streaming()
@@ -225,9 +275,17 @@ class StreamingCNN(torch.nn.Module):
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
         del state_dict
 
+    def _capture_public_output_spec(self) -> None:
+        """Capture user-facing output structure with reducers in normal (non-passthrough) mode."""
+        spec_tile = torch.ones(self.tile_shape, dtype=self.dtype, device=self.device)
+        with torch.no_grad():
+            output = self.stream_module(spec_tile)
+        _, output_spec = self._flatten_output_structure(output)
+        self._output_spec = output_spec
+
     def _set_reducer_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
-            if isinstance(mod, Reducer):
+            if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
@@ -272,8 +330,7 @@ class StreamingCNN(torch.nn.Module):
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
 
         # lost statistics assume you're always in the middle of an image, so left,bottom,top,right lost can always happen
-        if self.verbose:
-            print("\n", "Input gradient lost", self.tile_gradient_lost)
+        self._print_verbose("\n", "Input gradient lost", self.tile_gradient_lost)
 
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
@@ -282,8 +339,7 @@ class StreamingCNN(torch.nn.Module):
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
-        if self.verbose:
-            print("\n", "Output lost", self._tile_output_lost)
+        self._print_verbose("\n", "Output lost", self._tile_output_lost)
 
     def _flatten_output_structure(self, output):
         if isinstance(output, torch.Tensor):
@@ -330,6 +386,64 @@ class StreamingCNN(torch.nn.Module):
                 value, index = self._unflatten_output_structure(flat, child, index)
                 values[key] = value
             return values, index
+        raise TypeError(f"Unsupported output spec kind: {kind}")
+
+
+    def _reducer_aux_indices(self) -> set[int]:
+        aux_indices = set()
+        for reducer_head, indices in self._reducer_input_indices.items():
+            if reducer_head in self._reducer_head_map:
+                aux_indices.update(indices[1:])
+        return aux_indices
+
+    def _public_output_indices(self) -> list[int]:
+        reducer_aux_indices = self._reducer_aux_indices()
+        return [
+            idx
+            for idx in range(len(self._tile_output_shapes))
+            if idx not in reducer_aux_indices
+        ]
+
+    def _public_output_debug_context(self, public_indices, reducer_aux_indices=None) -> str:
+        if reducer_aux_indices is None:
+            reducer_aux_indices = self._reducer_aux_indices()
+        return (
+            f"public_indices={list(public_indices)}, "
+            f"reducer_auxiliary_indices={sorted(reducer_aux_indices)}, "
+            f"self._reducer_input_indices={self._reducer_input_indices}"
+        )
+
+    def _validate_public_output_indices(self, public_indices) -> None:
+        reducer_aux_indices = self._reducer_aux_indices()
+        leaked_aux_indices = sorted(set(public_indices) & reducer_aux_indices)
+        if leaked_aux_indices:
+            raise RuntimeError(
+                "Public output indices include reducer auxiliary indices; "
+                f"leaked_auxiliary_indices={leaked_aux_indices}; "
+                f"{self._public_output_debug_context(public_indices, reducer_aux_indices)}"
+            )
+
+    def _validate_public_forward_outputs(self, outputs, public_indices) -> None:
+        context = self._public_output_debug_context(public_indices)
+        for idx in public_indices:
+            output = outputs[idx]
+            if output is None:
+                raise RuntimeError(
+                    f"Public output head {idx} was not populated during streaming forward; {context}"
+                )
+            if getattr(self, "debug_forward_sentinel_check", False) and torch.all(output == 999):
+                raise RuntimeError(
+                    f"Public output head {idx} still contains only the unstitched sentinel value 999; {context}"
+                )
+
+    def _count_tensors_in_spec(self, spec) -> int:
+        kind, payload = spec
+        if kind == "tensor":
+            return 1
+        if kind in {"tuple", "list"}:
+            return sum(self._count_tensors_in_spec(child) for child in payload)
+        if kind == "dict":
+            return sum(self._count_tensors_in_spec(child) for _, child in payload)
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
     def _compute_internal_safe_input_step(self):
@@ -426,8 +540,8 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif isinstance(module, Reducer):
-            mod = StreamingReducer.from_reducer(module)
+        elif isinstance(module, BaseReducer):
+            mod = module.to_streaming()
             self._streaming_reducers.append(mod)
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
@@ -456,7 +570,7 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
-        elif isinstance(module, StreamingReducer):
+        elif isinstance(module, BaseStreamingGlobalReducer):
             mod = module.to_reducer()
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
@@ -490,13 +604,35 @@ class StreamingCNN(torch.nn.Module):
         if self._reducer_head_map or not self._streaming_reducers:
             return
 
-        output_id_to_index = {id(tensor): idx for idx, tensor in enumerate(flat_outputs)}
+        output_id_to_index = {}
+        for idx, tensor in enumerate(flat_outputs):
+            output_id_to_index.setdefault(id(tensor), idx)
         for reducer in self._streaming_reducers:
+            reducer_inputs = getattr(reducer, "_last_inputs", None)
+            if reducer_inputs is not None:
+                if not isinstance(reducer_inputs, (tuple, list)):
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}")
+                input_indices = []
+                for input_pos, inp in enumerate(reducer_inputs):
+                    idx = output_id_to_index.get(id(inp))
+                    if idx is None:
+                        raise RuntimeError(
+                            f"Reducer {type(reducer).__name__} input {input_pos} is not present in flattened outputs; cannot resolve reducer head inputs."
+                        )
+                    input_indices.append(idx)
+                output_index = output_id_to_index.get(id(reducer._last_output))
+                if output_index is None:
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} output is not present in flattened outputs.")
+                self._reducer_head_map[output_index] = reducer
+                self._reducer_input_indices[output_index] = tuple(input_indices)
+                continue
+
             if reducer._last_output is None:
                 continue
             output_index = output_id_to_index.get(id(reducer._last_output))
             if output_index is not None:
                 self._reducer_head_map[output_index] = reducer
+                self._reducer_input_indices[output_index] = (output_index,)
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -627,8 +763,13 @@ class StreamingCNN(torch.nn.Module):
         outputs = [None] * len(self._tile_output_shapes)
 
         def allocate_non_reducer_outputs():
+            aux_indices = self._reducer_aux_indices()
             for idx in range(len(self._tile_output_shapes)):
-                if idx in self._reducer_head_map or outputs[idx] is not None:
+                if idx in self._reducer_head_map:
+                    continue
+                if idx in aux_indices:
+                    continue
+                if outputs[idx] is not None:
                     continue
                 outputs[idx] = torch.empty(
                     (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
@@ -744,31 +885,126 @@ class StreamingCNN(torch.nn.Module):
         trimmed_output = self._trim_head_output(head_output, head_lost)
         return head_lost, output_loc, trimmed_output
 
+    def _build_common_aligned_reducer_payload(
+        self,
+        *,
+        head_idx,
+        tile_outputs,
+        ordered_indices,
+        tile_input_y,
+        tile_input_x,
+        sides,
+    ):
+        if not ordered_indices or ordered_indices[0] != head_idx:
+            raise RuntimeError(f"Reducer head {head_idx} input index order mismatch: indices={ordered_indices}")
+
+        payload_entries = []
+        previous_idx = -1
+        for reducer_input_idx in ordered_indices:
+            if reducer_input_idx <= previous_idx or reducer_input_idx >= len(tile_outputs):
+                raise RuntimeError(
+                    f"Reducer head {head_idx} input index order mismatch: "
+                    f"indices={ordered_indices} over outputs={len(tile_outputs)}"
+                )
+            previous_idx = reducer_input_idx
+            _, input_loc, input_trimmed = self._build_stitched_tile_output(
+                head_idx=reducer_input_idx,
+                head_output=tile_outputs[reducer_input_idx],
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
+                sides=sides,
+            )
+            if input_trimmed.ndim != 4:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input {reducer_input_idx} must be NCHW, "
+                    f"got {tuple(input_trimmed.shape)}"
+                )
+            payload_entries.append((reducer_input_idx, input_loc, input_trimmed))
+
+        common_y0 = max(int(loc.y) for _, loc, _ in payload_entries)
+        common_x0 = max(int(loc.x) for _, loc, _ in payload_entries)
+        common_y1 = min(int(loc.y) + int(tensor.shape[H_DIM]) for _, loc, tensor in payload_entries)
+        common_x1 = min(int(loc.x) + int(tensor.shape[W_DIM]) for _, loc, tensor in payload_entries)
+        if common_y1 <= common_y0 or common_x1 <= common_x0:
+            boxes = [
+                (idx, int(loc.y), int(loc.y) + int(tensor.shape[H_DIM]), int(loc.x), int(loc.x) + int(tensor.shape[W_DIM]))
+                for idx, loc, tensor in payload_entries
+            ]
+            raise RuntimeError(f"Reducer head {head_idx} inputs have no common valid intersection: boxes={boxes}")
+
+        cropped_payload = []
+        ref_batch = None
+        common_h = common_y1 - common_y0
+        common_w = common_x1 - common_x0
+        for input_pos, (reducer_input_idx, input_loc, input_trimmed) in enumerate(payload_entries):
+            if ref_batch is None:
+                ref_batch = input_trimmed.shape[B_DIM]
+            elif input_trimmed.shape[B_DIM] != ref_batch:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input batch mismatch at position {input_pos}: "
+                    f"expected N={ref_batch}, got shape={tuple(input_trimmed.shape)}"
+                )
+            src_y0 = common_y0 - int(input_loc.y)
+            src_y1 = src_y0 + common_h
+            src_x0 = common_x0 - int(input_loc.x)
+            src_x1 = src_x0 + common_w
+            cropped = input_trimmed[:, :, src_y0:src_y1, src_x0:src_x1]
+            if cropped.shape[H_DIM] != common_h or cropped.shape[W_DIM] != common_w:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} common crop failed for input {reducer_input_idx}: "
+                    f"crop={tuple(cropped.shape)} expected spatial=({common_h}, {common_w})"
+                )
+            cropped_payload.append(cropped)
+
+        common_loc = Box(common_y0, -1, common_x0, -1, sides)
+        return cropped_payload, common_loc, (common_y0, common_y1, common_x0, common_x1)
+
     def _accumulate_reducer_forward_tile(
         self,
         head_idx,
-        trimmed_output,
-        output_loc,
+        trimmed_payload,
+        dst_box,
         tile_input_y,
         tile_input_x,
         sides,
         user_mask,
     ):
-        dst_y0 = int(output_loc.y)
-        dst_y1 = int(output_loc.y + trimmed_output.shape[H_DIM])
-        dst_x0 = int(output_loc.x)
-        dst_x1 = int(output_loc.x + trimmed_output.shape[W_DIM])
+        if not isinstance(trimmed_payload, (tuple, list)) or len(trimmed_payload) == 0:
+            raise RuntimeError(f"Reducer head {head_idx} expects non-empty tuple/list payload, got {type(trimmed_payload)}")
+        ref = trimmed_payload[0]
+        for i, t in enumerate(trimmed_payload):
+            if t.ndim != 4:
+                raise RuntimeError(f"Reducer head {head_idx} tile input {i} must be NCHW, got {tuple(t.shape)}")
+            if t.shape[0] != ref.shape[0] or t.shape[H_DIM] != ref.shape[H_DIM] or t.shape[W_DIM] != ref.shape[W_DIM]:
+                raise RuntimeError(
+                    f"Reducer head {head_idx} tile input spatial mismatch after common crop: "
+                    f"input0={tuple(ref.shape)} input{i}={tuple(t.shape)}; expected same [N,*,H,W]."
+                )
+        dst_y0, dst_y1, dst_x0, dst_x1 = (int(v) for v in dst_box)
+        payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
+        tile_mask = self._slice_reducer_mask(
+            user_mask,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+            context=f"forward reducer head {head_idx}",
+            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
+        )
         self._reducer_head_map[head_idx].accumulate_stream_tile(
-            trimmed_output=trimmed_output,
+            trimmed_output=payload,
             tile_y=int(tile_input_y),
             tile_x=int(tile_input_x),
             sides=sides,
             dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
-            user_mask=None if user_mask is None else user_mask[dst_y0:dst_y1, dst_x0:dst_x1],
+            user_mask=tile_mask,
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
+        reducer_aux_indices = self._reducer_aux_indices()
         for head_idx, head_output in enumerate(tile_outputs):
+            if head_idx in reducer_aux_indices:
+                continue
             _, output_loc, trimmed_output = self._build_stitched_tile_output(
                 head_idx=head_idx,
                 head_output=head_output,
@@ -778,10 +1014,21 @@ class StreamingCNN(torch.nn.Module):
             )
 
             if head_idx in self._reducer_head_map:
+                expected_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+                if expected_indices[0] != head_idx:
+                    continue
+                reducer_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+                    head_idx=head_idx,
+                    tile_outputs=tile_outputs,
+                    ordered_indices=expected_indices,
+                    tile_input_y=tile_input_y,
+                    tile_input_x=tile_input_x,
+                    sides=sides,
+                )
                 self._accumulate_reducer_forward_tile(
                     head_idx=head_idx,
-                    trimmed_output=trimmed_output,
-                    output_loc=output_loc,
+                    trimmed_payload=reducer_payload,
+                    dst_box=common_dst_box,
                     tile_input_y=tile_input_y,
                     tile_input_x=tile_input_x,
                     sides=sides,
@@ -876,10 +1123,14 @@ class StreamingCNN(torch.nn.Module):
 
         trimmed_outputs = []
         trimmed_grads = []
-        for idx, (head_output, head_grad) in enumerate(zip(tile_outputs, backward_ctx.grad_tensors)):
+        for idx, head_output in enumerate(tile_outputs):
+            head_grad = backward_ctx.grad_tensors[idx]
+            if head_grad is None:
+                continue
             paired_output, paired_grad = self._build_head_backward_pair(
                 head_idx=idx,
                 head_output=head_output,
+                tile_outputs=tile_outputs,
                 head_grad=head_grad,
                 tile_input_y=input_y,
                 tile_input_x=input_x,
@@ -920,11 +1171,14 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         self._last_forward_tiles = []
-        if self.verbose:
-            print(
-                f"Forward tiling step: valid_input_height={valid_input_height}, "
-                f"valid_input_width={valid_input_width}, tiles={n_rows}x{n_cols}={n_rows * n_cols}"
-            )
+        logger.debug(
+            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s",
+            valid_input_height,
+            valid_input_width,
+            n_rows,
+            n_cols,
+            n_rows * n_cols,
+        )
 
         result_device = torch.device("cpu") if result_on_cpu else self.device
         forward_ctx = ForwardContext(
@@ -940,6 +1194,7 @@ class StreamingCNN(torch.nn.Module):
             result_device=result_device,
         )
         self._reducer_head_map = {}
+        self._reducer_input_indices = {}
         reducers_initialized = False
         outputs, allocate_non_reducer_outputs = self._prepare_forward_outputs(
             image=forward_ctx.image,
@@ -1003,12 +1258,19 @@ class StreamingCNN(torch.nn.Module):
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
 
-        for idx, output in enumerate(outputs):
-            if output is None:
-                raise RuntimeError(f"Output head {idx} was not populated during streaming forward.")
+        public_indices = self._public_output_indices()
+        self._validate_public_output_indices(public_indices)
+        expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
+        if len(public_indices) != expected_flat_outputs:
+            raise RuntimeError(
+                f"Public output index count mismatch: expected={expected_flat_outputs}, "
+                f"actual={len(public_indices)}; {self._public_output_debug_context(public_indices)}"
+            )
+        self._validate_public_forward_outputs(outputs, public_indices)
+        materialized_outputs = [outputs[idx] for idx in public_indices]
 
-        output, final_idx = self._unflatten_output_structure(outputs, self._output_spec)
-        assert final_idx == len(outputs)
+        output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
+        assert final_idx == len(materialized_outputs)
         return output
 
     def backward(self, image, grad, mask=None):
@@ -1037,8 +1299,19 @@ class StreamingCNN(torch.nn.Module):
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
+        public_indices = self._public_output_indices()
+        if len(grad_tensors) != len(public_indices):
+            raise ValueError(
+                f"Gradient tensor count mismatch: expected={len(public_indices)}, "
+                f"actual={len(grad_tensors)}, public_indices={public_indices}"
+            )
+
+        internal_grad_tensors = [None] * len(self._tile_output_shapes)
+        for public_grad, internal_idx in zip(grad_tensors, public_indices):
+            internal_grad_tensors[internal_idx] = public_grad
+
         if len(self._tile_output_shapes) == 1:
-            tile_iter = self._prepare_backward_tile_iter_single_head(image, grad_tensors, tile_height, tile_width)
+            tile_iter = self._prepare_backward_tile_iter_single_head(image, internal_grad_tensors, tile_height, tile_width)
         else:
             tile_iter = self._prepare_backward_tile_iter_multi_head(
                 image=image,
@@ -1054,7 +1327,7 @@ class StreamingCNN(torch.nn.Module):
 
         backward_ctx = BackwardContext(
             image=image,
-            grad_tensors=grad_tensors,
+            grad_tensors=internal_grad_tensors,
             tile_height=tile_height,
             tile_width=tile_width,
             output_heights=output_heights,
@@ -1094,6 +1367,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         head_idx,
         head_output,
+        tile_outputs,
         head_grad,
         tile_input_y,
         tile_input_x,
@@ -1131,6 +1405,7 @@ class StreamingCNN(torch.nn.Module):
             return self._build_reducer_backward_pair(
                 head_idx=head_idx,
                 trimmed_output=trimmed_output,
+                tile_outputs=tile_outputs,
                 gradient=gradient,
                 tile_input_y=tile_input_y,
                 tile_input_x=tile_input_x,
@@ -1164,6 +1439,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         head_idx,
         trimmed_output,
+        tile_outputs,
         gradient,
         tile_input_y,
         tile_input_x,
@@ -1172,15 +1448,40 @@ class StreamingCNN(torch.nn.Module):
         output_x,
     ):
         reducer = self._reducer_head_map[head_idx]
-        valid_mask = None
-        if self._active_reducer_mask is not None:
-            valid_mask = self._active_reducer_mask[
-                output_y : output_y + trimmed_output.shape[H_DIM],
-                output_x : output_x + trimmed_output.shape[W_DIM],
-            ]
+        ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+        if len(ordered_indices) == 1:
+            payload = trimmed_output
+            common_dst_box = (
+                int(output_y),
+                int(output_y + trimmed_output.shape[H_DIM]),
+                int(output_x),
+                int(output_x + trimmed_output.shape[W_DIM]),
+            )
+        else:
+            trimmed_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+                head_idx=head_idx,
+                tile_outputs=tile_outputs,
+                ordered_indices=ordered_indices,
+                tile_input_y=tile_input_y,
+                tile_input_x=tile_input_x,
+                sides=sides,
+            )
+            payload = tuple(t.to(self.device, non_blocking=True) for t in trimmed_payload)
+
+        dst_y0, dst_y1, dst_x0, dst_x1 = common_dst_box
+        ref = payload[0] if isinstance(payload, (tuple, list)) else payload
+        valid_mask = self._slice_reducer_mask(
+            self._active_reducer_mask,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+            context=f"backward reducer head {head_idx}",
+            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
+        )
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
-            trimmed_output,
+            payload,
             gradient,
             input_y=int(tile_input_y),
             input_x=int(tile_input_x),
@@ -1323,8 +1624,7 @@ class StreamingCNN(torch.nn.Module):
             ] = 1
 
             module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
-            if self.verbose:
-                print(module, "\n", module_stats["lost"])
+            self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt
             self._module_stats[module] = module_stats
@@ -1384,16 +1684,20 @@ class StreamingCNN(torch.nn.Module):
                 f_grad = np.repeat(f_grad, stride[2], axis=1)
                 grad = np.zeros(grad_in[0].shape[2:])
 
-                print("testing shape gradient fix")
+                self._print_verbose("testing shape gradient fix")
                 grad[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[: grad.shape[0], : grad.shape[1]]
 
                 f_grad = torch.from_numpy(grad)
                 f_grad = f_grad.to(self.device)
 
+            if grad_out[0].numel() == 0 or torch.count_nonzero(grad_out[0]) == 0:
+                # Some connected branches (e.g. zero-scaled passthrough links for graph connectivity)
+                # produce valid but all-zero gradients during stats gathering; skip border inference.
+                return grad_in
+
             grad_lost = self._non_max_border_amount(grad_out[0])
 
-            if self.verbose:
-                print(module, "\n", grad_lost)
+            self._print_verbose(module, "\n", grad_lost)
             self._module_stats[module]["grad_lost"] = grad_lost
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
