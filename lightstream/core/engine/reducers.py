@@ -163,10 +163,10 @@ class ReducerMixin:
         for idx, tensor in enumerate(flat_outputs):
             output_id_to_index.setdefault(id(tensor), idx)
         for reducer in self._streaming_reducers:
-            reducer_inputs = getattr(reducer, "_last_inputs", None)
+            reducer_inputs = getattr(reducer, "_passthrough_inputs", None)
             if reducer_inputs is not None:
                 if not isinstance(reducer_inputs, (tuple, list)):
-                    raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}")
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} _passthrough_inputs must be tuple/list, got {type(reducer_inputs)}")
                 input_indices = []
                 for input_pos, inp in enumerate(reducer_inputs):
                     idx = output_id_to_index.get(id(inp))
@@ -175,16 +175,16 @@ class ReducerMixin:
                             f"Reducer {type(reducer).__name__} input {input_pos} is not present in flattened outputs; cannot resolve reducer head inputs."
                         )
                     input_indices.append(idx)
-                output_index = output_id_to_index.get(id(reducer._last_output))
+                output_index = output_id_to_index.get(id(reducer._passthrough_output))
                 if output_index is None:
                     raise RuntimeError(f"Reducer {type(reducer).__name__} output is not present in flattened outputs.")
                 self._reducer_head_map[output_index] = reducer
                 self._reducer_input_indices[output_index] = tuple(input_indices)
                 continue
 
-            if reducer._last_output is None:
+            if getattr(reducer, "_passthrough_output", None) is None:
                 continue
-            output_index = output_id_to_index.get(id(reducer._last_output))
+            output_index = output_id_to_index.get(id(reducer._passthrough_output))
             if output_index is not None:
                 self._reducer_head_map[output_index] = reducer
                 self._reducer_input_indices[output_index] = (output_index,)

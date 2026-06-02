@@ -1,4 +1,4 @@
-from .base import BaseStreamingGlobalReducer, StreamingReducer
+from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerReplayRecord, ReducerTile, StreamingReducer
 from .attention_gem import AttentionGeMReducer, StreamingAttentionGeMReducer
 from .gem import GeMReducer, StreamingGeMReducer
 from .mean import MeanReducer, StreamingMeanReducer
@@ -14,6 +14,9 @@ __all__ = [
     "ManualVJPReducer",
     "ManualBackwardReducer",
     "BaseStreamingGlobalReducer",
+    "ReducerMeta",
+    "ReducerTile",
+    "ReducerReplayRecord",
     "StreamingReducer",
     "StreamingMeanReducer",
     "StreamingSumReducer",

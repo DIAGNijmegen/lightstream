@@ -1,10 +1,13 @@
 """Mean reducer implementations for offline and streaming execution."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 
-from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
+from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
 from .reducer_base import SpatialReducer
-from .sum import StreamingSumReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
@@ -36,33 +39,46 @@ class MeanReducer(SpatialReducer):
         return StreamingMeanReducer(accumulator_dtype=self.accumulator_dtype)
 
 
-class StreamingMeanReducer(StreamingSumReducer):
-    """Streaming reducer configured for mean semantics."""
+@dataclass
+class MeanState:
+    running_sum: torch.Tensor
+    running_count: torch.Tensor
+
+
+class StreamingMeanReducer(BaseStreamingGlobalReducer):
+    """Streaming reducer configured for mean semantics using the ReducerTile API."""
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None):
-        super().__init__(accumulator_dtype=accumulator_dtype)
-        self.mode = "mean"
+        super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
 
-    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
-        super().accumulate_valid_tile(tile, valid_mask)
-        n_pixels = int(valid_mask.sum().item())
-        pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
-        self.running_count = self.running_count + pixel_increment
+    def init_state(self, meta: ReducerMeta) -> MeanState:
+        running_sum = torch.zeros((meta.batch_size, meta.channels, 1, 1), device=meta.device, dtype=meta.dtype)
+        running_count = torch.zeros((meta.batch_size, 1, 1, 1), device=meta.device, dtype=meta.dtype)
+        self.running_sum = running_sum
+        self.running_count = running_count
+        return MeanState(running_sum=running_sum, running_count=running_count)
 
-    def finalize_from_state(self) -> torch.Tensor:
-        if self.running_sum.numel() == 0:
-            raise RuntimeError("StreamingReducer state is empty, accumulate_stream_tile() was not called.")
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
-        denom = self.running_count.to(dtype=acc_dtype).clamp_min(1)
-        if denom.dtype != self.running_sum.dtype:
-            denom = denom.to(dtype=self.running_sum.dtype)
-        return self.running_sum / denom
+    def update(self, state: MeanState, tile: ReducerTile) -> MeanState:
+        (x,) = tile.tensors
+        tile_contribution = streaming_reduce_tile(x, tile.mask, None).to(dtype=state.running_sum.dtype)
+        state.running_sum = state.running_sum + tile_contribution
+        n_pixels = int(tile.mask.sum().item()) if tile.mask is not None else int(x.shape[-2] * x.shape[-1])
+        state.running_count = state.running_count + torch.tensor(n_pixels, device=state.running_count.device, dtype=state.running_count.dtype)
+        self.running_sum = state.running_sum
+        self.running_count = state.running_count
+        return state
+
+    def finalize(self, state: MeanState) -> torch.Tensor:
+        if state.running_sum.numel() == 0:
+            raise RuntimeError("StreamingMeanReducer state is empty.")
+        denom = state.running_count.to(dtype=state.running_sum.dtype).clamp_min(1)
+        return state.running_sum / denom
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         return {"normalization": self.running_count}
 
-    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
+    def reduce_tile_for_backward(self, tile: ReducerTile, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        return streaming_reduce_tile(tile.tensors[0], tile.mask, global_context.get("normalization"))
 
     def to_reducer(self) -> MeanReducer:
         return MeanReducer(accumulator_dtype=self.accumulator_dtype)

@@ -1,8 +1,12 @@
 """Sum reducer implementations for offline and streaming execution."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 
-from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
+from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
 from .reducer_base import ManualVJPReducer, SpatialReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
@@ -33,31 +37,39 @@ class SumReducer(SpatialReducer):
         return StreamingSumReducer(accumulator_dtype=self.accumulator_dtype)
 
 
+@dataclass
+class SumState:
+    running_sum: torch.Tensor
+
+
 class StreamingSumReducer(ManualVJPReducer):
-    """Streaming reducer configured for sum semantics."""
+    """Streaming reducer configured for sum semantics using the ReducerTile API."""
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None):
         super().__init__(mode="sum", accumulator_dtype=accumulator_dtype)
 
-    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
-        _ = (batch_size, channels, device, dtype, accumulator_dtype)
+    def init_state(self, meta: ReducerMeta) -> SumState:
+        running_sum = torch.zeros((meta.batch_size, meta.channels, 1, 1), device=meta.device, dtype=meta.dtype)
+        self.running_sum = running_sum
+        return SumState(running_sum=running_sum)
 
-    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
-        if self.running_sum.numel() == 0:
-            self.reset_stream_state(batch_size=tile.shape[0], channels=tile.shape[1], device=tile.device, dtype=tile.dtype)
-        tile_contribution = streaming_reduce_tile(tile, valid_mask, None)
-        self.running_sum = self.running_sum + tile_contribution
+    def update(self, state: SumState, tile: ReducerTile) -> SumState:
+        (x,) = tile.tensors
+        tile_contribution = streaming_reduce_tile(x, tile.mask, None).to(dtype=state.running_sum.dtype)
+        state.running_sum = state.running_sum + tile_contribution
+        self.running_sum = state.running_sum
+        return state
 
-    def finalize_from_state(self) -> torch.Tensor:
-        if self.running_sum.numel() == 0:
-            raise RuntimeError("StreamingReducer state is empty, accumulate_stream_tile() was not called.")
-        return self.running_sum
+    def finalize(self, state: SumState) -> torch.Tensor:
+        if state.running_sum.numel() == 0:
+            raise RuntimeError("StreamingSumReducer state is empty.")
+        return state.running_sum
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         return {"normalization": None}
 
-    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
+    def reduce_tile_for_backward(self, tile: ReducerTile, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        return streaming_reduce_tile(tile.tensors[0], tile.mask, global_context.get("normalization"))
 
     def to_reducer(self) -> SumReducer:
         return SumReducer(accumulator_dtype=self.accumulator_dtype)
