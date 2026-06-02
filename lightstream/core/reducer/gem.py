@@ -1,8 +1,10 @@
 """GeM reducer implementations for offline and streaming execution."""
 
+from dataclasses import dataclass
+
 import torch
 
-from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
+from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
 from .reducer_base import ManualVJPReducer, SpatialReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
@@ -63,6 +65,13 @@ class GeMReducer(SpatialReducer):
         return reducer
 
 
+@dataclass
+class GeMState:
+    running_sum: torch.Tensor
+    running_count: torch.Tensor
+    running_q: torch.Tensor
+
+
 class StreamingGeMReducer(ManualVJPReducer):
     """Streaming global GeM reducer."""
 
@@ -83,40 +92,46 @@ class StreamingGeMReducer(ManualVJPReducer):
     def current_r(self) -> torch.Tensor:
         return self.r
 
-    def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
-        self.running_q = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
+    def init_state(self, meta: ReducerMeta) -> "GeMState":
+        running_sum = torch.zeros((meta.batch_size, meta.channels, 1, 1), device=meta.device, dtype=meta.dtype)
+        running_count = torch.zeros((meta.batch_size, 1, 1, 1), device=meta.device, dtype=meta.accumulator_dtype)
+        running_q = torch.zeros((meta.batch_size, meta.channels, 1, 1), device=meta.device, dtype=meta.dtype)
+        self.running_sum = running_sum
+        self.running_count = running_count
+        self.running_q = running_q
+        return GeMState(running_sum=running_sum, running_count=running_count, running_q=running_q)
 
-    def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
-        if self.running_sum.numel() == 0:
-            self.reset_stream_state(batch_size=tile.shape[0], channels=tile.shape[1], device=tile.device, dtype=tile.dtype)
-
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, tile.dtype)
-        x = tile.to(dtype=acc_dtype)
+    def update(self, state: "GeMState", tile: ReducerTile) -> "GeMState":
+        (x_tile,) = tile.tensors
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x_tile.dtype)
+        x = x_tile.to(dtype=acc_dtype)
         x_clamped = x.clamp_min(self.eps)
-        r = self.current_r.to(device=tile.device, dtype=acc_dtype)
+        r = self.current_r.to(device=x_tile.device, dtype=acc_dtype)
 
         x_pow = x_clamped.pow(r)
-        s_tile = streaming_reduce_tile(x_pow, valid_mask, None).to(dtype=self.running_sum.dtype)
-        q_tile = streaming_reduce_tile(x_pow * x_clamped.log(), valid_mask, None).to(dtype=self.running_q.dtype)
+        s_tile = streaming_reduce_tile(x_pow, tile.mask, None).to(dtype=state.running_sum.dtype)
+        q_tile = streaming_reduce_tile(x_pow * x_clamped.log(), tile.mask, None).to(dtype=state.running_q.dtype)
 
-        self.running_sum = self.running_sum + s_tile
-        self.running_q = self.running_q + q_tile
+        state.running_sum = state.running_sum + s_tile
+        state.running_q = state.running_q + q_tile
+        n_pixels = int(tile.mask.sum().item()) if tile.mask is not None else int(x_tile.shape[-2] * x_tile.shape[-1])
+        state.running_count = state.running_count + torch.tensor(n_pixels, device=state.running_count.device, dtype=state.running_count.dtype)
+        self.running_sum = state.running_sum
+        self.running_count = state.running_count
+        self.running_q = state.running_q
+        return state
 
-        n_pixels = int(valid_mask.sum().item())
-        pixel_increment = torch.tensor(n_pixels, device=self.running_count.device, dtype=self.running_count.dtype)
-        self.running_count = self.running_count + pixel_increment
+    def finalize(self, state: "GeMState") -> torch.Tensor:
+        if state.running_sum.numel() == 0:
+            raise RuntimeError("StreamingGeMReducer state is empty.")
 
-    def finalize_from_state(self) -> torch.Tensor:
-        if self.running_sum.numel() == 0:
-            raise RuntimeError("StreamingGeMReducer state is empty, accumulate_stream_tile() was not called.")
-
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
-        r = self.current_r.to(device=self.running_sum.device, dtype=acc_dtype)
-        s = self.running_sum.to(dtype=acc_dtype)
-        n = self.running_count.to(dtype=acc_dtype).clamp_min(1)
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, state.running_sum.dtype)
+        r = self.current_r.to(device=state.running_sum.device, dtype=acc_dtype)
+        s = state.running_sum.to(dtype=acc_dtype)
+        n = state.running_count.to(dtype=acc_dtype).clamp_min(1)
         m = (s / n).clamp_min(self.eps)
         y = m.pow(1.0 / r)
-        return y.to(dtype=self.running_sum.dtype)
+        return y.to(dtype=state.running_sum.dtype)
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_sum.dtype)
@@ -131,9 +146,10 @@ class StreamingGeMReducer(ManualVJPReducer):
             "q": self.running_q.to(dtype=acc_dtype),
         }
 
-    def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
-        if valid_mask is None:
-            raise ValueError("StreamingGeMReducer backward replay requires a valid_mask.")
+    def reduce_tile_for_backward(self, tile: ReducerTile, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
+        if tile.mask is None:
+            raise ValueError("StreamingGeMReducer backward replay requires a tile mask.")
+        trimmed_output = tile.tensors[0]
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, trimmed_output.dtype)
         x = trimmed_output.to(dtype=acc_dtype)
@@ -142,7 +158,7 @@ class StreamingGeMReducer(ManualVJPReducer):
         n = global_context["normalization"].to(device=trimmed_output.device, dtype=acc_dtype).clamp_min(1)
 
         x_pow = x_clamped.pow(r)
-        local_m = streaming_reduce_tile(x_pow, valid_mask, n)
+        local_m = streaming_reduce_tile(x_pow, tile.mask, n)
 
         global_m = global_context["m"].to(device=trimmed_output.device, dtype=acc_dtype)
         scale = (1.0 / r) * global_m.clamp_min(self.eps).pow(1.0 / r - 1.0)
