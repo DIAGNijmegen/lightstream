@@ -1,6 +1,5 @@
 from .base import BaseStreamingGlobalReducer, StreamingReducer
 from .attention_gem import AttentionGeMReducer, StreamingAttentionGeMReducer
-from .fused_attention_gem import FusedAttentionGeMReducer, StreamingFusedAttentionGeMReducer
 from .gem import GeMReducer, StreamingGeMReducer
 from .mean import MeanReducer, StreamingMeanReducer
 from .reducer_base import BaseReducer
@@ -18,6 +17,4 @@ __all__ = [
     "StreamingGeMReducer",
     "AttentionGeMReducer",
     "StreamingAttentionGeMReducer",
-    "FusedAttentionGeMReducer",
-    "StreamingFusedAttentionGeMReducer",
 ]
