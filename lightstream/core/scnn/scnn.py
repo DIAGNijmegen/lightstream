@@ -17,6 +17,17 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.engine.config import StreamingConfig
+from lightstream.core.engine.output import (
+    count_tensors_in_spec,
+    flatten_output_structure,
+    public_output_debug_context,
+    public_output_indices,
+    reducer_aux_indices as get_reducer_aux_indices,
+    unflatten_output_structure,
+    validate_public_forward_outputs,
+    validate_public_output_indices,
+)
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -109,29 +120,44 @@ class StreamingCNN(torch.nn.Module):
         """
         super().__init__()
         global H_DIM, W_DIM
+        self.config = StreamingConfig(
+            tile_shape=tile_shape,
+            verbose=verbose,
+            deterministic=deterministic,
+            saliency=saliency,
+            eps=eps,
+            copy_to_gpu=copy_to_gpu,
+            dtype=dtype,
+            statistics_on_cpu=statistics_on_cpu,
+            normalize_on_gpu=normalize_on_gpu,
+            mean=mean,
+            std=std,
+        )
         self.stream_module = stream_module
-        self.verbose = verbose
-        self.deterministic = deterministic
-        self.eps = eps
+        self.verbose = self.config.verbose
+        self.deterministic = self.config.deterministic
+        self.eps = self.config.eps
         self.device = next(stream_module.parameters()).device
         self.dtype = next(stream_module.parameters()).dtype
-        if dtype is not None:
-            self.dtype = dtype
-        self.tile_shape = tile_shape
-        self.gather_input_gradient = saliency
-        self.copy_to_gpu = copy_to_gpu
-        self.statistics_on_cpu = statistics_on_cpu
+        if self.config.dtype is not None:
+            self.dtype = self.config.dtype
+        self.tile_shape = self.config.tile_shape
+        self.gather_input_gradient = self.config.saliency
+        self.copy_to_gpu = self.config.copy_to_gpu
+        self.statistics_on_cpu = self.config.statistics_on_cpu
 
+        mean = self.config.mean
         if mean is not None and not isinstance(mean, torch.Tensor):
             mean = torch.Tensor(mean)[:, None, None]
 
+        std = self.config.std
         if std is not None and not isinstance(std, torch.Tensor):
             std = torch.Tensor(std)[:, None, None]
 
         self.mean = mean if mean is not None else torch.tensor([0.485, 0.456, 0.406])[:, None, None]
         self.std = std if std is not None else torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
-        self.should_normalize = normalize_on_gpu
+        self.should_normalize = self.config.normalize_on_gpu
 
         self._tile_output_shape = None
         self._tile_output_shapes = None
@@ -280,7 +306,7 @@ class StreamingCNN(torch.nn.Module):
         spec_tile = torch.ones(self.tile_shape, dtype=self.dtype, device=self.device)
         with torch.no_grad():
             output = self.stream_module(spec_tile)
-        _, output_spec = self._flatten_output_structure(output)
+        _, output_spec = flatten_output_structure(output)
         self._output_spec = output_spec
 
     def _set_reducer_passthrough(self, enabled: bool):
@@ -292,7 +318,7 @@ class StreamingCNN(torch.nn.Module):
         # Forward pass with grads enabled
         torch.set_grad_enabled(True)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec = flatten_output_structure(output)
         self._output_spec = output_spec
 
         # Gather backward statistics
@@ -335,116 +361,11 @@ class StreamingCNN(torch.nn.Module):
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec = flatten_output_structure(output)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
         self._print_verbose("\n", "Output lost", self._tile_output_lost)
-
-    def _flatten_output_structure(self, output):
-        if isinstance(output, torch.Tensor):
-            return [output], ("tensor", None)
-        if isinstance(output, tuple):
-            flat = []
-            children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
-                flat.extend(child_flat)
-                children.append(child_spec)
-            return flat, ("tuple", children)
-        if isinstance(output, list):
-            flat = []
-            children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
-                flat.extend(child_flat)
-                children.append(child_spec)
-            return flat, ("list", children)
-        if isinstance(output, dict):
-            flat = []
-            children = []
-            for key in sorted(output.keys()):
-                child_flat, child_spec = self._flatten_output_structure(output[key])
-                flat.extend(child_flat)
-                children.append((key, child_spec))
-            return flat, ("dict", children)
-        raise TypeError(f"Unsupported output type for streaming: {type(output)}")
-
-    def _unflatten_output_structure(self, flat, spec, index=0):
-        kind, payload = spec
-        if kind == "tensor":
-            return flat[index], index + 1
-        if kind in {"tuple", "list"}:
-            values = []
-            for child in payload:
-                value, index = self._unflatten_output_structure(flat, child, index)
-                values.append(value)
-            return (tuple(values) if kind == "tuple" else values), index
-        if kind == "dict":
-            values = {}
-            for key, child in payload:
-                value, index = self._unflatten_output_structure(flat, child, index)
-                values[key] = value
-            return values, index
-        raise TypeError(f"Unsupported output spec kind: {kind}")
-
-
-    def _reducer_aux_indices(self) -> set[int]:
-        aux_indices = set()
-        for reducer_head, indices in self._reducer_input_indices.items():
-            if reducer_head in self._reducer_head_map:
-                aux_indices.update(indices[1:])
-        return aux_indices
-
-    def _public_output_indices(self) -> list[int]:
-        reducer_aux_indices = self._reducer_aux_indices()
-        return [
-            idx
-            for idx in range(len(self._tile_output_shapes))
-            if idx not in reducer_aux_indices
-        ]
-
-    def _public_output_debug_context(self, public_indices, reducer_aux_indices=None) -> str:
-        if reducer_aux_indices is None:
-            reducer_aux_indices = self._reducer_aux_indices()
-        return (
-            f"public_indices={list(public_indices)}, "
-            f"reducer_auxiliary_indices={sorted(reducer_aux_indices)}, "
-            f"self._reducer_input_indices={self._reducer_input_indices}"
-        )
-
-    def _validate_public_output_indices(self, public_indices) -> None:
-        reducer_aux_indices = self._reducer_aux_indices()
-        leaked_aux_indices = sorted(set(public_indices) & reducer_aux_indices)
-        if leaked_aux_indices:
-            raise RuntimeError(
-                "Public output indices include reducer auxiliary indices; "
-                f"leaked_auxiliary_indices={leaked_aux_indices}; "
-                f"{self._public_output_debug_context(public_indices, reducer_aux_indices)}"
-            )
-
-    def _validate_public_forward_outputs(self, outputs, public_indices) -> None:
-        context = self._public_output_debug_context(public_indices)
-        for idx in public_indices:
-            output = outputs[idx]
-            if output is None:
-                raise RuntimeError(
-                    f"Public output head {idx} was not populated during streaming forward; {context}"
-                )
-            if getattr(self, "debug_forward_sentinel_check", False) and torch.all(output == 999):
-                raise RuntimeError(
-                    f"Public output head {idx} still contains only the unstitched sentinel value 999; {context}"
-                )
-
-    def _count_tensors_in_spec(self, spec) -> int:
-        kind, payload = spec
-        if kind == "tensor":
-            return 1
-        if kind in {"tuple", "list"}:
-            return sum(self._count_tensors_in_spec(child) for child in payload)
-        if kind == "dict":
-            return sum(self._count_tensors_in_spec(child) for _, child in payload)
-        raise TypeError(f"Unsupported output spec kind: {kind}")
 
     def _compute_internal_safe_input_step(self):
         """Compute conservative input-step bounds from per-layer backward stats."""
@@ -763,7 +684,7 @@ class StreamingCNN(torch.nn.Module):
         outputs = [None] * len(self._tile_output_shapes)
 
         def allocate_non_reducer_outputs():
-            aux_indices = self._reducer_aux_indices()
+            aux_indices = get_reducer_aux_indices(self._reducer_input_indices, self._reducer_head_map)
             for idx in range(len(self._tile_output_shapes)):
                 if idx in self._reducer_head_map:
                     continue
@@ -789,7 +710,7 @@ class StreamingCNN(torch.nn.Module):
             tile = self._normalize_on_gpu(tile)
 
         tile_output = self.stream_module(tile)
-        tile_outputs, _ = self._flatten_output_structure(tile_output)
+        tile_outputs, _ = flatten_output_structure(tile_output)
         return tile, tile_outputs
 
     def _stitch_non_reducer_output(self, outputs, idx, trimmed_output, output_loc):
@@ -1001,7 +922,7 @@ class StreamingCNN(torch.nn.Module):
         )
 
     def _stitch_forward_outputs(self, outputs, tile_outputs, tile_input_y, tile_input_x, sides, user_mask):
-        reducer_aux_indices = self._reducer_aux_indices()
+        reducer_aux_indices = get_reducer_aux_indices(self._reducer_input_indices, self._reducer_head_map)
         for head_idx, head_output in enumerate(tile_outputs):
             if head_idx in reducer_aux_indices:
                 continue
@@ -1117,7 +1038,7 @@ class StreamingCNN(torch.nn.Module):
                 tile_output = self.stream_module(tile)
         else:
             tile_output = self.stream_module(tile)
-        tile_outputs, _ = self._flatten_output_structure(tile_output)
+        tile_outputs, _ = flatten_output_structure(tile_output)
 
         del tile
 
@@ -1258,18 +1179,29 @@ class StreamingCNN(torch.nn.Module):
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
 
-        public_indices = self._public_output_indices()
-        self._validate_public_output_indices(public_indices)
-        expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
+        public_indices = public_output_indices(
+            self._tile_output_shapes,
+            self._reducer_input_indices,
+            self._reducer_head_map,
+        )
+        validate_public_output_indices(public_indices, self._reducer_input_indices, self._reducer_head_map)
+        expected_flat_outputs = count_tensors_in_spec(self._output_spec)
         if len(public_indices) != expected_flat_outputs:
             raise RuntimeError(
                 f"Public output index count mismatch: expected={expected_flat_outputs}, "
-                f"actual={len(public_indices)}; {self._public_output_debug_context(public_indices)}"
+                f"actual={len(public_indices)}; "
+                f"{public_output_debug_context(public_indices, self._reducer_input_indices, self._reducer_head_map)}"
             )
-        self._validate_public_forward_outputs(outputs, public_indices)
+        validate_public_forward_outputs(
+            outputs,
+            public_indices,
+            self._reducer_input_indices,
+            self._reducer_head_map,
+            debug_forward_sentinel_check=getattr(self, "debug_forward_sentinel_check", False),
+        )
         materialized_outputs = [outputs[idx] for idx in public_indices]
 
-        output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
+        output, final_idx = unflatten_output_structure(materialized_outputs, self._output_spec)
         assert final_idx == len(materialized_outputs)
         return output
 
@@ -1295,11 +1227,15 @@ class StreamingCNN(torch.nn.Module):
             valid_input_width=valid_input_width,
         )
 
-        grad_tensors, grad_spec = self._flatten_output_structure(grad)
+        grad_tensors, grad_spec = flatten_output_structure(grad)
         if grad_spec != self._output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
-        public_indices = self._public_output_indices()
+        public_indices = public_output_indices(
+            self._tile_output_shapes,
+            self._reducer_input_indices,
+            self._reducer_head_map,
+        )
         if len(grad_tensors) != len(public_indices):
             raise ValueError(
                 f"Gradient tensor count mismatch: expected={len(public_indices)}, "
