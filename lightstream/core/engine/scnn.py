@@ -11,7 +11,7 @@ from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 
 from .backward import BackwardMixin
-from .config import BackwardContext, ForwardContext, StreamingConfig, TileSpec
+from .config import BackwardContext, CompiledPlan, ForwardContext, StreamingConfig, TileSpec
 from .conversion import ConversionMixin
 from .forward import ForwardMixin
 from .planner import PlannerMixin
@@ -84,6 +84,7 @@ class StreamingCNN(
 
         self.should_normalize = normalize_on_gpu
 
+        self.compiled_plan = CompiledPlan(stream_network=self)
         self._tile_output_shape = None
         self._tile_output_shapes = None
         self._tile_output_lost = None
@@ -104,6 +105,79 @@ class StreamingCNN(
             self._configure()
         else:
             self.load_tile_cache(state_dict)
+
+
+    @property
+    def _tile_output_shape(self):
+        return self.compiled_plan.plan_state.tile_output_shape
+
+    @_tile_output_shape.setter
+    def _tile_output_shape(self, value):
+        self.compiled_plan.plan_state.tile_output_shape = value
+
+    @property
+    def _tile_output_shapes(self):
+        return self.compiled_plan.plan_state.tile_output_shapes
+
+    @_tile_output_shapes.setter
+    def _tile_output_shapes(self, value):
+        self.compiled_plan.plan_state.tile_output_shapes = value
+
+    @property
+    def _tile_output_lost(self):
+        return self.compiled_plan.plan_state.tile_output_lost
+
+    @_tile_output_lost.setter
+    def _tile_output_lost(self, value):
+        self.compiled_plan.plan_state.tile_output_lost = value
+
+    @property
+    def _output_stride_per_output(self):
+        return self.compiled_plan.plan_state.output_stride_per_output
+
+    @_output_stride_per_output.setter
+    def _output_stride_per_output(self, value):
+        self.compiled_plan.plan_state.output_stride_per_output = value
+
+    @property
+    def _output_spec(self):
+        return self.compiled_plan.plan_state.output_spec
+
+    @_output_spec.setter
+    def _output_spec(self, value):
+        self.compiled_plan.plan_state.output_spec = value
+
+    @property
+    def _reducer_head_map(self):
+        return self.compiled_plan.session_state.reducer_head_map
+
+    @_reducer_head_map.setter
+    def _reducer_head_map(self, value):
+        self.compiled_plan.session_state.reducer_head_map = value
+
+    @property
+    def _reducer_input_indices(self):
+        return self.compiled_plan.session_state.reducer_input_indices
+
+    @_reducer_input_indices.setter
+    def _reducer_input_indices(self, value):
+        self.compiled_plan.session_state.reducer_input_indices = value
+
+    @property
+    def _last_forward_tiles(self):
+        return self.compiled_plan.session_state.last_forward_tiles
+
+    @_last_forward_tiles.setter
+    def _last_forward_tiles(self, value):
+        self.compiled_plan.session_state.last_forward_tiles = value
+
+    @property
+    def _active_reducer_mask(self):
+        return self.compiled_plan.session_state.active_reducer_mask
+
+    @_active_reducer_mask.setter
+    def _active_reducer_mask(self, value):
+        self.compiled_plan.session_state.active_reducer_mask = value
 
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
