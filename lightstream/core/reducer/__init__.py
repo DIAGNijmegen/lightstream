@@ -2,13 +2,17 @@ from .base import BaseStreamingGlobalReducer, StreamingReducer
 from .attention_gem import AttentionGeMReducer, StreamingAttentionGeMReducer
 from .gem import GeMReducer, StreamingGeMReducer
 from .mean import MeanReducer, StreamingMeanReducer
-from .reducer_base import BaseReducer
+from .reducer_base import BaseReducer, ManualBackwardReducer, ManualVJPReducer, MultiInputSpatialReducer, SpatialReducer
 from .sum import StreamingSumReducer, SumReducer
 
 __all__ = [
     "MeanReducer",
     "SumReducer",
     "BaseReducer",
+    "SpatialReducer",
+    "MultiInputSpatialReducer",
+    "ManualVJPReducer",
+    "ManualBackwardReducer",
     "BaseStreamingGlobalReducer",
     "StreamingReducer",
     "StreamingMeanReducer",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .reducer_base import BaseReducer
+from .reducer_base import ManualVJPReducer, MultiInputSpatialReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
 
 
@@ -32,7 +32,7 @@ def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"logits must be 3D/4D spatial tensor, got shape={tuple(logits.shape)}")
 
 
-class AttentionGeMReducer(BaseReducer):
+class AttentionGeMReducer(MultiInputSpatialReducer):
     """Apply attention-weighted global GeM reduction on NCHW tensors."""
 
     def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None):
@@ -95,7 +95,7 @@ class AttentionGeMReducer(BaseReducer):
         return reducer
 
 
-class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
+class StreamingAttentionGeMReducer(ManualVJPReducer):
     """Streaming attention-weighted global GeM reducer with stable softmax accumulation."""
 
     def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None):
