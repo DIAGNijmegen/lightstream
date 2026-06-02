@@ -88,11 +88,16 @@ class StreamingEngine:
 
     def get_tile_cache(self) -> dict:
         """Return the compiled tile-cache state."""
-        return self._require_stream_network().get_tile_cache()
+        stream_network = self._require_stream_network()
+        cache = stream_network.get_tile_cache()
+        self.plan = stream_network.compiled_plan
+        return cache
 
     def load_tile_cache(self, state: dict) -> None:
         """Load tile-cache state into an already compiled engine."""
-        self._require_stream_network().load_tile_cache(state)
+        stream_network = self._require_stream_network()
+        stream_network.load_tile_cache(state)
+        self.plan = stream_network.compiled_plan
 
     def state_dict(self) -> dict:
         """Alias for :meth:`get_tile_cache` for cache-oriented lifecycle usage."""

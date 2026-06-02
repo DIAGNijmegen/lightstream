@@ -143,8 +143,11 @@ class BackwardMixin:
         if mask is not None:
             self._active_reducer_mask = self._normalize_reducer_mask(mask, image)
 
-        tile_height = self.tile_shape[H_DIM]
-        tile_width = self.tile_shape[W_DIM]
+        plan = self.compiled_plan
+        tile_shape = plan.tile_plan.tile_shape if plan.tile_plan is not None else self.tile_shape
+        output_spec = plan.public_output_spec if plan.public_output_spec is not None else self._output_spec
+        tile_height = tile_shape[H_DIM]
+        tile_width = tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
@@ -159,7 +162,7 @@ class BackwardMixin:
         )
 
         grad_tensors, grad_spec = self._flatten_output_structure(grad)
-        if grad_spec != self._output_spec:
+        if grad_spec != output_spec:
             raise ValueError("Gradient output structure does not match streaming output structure")
 
         public_indices = self._public_output_indices()
@@ -195,6 +198,7 @@ class BackwardMixin:
             tile_width=tile_width,
             output_heights=output_heights,
             output_widths=output_widths,
+            compiled_plan=plan,
         )
 
         if self.debug_reducer_replay:

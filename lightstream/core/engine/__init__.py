@@ -15,6 +15,8 @@ __all__ = [
     "ReducerRuntime",
     "StreamableLayerAdapter",
     "StreamingConfig",
+    "TensorSpec",
+    "TilePlan",
     "StreamingEngine",
     "TilePlanner",
     "TileSpec",
