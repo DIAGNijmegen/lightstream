@@ -1,31 +1,52 @@
 """Public reducer API.
 
 This plural package is the preferred import location for reducer extension
-points. The legacy :mod:`lightstream.core.reducer` package re-exports the same
-symbols for compatibility.
+points. Concrete reducer implementations are loaded lazily to keep compatibility
+with the legacy :mod:`lightstream.core.reducer` package during import.
 """
 
-from lightstream.core.reducer import (
-    AttentionGeMReducer,
+from .api import (
     BaseReducer,
-    BaseStreamingGlobalReducer,
-    GeMReducer,
     ManualBackwardReducer,
     ManualVJPReducer,
-    MeanReducer,
     MultiInputSpatialReducer,
+    SpatialReducer,
+    validate_aligned_nchw_inputs,
+    validate_arity,
+    validate_channel_compatibility,
+    validate_mask_shape,
+    validate_nchw_shape,
+)
+from .base import (
+    BaseStreamingGlobalReducer,
     ReducerMeta,
     ReducerReplayRecord,
     ReducerTile,
-    SpatialReducer as OfflineSpatialReducer,
-    StreamingAttentionGeMReducer,
-    StreamingGeMReducer,
-    StreamingMeanReducer,
     StreamingReducer,
-    StreamingSumReducer,
-    SumReducer,
+    streaming_reduce_tile,
 )
-from .base import SpatialReducer
+
+_LAZY_REDUCER_EXPORTS = {
+    "MeanReducer",
+    "SumReducer",
+    "GeMReducer",
+    "AttentionGeMReducer",
+    "StreamingMeanReducer",
+    "StreamingSumReducer",
+    "StreamingGeMReducer",
+    "StreamingAttentionGeMReducer",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_REDUCER_EXPORTS:
+        from lightstream.core import reducer as _legacy_reducer
+
+        value = getattr(_legacy_reducer, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "MeanReducer",
@@ -34,7 +55,6 @@ __all__ = [
     "AttentionGeMReducer",
     "BaseReducer",
     "SpatialReducer",
-    "OfflineSpatialReducer",
     "MultiInputSpatialReducer",
     "ManualVJPReducer",
     "ManualBackwardReducer",
@@ -43,8 +63,14 @@ __all__ = [
     "ReducerMeta",
     "ReducerTile",
     "ReducerReplayRecord",
+    "streaming_reduce_tile",
     "StreamingMeanReducer",
     "StreamingSumReducer",
     "StreamingGeMReducer",
     "StreamingAttentionGeMReducer",
+    "validate_arity",
+    "validate_nchw_shape",
+    "validate_channel_compatibility",
+    "validate_aligned_nchw_inputs",
+    "validate_mask_shape",
 ]

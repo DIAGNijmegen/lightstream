@@ -6,7 +6,7 @@ import torch
 
 from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
 from .reducer_base import ManualVJPReducer, SpatialReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import resolve_accumulator_dtype
 
 
 class GeMReducer(SpatialReducer):
@@ -29,15 +29,7 @@ class GeMReducer(SpatialReducer):
     def current_r(self) -> torch.Tensor:
         return self.r
 
-    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        if len(inputs) != 1:
-            raise ValueError(f"GeMReducer expects exactly one tensor input, got {len(inputs)}.")
-        x = inputs[0]
-        if x.ndim != 4:
-            raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
-        if self._streaming_passthrough:
-            return x
-
+    def reduce_spatial(self, x: torch.Tensor, *, mask: torch.Tensor | None = None) -> torch.Tensor:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
         x_clamped = x_acc.clamp_min(self.eps)
@@ -45,8 +37,7 @@ class GeMReducer(SpatialReducer):
         x_pow = x_clamped.pow(r)
 
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x)
-            mask_acc = mask_nchw.to(dtype=acc_dtype)
+            mask_acc = mask.to(dtype=acc_dtype)
             denom = mask_acc.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
             mean_pow = (x_pow * mask_acc).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
         else:

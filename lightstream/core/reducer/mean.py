@@ -8,7 +8,7 @@ import torch
 
 from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
 from .reducer_base import SpatialReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import resolve_accumulator_dtype
 
 
 class MeanReducer(SpatialReducer):
@@ -18,19 +18,11 @@ class MeanReducer(SpatialReducer):
         super().__init__()
         self.accumulator_dtype = accumulator_dtype
 
-    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        if len(inputs) != 1:
-            raise ValueError(f"MeanReducer expects exactly one tensor input, got {len(inputs)}.")
-        x = inputs[0]
-        if x.ndim != 4:
-            raise ValueError(f"Reducer expects NCHW tensor, got shape={tuple(x.shape)}")
-        if self._streaming_passthrough:
-            return x
+    def reduce_spatial(self, x: torch.Tensor, *, mask: torch.Tensor | None = None) -> torch.Tensor:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x)
-            masked = x * mask_nchw.to(dtype=x.dtype)
-            denom = mask_nchw.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
+            masked = x * mask.to(dtype=x.dtype)
+            denom = mask.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
             mean = masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
             return mean.to(dtype=x.dtype)
         return x.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)

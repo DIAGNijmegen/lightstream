@@ -1,4 +1,4 @@
-"""Preferred reducer extension API."""
+"""Preferred reducer streaming primitives."""
 
 from lightstream.core.reducer.base import (
     BaseStreamingGlobalReducer,
@@ -9,12 +9,7 @@ from lightstream.core.reducer.base import (
     streaming_reduce_tile,
 )
 
-# ``SpatialReducer`` is the preferred name for authors implementing the new
-# streaming contract: init_state(meta), update(state, tile), finalize(state).
-SpatialReducer = BaseStreamingGlobalReducer
-
 __all__ = [
-    "SpatialReducer",
     "BaseStreamingGlobalReducer",
     "StreamingReducer",
     "ReducerMeta",

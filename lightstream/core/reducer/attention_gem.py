@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from .base import BaseStreamingGlobalReducer, ReducerMeta, ReducerTile, streaming_reduce_tile
-from .reducer_base import ManualVJPReducer, MultiInputSpatialReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .reducer_base import ManualVJPReducer, MultiInputSpatialReducer, validate_mask_shape, validate_nchw_shape
+from .utils import resolve_accumulator_dtype
 
 
 def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -37,6 +37,8 @@ def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 class AttentionGeMReducer(MultiInputSpatialReducer):
     """Apply attention-weighted global GeM reduction on NCHW tensors."""
 
+    expected_inputs = 2
+
     def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None):
         super().__init__()
         self.eps = float(eps)
@@ -48,11 +50,10 @@ class AttentionGeMReducer(MultiInputSpatialReducer):
         return self.r
 
     def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if len(inputs) != 2:
+        if len(inputs) != self.expected_inputs:
             raise ValueError(f"AttentionGeMReducer expects exactly two inputs (x, attn_logits), got {len(inputs)}.")
         x, attn_logits = inputs
-        if x.ndim != 4:
-            raise ValueError(f"Reducer expects NCHW x tensor, got shape={tuple(x.shape)}")
+        x = validate_nchw_shape(x, name="x", reducer_name=type(self).__name__)
         logits = _normalize_logits(attn_logits, x)
         if self._streaming_passthrough:
             logits_term = logits.to(dtype=x.dtype).sum(dim=(-2, -1), keepdim=True)
@@ -60,13 +61,25 @@ class AttentionGeMReducer(MultiInputSpatialReducer):
             x_passthrough = x + graph_passthrough
             return x_passthrough, logits
 
+        mask_nchw = validate_mask_shape(mask, x, reducer_name=type(self).__name__)
+        return self._reduce_attention_gem(x, logits, mask=mask_nchw)
+
+    def reduce_spatial_inputs(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if len(inputs) != self.expected_inputs:
+            raise ValueError(f"AttentionGeMReducer expects exactly two inputs (x, attn_logits), got {len(inputs)}.")
+        x, attn_logits = inputs
+        x = validate_nchw_shape(x, name="x", reducer_name=type(self).__name__)
+        logits = _normalize_logits(attn_logits, x)
+        return self._reduce_attention_gem(x, logits, mask=mask)
+
+    def _reduce_attention_gem(self, x: torch.Tensor, logits: torch.Tensor, *, mask: torch.Tensor | None = None) -> torch.Tensor:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
         x_pow = x_acc.clamp_min(self.eps).pow(self.current_r.to(device=x.device, dtype=acc_dtype))
         logits_acc = logits.to(dtype=acc_dtype)
 
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x).to(device=x.device)
+            mask_nchw = mask.to(device=x.device, dtype=torch.bool)
             neg_inf = torch.finfo(acc_dtype).min
             logits_acc = torch.where(mask_nchw, logits_acc, torch.full_like(logits_acc, neg_inf))
             any_valid = mask_nchw.flatten(2).any(dim=-1, keepdim=True).unsqueeze(-1)
