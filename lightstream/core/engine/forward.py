@@ -213,8 +213,11 @@ class ForwardMixin:
             image = image.to(self.device, non_blocking=True)
         self._active_reducer_mask = self._normalize_reducer_mask(mask, image)
 
-        tile_height = self.tile_shape[H_DIM]
-        tile_width = self.tile_shape[W_DIM]
+        plan = self.compiled_plan
+        tile_shape = plan.tile_plan.tile_shape if plan.tile_plan is not None else self.tile_shape
+        output_spec = plan.public_output_spec if plan.public_output_spec is not None else self._output_spec
+        tile_height = tile_shape[H_DIM]
+        tile_width = tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
@@ -253,6 +256,7 @@ class ForwardMixin:
             n_rows=n_rows,
             n_cols=n_cols,
             result_device=result_device,
+            compiled_plan=plan,
         )
         self._reducer_head_map = {}
         self._reducer_input_indices = {}
@@ -313,6 +317,7 @@ class ForwardMixin:
         )
 
         self._validate_reducer_head_map_resolved()
+        self._refresh_compiled_plan()
 
         del image
         self._saved_tensors = {}
@@ -321,7 +326,7 @@ class ForwardMixin:
 
         public_indices = self._public_output_indices()
         self._validate_public_output_indices(public_indices)
-        expected_flat_outputs = self._count_tensors_in_spec(self._output_spec)
+        expected_flat_outputs = self._count_tensors_in_spec(output_spec)
         if len(public_indices) != expected_flat_outputs:
             raise RuntimeError(
                 f"Public output index count mismatch: expected={expected_flat_outputs}, "
@@ -330,7 +335,7 @@ class ForwardMixin:
         self._validate_public_forward_outputs(outputs, public_indices)
         materialized_outputs = [outputs[idx] for idx in public_indices]
 
-        output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
+        output, final_idx = self._unflatten_output_structure(materialized_outputs, output_spec)
         assert final_idx == len(materialized_outputs)
         return output
 

@@ -71,7 +71,6 @@ class StreamingEngine:
         )
         stream_network = self.constructor.prepare_streaming_model()
         self.plan = stream_network.compiled_plan
-        self.plan.stream_network = stream_network
         return self.plan
 
     def _require_stream_network(self) -> nn.Module:
@@ -85,21 +84,29 @@ class StreamingEngine:
         stream_network = self._require_stream_network()
         result_on_cpu = result_device is not None and torch.device(result_device).type == "cpu"
         output = stream_network.forward(image, result_on_cpu=result_on_cpu, mask=mask)
+        self.plan = stream_network.compiled_plan
         if result_device is None or result_on_cpu:
             return output
         return self._move_output(output, torch.device(result_device))
 
     def backward(self, image: torch.Tensor, grad, *, mask: torch.Tensor | None = None) -> None:
         """Run a streaming backward pass."""
-        self._require_stream_network().backward(image, grad, mask=mask)
+        stream_network = self._require_stream_network()
+        stream_network.backward(image, grad, mask=mask)
+        self.plan = stream_network.compiled_plan
 
     def get_tile_cache(self) -> dict:
         """Return the compiled tile-cache state."""
-        return self._require_stream_network().get_tile_cache()
+        stream_network = self._require_stream_network()
+        cache = stream_network.get_tile_cache()
+        self.plan = stream_network.compiled_plan
+        return cache
 
     def load_tile_cache(self, state: dict) -> None:
         """Load tile-cache state into an already compiled engine."""
-        self._require_stream_network().load_tile_cache(state)
+        stream_network = self._require_stream_network()
+        stream_network.load_tile_cache(state)
+        self.plan = stream_network.compiled_plan
 
     def state_dict(self) -> dict:
         """Alias for :meth:`get_tile_cache` for cache-oriented lifecycle usage."""
