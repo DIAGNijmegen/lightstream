@@ -1,13 +1,31 @@
 """Streaming engine package."""
-from .config import BackwardContext, CompiledPlan, ForwardContext, StreamingConfig, TileSpec
+from .config import (
+    BackwardContext,
+    CompiledPlan,
+    ForwardContext,
+    InputSpec,
+    LayerPlan,
+    OutputLayout,
+    ReducerNode,
+    StreamingConfig,
+    TensorSpec,
+    TilePlan,
+    TileSpec,
+)
 from .scnn import StreamingCNN
 
 __all__ = [
     "BackwardContext",
     "CompiledPlan",
     "ForwardContext",
+    "InputSpec",
+    "LayerPlan",
+    "OutputLayout",
+    "ReducerNode",
     "StreamingCNN",
     "StreamingConfig",
+    "TensorSpec",
+    "TilePlan",
     "StreamingEngine",
     "TileSpec",
 ]

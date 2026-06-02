@@ -384,6 +384,15 @@ class StatisticsMixin:
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
         named_stats["output_spec"] = self._output_spec
+        self._refresh_compiled_plan()
+        named_stats["compiled_plan"] = self.compiled_plan
+        named_stats["plan_metadata"] = {
+            "tile_shape": self.compiled_plan.tile_plan.tile_shape if self.compiled_plan.tile_plan is not None else tuple(self.tile_shape),
+            "model_signature": self.compiled_plan.input_spec.model_signature if self.compiled_plan.input_spec is not None else (),
+            "output_structure": self.compiled_plan.output_layout.output_structure if self.compiled_plan.output_layout is not None else self._output_spec,
+            "reducer_nodes": self.compiled_plan.reducer_nodes,
+            "layer_plans": self.compiled_plan.layer_plans,
+        }
         return named_stats
 
     def load_tile_cache(self, state):
@@ -407,3 +416,4 @@ class StatisticsMixin:
                 self._module_stats[module] = state["net_stats"][name]
 
         self.enable()
+        self._refresh_compiled_plan()

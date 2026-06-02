@@ -1,17 +1,24 @@
 """Streaming CNN engine orchestration."""
 import copy
 import logging
-
 import torch
 import torch.backends
 
-from lightstream.core.reducer import BaseReducer
+from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 from lightstream.core.scnn.utils import H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 
 from .backward import BackwardMixin
-from .config import BackwardContext, CompiledPlan, ForwardContext, StreamingConfig, TileSpec
+from .config import (
+    CompiledPlan,
+    InputSpec,
+    LayerPlan,
+    OutputLayout,
+    ReducerNode,
+    TensorSpec,
+    TilePlan,
+)
 from .conversion import ConversionMixin
 from .forward import ForwardMixin
 from .planner import PlannerMixin
@@ -179,6 +186,114 @@ class StreamingCNN(
     def _active_reducer_mask(self, value):
         self.compiled_plan.session_state.active_reducer_mask = value
 
+
+    def _shape_tuple(self, shape):
+        return tuple(int(v) for v in shape) if shape is not None else None
+
+    def _tensor_spec_from_shape(self, shape, *, dtype=None, device=None):
+        return TensorSpec(
+            shape=self._shape_tuple(shape) or (),
+            dtype=str(dtype) if dtype is not None else None,
+            device=str(device) if device is not None else None,
+        )
+
+    def _model_signature(self):
+        return tuple((name, type(module).__qualname__) for name, module in self.stream_module.named_modules())
+
+    def _build_layer_plans(self):
+        layer_plans = []
+        for name, module in self.stream_module.named_modules():
+            if not name:
+                continue
+            stats = self._module_stats.get(module, {})
+            streamable = isinstance(module, (StreamingConv2d, StreamingUpsample2d, BaseReducer, BaseStreamingGlobalReducer)) or bool(stats)
+            if not streamable:
+                continue
+            metadata = {
+                key: value
+                for key, value in stats.items()
+                if key not in {"module", "lost", "grad_lost", "output_stride"}
+            }
+            layer_plans.append(
+                LayerPlan(
+                    name=name,
+                    module_type=type(module).__qualname__,
+                    streamable=streamable,
+                    output_stride=stats.get("output_stride", getattr(module, "output_stride", None)),
+                    lost=stats.get("lost"),
+                    grad_lost=stats.get("grad_lost", getattr(module, "grad_lost", None)),
+                    metadata=metadata,
+                )
+            )
+        return tuple(layer_plans)
+
+    def _build_reducer_nodes(self):
+        module_names = {module: name for name, module in self.stream_module.named_modules()}
+        reducer_nodes = []
+        for reducer in self._streaming_reducers:
+            output_index = None
+            input_indices = ()
+            for candidate_output_index, candidate_reducer in self._reducer_head_map.items():
+                if candidate_reducer is reducer:
+                    output_index = int(candidate_output_index)
+                    input_indices = tuple(int(v) for v in self._reducer_input_indices.get(candidate_output_index, ()))
+                    break
+            reducer_nodes.append(
+                ReducerNode(
+                    name=module_names.get(reducer, ""),
+                    reducer_type=type(reducer).__qualname__,
+                    output_index=output_index,
+                    input_indices=input_indices,
+                    metadata={"debug_replay": bool(getattr(reducer, "_debug_replay_enabled", False))},
+                )
+            )
+        return tuple(reducer_nodes)
+
+    def _build_output_layout(self):
+        tensor_specs = tuple(
+            self._tensor_spec_from_shape(shape, dtype=self.dtype, device=self.device)
+            for shape in (self._tile_output_shapes or [])
+        )
+        reducer_aux_indices = tuple(sorted(self._reducer_aux_indices())) if self._reducer_input_indices else ()
+        public_indices = tuple(
+            idx for idx in range(len(tensor_specs)) if idx not in set(reducer_aux_indices)
+        )
+        return OutputLayout(
+            tensor_specs=tensor_specs,
+            output_structure=self._output_spec,
+            public_indices=public_indices,
+            reducer_auxiliary_indices=reducer_aux_indices,
+        )
+
+    def _build_tile_plan(self):
+        return TilePlan(
+            tile_shape=tuple(int(v) for v in self.tile_shape),
+            tile_output_shape=self._shape_tuple(self._tile_output_shape),
+            tile_output_shapes=tuple(self._shape_tuple(shape) or () for shape in (self._tile_output_shapes or [])),
+            tile_output_lost=tuple(self._tile_output_lost or ()),
+            tile_gradient_lost=getattr(self, "tile_gradient_lost", None),
+            output_stride_per_output=tuple(self._output_stride_per_output or ()),
+            output_stride=getattr(self, "output_stride", None),
+        )
+
+    def _refresh_compiled_plan(self):
+        """Publish a coherent immutable plan snapshot from current compile/session metadata."""
+        session_state = self.compiled_plan.session_state
+        plan_state = self.compiled_plan.plan_state
+        tensor_spec = self._tensor_spec_from_shape(self.tile_shape, dtype=self.dtype, device=self.device)
+        self.compiled_plan = CompiledPlan(
+            input_spec=InputSpec(tensor=tensor_spec, model_signature=self._model_signature()),
+            tile_plan=self._build_tile_plan(),
+            output_layout=self._build_output_layout(),
+            layer_plans=self._build_layer_plans(),
+            reducer_nodes=self._build_reducer_nodes(),
+            public_output_spec=self._output_spec,
+            stream_network=self,
+            session_state=session_state,
+            plan_state=plan_state,
+        )
+        return self.compiled_plan
+
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
             print(*args, **kwargs)
@@ -236,6 +351,7 @@ class StreamingCNN(
                 param.grad.data.zero_()
 
         self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
+        self._refresh_compiled_plan()
         del state_dict
 
     def _capture_public_output_spec(self) -> None:
