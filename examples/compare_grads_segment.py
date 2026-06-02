@@ -5,7 +5,7 @@ import argparse
 
 import torch
 import torch.nn as nn
-
+from time import time
 from lightstream.models.segment.streamingwss import StreamingWSS
 
 
@@ -129,6 +129,8 @@ def main() -> None:
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
 
+
+
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
     print(
@@ -139,7 +141,9 @@ def main() -> None:
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
+    start_streaming_forward = time()
     stream_outputs = network(img, mask=mask)
+    end_streaming_forward = time() - start_streaming_forward
     for out in stream_outputs:
         out.requires_grad = True
         out.retain_grad()
@@ -147,9 +151,13 @@ def main() -> None:
     y_pred_streaming = [torch.sigmoid(torch.mean(x)) for x in stream_outputs]
     loss = [criterion(x, target) for x in y_pred_streaming]
     total_loss = sum(loss)
+
+    start_streaming_backward = time()
     total_loss.backward()
     output_grads = tuple(out.grad for out in stream_outputs)
     network.stream_network.backward(img, output_grads, mask=mask)
+    end_streaming_backward = time() - start_streaming_backward
+
 
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
@@ -158,7 +166,10 @@ def main() -> None:
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)
+
+    start_normal_forward = time()
     normal_outputs = normal_net(img_normal, mask=mask)
+    end_normal_forward = time() - start_normal_forward
 
     for stream_out, normal_out in zip(stream_outputs, normal_outputs):
         diff = (stream_out - normal_out).abs()
@@ -167,7 +178,9 @@ def main() -> None:
     y_pred_normal = [torch.sigmoid(torch.mean(x)) for x in normal_outputs]
     normal_loss = [criterion(x, target) for x in y_pred_normal]
     total_loss = sum(normal_loss)
+    start_normal_backward = time()
     total_loss.backward()
+    end_normal_backward = time() - start_normal_backward
     normal_param_grads = _gather_param_grads(normal_net)
 
     if img_normal.grad is not None:
@@ -177,6 +190,16 @@ def main() -> None:
     _compare_grads(streaming_param_grads, normal_param_grads)
     _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)
 
+    print("\n\n")
+    print("Timings")
+    print("Time spend in streaming forward:", end_streaming_forward)
+    print("Time spend in streaming backward:", end_streaming_backward)
+    print("Time spend in normal forward:", end_normal_forward)
+    print("Time spend in normal backward:", end_normal_backward)
+
+    print("\n\n")
+    print("Time difference forward streaming vs normal", end_streaming_forward - end_normal_forward)
+    print("Time difference backward streaming vs normal", end_streaming_backward - end_normal_backward)
 
 if __name__ == "__main__":
     main()

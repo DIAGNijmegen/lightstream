@@ -14,9 +14,9 @@ Only models with a 'simple' design are supported, primarily aimed at torchvision
 
 import torch
 from lightstream.modules.lightningstreaming import StreamingModule
-from core.scnn.scnn import StreamingConv2d
+from lightstream.core.scnn.scnn import StreamingConv2d
 from torchvision.models import resnet18, resnet34, resnet50
-from models.resnet.resnet import split_resnet
+from lightstream.models.resnet.resnet import split_resnet
 
 
 def create_dummy_data(self):

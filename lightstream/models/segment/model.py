@@ -7,13 +7,14 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.reducer import MeanReducer, AttentionGeMReducer, FusedAttentionGeMReducer
+from lightstream.core.reducer import MeanReducer
 from torchinfo import summary
 
 
 
 
 class WSS(nn.Module):
+    "Streaming application of SWIN MIL: https://github.com/Nexuslkl/Swin_MIL"
     def __init__(
         self,
         encoder: str,
@@ -23,26 +24,9 @@ class WSS(nn.Module):
     ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = AttentionGeMReducer(r_init=3.0, accumulator_dtype=reducer_accumulator_dtype)
-        self.red2 = AttentionGeMReducer(r_init=3.0, accumulator_dtype=reducer_accumulator_dtype)
-        self.red3 = AttentionGeMReducer(r_init=3.0, accumulator_dtype=reducer_accumulator_dtype)
-        self.red4 = FusedAttentionGeMReducer(r_init=3.0, accumulator_dtype=reducer_accumulator_dtype)
-
-
-        self.att1 = nn.Sequential(
-            nn.Conv2d(64, 1, 1),
-            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
-        )
-
-        self.att2 = nn.Sequential(
-            nn.Conv2d(128, 1, 1),
-            nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
-        )
-
-        self.att3 = nn.Sequential(
-            nn.Conv2d(256, 1, 1),
-            nn.Upsample(scale_factor=16, mode="bilinear", align_corners=False),
-        )
+        self.red1 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red2 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red3 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -69,18 +53,10 @@ class WSS(nn.Module):
         y1 = self.decoder1(x1)
         y2 = self.decoder2(x2)
         y3 = self.decoder3(x3)
-        #y = 0.3 * y1 + 0.4*y2 + 0.3*y3
+        y = 0.3 * y1 + 0.4*y2 + 0.3*y3
 
-        att1 = self.att1(x1)
-        att2 = self.att2(x2)
-        att3 = self.att3(x3)
+        return self.red1(y1, mask=mask), self.red2(y2, mask=mask), self.red3(y3, mask=mask), y
 
-        return (
-            self.red1(y1, att1, mask=mask),
-            self.red2(y2, att2, mask=mask),
-            self.red3(y3, att3, mask=mask),
-            self.red4(y1, y2, y3, att1, att2, att3, mask=mask),
-        )
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
