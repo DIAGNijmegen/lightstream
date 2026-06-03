@@ -3,6 +3,8 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.core.scnn.utils import Lost
 from lightstream.core.reducer import (
     BaseReducer,
     BaseStreamingGlobalReducer,
@@ -135,6 +137,19 @@ class ValueLogitsHeadNet(nn.Module):
         logits = self.logit_head(feat)
         reduced = self.reducer(value, logits, mask=mask)
         return reduced, value, logits
+
+
+class MultiplicativeStatsNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.left = nn.Conv2d(3, 1, kernel_size=3, padding=1, bias=False)
+        self.right = nn.Conv2d(3, 1, kernel_size=3, padding=1, bias=False)
+        self.out = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        left = self.left(x) * 1e20
+        right = self.right(x) * 1e20
+        return self.out(left * right)
 
 
 def _make_streaming(model: nn.Module, tile_size: int = 4):
@@ -472,3 +487,70 @@ def test_scnn_multi_input_reducer_failure_on_input_order_mismatch():
     scnn._reducer_input_indices = {0: (0, 2, 1)}
     with pytest.raises(RuntimeError, match="input index order mismatch"):
         scnn._stitch_forward_outputs([None, None, None], (torch.randn(1, 3, 3, 3),) * 3, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), None)
+
+
+def _unconfigured_scnn_for_statistics():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.device = torch.device("cpu")
+    scnn.dtype = torch.float32
+    return scnn
+
+
+def test_scnn_statistics_gradient_normalization_cleans_nonfinite_without_abs_support():
+    scnn = _unconfigured_scnn_for_statistics()
+    tensor = torch.tensor([[float("nan"), float("inf")], [float("-inf"), 2.0]])
+
+    normalized = scnn._normalize_statistics_gradient(tensor, context="unit test")
+
+    assert torch.isfinite(normalized).all()
+    assert normalized.max() == 1
+    assert normalized[0, 0] == 0
+    assert normalized[0, 1] == 1
+    assert normalized[1, 0] == -0.5
+    assert normalized[1, 1] == 1
+
+    negative_only = torch.tensor([[-4.0, -2.0]])
+    assert torch.equal(scnn._normalize_statistics_gradient(negative_only), negative_only)
+
+
+def test_scnn_non_max_border_amount_rejects_missing_positive_support_with_diagnostics():
+    scnn = _unconfigured_scnn_for_statistics()
+
+    with pytest.raises(RuntimeError, match="finite positive maximum") as exc_info:
+        scnn._non_max_border_amount(torch.tensor([[0.0, float("nan")], [float("-inf"), -2.0]]))
+
+    message = str(exc_info.value)
+    assert "shape=(2, 2)" in message
+    assert "dtype=torch.float32" in message
+    assert "finite_count=2" in message
+    assert "nan_count=1" in message
+    assert "negative_infinity_count=1" in message
+
+
+def test_scnn_multiplicative_statistics_normalization_keeps_lost_values_stable():
+    torch.manual_seed(131)
+    model = MultiplicativeStatsNet().eval()
+
+    first = StreamingCNN(
+        model,
+        tile_shape=(1, 3, 8, 8),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    second = StreamingCNN(
+        MultiplicativeStatsNet().eval(),
+        tile_shape=(1, 3, 8, 8),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+    assert first.tile_output_lost == second.tile_output_lost == Lost(1, 1, 1, 1)
+    assert first.tile_gradient_lost == second.tile_gradient_lost
+    assert all(torch.isfinite(stat["output_stride"]).all() for stat in first._module_stats.values())
