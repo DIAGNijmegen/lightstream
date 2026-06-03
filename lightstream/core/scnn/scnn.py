@@ -637,9 +637,13 @@ class StreamingCNN(torch.nn.Module):
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
             if isinstance(mod, (torch.nn.Conv2d)):
-                # to counter floating precision errors, we assign 1 to the weights and
-                # normalize the output after the conv.
-                torch.nn.init.constant_(mod.weight, 1)
+                kernel_h, kernel_w = mod.kernel_size
+                fan_in = (mod.in_channels / mod.groups) * kernel_h * kernel_w
+                fan_out = (mod.out_channels / mod.groups) * kernel_h * kernel_w
+                scale = 1.0 / max(fan_in, fan_out)
+                # Keep positive support geometry while preventing fan-in/fan-out
+                # amplification during tile-statistics generation.
+                torch.nn.init.constant_(mod.weight, scale)
                 if mod.bias is not None:
                     torch.nn.init.constant_(mod.bias, 0)
 
