@@ -7,10 +7,32 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.reducer import MeanReducer
+from lightstream.core.reducer import MeanReducer, AttentionGeMReducer, FusedAttentionGeMReducer
 from torchinfo import summary
 
 
+class GatedAttention(nn.Module):
+    """Convolutional implementation of Gated Attention compatible with streaming."""
+
+    def __init__(self, in_channels: int, hidden_channels: int, n_classes: int, scale_factor: int=1):
+        super(GatedAttention, self).__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = n_classes
+
+        self.sigmoid_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Sigmoid()])
+        self.tanh_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Tanh()])
+
+        self.att_logits = nn.Conv2d(hidden_channels, n_classes, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        sigmoid_att = self.sigmoid_branch(x)
+        tanh_att = self.tanh_branch(x)
+
+        dot_product = sigmoid_att * tanh_att
+
+        att_logits = self.att_logits(dot_product)
+        return att_logits
 
 
 class WSS(nn.Module):
@@ -24,9 +46,9 @@ class WSS(nn.Module):
     ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red2 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red3 = MeanReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
+        self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -44,6 +66,10 @@ class WSS(nn.Module):
             nn.Sigmoid(),
         )
 
+        self.att_1 = GatedAttention(in_channels=1, hidden_channels=1, n_classes=1, scale_factor=1)
+        self.att_2 = GatedAttention(in_channels=1, hidden_channels=1, n_classes=1, scale_factor=1)
+        self.att_3 = GatedAttention(in_channels=1, hidden_channels=1, n_classes=1, scale_factor=1)
+
         self.w = [0.3, 0.4, 0.3]
 
 
@@ -55,7 +81,11 @@ class WSS(nn.Module):
         y3 = self.decoder3(x3)
         y = 0.3 * y1 + 0.4*y2 + 0.3*y3
 
-        return self.red1(y1, mask=mask), self.red2(y2, mask=mask), self.red3(y3, mask=mask), y
+        att1 = self.att_1(y1)
+        att2 = self.att_2(y2)
+        att3 = self.att_3(y3)
+
+        return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), y
 
 
 if __name__ == "__main__":

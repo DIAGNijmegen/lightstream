@@ -1694,7 +1694,7 @@ class StreamingCNN(torch.nn.Module):
                 # Some connected branches (e.g. zero-scaled passthrough links for graph connectivity)
                 # produce valid but all-zero gradients during stats gathering; skip border inference.
                 return grad_in
-
+            print(grad_out[0])
             grad_lost = self._non_max_border_amount(grad_out[0])
 
             self._print_verbose(module, "\n", grad_lost)
