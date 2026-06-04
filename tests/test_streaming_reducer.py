@@ -1364,3 +1364,72 @@ def test_streaming_fused_attention_gem_backward_parity_all_inputs():
     for name, ref_grad in ref_grads.items():
         assert name in stream_grads
         assert torch.allclose(stream_grads[name], ref_grad, atol=4e-5, rtol=4e-4), name
+
+
+class RecordingBackwardReducer:
+    def __init__(self):
+        self.valid_masks = []
+
+    def build_backward_pair(
+        self,
+        payload,
+        gradient,
+        *,
+        input_y,
+        input_x,
+        sides,
+        valid_mask,
+    ):
+        self.valid_masks.append(valid_mask.detach().clone())
+        return payload, gradient
+
+
+def test_scnn_backward_reducer_effective_masks_are_per_head_and_common_dst_box():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    reducer0 = RecordingBackwardReducer()
+    reducer1 = RecordingBackwardReducer()
+    scnn._reducer_head_map = {0: reducer0, 1: reducer1}
+    scnn._reducer_input_indices = {}
+    scnn._active_reducer_mask = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [1, 0, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    scnn._backward_reducer_seen_masks = {
+        0: torch.zeros((4, 4), dtype=torch.bool),
+        1: torch.zeros((4, 4), dtype=torch.bool),
+    }
+    scnn.device = torch.device("cpu")
+    sides = type("S", (), dict(top=False, left=False, right=False, bottom=False))()
+    gradient = torch.ones((1, 1, 1, 1))
+
+    first_tile = torch.ones((1, 1, 2, 2))
+    second_tile = torch.ones((1, 1, 2, 2))
+    scnn._build_reducer_backward_pair(
+        0, first_tile, [first_tile], gradient, 0, 0, sides, 0, 0
+    )
+    scnn._build_reducer_backward_pair(
+        0, second_tile, [second_tile], gradient, 0, 0, sides, 1, 1
+    )
+    scnn._build_reducer_backward_pair(
+        1, second_tile, [second_tile], gradient, 0, 0, sides, 1, 1
+    )
+
+    assert torch.equal(
+        reducer0.valid_masks[0],
+        torch.tensor([[1, 1], [1, 0]], dtype=torch.bool),
+    )
+    assert torch.equal(
+        reducer0.valid_masks[1],
+        torch.tensor([[0, 1], [1, 1]], dtype=torch.bool),
+    )
+    assert torch.equal(
+        reducer1.valid_masks[0],
+        torch.tensor([[0, 1], [1, 1]], dtype=torch.bool),
+    )
+    assert scnn._backward_reducer_seen_masks[0].sum().item() == 7
+    assert scnn._backward_reducer_seen_masks[1].sum().item() == 4
