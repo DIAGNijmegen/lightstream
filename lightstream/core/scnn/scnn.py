@@ -17,7 +17,12 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
+from lightstream.core.reducer import (
+    BaseReducer,
+    BaseStreamingGlobalReducer,
+    FusedAttentionGeMReducer,
+    StreamingFusedAttentionGeMReducer,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -598,41 +603,85 @@ class StreamingCNN(torch.nn.Module):
                 "Reducer backward replay requires prior streaming forward pass to resolve reducer heads."
             )
 
+    def _is_fused_attention_gem_reducer(self, reducer) -> bool:
+        return isinstance(reducer, (FusedAttentionGeMReducer, StreamingFusedAttentionGeMReducer))
+
+    def _assert_fused_reducer_payload_order(self, *, reducer, head_idx, ordered_indices, location: str) -> None:
+        if not self._is_fused_attention_gem_reducer(reducer):
+            return
+        expected_indices = tuple(range(int(head_idx), int(head_idx) + 6))
+        if tuple(ordered_indices) != expected_indices:
+            raise RuntimeError(
+                f"{location}: fused reducer head {head_idx} must consume its own passthrough payload "
+                "in order (y1, y2, y3, logits1, logits2, logits3); "
+                f"expected indices={expected_indices}, got indices={tuple(ordered_indices)}"
+            )
+
+    def _find_reducer_payload_occurrence(self, *, reducer, reducer_inputs, flat_output_ids, claimed_output_indices):
+        target_ids = tuple(id(inp) for inp in reducer_inputs)
+        arity = len(target_ids)
+        matches = [
+            start
+            for start in range(0, len(flat_output_ids) - arity + 1)
+            if tuple(flat_output_ids[start : start + arity]) == target_ids
+        ]
+        for start in matches:
+            if all(idx not in claimed_output_indices for idx in range(start, start + arity)):
+                return start
+        if matches:
+            raise RuntimeError(
+                f"Reducer {type(reducer).__name__} passthrough occurrence is ambiguous; "
+                f"matched already-claimed output indices={matches}."
+            )
+        raise RuntimeError(
+            f"Reducer {type(reducer).__name__} passthrough payload is not present as a contiguous "
+            "occurrence in flattened outputs; cannot resolve reducer head inputs."
+        )
+
     def _resolve_reducer_head_map(self, flat_outputs):
         # Invariant: reducer-head resolution happens once per forward stream and remains stable
-        # for the paired backward replay traversal.
+        # for the paired backward replay traversal. Multi-input reducers must be resolved by
+        # their own flattened return occurrence, not by the first matching tensor identity:
+        # WSS-style models intentionally feed the same semantic tensors into red1/red2/red3
+        # and a later fused reducer passthrough.
         if self._reducer_head_map or not self._streaming_reducers:
             return
 
-        output_id_to_index = {}
-        for idx, tensor in enumerate(flat_outputs):
-            output_id_to_index.setdefault(id(tensor), idx)
+        flat_output_ids = [id(tensor) for tensor in flat_outputs]
+        claimed_output_indices = set()
         for reducer in self._streaming_reducers:
             reducer_inputs = getattr(reducer, "_last_inputs", None)
             if reducer_inputs is not None:
                 if not isinstance(reducer_inputs, (tuple, list)):
                     raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}")
-                input_indices = []
-                for input_pos, inp in enumerate(reducer_inputs):
-                    idx = output_id_to_index.get(id(inp))
-                    if idx is None:
-                        raise RuntimeError(
-                            f"Reducer {type(reducer).__name__} input {input_pos} is not present in flattened outputs; cannot resolve reducer head inputs."
-                        )
-                    input_indices.append(idx)
-                output_index = output_id_to_index.get(id(reducer._last_output))
-                if output_index is None:
-                    raise RuntimeError(f"Reducer {type(reducer).__name__} output is not present in flattened outputs.")
+                if len(reducer_inputs) == 0:
+                    raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must not be empty.")
+                output_index = self._find_reducer_payload_occurrence(
+                    reducer=reducer,
+                    reducer_inputs=reducer_inputs,
+                    flat_output_ids=flat_output_ids,
+                    claimed_output_indices=claimed_output_indices,
+                )
+                input_indices = tuple(range(output_index, output_index + len(reducer_inputs)))
+                self._assert_fused_reducer_payload_order(
+                    reducer=reducer,
+                    head_idx=output_index,
+                    ordered_indices=input_indices,
+                    location="StreamingCNN._resolve_reducer_head_map",
+                )
                 self._reducer_head_map[output_index] = reducer
-                self._reducer_input_indices[output_index] = tuple(input_indices)
+                self._reducer_input_indices[output_index] = input_indices
+                claimed_output_indices.update(input_indices)
                 continue
 
             if reducer._last_output is None:
                 continue
-            output_index = output_id_to_index.get(id(reducer._last_output))
+            matches = [idx for idx, tensor_id in enumerate(flat_output_ids) if tensor_id == id(reducer._last_output)]
+            output_index = next((idx for idx in matches if idx not in claimed_output_indices), None)
             if output_index is not None:
                 self._reducer_head_map[output_index] = reducer
                 self._reducer_input_indices[output_index] = (output_index,)
+                claimed_output_indices.add(output_index)
 
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
@@ -904,6 +953,13 @@ class StreamingCNN(torch.nn.Module):
     ):
         if not ordered_indices or ordered_indices[0] != head_idx:
             raise RuntimeError(f"Reducer head {head_idx} input index order mismatch: indices={ordered_indices}")
+        reducer = self._reducer_head_map.get(head_idx)
+        self._assert_fused_reducer_payload_order(
+            reducer=reducer,
+            head_idx=head_idx,
+            ordered_indices=ordered_indices,
+            location="StreamingCNN._build_common_aligned_reducer_payload",
+        )
 
         payload_entries = []
         previous_idx = -1
@@ -1457,6 +1513,12 @@ class StreamingCNN(torch.nn.Module):
     ):
         reducer = self._reducer_head_map[head_idx]
         ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
+        self._assert_fused_reducer_payload_order(
+            reducer=reducer,
+            head_idx=head_idx,
+            ordered_indices=ordered_indices,
+            location="StreamingCNN._build_reducer_backward_pair",
+        )
         if len(ordered_indices) == 1:
             payload = trimmed_output
             common_dst_box = (

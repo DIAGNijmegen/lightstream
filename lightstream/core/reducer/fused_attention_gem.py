@@ -212,7 +212,15 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         payload = self._parse_multi_input_payload(trimmed_output)
         if len(payload) != 6:
             raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
-        y1 = payload[0]
+        y1, y2, y3, logits1, logits2, logits3 = payload
+        try:
+            _validate_value_maps(y1, y2, y3)
+            _normalize_three_logits(logits1, logits2, logits3, y1)
+        except Exception as exc:
+            raise RuntimeError(
+                "StreamingFusedAttentionGeMReducer.build_backward_pair expected payload order "
+                "(y1, y2, y3, logits1, logits2, logits3)."
+            ) from exc
         expected_h, expected_w = int(y1.shape[-2]), int(y1.shape[-1])
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:

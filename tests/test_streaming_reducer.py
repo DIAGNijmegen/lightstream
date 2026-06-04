@@ -860,6 +860,30 @@ def _install_common_crop_recorder(scnn: StreamingCNN):
     return records
 
 
+
+def test_resolve_fused_reducer_uses_own_repeated_passthrough_occurrence():
+    reducer = StreamingFusedAttentionGeMReducer(r_init=2.0)
+    y1 = torch.randn(1, 1, 4, 4)
+    y2 = torch.randn(1, 1, 4, 4)
+    y3 = torch.randn(1, 1, 4, 4)
+    logits1 = torch.randn(1, 1, 4, 4)
+    logits2 = torch.randn(1, 1, 4, 4)
+    logits3 = torch.randn(1, 1, 4, 4)
+    reducer._last_inputs = (y1, y2, y3, logits1, logits2, logits3)
+    reducer._last_output = y1
+
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    object.__setattr__(scnn, "_streaming_reducers", [reducer])
+    object.__setattr__(scnn, "_reducer_head_map", {})
+    object.__setattr__(scnn, "_reducer_input_indices", {})
+
+    flat_outputs = (y1, logits1, y2, logits2, y3, logits3, y1, y2, y3, logits1, logits2, logits3)
+    scnn._resolve_reducer_head_map(flat_outputs)
+
+    assert scnn._reducer_head_map == {6: reducer}
+    assert scnn._reducer_input_indices == {6: (6, 7, 8, 9, 10, 11)}
+
+
 def test_streaming_wss_like_branch_gradients_match_non_streaming_with_masked_lost_borders():
     torch.manual_seed(211)
     model = SmallWSSLikeReducerNet().eval()
@@ -893,6 +917,7 @@ def test_streaming_wss_like_branch_gradients_match_non_streaming_with_masked_los
     assert scnn.tile_gradient_lost.right > 0
 
     stream_outputs = scnn.forward(image.detach().clone(), mask=mask)
+    assert scnn._reducer_input_indices.get(6) == (6, 7, 8, 9, 10, 11)
     assert isinstance(stream_outputs, tuple)
     assert len(stream_outputs) == 4
     for stream_output, ref_output in zip(stream_outputs, ref_outputs):
