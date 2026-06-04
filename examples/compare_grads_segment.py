@@ -18,6 +18,122 @@ MODE_ACTIVE_OUTPUTS: dict[str, tuple[int, ...]] = {
 }
 
 
+DECODER_DIAGNOSTIC_STRIDES: dict[str, int] = {
+    "decoder1.x": 4,
+    "decoder1.conv_out": 4,
+    "decoder1.upsample_out": 1,
+    "decoder1.y": 1,
+    "decoder2.x": 8,
+    "decoder2.conv_out": 8,
+    "decoder2.upsample_out": 1,
+    "decoder2.y": 1,
+    "decoder3.x": 16,
+    "decoder3.conv_out": 16,
+    "decoder3.upsample_out": 1,
+    "decoder3.y": 1,
+}
+
+
+def _decoder_branch_grad_records(model: nn.Module) -> dict[str, torch.Tensor]:
+    records = getattr(model, "decoder_branch_tensors", None)
+    if not records:
+        raise RuntimeError("No decoder branch diagnostic tensors were captured.")
+    record = records[-1]
+    result = {}
+    for name in DECODER_DIAGNOSTIC_STRIDES:
+        tensor = record[name]
+        if tensor.grad is None:
+            raise RuntimeError(f"Missing retained gradient for {name}.")
+        result[name] = tensor.grad.detach().clone()
+    return result
+
+
+def _decoder_branch_stream_grad_records(
+    records: list[dict[str, torch.Tensor]], ref_grads: dict[str, torch.Tensor], tile_records: list[tuple[int, int]]
+) -> dict[str, torch.Tensor]:
+    if not records:
+        raise RuntimeError("No streaming decoder branch diagnostic tensors were captured.")
+    if len(records) != len(tile_records):
+        raise RuntimeError(
+            f"Expected one decoder diagnostic record per backward tile; got {len(records)} records "
+            f"for {len(tile_records)} tiles."
+        )
+
+    result = {}
+    for name, stride in DECODER_DIAGNOSTIC_STRIDES.items():
+        canvas = torch.zeros_like(ref_grads[name])
+        for record, (input_y, input_x) in zip(records, tile_records):
+            grad = record[name].grad
+            if grad is None:
+                raise RuntimeError(f"Missing retained streaming gradient for {name}.")
+            dst_y = int(input_y) // stride
+            dst_x = int(input_x) // stride
+            h = min(grad.shape[-2], canvas.shape[-2] - dst_y)
+            w = min(grad.shape[-1], canvas.shape[-1] - dst_x)
+            if h > 0 and w > 0:
+                canvas[:, :, dst_y : dst_y + h, dst_x : dst_x + w] += (
+                    grad[:, :, :h, :w].detach().to(canvas.device)
+                )
+        result[name] = canvas
+    return result
+
+
+def _decoder_branch_gradient_diagnostics(
+    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor]
+) -> dict[str, dict[str, object]]:
+    diagnostics = {}
+    for name in DECODER_DIAGNOSTIC_STRIDES:
+        stream = stream_grads[name]
+        normal = normal_grads[name].to(stream.device)
+        diff = (stream - normal).abs()
+        flat_idx = int(diff.reshape(-1).argmax().item())
+        diagnostics[name] = {
+            "mean_abs_diff": float(diff.mean().item()),
+            "max_abs_diff": float(diff.reshape(-1)[flat_idx].item()),
+            "stream_mean_abs": float(stream.abs().mean().item()),
+            "normal_mean_abs": float(normal.abs().mean().item()),
+            "max_diff_index": tuple(int(i) for i in torch.unravel_index(torch.tensor(flat_idx), diff.shape)),
+        }
+    return diagnostics
+
+
+def _first_decoder_divergence(
+    diagnostics: dict[str, dict[str, object]], *, atol: float = 3e-4, rtol: float = 3e-3
+) -> str:
+    for branch in (1, 2, 3):
+        for suffix in ("y", "upsample_out", "conv_out", "x"):
+            name = f"decoder{branch}.{suffix}"
+            values = diagnostics[name]
+            limit = atol + rtol * float(values["normal_mean_abs"])
+            if float(values["max_abs_diff"]) > limit:
+                if suffix == "y" and branch in (1, 2):
+                    return "divergence at y1/y2: red4 payload/crop/reducer replay problem"
+                if suffix == "conv_out":
+                    x_name = f"decoder{branch}.x"
+                    x_values = diagnostics[x_name]
+                    x_limit = atol + rtol * float(x_values["normal_mean_abs"])
+                    if float(x_values["max_abs_diff"]) <= x_limit:
+                        return "conv_out gradient differs but x gradient matches: conv weight-gradient crop/aggregation issue"
+                    return "divergence appears after upsample backward: StreamingUpsample2d / tile-lost crop problem"
+                return f"first retained decoder divergence: {name}"
+    return "no retained decoder branch gradient divergence found within tolerance"
+
+
+def _print_decoder_branch_gradient_diagnostics(
+    stream_grads: dict[str, torch.Tensor], normal_grads: dict[str, torch.Tensor]
+) -> None:
+    diagnostics = _decoder_branch_gradient_diagnostics(stream_grads, normal_grads)
+    print("\nDecoder branch retained-gradient diagnostics:")
+    for name, values in diagnostics.items():
+        print(
+            f"  {name}: mean_abs_diff={values['mean_abs_diff']:.6e}, "
+            f"max_abs_diff={values['max_abs_diff']:.6e}, "
+            f"stream_mean_abs={values['stream_mean_abs']:.6e}, "
+            f"normal_mean_abs={values['normal_mean_abs']:.6e}, "
+            f"max_diff_index={values['max_diff_index']}"
+        )
+    print("First-divergence interpretation:", _first_decoder_divergence(diagnostics))
+
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
     grads: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
@@ -169,6 +285,7 @@ def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torc
     )
 
     _freeze_batchnorm(network.stream_network.stream_module)
+    network.stream_network.stream_module.capture_decoder_branch_grads = args.decoder_diagnostics
 
     _zero_grads(network.stream_network.stream_module.parameters())
     start_streaming_forward = time()
@@ -188,18 +305,37 @@ def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torc
         [f"red{idx + 1}={grad.abs().mean().item():.6e}" for idx, grad in enumerate(output_grads)],
     )
 
+    network.stream_network.stream_module.reset_decoder_branch_grad_capture()
+    tile_records: list[tuple[int, int]] = []
+    original_run_backward_tile = network.stream_network._run_backward_tile
+
+    def recording_run_backward_tile(**kwargs):
+        tile_records.append((int(kwargs["input_y"]), int(kwargs["input_x"])))
+        return original_run_backward_tile(**kwargs)
+
+    if args.decoder_diagnostics:
+        network.stream_network._run_backward_tile = recording_run_backward_tile
     start_streaming_backward = time()
-    network.stream_network.backward(img, output_grads, mask=mask)
+    try:
+        network.stream_network.backward(img, output_grads, mask=mask)
+    finally:
+        if args.decoder_diagnostics:
+            network.stream_network._run_backward_tile = original_run_backward_tile
     end_streaming_backward = time() - start_streaming_backward
 
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
+    streaming_decoder_records = list(
+        getattr(network.stream_network.stream_module, "decoder_branch_tensors", [])
+    )
 
     network.stream_network.disable()
     normal_net = network.stream_network.stream_module
+    normal_net.capture_decoder_branch_grads = args.decoder_diagnostics
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(args.input_grad)
 
+    normal_net.reset_decoder_branch_grad_capture()
     start_normal_forward = time()
     normal_outputs = normal_net(img_normal, mask=mask)
     end_normal_forward = time() - start_normal_forward
@@ -212,6 +348,13 @@ def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torc
     torch.autograd.backward(normal_outputs, tuple(grad.detach().clone() for grad in output_grads))
     end_normal_backward = time() - start_normal_backward
     normal_param_grads = _gather_param_grads(normal_net)
+
+    if args.decoder_diagnostics:
+        normal_decoder_grads = _decoder_branch_grad_records(normal_net)
+        streaming_decoder_grads = _decoder_branch_stream_grad_records(
+            streaming_decoder_records, normal_decoder_grads, tile_records
+        )
+        _print_decoder_branch_gradient_diagnostics(streaming_decoder_grads, normal_decoder_grads)
 
     if args.input_grad:
         if img_normal.grad is None:
@@ -264,7 +407,13 @@ def main() -> None:
         action="store_false",
         help="Disable streaming saliency/input-gradient gathering and skip input-gradient comparison.",
     )
-    parser.set_defaults(input_grad=True)
+    parser.add_argument(
+        "--no-decoder-diagnostics",
+        dest="decoder_diagnostics",
+        action="store_false",
+        help="Disable retained-gradient diagnostics for WSS decoder branch internals.",
+    )
+    parser.set_defaults(input_grad=True, decoder_diagnostics=True)
 
     args = parser.parse_args()
 
