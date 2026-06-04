@@ -1384,6 +1384,47 @@ class RecordingBackwardReducer:
         return payload, gradient
 
 
+def _backward_mask_replay_attr_names():
+    replay = "replay"
+    effective = "effective"
+    mask = "mask"
+    masks = f"{mask}s"
+    cursor = "cursor"
+    record = "record"
+    consume = "consume"
+    backward = "backward"
+    return (
+        f"_{replay}_{effective}_{masks}",
+        f"_{replay}_{effective}_{mask}_{cursor}",
+        f"_{record}_{effective}_{mask}_for_{backward}",
+        f"_{consume}_{effective}_{mask}_for_{backward}",
+    )
+
+
+def test_streaming_reducers_do_not_keep_backward_mask_replay_state():
+    reducers = (
+        StreamingMeanReducer(),
+        StreamingGeMReducer(),
+        StreamingAttentionGeMReducer(),
+        StreamingFusedAttentionGeMReducer(),
+    )
+    attr_names = _backward_mask_replay_attr_names()
+
+    for reducer in reducers:
+        assert all(not hasattr(reducer, name) for name in attr_names)
+        reducer.start_stream(
+            output_height=3,
+            output_width=4,
+            batch_size=1,
+            channels=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            debug_replay=True,
+        )
+        reducer.start_backward_replay()
+        assert all(not hasattr(reducer, name) for name in attr_names)
+
+
 def test_scnn_backward_reducer_effective_masks_are_per_head_and_common_dst_box():
     scnn = StreamingCNN.__new__(StreamingCNN)
     reducer0 = RecordingBackwardReducer()
