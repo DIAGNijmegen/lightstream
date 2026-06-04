@@ -245,15 +245,16 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         logits = torch.where(valid4d, logits, torch.full_like(logits, neg_inf))
         weights_unnorm = torch.exp(logits - m)
         weights_unnorm = torch.where(valid4d, weights_unnorm, torch.zeros_like(weights_unnorm))
-        local_s_over_z = streaming_reduce_tile(weights_unnorm * x_pow, valid_mask, zhat)
-        local_z_over_z = streaming_reduce_tile(weights_unnorm, valid_mask, zhat)
+        centered_x_pow = x_pow - global_mean.detach()
+        replay_term = streaming_reduce_tile(weights_unnorm * centered_x_pow, valid_mask, zhat)
+
 
         # Backward replay uses this as a surrogate for the derivative of the
         # finalized global reducer output y = (global_S / global_Z) ** (1/r).
         # Do not finalize each tile independently; the summed tile gradients must
         # match the gradient of that single global expression.
         scale = (1.0 / r) * global_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
-        surrogate = scale.detach() * (local_s_over_z - global_mean.detach() * local_z_over_z)
+        surrogate = scale.detach() * replay_term
         return surrogate.to(dtype=x_tile.dtype)
 
     def to_reducer(self) -> AttentionGeMReducer:
