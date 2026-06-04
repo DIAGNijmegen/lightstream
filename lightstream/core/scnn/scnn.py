@@ -148,6 +148,7 @@ class StreamingCNN(torch.nn.Module):
         self._reducer_head_map = {}
         self._reducer_input_indices = {}
         self._active_reducer_mask = None
+        self._backward_reducer_seen_masks = {}
 
         if state_dict is None:
             self._configure()
@@ -1345,6 +1346,15 @@ class StreamingCNN(torch.nn.Module):
             for reducer in self._reducer_head_map.values():
                 reducer.start_backward_replay()
 
+        self._backward_reducer_seen_masks = {
+            head_idx: torch.zeros(
+                (int(output_heights[head_idx]), int(output_widths[head_idx])),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            for head_idx in self._reducer_head_map
+        }
+
         last_sides = None
         for input_y, input_x, sides in tile_iter:
             last_sides = sides
@@ -1358,6 +1368,8 @@ class StreamingCNN(torch.nn.Module):
         if self.debug_reducer_replay:
             for idx, reducer in self._reducer_head_map.items():
                 reducer.validate_backward_replay_consumed(head_idx=idx)
+
+        self._backward_reducer_seen_masks = {}
 
         self._saved_tensors = {}
 
@@ -1486,6 +1498,20 @@ class StreamingCNN(torch.nn.Module):
             context=f"backward reducer head {head_idx}",
             expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
         )
+
+        seen_mask = self._backward_reducer_seen_masks.get(head_idx)
+        if seen_mask is None:
+            raise RuntimeError(f"Backward reducer seen mask missing for reducer head {head_idx}.")
+
+        seen_slice = seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
+        new_mask = ~seen_slice
+
+        if valid_mask is None:
+            valid_mask = new_mask
+        else:
+            valid_mask = valid_mask.to(device=new_mask.device, dtype=torch.bool) & new_mask
+
+        seen_slice |= new_mask
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
             payload,
