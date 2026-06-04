@@ -8,8 +8,10 @@ from lightstream.core.reducer import (
     BaseReducer,
     BaseStreamingGlobalReducer,
     AttentionGeMReducer,
+    FusedAttentionGeMReducer,
     GeMReducer,
     MeanReducer,
+    StreamingFusedAttentionGeMReducer,
     StreamingGeMReducer,
     StreamingMeanReducer,
     StreamingSumReducer,
@@ -95,6 +97,31 @@ class AttentionGeMHeadNet(nn.Module):
         logits = self.att_logits(feat)
         reduced = self.reducer(value, logits, mask=mask)
         return reduced, value, logits
+
+
+
+class FusedAttentionGeMHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=3, padding=1, bias=False),
+            nn.Softplus(),
+        )
+        self.value_heads = nn.ModuleList(
+            [
+                nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=True), nn.Softplus()),
+                nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=True), nn.Softplus()),
+                nn.Sequential(nn.Conv2d(5, 2, kernel_size=1, bias=True), nn.Softplus()),
+            ]
+        )
+        self.logit_heads = nn.ModuleList([nn.Conv2d(5, 1, kernel_size=1, bias=True) for _ in range(3)])
+        self.reducer = FusedAttentionGeMReducer(r_init=2.5, eps=1e-6)
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.backbone(x)
+        values = [head(feat) for head in self.value_heads]
+        logits = [head(feat) for head in self.logit_heads]
+        return self.reducer(*values, *logits, mask=mask)
 
 
 class ValueLogitsReducer(BaseReducer):
@@ -532,3 +559,40 @@ def test_scnn_multi_input_reducer_failure_on_input_order_mismatch():
     scnn._reducer_input_indices = {0: (0, 2, 1)}
     with pytest.raises(RuntimeError, match="input index order mismatch"):
         scnn._stitch_forward_outputs([None, None, None], (torch.randn(1, 3, 3, 3),) * 3, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), None)
+
+
+def test_streaming_fused_attention_gem_reducer_exposes_four_tensor_payload():
+    torch.manual_seed(127)
+    reducer = FusedAttentionGeMReducer(value_weights=(0.2, 0.5, 0.3)).to_streaming()
+    y1 = torch.rand(1, 2, 4, 5) + 0.1
+    y2 = torch.rand(1, 2, 4, 5) + 0.1
+    y3 = torch.rand(1, 2, 4, 5) + 0.1
+    logits = [torch.randn(1, 1, 4, 5) for _ in range(3)]
+
+    payload = reducer(y1, y2, y3, *logits)
+
+    assert isinstance(reducer, StreamingFusedAttentionGeMReducer)
+    assert len(payload) == 4
+    expected_fused = 0.2 * y1 + 0.5 * y2 + 0.3 * y3
+    assert torch.allclose(payload[0], expected_fused)
+    assert reducer._last_inputs is payload
+    assert reducer._last_output is payload[0]
+
+
+def test_scnn_fused_attention_gem_internal_payload_count_shrinks_to_four():
+    torch.manual_seed(131)
+    model = FusedAttentionGeMHeadNet().eval()
+    image = torch.rand(1, 3, 9, 11) + 0.05
+    mask = torch.rand(9, 11) > 0.2
+
+    with torch.no_grad():
+        expected = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=4)
+    assert isinstance(scnn.stream_module.reducer, StreamingFusedAttentionGeMReducer)
+    assert len(scnn._tile_output_shapes) == 4
+
+    with torch.no_grad():
+        streamed = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
