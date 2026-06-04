@@ -74,6 +74,26 @@ class WSS(nn.Module):
 
         self.w = [0.3, 0.4, 0.3]
 
+        # Test/diagnostic-only switch used to inspect the exact autograd
+        # boundary feeding ``red4``.  It is intentionally opt-in so normal
+        # training/inference does not retain intermediate gradients.
+        self.capture_red4_boundary_grads = False
+        self.red4_boundary_tensors: list[dict[str, Tensor]] = []
+
+    def reset_red4_boundary_grad_capture(self) -> None:
+        """Clear retained ``red4`` input tensors captured for diagnostics."""
+        self.red4_boundary_tensors.clear()
+
+    def _capture_red4_boundary_tensors(self, **tensors: Tensor) -> None:
+        if not self.capture_red4_boundary_grads:
+            return
+
+        captured = {}
+        for name, tensor in tensors.items():
+            if tensor.requires_grad:
+                tensor.retain_grad()
+            captured[name] = tensor
+        self.red4_boundary_tensors.append(captured)
 
     def forward(self, x, mask: torch.Tensor | None = None):
         x1, x2, x3 = self.backbone(x)
@@ -86,6 +106,15 @@ class WSS(nn.Module):
         att1 = self.att_1(x1)
         att2 = self.att_2(x2)
         att3 = self.att_3(x3)
+
+        self._capture_red4_boundary_tensors(
+            y1=y1,
+            y2=y2,
+            y3=y3,
+            att1=att1,
+            att2=att2,
+            att3=att3,
+        )
 
         return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), self.red4(y1,y2,y3,att1,att2,att3,mask=mask)
 
