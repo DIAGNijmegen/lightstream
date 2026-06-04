@@ -6,6 +6,7 @@ import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.models.segment.model import WSS
 from lightstream.models.segment.streamingwss import StreamingWSS
 
 from lightstream.core.reducer import (
@@ -115,6 +116,84 @@ class SmallWSSLikeReducerNet(nn.Module):
             self.red4(y1, y2, y3, att1, att2, att3, mask=mask),
         )
 
+
+def _red4_boundary_grad_records(model: WSS) -> dict[str, torch.Tensor]:
+    assert model.red4_boundary_tensors
+    record = model.red4_boundary_tensors[-1]
+    result = {}
+    for name, tensor in record.items():
+        assert tensor.grad is not None, name
+        result[name] = tensor.grad.detach().clone()
+    return result
+
+
+def _red4_boundary_stream_grad_records(
+    model: WSS, image_shape: torch.Size, tile_records: list[tuple[int, int]]
+) -> dict[str, torch.Tensor]:
+    assert model.red4_boundary_tensors
+    assert len(model.red4_boundary_tensors) == len(tile_records)
+    result = {}
+    for name in ("y1", "y2", "y3", "att1", "att2", "att3"):
+        first_grad = model.red4_boundary_tensors[0][name].grad
+        assert first_grad is not None, name
+        canvas = torch.zeros(
+            first_grad.shape[0],
+            first_grad.shape[1],
+            image_shape[-2],
+            image_shape[-1],
+            dtype=first_grad.dtype,
+            device=first_grad.device,
+        )
+        for record, (input_y, input_x) in zip(model.red4_boundary_tensors, tile_records):
+            grad = record[name].grad
+            assert grad is not None, name
+            h = min(grad.shape[-2], canvas.shape[-2] - input_y)
+            w = min(grad.shape[-1], canvas.shape[-1] - input_x)
+            if h > 0 and w > 0:
+                canvas[:, :, input_y : input_y + h, input_x : input_x + w] += grad[
+                    :, :, :h, :w
+                ].detach()
+        result[name] = canvas
+    return result
+
+
+def _red4_boundary_gradient_diagnostics(
+    stream_grads: dict[str, torch.Tensor], ref_grads: dict[str, torch.Tensor]
+) -> dict[str, dict[str, object]]:
+    diagnostics = {}
+    for name in ("y1", "y2", "y3", "att1", "att2", "att3"):
+        stream = stream_grads[name]
+        ref = ref_grads[name].to(stream.device)
+        diff = (stream - ref).abs()
+        flat_idx = int(diff.reshape(-1).argmax().item())
+        diagnostics[name] = {
+            "mean_abs_diff": float(diff.mean().item()),
+            "max_abs_diff": float(diff.reshape(-1)[flat_idx].item()),
+            "stream_mean_abs": float(stream.abs().mean().item()),
+            "normal_mean_abs": float(ref.abs().mean().item()),
+            "max_diff_index": tuple(
+                int(i) for i in torch.unravel_index(torch.tensor(flat_idx), diff.shape)
+            ),
+        }
+    return diagnostics
+
+
+def _format_red4_boundary_diagnostics(diagnostics: dict[str, dict[str, object]]) -> str:
+    lines = ["red4_only boundary gradient diagnostics:"]
+    for name, values in diagnostics.items():
+        lines.append(
+            f"  {name}: mean_abs_diff={values['mean_abs_diff']:.6g}, "
+            f"max_abs_diff={values['max_abs_diff']:.6g}, "
+            f"stream_mean_abs={values['stream_mean_abs']:.6g}, "
+            f"normal_mean_abs={values['normal_mean_abs']:.6g}, "
+            f"max_diff_index={values['max_diff_index']}"
+        )
+    lines.append(
+        "Interpretation: if y1/y2/att1/att2 already differ while y3/att3 match, "
+        "inspect red4 payload alignment/cropping; if all six boundary gradients match, "
+        "inspect decoder upsample backward/cropping for decoder1 and decoder2."
+    )
+    return "\n".join(lines)
 
 def _require_and_retain_output_grads(outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     for output in outputs:
@@ -828,6 +907,88 @@ def test_streaming_wss_attention_gem_backward_public_outputs_drive_aux_attention
 
     for name in ("att1.0.weight", "att2.0.weight", "att3.0.weight"):
         assert stream_grads[name].abs().sum() > 0, name
+
+
+def test_streaming_wss_red4_only_boundary_gradient_diagnostics(tmp_path):
+    torch.manual_seed(23)
+    image = torch.rand(1, 3, 80, 80)
+    network = StreamingWSS(
+        "resnet18",
+        tile_size=64,
+        weights=None,
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        tile_cache_path=tmp_path / "resnet18_wss_red4_only_boundary_grad_cache",
+    ).eval()
+    scnn = network.stream_network
+    reference = copy.deepcopy(scnn.stream_module).eval()
+
+    assert isinstance(reference, WSS)
+    assert isinstance(scnn.stream_module, WSS)
+    reference.capture_red4_boundary_grads = True
+    scnn.stream_module.capture_red4_boundary_grads = True
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    reference.reset_red4_boundary_grad_capture()
+    ref_outputs = reference(ref_image)
+    ref_grads_out = (
+        torch.zeros_like(ref_outputs[0]),
+        torch.zeros_like(ref_outputs[1]),
+        torch.zeros_like(ref_outputs[2]),
+        torch.full_like(ref_outputs[3], 0.07),
+    )
+    torch.autograd.backward(ref_outputs, ref_grads_out)
+    ref_boundary_grads = _red4_boundary_grad_records(reference)
+
+    scnn.stream_module.reset_red4_boundary_grad_capture()
+    stream_outputs = scnn.forward(image.detach().clone())
+    assert isinstance(stream_outputs, tuple)
+    assert len(stream_outputs) == 4
+    for stream_output, ref_output in zip(stream_outputs, ref_outputs):
+        assert torch.allclose(stream_output, ref_output.detach(), atol=2e-4, rtol=2e-3)
+
+    stream_grads_out = (
+        torch.zeros_like(stream_outputs[0]),
+        torch.zeros_like(stream_outputs[1]),
+        torch.zeros_like(stream_outputs[2]),
+        torch.full_like(stream_outputs[3], 0.07),
+    )
+
+    scnn.stream_module.reset_red4_boundary_grad_capture()
+    tile_records = []
+    original_run_backward_tile = scnn._run_backward_tile
+
+    def recording_run_backward_tile(**kwargs):
+        tile_records.append((int(kwargs["input_y"]), int(kwargs["input_x"])))
+        return original_run_backward_tile(**kwargs)
+
+    scnn._run_backward_tile = recording_run_backward_tile
+    try:
+        scnn.backward(image.detach().clone(), stream_grads_out)
+    finally:
+        scnn._run_backward_tile = original_run_backward_tile
+
+    stream_boundary_grads = _red4_boundary_stream_grad_records(
+        scnn.stream_module, image.shape, tile_records
+    )
+    diagnostics = _red4_boundary_gradient_diagnostics(stream_boundary_grads, ref_boundary_grads)
+    diagnostic_message = _format_red4_boundary_diagnostics(diagnostics)
+
+    for name, values in diagnostics.items():
+        assert values["stream_mean_abs"] > 0, (
+            f"{name} has zero streaming red4_only gradient; {diagnostic_message}"
+        )
+        assert values["normal_mean_abs"] > 0, (
+            f"{name} has zero normal red4_only gradient; {diagnostic_message}"
+        )
+        assert torch.allclose(
+            stream_boundary_grads[name], ref_boundary_grads[name], atol=3e-4, rtol=3e-3
+        ), diagnostic_message
 
 
 def _install_common_crop_recorder(scnn: StreamingCNN):
