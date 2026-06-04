@@ -175,6 +175,10 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         self._last_output = passthrough[0]
         return passthrough
 
+    @staticmethod
+    def _payload_spatial_shapes(payload: tuple[torch.Tensor, ...]) -> tuple[tuple[int, int], ...]:
+        return tuple((int(t.shape[-2]), int(t.shape[-1])) for t in payload)
+
     def accumulate_stream_tile(self, trimmed_output, tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
         payload = self._parse_multi_input_payload(trimmed_output)
         if len(payload) != 6:
@@ -202,6 +206,9 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
                     int(dst_x0),
                     int(dst_x1),
                     len(payload),
+                    self._payload_spatial_shapes(payload),
+                    int(effective_mask.sum().item()),
+                    bool(user_mask is not None),
                 )
             )
         if torch.any(effective_mask):
@@ -217,7 +224,8 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
-            self._replay_cursor = self._validate_replay_assignment(
+            backward_valid_pixels = None if valid_mask is None else int(valid_mask.sum().item())
+            self._replay_cursor = self._validate_fused_replay_assignment(
                 assignments=self._replay_assignments,
                 cursor=self._replay_cursor,
                 input_y=input_y,
@@ -226,9 +234,101 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
                 expected_h=expected_h,
                 expected_w=expected_w,
                 expected_arity=len(payload),
+                backward_payload_shapes=self._payload_spatial_shapes(payload),
+                backward_valid_pixels=backward_valid_pixels,
+                backward_valid_mask_shape=(
+                    None if valid_mask is None else (int(valid_mask.shape[-2]), int(valid_mask.shape[-1]))
+                ),
             )
         reduced_output = self.reduce_tile_for_backward(payload, valid_mask=valid_mask, global_context=self.extra_state_for_backward())
         return reduced_output, gradient
+
+    def _validate_fused_replay_assignment(
+        self,
+        *,
+        assignments: list[tuple],
+        cursor: int,
+        input_y: int,
+        input_x: int,
+        sides,
+        expected_h: int,
+        expected_w: int,
+        expected_arity: int,
+        backward_payload_shapes: tuple[tuple[int, int], ...],
+        backward_valid_pixels: int | None,
+        backward_valid_mask_shape: tuple[int, int] | None,
+    ) -> int:
+        if cursor >= len(assignments):
+            raise RuntimeError("Reducer assignment cursor out of range.")
+        (
+            f_tile_y,
+            f_tile_x,
+            f_top,
+            f_left,
+            f_right,
+            f_bottom,
+            f_h,
+            f_w,
+            dst_y0,
+            dst_y1,
+            dst_x0,
+            dst_x1,
+            f_arity,
+            forward_payload_shapes,
+            forward_effective_pixels,
+            forward_user_mask_present,
+        ) = assignments[cursor]
+        if (
+            int(input_y) != int(f_tile_y)
+            or int(input_x) != int(f_tile_x)
+            or bool(sides.top) != bool(f_top)
+            or bool(sides.left) != bool(f_left)
+            or bool(sides.right) != bool(f_right)
+            or bool(sides.bottom) != bool(f_bottom)
+        ):
+            raise RuntimeError(
+                "Reducer tile replay mismatch: "
+                f"forward tile=({f_tile_y},{f_tile_x},{f_top},{f_left},{f_right},{f_bottom}) "
+                f"backward tile=({int(input_y)},{int(input_x)},{bool(sides.top)},{bool(sides.left)},{bool(sides.right)},{bool(sides.bottom)})"
+            )
+        dst_box = (int(dst_y0), int(dst_y1), int(dst_x0), int(dst_x1))
+        if expected_h != int(f_h) or expected_w != int(f_w):
+            raise RuntimeError(
+                "Reducer trimmed shape mismatch: "
+                f"forward=({f_h},{f_w}) backward=({expected_h},{expected_w}) dst_box={dst_box}"
+            )
+        if (dst_y1 - dst_y0) != expected_h or (dst_x1 - dst_x0) != expected_w:
+            raise RuntimeError(
+                "Reducer assignment mismatch: "
+                f"stored=({dst_y0}:{dst_y1},{dst_x0}:{dst_x1}) current=({expected_h},{expected_w})"
+            )
+        if int(f_arity) != int(expected_arity):
+            raise RuntimeError(
+                f"Reducer input arity mismatch: forward={int(f_arity)} "
+                f"backward={int(expected_arity)} dst_box={dst_box}"
+            )
+        if tuple(forward_payload_shapes) != tuple(backward_payload_shapes):
+            raise RuntimeError(
+                "FusedAttentionGeM reducer payload spatial shape replay mismatch: "
+                f"forward={tuple(forward_payload_shapes)} backward={tuple(backward_payload_shapes)} dst_box={dst_box}"
+            )
+        expected_mask_shape = (int(dst_y1 - dst_y0), int(dst_x1 - dst_x0))
+        if backward_valid_mask_shape != expected_mask_shape:
+            raise RuntimeError(
+                "FusedAttentionGeM reducer backward valid mask shape mismatch: "
+                f"forward dst_box={dst_box} expected_shape={expected_mask_shape} backward_shape={backward_valid_mask_shape}"
+            )
+        if backward_valid_pixels is None:
+            raise RuntimeError("FusedAttentionGeM reducer backward replay requires valid_mask diagnostics.")
+        if int(forward_effective_pixels) != int(backward_valid_pixels):
+            raise RuntimeError(
+                "FusedAttentionGeM reducer forward/backward effective pixel count mismatch: "
+                f"forward_effective_pixels={int(forward_effective_pixels)} "
+                f"backward_valid_pixels={int(backward_valid_pixels)} "
+                f"dst_box={dst_box} payload_shapes={tuple(forward_payload_shapes)} "
+                f"user_mask_present={bool(forward_user_mask_present)}"
+            )
+        return cursor + 1
 
     def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
         self._stream_output_dtype = dtype
