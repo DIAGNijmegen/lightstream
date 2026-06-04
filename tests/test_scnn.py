@@ -7,6 +7,7 @@ from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.reducer import (
     BaseReducer,
     BaseStreamingGlobalReducer,
+    AttentionGeMReducer,
     GeMReducer,
     MeanReducer,
     StreamingGeMReducer,
@@ -72,6 +73,28 @@ class GeMHeadNet(nn.Module):
     def forward(self, x):
         feat = self.backbone(x)
         return self.gem_head(feat)
+
+
+class AttentionGeMHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=3, padding=1, bias=False),
+            nn.Softplus(),
+        )
+        self.value_head = nn.Sequential(
+            nn.Conv2d(5, 2, kernel_size=1, bias=True),
+            nn.Softplus(),
+        )
+        self.att_logits = nn.Conv2d(5, 1, kernel_size=1, bias=True)
+        self.reducer = AttentionGeMReducer(r_init=2.0, eps=1e-6)
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.backbone(x)
+        value = self.value_head(feat)
+        logits = self.att_logits(feat)
+        reduced = self.reducer(value, logits, mask=mask)
+        return reduced, value, logits
 
 
 class ValueLogitsReducer(BaseReducer):
@@ -383,6 +406,42 @@ def test_scnn_multi_input_reducer_backward_positional_input_parity_streaming_vs_
     for name, ref_grad in ref_grads.items():
         assert name in stream_grads
         assert torch.allclose(stream_grads[name], ref_grad, atol=1e-5, rtol=1e-4), name
+
+
+def test_attention_gem_streaming_passthrough_logit_bias_gradient_uniform_shift_parity():
+    torch.manual_seed(123)
+    reference = AttentionGeMHeadNet().eval()
+    streaming_probe = AttentionGeMHeadNet().eval()
+    streaming_probe.load_state_dict(reference.state_dict())
+    image = torch.randn(1, 3, 11, 13)
+    mask = torch.rand(11, 13) > 0.2
+
+    ref_reduced, ref_value, ref_logits = reference(image.clone().requires_grad_(True), mask=mask)
+    torch.autograd.backward(
+        (ref_reduced, ref_value, ref_logits),
+        (torch.ones_like(ref_reduced), torch.zeros_like(ref_value), torch.zeros_like(ref_logits)),
+    )
+    ref_bias_grad = reference.att_logits.bias.grad.detach().clone()
+
+    streaming_probe.reducer._streaming_passthrough = True
+    (stream_value, stream_logits), public_value, public_logits = streaming_probe(image.clone().requires_grad_(True), mask=mask)
+    torch.autograd.backward(
+        (stream_value, stream_logits, public_value, public_logits),
+        (
+            torch.ones_like(stream_value),
+            torch.zeros_like(stream_logits),
+            torch.zeros_like(public_value),
+            torch.zeros_like(public_logits),
+        ),
+    )
+    stream_bias_grad = streaming_probe.att_logits.bias.grad.detach().clone()
+
+    assert streaming_probe.reducer._last_inputs[0] is stream_value
+    assert streaming_probe.reducer._last_inputs[1] is stream_logits
+    assert streaming_probe.reducer._last_output is stream_value
+    assert torch.allclose(stream_bias_grad, ref_bias_grad, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(ref_bias_grad, torch.zeros_like(ref_bias_grad), atol=1e-6, rtol=0)
+    assert torch.allclose(stream_bias_grad, torch.zeros_like(stream_bias_grad), atol=1e-6, rtol=0)
 
 
 def test_scnn_single_input_reducers_compatibility_unchanged():
