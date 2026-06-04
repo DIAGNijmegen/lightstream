@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.reducer import MeanReducer, AttentionGeMReducer, FusedAttentionGeMReducer
+from lightstream.core.reducer import MeanReducer, GeMReducer, AttentionGeMReducer, FusedAttentionGeMReducer
 from torchinfo import summary
 
 
@@ -49,7 +49,7 @@ class WSS(nn.Module):
         self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
         self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
         self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red4 = FusedAttentionGeMReducer(r_init=4.0, accumulator_dtype=reducer_accumulator_dtype)
+        #self.red4 = FusedAttentionGeMReducer(r_init=4.0, accumulator_dtype=reducer_accumulator_dtype)
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -86,7 +86,7 @@ class WSS(nn.Module):
         att2 = self.att_2(y2)
         att3 = self.att_3(y3)
 
-        return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), self.red4(y1,y2,y3,att1,att2,att3,mask=mask)
+        return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), y
 
 
 if __name__ == "__main__":
