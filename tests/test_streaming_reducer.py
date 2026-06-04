@@ -1131,6 +1131,148 @@ def test_streaming_fused_attention_gem_forward_parity_odd_masked_tiles():
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-4)
 
 
+
+
+def _scnn_like_reducer_tiles(height: int, width: int, tile_height: int, tile_width: int, step_y: int, step_x: int):
+    """Yield reducer-domain tile windows with SCNN bottom/right repositioning."""
+    import math
+
+    n_rows = math.ceil(float(max(1, height - tile_height)) / float(step_y)) + 1
+    n_cols = math.ceil(float(max(1, width - tile_width)) / float(step_x)) + 1
+    if height <= tile_height:
+        n_rows = 1
+    if width <= tile_width:
+        n_cols = 1
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            y0 = row * step_y
+            x0 = col * step_x
+            bottom = y0 + tile_height >= height
+            right = x0 + tile_width >= width
+            if bottom:
+                y0 = max(height - tile_height, 0)
+            if right:
+                x0 = max(width - tile_width, 0)
+            if row == 0:
+                y0 = 0
+            if col == 0:
+                x0 = 0
+            y1 = min(y0 + tile_height, height)
+            x1 = min(x0 + tile_width, width)
+            sides = type("S", (), dict(top=row == 0, left=col == 0, right=right, bottom=bottom))()
+            yield y0, y1, x0, x1, sides
+
+
+def test_streaming_fused_attention_gem_reduce_tile_for_backward_scnn_like_tiles_all_inputs():
+    torch.manual_seed(209)
+    dtype = torch.float64
+    batch, channels, height, width = 1, 2, 48, 50
+    tile_height, tile_width = 25, 25
+    step_y, step_x = 16, 16
+    value_weights = (0.2, 0.5, 0.3)
+    attention_weights = (0.6, 0.1, 0.3)
+    r_init = 2.6
+    eps = 1e-6
+
+    base_inputs = {
+        "y1": torch.rand(batch, channels, height, width, dtype=dtype) + 0.05,
+        "y2": torch.rand(batch, channels, height, width, dtype=dtype) + 0.05,
+        "y3": torch.rand(batch, channels, height, width, dtype=dtype) + 0.05,
+        "logits1": torch.randn(batch, 1, height, width, dtype=dtype),
+        "logits2": torch.randn(batch, 1, height, width, dtype=dtype),
+        "logits3": torch.randn(batch, 1, height, width, dtype=dtype),
+    }
+    mask = (torch.rand(height, width) > 0.17)
+    upstream = torch.tensor([[[[0.37]], [[-0.19]]]], dtype=dtype)
+
+    ref_inputs = {name: tensor.detach().clone().requires_grad_(True) for name, tensor in base_inputs.items()}
+    ref_reducer = FusedAttentionGeMReducer(
+        r_init=r_init,
+        eps=eps,
+        value_weights=value_weights,
+        attention_weights=attention_weights,
+        accumulator_dtype=torch.float64,
+    )
+    ref_out = ref_reducer(
+        ref_inputs["y1"],
+        ref_inputs["y2"],
+        ref_inputs["y3"],
+        ref_inputs["logits1"],
+        ref_inputs["logits2"],
+        ref_inputs["logits3"],
+        mask=mask,
+    )
+    torch.autograd.backward(ref_out, upstream)
+    ref_grads = {name: tensor.grad.detach().clone() for name, tensor in ref_inputs.items()}
+
+    stream_inputs = {name: tensor.detach().clone().requires_grad_(True) for name, tensor in base_inputs.items()}
+    stream_reducer = StreamingFusedAttentionGeMReducer(
+        r_init=r_init,
+        eps=eps,
+        value_weights=value_weights,
+        attention_weights=attention_weights,
+        accumulator_dtype=torch.float64,
+    )
+    stream_reducer.start_stream(
+        output_height=height,
+        output_width=width,
+        batch_size=batch,
+        channels=channels,
+        device=base_inputs["y1"].device,
+        dtype=dtype,
+    )
+
+    tiles = list(_scnn_like_reducer_tiles(height, width, tile_height, tile_width, step_y, step_x))
+    assert len(tiles) == 9
+    assert tiles[-1][:4] == (height - tile_height, height, width - tile_width, width)
+
+    with torch.no_grad():
+        for tile_idx, (y0, y1, x0, x1, sides) in enumerate(tiles):
+            forward_tile = tuple(
+                base_inputs[name][:, :, y0:y1, x0:x1]
+                for name in ("y1", "y2", "y3", "logits1", "logits2", "logits3")
+            )
+            stream_reducer.accumulate_stream_tile(
+                forward_tile,
+                tile_idx // 3,
+                tile_idx % 3,
+                sides,
+                (y0, y1, x0, x1),
+                user_mask=mask[y0:y1, x0:x1],
+            )
+        stream_out = stream_reducer.finish_stream()
+
+    assert torch.allclose(stream_out, ref_out.detach(), atol=1e-12, rtol=1e-12)
+
+    stream_reducer.start_backward_replay()
+    replay_outputs = []
+    replay_grads = []
+    for tile_idx, (y0, y1, x0, x1, sides) in enumerate(tiles):
+        backward_tile = tuple(
+            stream_inputs[name][:, :, y0:y1, x0:x1]
+            for name in ("y1", "y2", "y3", "logits1", "logits2", "logits3")
+        )
+        replay_output, replay_grad = stream_reducer.build_backward_pair(
+            backward_tile,
+            upstream,
+            input_y=tile_idx // 3,
+            input_x=tile_idx % 3,
+            sides=sides,
+            valid_mask=mask[y0:y1, x0:x1],
+        )
+        replay_outputs.append(replay_output)
+        replay_grads.append(replay_grad)
+
+    torch.autograd.backward(tuple(replay_outputs), tuple(replay_grads))
+    stream_reducer.validate_backward_replay_consumed(head_idx=0)
+
+    for name in ("y1", "y2", "y3", "logits1", "logits2", "logits3"):
+        assert stream_inputs[name].grad is not None, name
+        assert torch.isfinite(stream_inputs[name].grad).all(), name
+        assert torch.allclose(stream_inputs[name].grad, ref_grads[name], atol=5e-10, rtol=5e-9), name
+
+
 def test_scnn_fused_attention_gem_conversion_and_public_outputs_skip_aux_payloads():
     torch.manual_seed(205)
     model = FusedAttentionGeMHeadNet().eval()
