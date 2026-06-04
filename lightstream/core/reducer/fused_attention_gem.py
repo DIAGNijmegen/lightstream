@@ -204,7 +204,6 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
                     len(payload),
                 )
             )
-        self._record_effective_mask_for_backward(effective_mask)
         if torch.any(effective_mask):
             self.accumulate_valid_tile(payload, valid_mask=effective_mask)
         seen_slice |= new_mask
@@ -214,7 +213,6 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         if len(payload) != 6:
             raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
         y1 = payload[0]
-        valid_mask = self._consume_effective_mask_for_backward(valid_mask, y1)
         expected_h, expected_w = int(y1.shape[-2]), int(y1.shape[-1])
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:

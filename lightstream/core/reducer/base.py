@@ -186,8 +186,6 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
         self._replay_cursor: int | None = None
-        self._replay_effective_masks: list[torch.Tensor] | None = None
-        self._replay_effective_mask_cursor: int | None = None
 
     def reset_stream_state(
         self,
@@ -233,8 +231,6 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self._debug_replay_enabled = debug_replay
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
-        self._replay_effective_masks = []
-        self._replay_effective_mask_cursor = None
 
     def accumulate_stream_tile(self, trimmed_output: torch.Tensor | Sequence[torch.Tensor], tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
         """Accumulate one tile while enforcing non-overlapping pixel counting.
@@ -270,7 +266,6 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
                     1,
                 )
             )
-        self._record_effective_mask_for_backward(effective_mask)
         if torch.any(effective_mask):
             self.accumulate_valid_tile(tile_payload, valid_mask=effective_mask)
         seen_slice |= new_mask
@@ -280,10 +275,7 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         return self.finalize_stream()
 
     def start_backward_replay(self):
-        """Prepare replay cursors used by backward tile checks and masks."""
-        if self._replay_effective_masks is None:
-            raise RuntimeError("Reducer effective-mask replay state is not available. Run forward before backward.")
-        self._replay_effective_mask_cursor = 0
+        """Prepare replay cursor used by debug backward checks."""
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not available for backward replay.")
@@ -292,62 +284,13 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
             self._replay_cursor = None
 
     def validate_backward_replay_consumed(self, *, head_idx: int):
-        """Validate that backward replay consumed all recorded assignments and masks."""
-        if self._replay_effective_masks is None or self._replay_effective_mask_cursor is None:
-            raise RuntimeError("Reducer effective-mask replay state is not initialized.")
-        if self._replay_effective_mask_cursor != len(self._replay_effective_masks):
-            raise RuntimeError(
-                f"Reducer effective-mask replay incomplete for head {head_idx}: "
-                f"consumed={self._replay_effective_mask_cursor}, expected={len(self._replay_effective_masks)}"
-            )
+        """Validate that backward replay consumed all recorded assignments."""
         if not self._debug_replay_enabled:
             return
         if self._replay_assignments is None or self._replay_cursor is None:
             raise RuntimeError("Reducer replay state is not initialized.")
         if self._replay_cursor != len(self._replay_assignments):
             raise RuntimeError(f"Reducer assignment replay incomplete for head {head_idx}: consumed={self._replay_cursor}, expected={len(self._replay_assignments)}")
-
-    def _record_effective_mask_for_backward(self, effective_mask: torch.Tensor) -> None:
-        """Store the exact forward contribution mask for backward replay."""
-        if self._replay_effective_masks is None:
-            raise RuntimeError("Reducer effective-mask replay storage is not initialized.")
-        self._replay_effective_masks.append(effective_mask.detach().clone())
-
-    def _consume_effective_mask_for_backward(
-        self,
-        valid_mask: torch.Tensor | None,
-        reference: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Return the forward effective mask for this backward replay tile.
-
-        Reducer forward accumulation counts each reducer-domain pixel once by
-        combining the user mask with the not-yet-seen overlap mask.  Backward
-        replay must use that same effective mask; using only the user mask
-        double-counts overlapping regions when multiple tiles cover a pixel.
-        """
-        if self._replay_effective_masks is None or self._replay_effective_mask_cursor is None:
-            raise RuntimeError("Reducer effective-mask replay state is not initialized. Call start_backward_replay() first.")
-        if self._replay_effective_mask_cursor >= len(self._replay_effective_masks):
-            raise RuntimeError("Reducer effective-mask replay consumed more tiles than were recorded during forward.")
-
-        effective_mask = self._replay_effective_masks[self._replay_effective_mask_cursor]
-        self._replay_effective_mask_cursor += 1
-        effective_mask = effective_mask.to(device=reference.device, dtype=torch.bool)
-        expected_shape = tuple(reference.shape[-2:])
-        if tuple(effective_mask.shape) != expected_shape:
-            raise RuntimeError(
-                f"Reducer effective-mask replay shape mismatch: got {tuple(effective_mask.shape)}, "
-                f"expected {expected_shape}."
-            )
-        if valid_mask is None:
-            return effective_mask
-        user_mask = valid_mask.to(device=reference.device, dtype=torch.bool)
-        if tuple(user_mask.shape) != expected_shape:
-            raise RuntimeError(
-                f"Reducer backward valid-mask shape mismatch: got {tuple(user_mask.shape)}, "
-                f"expected {expected_shape}."
-            )
-        return effective_mask & user_mask
 
     def finalize_stream(self) -> torch.Tensor:
         """Compute final output from reducer state."""
@@ -363,7 +306,6 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
             or structured tuple/list for multi-input reducers.
         """
         tile_payload = self._parse_single_input_payload(trimmed_output)
-        valid_mask = self._consume_effective_mask_for_backward(valid_mask, tile_payload)
         expected_h = int(tile_payload.shape[-2])
         expected_w = int(tile_payload.shape[-1])
         if self._debug_replay_enabled:
