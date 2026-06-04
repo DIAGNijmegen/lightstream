@@ -152,6 +152,11 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         seen_slice |= new_mask
 
     def build_backward_pair(self, trimmed_output, gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None):
+        """Build a replay tile pair using the mask prepared by ``StreamingCNN``.
+
+        ``valid_mask`` is already overlap-safe for the backward tile, so this
+        reducer applies it locally without retaining separate mask replay state.
+        """
         payload = self._parse_multi_input_payload(trimmed_output)
         x_tile = payload[0]
         expected_h, expected_w = int(x_tile.shape[-2]), int(x_tile.shape[-1])
