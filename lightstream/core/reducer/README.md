@@ -188,7 +188,7 @@ The reducer first fuses the three value maps with the constant `value_weights` b
 
 Both `value_weights` and `attention_weights` are registered as non-trainable buffers, alongside the non-trainable GeM exponent `r`. They are included in module state and copied by `to_streaming()`, but they are not optimized during training.
 
-SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which preserves the same ordered six-tensor payload for tiled accumulation and backward replay.
+SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which keeps the public six-input reducer API but exposes a compact four-tensor internal payload `(fused_y, att_logits1, att_logits2, att_logits3)` for tiled accumulation and backward replay.
 
 ## Extension guide: custom reducers
 
