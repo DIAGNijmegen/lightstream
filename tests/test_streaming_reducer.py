@@ -51,6 +51,71 @@ class MultiReducerNet(nn.Module):
         return self.sum_head(feat), self.mean_head(feat)
 
 
+class SmallGatedAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sigmoid_branch = nn.Sequential(nn.Conv2d(1, 1, kernel_size=1), nn.Sigmoid())
+        self.tanh_branch = nn.Sequential(nn.Conv2d(1, 1, kernel_size=1), nn.Tanh())
+        self.att_logits = nn.Conv2d(1, 1, kernel_size=1)
+
+    def forward(self, x):
+        return self.att_logits(self.sigmoid_branch(x) * self.tanh_branch(x))
+
+
+class SmallWSSLikeReducerNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(),
+        )
+        self.decoder1 = nn.Sequential(
+            nn.Conv2d(4, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.decoder2 = nn.Sequential(
+            nn.Conv2d(4, 3, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(3, 1, kernel_size=1),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Sigmoid(),
+        )
+        self.decoder3 = nn.Sequential(
+            nn.Conv2d(4, 3, kernel_size=3, stride=4, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(3, 1, kernel_size=1),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
+            nn.Sigmoid(),
+        )
+        self.att1 = SmallGatedAttention()
+        self.att2 = SmallGatedAttention()
+        self.att3 = SmallGatedAttention()
+        self.red1 = AttentionGeMReducer(r_init=2.4, eps=1e-6)
+        self.red2 = AttentionGeMReducer(r_init=2.4, eps=1e-6)
+        self.red3 = AttentionGeMReducer(r_init=2.4, eps=1e-6)
+        self.red4 = FusedAttentionGeMReducer(
+            r_init=2.6,
+            eps=1e-6,
+            value_weights=(0.3, 0.4, 0.3),
+            attention_weights=(0.3, 0.4, 0.3),
+        )
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.stem(x)
+        y1 = self.decoder1(feat)
+        y2 = self.decoder2(feat)
+        y3 = self.decoder3(feat)
+        att1 = self.att1(y1)
+        att2 = self.att2(y2)
+        att3 = self.att3(y3)
+        return (
+            self.red1(y1, att1, mask=mask),
+            self.red2(y2, att2, mask=mask),
+            self.red3(y3, att3, mask=mask),
+            self.red4(y1, y2, y3, att1, att2, att3, mask=mask),
+        )
+
+
 def _require_and_retain_output_grads(outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     for output in outputs:
         output.requires_grad_(True)
@@ -763,6 +828,103 @@ def test_streaming_wss_attention_gem_backward_public_outputs_drive_aux_attention
 
     for name in ("att1.0.weight", "att2.0.weight", "att3.0.weight"):
         assert stream_grads[name].abs().sum() > 0, name
+
+
+def _install_common_crop_recorder(scnn: StreamingCNN):
+    records = []
+    original = scnn._build_common_aligned_reducer_payload
+
+    def recording_build_common_aligned_reducer_payload(
+        *, head_idx, tile_outputs, ordered_indices, tile_input_y, tile_input_x, sides
+    ):
+        result = original(
+            head_idx=head_idx,
+            tile_outputs=tile_outputs,
+            ordered_indices=ordered_indices,
+            tile_input_y=tile_input_y,
+            tile_input_x=tile_input_x,
+            sides=sides,
+        )
+        _trimmed_payload, _common_loc, common_dst_box = result
+        records.append(
+            {
+                "head_idx": int(head_idx),
+                "indices": tuple(int(idx) for idx in ordered_indices),
+                "tile": (int(tile_input_y), int(tile_input_x)),
+                "common_dst_box": tuple(int(v) for v in common_dst_box),
+            }
+        )
+        return result
+
+    scnn._build_common_aligned_reducer_payload = recording_build_common_aligned_reducer_payload
+    return records
+
+
+def test_streaming_wss_like_branch_gradients_match_non_streaming_with_masked_lost_borders():
+    torch.manual_seed(211)
+    model = SmallWSSLikeReducerNet().eval()
+    reference = SmallWSSLikeReducerNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = torch.randn(1, 3, 32, 36)
+    mask = (torch.arange(32)[:, None] * 3 + torch.arange(36)[None, :] * 5) % 7 != 0
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_outputs = reference(ref_image, mask=mask)
+    grad_outputs = (
+        torch.full_like(ref_outputs[0], 0.17),
+        torch.full_like(ref_outputs[1], -0.23),
+        torch.full_like(ref_outputs[2], 0.31),
+        torch.full_like(ref_outputs[3], 0.07),
+    )
+    torch.autograd.backward(ref_outputs, grad_outputs)
+    ref_grads = {
+        name: p.grad.detach().clone()
+        for name, p in reference.named_parameters()
+        if p.grad is not None
+    }
+
+    scnn = _make_streaming(model, tile_size=20)
+    scnn.debug_reducer_replay = True
+    common_crop_records = _install_common_crop_recorder(scnn)
+    assert scnn.tile_gradient_lost.top > 0
+    assert scnn.tile_gradient_lost.left > 0
+    assert scnn.tile_gradient_lost.bottom > 0
+    assert scnn.tile_gradient_lost.right > 0
+
+    stream_outputs = scnn.forward(image.detach().clone(), mask=mask)
+    assert isinstance(stream_outputs, tuple)
+    assert len(stream_outputs) == 4
+    for stream_output, ref_output in zip(stream_outputs, ref_outputs):
+        assert torch.allclose(stream_output, ref_output.detach(), atol=2e-5, rtol=2e-4)
+
+    scnn.backward(image.detach().clone(), tuple(grad.detach().clone() for grad in grad_outputs), mask=mask)
+    stream_grads = {
+        name: p.grad.detach().clone()
+        for name, p in scnn.stream_module.named_parameters()
+        if p.grad is not None
+    }
+
+    compared_names = [
+        name
+        for name, _param in reference.named_parameters()
+        if name.startswith(("decoder1.", "decoder2.", "decoder3.", "att1.", "att2.", "att3."))
+    ]
+    assert compared_names
+    assert common_crop_records
+
+    crop_debug = (
+        f"reducer_input_indices={scnn._reducer_input_indices}; "
+        f"common_crop_boxes={common_crop_records}"
+    )
+    for name in compared_names:
+        assert name in ref_grads, f"missing reference gradient for {name}; {crop_debug}"
+        assert name in stream_grads, f"missing streaming gradient for {name}; {crop_debug}"
+        assert torch.isfinite(ref_grads[name]).all(), f"non-finite reference gradient for {name}; {crop_debug}"
+        assert torch.isfinite(stream_grads[name]).all(), f"non-finite streaming gradient for {name}; {crop_debug}"
+        if not torch.allclose(stream_grads[name], ref_grads[name], atol=2e-5, rtol=2e-4):
+            max_abs = (stream_grads[name] - ref_grads[name]).abs().max().item()
+            pytest.fail(f"gradient mismatch for {name}: max_abs={max_abs}; {crop_debug}")
 
 
 def test_streaming_attention_gem_backward_parity_x_and_logits():
