@@ -1144,8 +1144,12 @@ class StreamingCNN(torch.nn.Module):
                 sides=sides,
                 backward_ctx=backward_ctx,
             )
-            trimmed_outputs.append(paired_output)
-            trimmed_grads.append(paired_grad)
+            if isinstance(paired_output, (tuple, list)):
+                trimmed_outputs.extend(paired_output)
+                trimmed_grads.extend(paired_grad)
+            else:
+                trimmed_outputs.append(paired_output)
+                trimmed_grads.append(paired_grad)
 
         torch.autograd.backward(trimmed_outputs, trimmed_grads)
 

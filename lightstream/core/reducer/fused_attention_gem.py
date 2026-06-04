@@ -227,8 +227,12 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
                 expected_w=expected_w,
                 expected_arity=len(payload),
             )
-        reduced_output = self.reduce_tile_for_backward(payload, valid_mask=valid_mask, global_context=self.extra_state_for_backward())
-        return reduced_output, gradient
+        return self.build_backward_tensors(
+            payload,
+            gradient,
+            valid_mask=valid_mask,
+            global_context=self.extra_state_for_backward(),
+        )
 
     def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
         self._stream_output_dtype = dtype
@@ -303,6 +307,81 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             "value_weights": self.value_weights.to(device=self.running_shat.device, dtype=acc_dtype),
             "attention_weights": aw,
         }
+
+    def build_backward_tensors(
+        self,
+        trimmed_output,
+        gradient: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None,
+        global_context,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        if valid_mask is None:
+            raise ValueError("StreamingFusedAttentionGeMReducer backward replay requires a valid_mask.")
+        y1, y2, y3, logits1, logits2, logits3 = self._parse_multi_input_payload(trimmed_output)
+        _validate_value_maps(y1, y2, y3)
+
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, y1.dtype)
+        vw = global_context["value_weights"].to(device=y1.device, dtype=acc_dtype)
+        aw = global_context["attention_weights"].to(device=y1.device, dtype=acc_dtype)
+        r = global_context["r"].to(device=y1.device, dtype=acc_dtype)
+        m = global_context["m"].to(device=y1.device, dtype=acc_dtype)
+        zhat = global_context["zhat"].to(device=y1.device, dtype=acc_dtype).clamp_min(self.eps)
+        branch_means = global_context["branch_means"].to(device=y1.device, dtype=acc_dtype)
+        weighted_mean = global_context["weighted_mean"].to(device=y1.device, dtype=acc_dtype)
+
+        fused_y = (
+            vw[0] * y1.to(dtype=acc_dtype)
+            + vw[1] * y2.to(device=y1.device, dtype=acc_dtype)
+            + vw[2] * y3.to(device=y1.device, dtype=acc_dtype)
+        )
+        x = fused_y.clamp_min(self.eps)
+        x_pow = x.pow(r)
+
+        logits = torch.stack(
+            [
+                logit.to(device=y1.device, dtype=acc_dtype)
+                for logit in _normalize_three_logits(logits1, logits2, logits3, y1)
+            ],
+            dim=1,
+        )
+
+        valid5d = valid_mask[None, None, None].to(device=y1.device, dtype=torch.bool)
+        weights_unnorm = torch.exp(logits - m)
+        weights_unnorm = torch.where(valid5d, weights_unnorm, torch.zeros_like(weights_unnorm))
+        weights = weights_unnorm / zhat
+
+        grad = gradient.to(device=y1.device, dtype=acc_dtype)
+        scale = grad * (1.0 / r) * weighted_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+
+        value_mix = (weights * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        dx = scale * value_mix * r * x.pow(r - 1.0)
+        dx = torch.where(fused_y < self.eps, torch.zeros_like(dx), dx)
+
+        dy1 = (vw[0] * dx).to(dtype=y1.dtype)
+        dy2 = (vw[1] * dx).to(dtype=y2.dtype)
+        dy3 = (vw[2] * dx).to(dtype=y3.dtype)
+
+        centered = x_pow[:, None] - branch_means.detach()
+        dlogits = scale[:, None] * aw.view(1, 3, 1, 1, 1) * weights * centered
+        dlogits = dlogits.sum(dim=2, keepdim=False)
+
+        dlogits1 = dlogits[:, 0:1].to(dtype=logits1.dtype)
+        dlogits2 = dlogits[:, 1:2].to(dtype=logits2.dtype)
+        dlogits3 = dlogits[:, 2:3].to(dtype=logits3.dtype)
+
+        valid4d = valid_mask[None, None].to(device=y1.device, dtype=torch.bool)
+        dy1 = torch.where(valid4d, dy1, torch.zeros_like(dy1))
+        dy2 = torch.where(valid4d, dy2, torch.zeros_like(dy2))
+        dy3 = torch.where(valid4d, dy3, torch.zeros_like(dy3))
+        dlogits1 = torch.where(valid4d, dlogits1, torch.zeros_like(dlogits1))
+        dlogits2 = torch.where(valid4d, dlogits2, torch.zeros_like(dlogits2))
+        dlogits3 = torch.where(valid4d, dlogits3, torch.zeros_like(dlogits3))
+
+        return (
+            (y1, y2, y3, logits1, logits2, logits3),
+            (dy1, dy2, dy3, dlogits1, dlogits2, dlogits3),
+        )
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
         if valid_mask is None:
