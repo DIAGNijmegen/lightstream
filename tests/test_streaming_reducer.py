@@ -1246,9 +1246,15 @@ def test_streaming_fused_attention_gem_reduce_tile_for_backward_scnn_like_tiles_
     assert torch.allclose(stream_out, ref_out.detach(), atol=1e-12, rtol=1e-12)
 
     stream_reducer.start_backward_replay()
+    seen = torch.zeros((height, width), dtype=torch.bool)
     replay_outputs = []
     replay_grads = []
     for tile_idx, (y0, y1, x0, x1, sides) in enumerate(tiles):
+        dst_box = (y0, y1, x0, x1)
+        dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
+        new_mask = ~seen[dst_y0:dst_y1, dst_x0:dst_x1]
+        tile_user_mask = mask[dst_y0:dst_y1, dst_x0:dst_x1]
+        effective_mask = new_mask & tile_user_mask
         backward_tile = tuple(
             stream_inputs[name][:, :, y0:y1, x0:x1]
             for name in ("y1", "y2", "y3", "logits1", "logits2", "logits3")
@@ -1259,10 +1265,11 @@ def test_streaming_fused_attention_gem_reduce_tile_for_backward_scnn_like_tiles_
             input_y=tile_idx // 3,
             input_x=tile_idx % 3,
             sides=sides,
-            valid_mask=mask[y0:y1, x0:x1],
+            valid_mask=effective_mask,
         )
         replay_outputs.append(replay_output)
         replay_grads.append(replay_grad)
+        seen[dst_y0:dst_y1, dst_x0:dst_x1] |= new_mask
 
     torch.autograd.backward(tuple(replay_outputs), tuple(replay_grads))
     stream_reducer.validate_backward_replay_consumed(head_idx=0)
