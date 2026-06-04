@@ -101,11 +101,7 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=2560)
     parser.add_argument("--input-size", type=int, default=3200)
-    parser.add_argument(
-        "--debug-reducer-replay",
-        action="store_true",
-        help="Enable reducer replay diagnostics during the streaming backward pass.",
-    )
+
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -133,7 +129,6 @@ def main() -> None:
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.stream_network.debug_reducer_replay = bool(args.debug_reducer_replay)
 
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
