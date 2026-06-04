@@ -637,6 +637,8 @@ class StreamingCNN(torch.nn.Module):
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
             if isinstance(mod, (torch.nn.Conv2d)):
+                # to counter floating precision errors, we assign 1 to the weights and
+                # normalize the output after the conv.
                 kernel_h, kernel_w = mod.kernel_size
                 fan_in = (mod.in_channels / mod.groups) * kernel_h * kernel_w
                 fan_out = (mod.out_channels / mod.groups) * kernel_h * kernel_w
@@ -646,6 +648,7 @@ class StreamingCNN(torch.nn.Module):
                 torch.nn.init.constant_(mod.weight, scale)
                 if mod.bias is not None:
                     torch.nn.init.constant_(mod.bias, 0)
+
 
         for m in self.stream_module.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
@@ -672,87 +675,14 @@ class StreamingCNN(torch.nn.Module):
     def _restore_parameters(self, state_dict):
         self.stream_module.load_state_dict(state_dict)
 
-    def _statistics_tensor_diagnostics(self, tensor, *, context: str = ""):
-        finite = torch.isfinite(tensor)
-        nan = torch.isnan(tensor) if torch.is_floating_point(tensor) else torch.zeros_like(tensor, dtype=torch.bool)
-        pos_inf = tensor == float("inf") if torch.is_floating_point(tensor) else torch.zeros_like(tensor, dtype=torch.bool)
-        neg_inf = tensor == float("-inf") if torch.is_floating_point(tensor) else torch.zeros_like(tensor, dtype=torch.bool)
-        prefix = f"{context}: " if context else ""
-        return (
-            f"{prefix}shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-            f"finite_count={int(finite.sum().item())}, nan_count={int(nan.sum().item())}, "
-            f"positive_infinity_count={int(pos_inf.sum().item())}, "
-            f"negative_infinity_count={int(neg_inf.sum().item())}"
-        )
-
-    def _normalize_statistics_gradient(self, tensor, *, context: str = ""):
-        if tensor is None:
-            return None
-        if tensor.numel() == 0:
-            return tensor
-        if not torch.is_floating_point(tensor):
-            return tensor
-
-        detached = tensor.detach()
-        finite = torch.isfinite(detached)
-
-        finite_positive = finite & (detached > 0)
-        if torch.any(finite_positive):
-            positive_sentinel = detached[finite_positive].max()
-        else:
-            positive_sentinel = torch.ones((), dtype=detached.dtype, device=detached.device)
-
-        finite_negative = finite & (detached < 0)
-        if torch.any(finite_negative):
-            negative_sentinel = detached[finite_negative].min()
-        else:
-            negative_sentinel = -torch.ones((), dtype=detached.dtype, device=detached.device)
-
-        cleaned = torch.where(
-            torch.isnan(detached),
-            torch.zeros((), dtype=detached.dtype, device=detached.device),
-            detached,
-        )
-        cleaned = torch.where(detached == float("inf"), positive_sentinel, cleaned)
-        cleaned = torch.where(detached == float("-inf"), negative_sentinel, cleaned)
-
-        scale = cleaned.max()
-        if torch.isfinite(scale).item() and (scale > 0).item():
-            return cleaned / scale
-        return cleaned
-
     def _non_max_border_amount(self, tensor):
-        if tensor is None:
-            raise RuntimeError("Cannot infer non-max border amount from None tensor")
-        if tensor.numel() == 0:
-            raise RuntimeError(
-                "Cannot infer non-max border amount from empty tensor: "
-                + self._statistics_tensor_diagnostics(tensor, context="non_max_border_amount")
-            )
-
-        original = tensor
-        tensor = self._normalize_statistics_gradient(tensor, context="non_max_border_amount")
-
         # Sum over the channels, useful for networks that treat certain channels
         # different (e.g., DenseNet)
         if tensor.dim() > 3:
             tensor = torch.sum(tensor, dim=1)[0]
-
-        tensor_max = tensor.max()
-        if (not torch.isfinite(tensor_max).item()) or (tensor_max <= 0).item():
-            raise RuntimeError(
-                "Cannot infer non-max border amount without a finite positive maximum: "
-                + self._statistics_tensor_diagnostics(original, context="non_max_border_amount")
-            )
-
-        tensor = tensor / tensor_max  # normalize by a positive scalar to preserve max localization
+        tensor = tensor / tensor.max()  # normalize
         tensor = tensor > tensor.max() * (1 - self.eps)
         non_zero = tensor.nonzero(as_tuple=False)
-        if non_zero.numel() == 0:
-            raise RuntimeError(
-                "Cannot infer non-max border amount because thresholding produced no support: "
-                + self._statistics_tensor_diagnostics(original, context="non_max_border_amount")
-            )
         top, left = non_zero.min(dim=0)[0]
         # for bottom and right we need to substract -1: correct index 3 is actually the 4th pixel
         bottom, right = (
@@ -1767,21 +1697,16 @@ class StreamingCNN(torch.nn.Module):
                 f_grad = torch.from_numpy(grad)
                 f_grad = f_grad.to(self.device)
 
-            normalized_grad_out = self._normalize_statistics_gradient(
-                grad_out[0], context=f"{type(module).__name__} grad_out statistics"
-            )
-            if normalized_grad_out.numel() == 0 or torch.count_nonzero(normalized_grad_out) == 0:
+            if grad_out[0].numel() == 0 or torch.count_nonzero(grad_out[0]) == 0:
                 # Some connected branches (e.g. zero-scaled passthrough links for graph connectivity)
                 # produce valid but all-zero gradients during stats gathering; skip border inference.
                 return grad_in
-            grad_lost = self._non_max_border_amount(normalized_grad_out)
+
+            grad_lost = self._non_max_border_amount(grad_out[0])
 
             self._print_verbose(module, "\n", grad_lost)
             self._module_stats[module]["grad_lost"] = grad_lost
 
-            f_grad = self._normalize_statistics_gradient(
-                f_grad, context=f"{type(module).__name__} input-gradient statistics"
-            )
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
             # When kernel_size > stride we have some _overlap_ of gradients,
