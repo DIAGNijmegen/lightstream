@@ -561,7 +561,7 @@ def test_scnn_multi_input_reducer_failure_on_input_order_mismatch():
         scnn._stitch_forward_outputs([None, None, None], (torch.randn(1, 3, 3, 3),) * 3, 0, 0, type('S', (), dict(top=False,left=False,right=False,bottom=False))(), None)
 
 
-def test_streaming_fused_attention_gem_reducer_exposes_four_tensor_payload():
+def test_streaming_fused_attention_gem_reducer_exposes_two_tensor_payload():
     torch.manual_seed(127)
     reducer = FusedAttentionGeMReducer(value_weights=(0.2, 0.5, 0.3)).to_streaming()
     y1 = torch.rand(1, 2, 4, 5) + 0.1
@@ -569,17 +569,26 @@ def test_streaming_fused_attention_gem_reducer_exposes_four_tensor_payload():
     y3 = torch.rand(1, 2, 4, 5) + 0.1
     logits = [torch.randn(1, 1, 4, 5) for _ in range(3)]
 
+    base_reducer = FusedAttentionGeMReducer(value_weights=(0.2, 0.5, 0.3))
+    base_reducer._streaming_passthrough = True
+    base_payload = base_reducer(y1, y2, y3, *logits)
     payload = reducer(y1, y2, y3, *logits)
 
+    assert len(base_payload) == 2
+    assert torch.allclose(base_payload[0], 0.2 * y1 + 0.5 * y2 + 0.3 * y3)
+    assert base_payload[1].shape == (1, 3, 4, 5)
+    assert torch.allclose(base_payload[1], torch.cat(logits, dim=1))
     assert isinstance(reducer, StreamingFusedAttentionGeMReducer)
-    assert len(payload) == 4
+    assert len(payload) == 2
     expected_fused = 0.2 * y1 + 0.5 * y2 + 0.3 * y3
     assert torch.allclose(payload[0], expected_fused)
+    assert payload[1].shape == (1, 3, 4, 5)
+    assert torch.allclose(payload[1], torch.cat(logits, dim=1))
     assert reducer._last_inputs is payload
     assert reducer._last_output is payload[0]
 
 
-def test_scnn_fused_attention_gem_internal_payload_count_shrinks_to_four():
+def test_scnn_fused_attention_gem_internal_payload_count_shrinks_to_two():
     torch.manual_seed(131)
     model = FusedAttentionGeMHeadNet().eval()
     image = torch.rand(1, 3, 9, 11) + 0.05
@@ -590,7 +599,7 @@ def test_scnn_fused_attention_gem_internal_payload_count_shrinks_to_four():
 
     scnn = _make_streaming(model, tile_size=4)
     assert isinstance(scnn.stream_module.reducer, StreamingFusedAttentionGeMReducer)
-    assert len(scnn._tile_output_shapes) == 4
+    assert len(scnn._tile_output_shapes) == 2
 
     with torch.no_grad():
         streamed = scnn.forward(image, mask=mask)
