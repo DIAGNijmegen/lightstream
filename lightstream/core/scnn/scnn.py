@@ -17,7 +17,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
+from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer, StreamingFusedAttentionGeMReducer
 
 
 logger = logging.getLogger(__name__)
@@ -1345,6 +1345,14 @@ class StreamingCNN(torch.nn.Module):
             for reducer in self._reducer_head_map.values():
                 reducer.start_backward_replay()
 
+        self._fused_reducer_backward_seen_masks = {}
+        for head_idx, reducer in self._reducer_head_map.items():
+            if isinstance(reducer, StreamingFusedAttentionGeMReducer):
+                self._fused_reducer_backward_seen_masks[head_idx] = torch.zeros(
+                    (output_heights[head_idx], output_widths[head_idx]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
 
         last_sides = None
         for input_y, input_x, sides in tile_iter:
@@ -1370,6 +1378,7 @@ class StreamingCNN(torch.nn.Module):
         assert last_sides is not None and last_sides.right and last_sides.bottom, (
             "It seems like we could not reconstruct all output"
         )
+        self._fused_reducer_backward_seen_masks = {}
 
     def _build_head_backward_pair(
         self,
@@ -1487,6 +1496,15 @@ class StreamingCNN(torch.nn.Module):
             context=f"backward reducer head {head_idx}",
             expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
         )
+        if isinstance(reducer, StreamingFusedAttentionGeMReducer):
+            seen = self._fused_reducer_backward_seen_masks[head_idx]
+            seen_slice = seen[dst_y0:dst_y1, dst_x0:dst_x1]
+            new_mask = ~seen_slice
+            effective_mask = new_mask if valid_mask is None else (
+                new_mask & valid_mask.to(device=new_mask.device, dtype=torch.bool)
+            )
+            valid_mask = effective_mask
+            seen_slice |= new_mask
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
             payload,
