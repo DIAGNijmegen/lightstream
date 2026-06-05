@@ -10,6 +10,7 @@ from lightstream.models.segment.streamingwss import StreamingWSS
 
 
 GRAD_MODES = ("red123_only", "red4_only", "red1_only", "all")
+
 MODE_ACTIVE_OUTPUTS: dict[str, tuple[int, ...]] = {
     "red123_only": (0, 1, 2),
     "red4_only": (3,),
