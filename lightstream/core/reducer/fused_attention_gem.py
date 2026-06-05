@@ -99,7 +99,8 @@ class FusedAttentionGeMReducer(BaseReducer):
         if self._streaming_passthrough:
             vw = self.value_weights.to(device=y1.device, dtype=y1.dtype)
             fused_y = vw[0] * y1 + vw[1] * y2 + vw[2] * y3
-            passthrough = (fused_y.view_as(fused_y), *logits)
+            logits_stacked = torch.cat(logits, dim=1)
+            passthrough = (fused_y.view_as(fused_y), logits_stacked.view_as(logits_stacked))
             self._last_inputs = passthrough
             self._last_output = passthrough[0]
             return passthrough
