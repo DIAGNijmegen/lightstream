@@ -15,13 +15,21 @@ class GeMReducer(BaseReducer):
         r_init: float = 4.0,
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
+        learnable_r: bool = False,
+        r: float | None = None,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
+        self.learnable_r = bool(learnable_r)
+        if r is not None:
+            r_init = r
 
         init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        self.register_buffer("r", init_r)
+        if self.learnable_r:
+            self.r = torch.nn.Parameter(init_r)
+        else:
+            self.register_buffer("r", init_r)
 
     @property
     def current_r(self) -> torch.Tensor:
@@ -58,8 +66,10 @@ class GeMReducer(BaseReducer):
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            learnable_r=self.learnable_r,
         )
-        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        with torch.no_grad():
+            reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
 
 
@@ -71,11 +81,20 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         r_init: float = 4.0,
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
+        learnable_r: bool = False,
+        r: float | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
+        self.learnable_r = bool(learnable_r)
+        if r is not None:
+            r_init = r
+
         init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        self.register_buffer("r", init_r)
+        if self.learnable_r:
+            self.r = torch.nn.Parameter(init_r)
+        else:
+            self.register_buffer("r", init_r)
 
         self.register_buffer("running_q", torch.zeros(0), persistent=False)
 
@@ -153,6 +172,8 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            learnable_r=self.learnable_r,
         )
-        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        with torch.no_grad():
+            reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
