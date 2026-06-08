@@ -26,15 +26,23 @@ def _zero_grads(parameters: Iterable[torch.nn.Parameter]) -> None:
 
 def _selected_param_names(model: nn.Module) -> list[str]:
     selected: list[str] = []
-    for name, param in model.named_parameters():
+    seen_param_ids = set()
+    named_parameters = list(model.named_parameters(remove_duplicate=False))
+    # Prefer the global WSS alias for shared reducer parameters when it exists.
+    named_parameters.sort(key=lambda item: 0 if item[0] == "reducer_r" else 1)
+
+    for name, param in named_parameters:
         is_decoder_or_attention = name.startswith(
             ("decoder1.", "decoder2.", "decoder3.", "att_1.", "att_2.", "att_3.")
         )
         is_backbone_conv_weight = (
             name.startswith("backbone.") and name.endswith("weight") and param.ndim == 4
         )
-        is_reducer_exponent = name == "r" or name.endswith(".r")
+        is_reducer_exponent = name == "r" or name.endswith(".r") or name == "reducer_r"
         if is_decoder_or_attention or is_backbone_conv_weight or is_reducer_exponent:
+            if id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
             selected.append(name)
     return selected
 
