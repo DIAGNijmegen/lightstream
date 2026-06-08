@@ -48,10 +48,24 @@ class WSS(nn.Module):
     ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
-        self.red2 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
-        self.red3 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
-        self.red4 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
+        self.reducer_r = nn.Parameter(torch.tensor(4.0, dtype=torch.float32))
+
+        self.red1 = GeMReducer(
+            accumulator_dtype=reducer_accumulator_dtype,
+            r_parameter=self.reducer_r,
+        )
+        self.red2 = GeMReducer(
+            accumulator_dtype=reducer_accumulator_dtype,
+            r_parameter=self.reducer_r,
+        )
+        self.red3 = GeMReducer(
+            accumulator_dtype=reducer_accumulator_dtype,
+            r_parameter=self.reducer_r,
+        )
+        self.red4 = GeMReducer(
+            accumulator_dtype=reducer_accumulator_dtype,
+            r_parameter=self.reducer_r,
+        )
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -88,7 +102,12 @@ class WSS(nn.Module):
         # att2 = self.att_2(x2)
         # att3 = self.att_3(x3)
 
-        return self.red1(y1,  mask=mask), self.red2(y2, mask=mask), self.red3(y3, mask=mask), self.red4(y ,mask=mask)
+        return (
+            self.red1(y1, mask=mask),
+            self.red2(y2, mask=mask),
+            self.red3(y3, mask=mask),
+            self.red4(y, mask=mask),
+        )
 
 
 if __name__ == "__main__":
