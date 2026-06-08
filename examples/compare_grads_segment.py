@@ -169,10 +169,12 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     stream_outputs = (
         (stream_outputs,) if isinstance(stream_outputs, torch.Tensor) else tuple(stream_outputs)
     )
-    #for output in stream_outputs:
-    #    output.requires_grad = True
+    stream_outputs_for_grads = tuple(
+        output if output.requires_grad else output.detach().requires_grad_()
+        for output in stream_outputs
+    )
 
-    output_grads = _base_output_grads(stream_outputs, target, criterion)
+    output_grads = _base_output_grads(stream_outputs_for_grads, target, criterion)
     print(
         "upstream grad mean abs per output:",
         [f"output{idx}={grad.abs().mean().item():.6e}" for idx, grad in enumerate(output_grads)],
