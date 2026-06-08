@@ -79,7 +79,7 @@ class GeMReducer(BaseReducer):
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
-            learnable_r=self.learnable_r,
+            learnable_r=False,
         )
         with torch.no_grad():
             reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
