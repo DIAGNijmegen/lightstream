@@ -68,6 +68,13 @@ class GeMReducer(BaseReducer):
         return y.to(dtype=x.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
+        if self.learnable_r:
+            return StreamingGeMReducer(
+                eps=self.eps,
+                accumulator_dtype=self.accumulator_dtype,
+                r_parameter=self.r,
+            )
+
         reducer = StreamingGeMReducer(
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
@@ -89,18 +96,24 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
         r: float | None = None,
+        r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
-        self.learnable_r = bool(learnable_r)
+
         if r is not None:
             r_init = r
 
-        init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        if self.learnable_r:
-            self.r = torch.nn.Parameter(init_r)
+        if r_parameter is not None:
+            self.r = r_parameter
+            self.learnable_r = True
         else:
-            self.register_buffer("r", init_r)
+            self.learnable_r = bool(learnable_r)
+            init_r = torch.tensor(float(r_init), dtype=torch.float32)
+            if self.learnable_r:
+                self.r = torch.nn.Parameter(init_r)
+            else:
+                self.register_buffer("r", init_r)
 
         self.register_buffer("running_q", torch.zeros(0), persistent=False)
         self._r_correction_emitted = False
@@ -198,6 +211,13 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         return (input_surrogate + r_correction).to(dtype=trimmed_output.dtype)
 
     def to_reducer(self) -> GeMReducer:
+        if self.learnable_r:
+            return GeMReducer(
+                eps=self.eps,
+                accumulator_dtype=self.accumulator_dtype,
+                r_parameter=self.r,
+            )
+
         reducer = GeMReducer(
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
