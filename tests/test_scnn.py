@@ -405,6 +405,46 @@ def test_gem_reducer_accepts_shared_r_parameter():
     assert dict(second.named_parameters())["r"] is shared_r
 
 
+def test_streaming_gem_reducer_accepts_shared_r_parameter_with_separate_state():
+    shared_r = torch.nn.Parameter(torch.tensor(3.5))
+
+    first = StreamingGeMReducer(r_parameter=shared_r)
+    second = StreamingGeMReducer(r_parameter=shared_r, r_init=1.0, learnable_r=False, r=2.0)
+
+    assert first.r is shared_r
+    assert second.r is shared_r
+    assert first.learnable_r is True
+    assert second.learnable_r is True
+    assert dict(first.named_parameters())["r"] is shared_r
+    assert dict(second.named_parameters())["r"] is shared_r
+
+    first.reset_stream_state(batch_size=1, channels=2, device=torch.device("cpu"), dtype=torch.float32)
+    second.reset_stream_state(batch_size=1, channels=2, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert first.running_sum is not second.running_sum
+    assert first.running_q is not second.running_q
+    assert first.running_count is not second.running_count
+    assert first.running_sum.data_ptr() != second.running_sum.data_ptr()
+    assert first.running_q.data_ptr() != second.running_q.data_ptr()
+    assert first.running_count.data_ptr() != second.running_count.data_ptr()
+
+
+def test_gem_reducer_to_streaming_shares_learnable_r_only():
+    reducer = GeMReducer(r_init=2.75, learnable_r=True)
+
+    streaming_reducer = reducer.to_streaming()
+
+    assert isinstance(streaming_reducer, StreamingGeMReducer)
+    assert streaming_reducer.r is reducer.r
+    assert streaming_reducer.learnable_r is True
+    assert dict(streaming_reducer.named_parameters())["r"] is reducer.r
+
+    streaming_reducer.reset_stream_state(batch_size=1, channels=2, device=torch.device("cpu"), dtype=torch.float32)
+    assert streaming_reducer.running_sum is not reducer.r
+    assert streaming_reducer.running_q is not reducer.r
+    assert streaming_reducer.running_count is not reducer.r
+
+
 def test_scnn_mixed_head_reducer_mapping_stable():
     torch.manual_seed(61)
     model = MixedHeadsNet().eval()
