@@ -169,8 +169,8 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     stream_outputs = (
         (stream_outputs,) if isinstance(stream_outputs, torch.Tensor) else tuple(stream_outputs)
     )
-    for output in stream_outputs:
-        output.requires_grad = True
+    #for output in stream_outputs:
+    #    output.requires_grad = True
 
     output_grads = _base_output_grads(stream_outputs, target, criterion)
     print(
