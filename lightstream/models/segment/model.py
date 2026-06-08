@@ -48,10 +48,10 @@ class WSS(nn.Module):
     ):
         super(WSS, self).__init__()
         self.backbone, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=not remove_last_block)
-        self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype)
-        self.red4 = FusedAttentionGeMReducer(r_init=4.0, accumulator_dtype=reducer_accumulator_dtype)
+        self.red1 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
+        self.red2 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
+        self.red3 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
+        self.red4 = GeMReducer(accumulator_dtype=reducer_accumulator_dtype, learnable_r=True)
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -69,9 +69,9 @@ class WSS(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.att_1 = GatedAttention(in_channels=64, hidden_channels=32, n_classes=1, scale_factor=4)
-        self.att_2 = GatedAttention(in_channels=128, hidden_channels=64, n_classes=1, scale_factor=8)
-        self.att_3 = GatedAttention(in_channels=256, hidden_channels=128, n_classes=1, scale_factor=16)
+        # self.att_1 = GatedAttention(in_channels=64, hidden_channels=32, n_classes=1, scale_factor=4)
+        # self.att_2 = GatedAttention(in_channels=128, hidden_channels=64, n_classes=1, scale_factor=8)
+        # self.att_3 = GatedAttention(in_channels=256, hidden_channels=128, n_classes=1, scale_factor=16)
 
         self.w = [0.3, 0.4, 0.3]
 
@@ -84,11 +84,11 @@ class WSS(nn.Module):
         y3 = self.decoder3(x3)
         y = 0.3 * y1 + 0.4*y2 + 0.3*y3
 
-        att1 = self.att_1(x1)
-        att2 = self.att_2(x2)
-        att3 = self.att_3(x3)
+        # att1 = self.att_1(x1)
+        # att2 = self.att_2(x2)
+        # att3 = self.att_3(x3)
 
-        return self.red1(y1, att1, mask=mask), self.red2(y2, att2, mask=mask), self.red3(y3, att3, mask=mask), self.red4(y1,y2,y3,att1,att2,att3,mask=mask)
+        return self.red1(y1,  mask=mask), self.red2(y2, mask=mask), self.red3(y3, mask=mask), self.red4(y ,mask=mask)
 
 
 if __name__ == "__main__":
