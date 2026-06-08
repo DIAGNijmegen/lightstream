@@ -349,7 +349,8 @@ def test_scnn_gem_conversion_forward_backward_parity(learnable_r):
 
     scnn.backward(image.detach().clone(), ref_grad.detach().clone())
 
-    stream_grads = {name: p.grad for name, p in scnn.stream_module.named_parameters() if p.grad is not None}
+    stream_parameters = dict(scnn.stream_module.named_parameters())
+    stream_grads = {name: p.grad for name, p in stream_parameters.items() if p.grad is not None}
     ref_grads = {name: p.grad for name, p in reference.named_parameters() if p.grad is not None}
     for name, ref_param_grad in ref_grads.items():
         assert name in stream_grads
@@ -367,8 +368,27 @@ def test_scnn_gem_conversion_forward_backward_parity(learnable_r):
 
     if learnable_r:
         assert reference.gem_head[1].r.grad is not None
+        assert "gem_head.1.r" in stream_parameters
         assert stream_grads["gem_head.1.r"] is not None
         assert torch.allclose(stream_grads["gem_head.1.r"], reference.gem_head[1].r.grad, atol=1e-5, rtol=1e-4)
+
+
+def test_gem_reducer_learnable_r_constructor_registers_parameter():
+    reducer = GeMReducer(r_init=2.75, learnable_r=True)
+
+    assert isinstance(reducer.r, torch.nn.Parameter)
+    assert reducer.learnable_r is True
+    assert torch.allclose(reducer.r.detach(), torch.tensor(2.75))
+    assert dict(reducer.named_parameters())["r"] is reducer.r
+
+
+def test_gem_reducer_legacy_r_constructor_registers_learnable_parameter():
+    reducer = GeMReducer(r=3.25, r_init=1.5, learnable_r=True)
+
+    assert isinstance(reducer.r, torch.nn.Parameter)
+    assert reducer.learnable_r is True
+    assert torch.allclose(reducer.r.detach(), torch.tensor(3.25))
+    assert dict(reducer.named_parameters())["r"] is reducer.r
 
 
 def test_scnn_mixed_head_reducer_mapping_stable():
