@@ -9,16 +9,6 @@ from time import time
 from lightstream.models.segment.streamingwss import StreamingWSS
 
 
-GRAD_MODES = ("red123_only", "red4_only", "red1_only", "all")
-
-MODE_ACTIVE_OUTPUTS: dict[str, tuple[int, ...]] = {
-    "red123_only": (0, 1, 2),
-    "red4_only": (3,),
-    "red1_only": (0,),
-    "all": (0, 1, 2, 3),
-}
-
-
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
     grads: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
@@ -43,7 +33,8 @@ def _selected_param_names(model: nn.Module) -> list[str]:
         is_backbone_conv_weight = (
             name.startswith("backbone.") and name.endswith("weight") and param.ndim == 4
         )
-        if is_decoder_or_attention or is_backbone_conv_weight:
+        is_reducer_exponent = name == "r" or name.endswith(".r")
+        if is_decoder_or_attention or is_backbone_conv_weight or is_reducer_exponent:
             selected.append(name)
     return selected
 
@@ -72,6 +63,17 @@ def _compare_selected_grads(
 
     print(f"\nSelected gradient stats ({len(selected_names)} parameters):")
     for name in selected_names:
+        if name == "r" or name.endswith(".r"):
+            missing = []
+            if name not in stream_grads:
+                missing.append("streaming")
+            if name not in normal_grads:
+                missing.append("normal")
+            if missing:
+                print(
+                    f"Warning: reducer exponent parameter {name} is missing "
+                    f"{', '.join(missing)} gradient(s); comparing against zeros."
+                )
         stream_grad = _grad_or_zeros(stream_grads, stream_params, name)
         normal_grad = _grad_or_zeros(normal_grads, normal_params, name)
         diff = (stream_grad - normal_grad).abs()
@@ -127,25 +129,14 @@ def _base_output_grads(
     return tuple(grad.detach().clone() for grad in grads)
 
 
-def _mode_output_grads(
-    outputs: Sequence[torch.Tensor], mode: str, target: torch.Tensor, criterion: nn.Module
-) -> tuple[torch.Tensor, ...]:
-    base_grads = _base_output_grads(outputs, target, criterion)
-    active_outputs = set(MODE_ACTIVE_OUTPUTS[mode])
-    return tuple(
-        base_grad if output_idx in active_outputs else torch.zeros_like(base_grad)
-        for output_idx, base_grad in enumerate(base_grads)
-    )
-
-
-def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torch.Tensor) -> None:
+def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor) -> None:
     device = img.device
     dtype = img.dtype
     target = torch.tensor(50.0, device=device, dtype=dtype)
     criterion = torch.nn.MSELoss()
 
     print("\n" + "=" * 80)
-    print(f"Gradient comparison mode: {mode}")
+    print("Gradient comparison")
     print("=" * 80)
 
     network = StreamingWSS(
@@ -175,18 +166,16 @@ def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torc
     start_streaming_forward = time()
     stream_outputs = network(img, mask=mask)
     end_streaming_forward = time() - start_streaming_forward
-    if not isinstance(stream_outputs, tuple) or len(stream_outputs) != 4:
-        output_count = len(stream_outputs) if hasattr(stream_outputs, "__len__") else "unknown"
-        raise RuntimeError(
-            f"Expected 4 reducer outputs, got {type(stream_outputs)} with length {output_count}"
-        )
+    stream_outputs = (
+        (stream_outputs,) if isinstance(stream_outputs, torch.Tensor) else tuple(stream_outputs)
+    )
     for output in stream_outputs:
         output.requires_grad = True
 
-    output_grads = _mode_output_grads(stream_outputs, mode, target, criterion)
+    output_grads = _base_output_grads(stream_outputs, target, criterion)
     print(
         "upstream grad mean abs per output:",
-        [f"red{idx + 1}={grad.abs().mean().item():.6e}" for idx, grad in enumerate(output_grads)],
+        [f"output{idx}={grad.abs().mean().item():.6e}" for idx, grad in enumerate(output_grads)],
     )
 
     start_streaming_backward = time()
@@ -204,10 +193,19 @@ def _run_mode(args: argparse.Namespace, mode: str, img: torch.Tensor, mask: torc
     start_normal_forward = time()
     normal_outputs = normal_net(img_normal, mask=mask)
     end_normal_forward = time() - start_normal_forward
+    normal_outputs = (
+        (normal_outputs,) if isinstance(normal_outputs, torch.Tensor) else tuple(normal_outputs)
+    )
 
-    for idx, (stream_out, normal_out) in enumerate(zip(stream_outputs, normal_outputs), start=1):
+    if len(stream_outputs) != len(normal_outputs):
+        raise RuntimeError(
+            f"Streaming and normal output counts differ: "
+            f"{len(stream_outputs)} vs {len(normal_outputs)}"
+        )
+
+    for idx, (stream_out, normal_out) in enumerate(zip(stream_outputs, normal_outputs)):
         diff = (stream_out - normal_out).abs()
-        print(f"red{idx} forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
+        print(f"output{idx} forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
     start_normal_backward = time()
     torch.autograd.backward(normal_outputs, tuple(grad.detach().clone() for grad in output_grads))
@@ -253,13 +251,6 @@ def main() -> None:
     parser.add_argument("--tile-size", type=int, default=2560)
     parser.add_argument("--input-size", type=int, default=5120)
     parser.add_argument(
-        "--modes",
-        nargs="+",
-        default=list(GRAD_MODES),
-        choices=GRAD_MODES,
-        help="Gradient routing modes to run. Defaults to every mode.",
-    )
-    parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
         action="store_false",
@@ -278,9 +269,7 @@ def main() -> None:
     mask = _build_dummy_mask(args.input_size, device=device)
 
     print(f"device={device}, dtype={dtype}, tile_size={args.tile_size}, input_size={args.input_size}")
-    print("modes:", ", ".join(args.modes))
-    for mode in args.modes:
-        _run_mode(args, mode, img, mask)
+    _run_compare(args, img, mask)
 
 
 if __name__ == "__main__":
