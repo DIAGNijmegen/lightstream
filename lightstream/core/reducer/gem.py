@@ -183,11 +183,11 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
                 - global_m.log() / (r * r)
             )
         ).detach()
-        if self.learnable_r and not self._r_correction_emitted:
-            self._r_correction_emitted = True
-            r_correction = (r - r.detach()) * dr_per_output
-        else:
+        r_correction = (r - r.detach()) * dr_per_output
+        if self._r_correction_emitted:
             r_correction = torch.zeros_like(input_surrogate)
+        else:
+            self._r_correction_emitted = True
 
         return (input_surrogate + r_correction).to(dtype=trimmed_output.dtype)
 
