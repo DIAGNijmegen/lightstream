@@ -97,6 +97,7 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             self.register_buffer("r", init_r)
 
         self.register_buffer("running_q", torch.zeros(0), persistent=False)
+        self._r_correction_emitted = False
 
     @property
     def current_r(self) -> torch.Tensor:
@@ -151,6 +152,10 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             "q": self.running_q.to(dtype=acc_dtype),
         }
 
+    def start_backward_replay(self):
+        super().start_backward_replay()
+        self._r_correction_emitted = False
+
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
         if valid_mask is None:
             raise ValueError("StreamingGeMReducer backward replay requires a valid_mask.")
@@ -178,7 +183,11 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
                 - global_m.log() / (r * r)
             )
         ).detach()
-        r_correction = (r - r.detach()) * dr_per_output
+        if self.learnable_r and not self._r_correction_emitted:
+            self._r_correction_emitted = True
+            r_correction = (r - r.detach()) * dr_per_output
+        else:
+            r_correction = torch.zeros_like(input_surrogate)
 
         return (input_surrogate + r_correction).to(dtype=trimmed_output.dtype)
 
