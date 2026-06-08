@@ -161,19 +161,26 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         r = global_context["r"].to(device=trimmed_output.device, dtype=acc_dtype)
         n = global_context["normalization"].to(device=trimmed_output.device, dtype=acc_dtype).clamp_min(1)
 
-        x_pow = x_clamped.pow(r)
+        x_pow = x_clamped.pow(r.detach())
         local_m = streaming_reduce_tile(x_pow, valid_mask, n)
 
-        global_m = global_context["m"].to(device=trimmed_output.device, dtype=acc_dtype)
-        y = global_m.clamp_min(self.eps).pow(1.0 / r)
-        scale = ((1.0 / r) * global_m.clamp_min(self.eps).pow(1.0 / r - 1.0)).detach()
+        global_m = global_context["m"].to(device=trimmed_output.device, dtype=acc_dtype).clamp_min(self.eps)
+        scale = ((1.0 / r) * global_m.pow(1.0 / r - 1.0)).detach()
+        input_surrogate = scale * local_m
 
-        n_t = valid_mask.sum().to(device=trimmed_output.device, dtype=acc_dtype)
-        tile_fraction = n_t / n
-        missing_dr = (-y * global_m.log() / (r * r)).detach()
-        correction = (r - r.detach()) * tile_fraction * missing_dr
+        s = global_context["s"].to(device=trimmed_output.device, dtype=acc_dtype)
+        q = global_context["q"].to(device=trimmed_output.device, dtype=acc_dtype)
+        y = global_m.pow(1.0 / r)
+        dr_per_output = (
+            y
+            * (
+                q / (r * s.clamp_min(self.eps))
+                - global_m.log() / (r * r)
+            )
+        ).detach()
+        r_correction = (r - r.detach()) * dr_per_output
 
-        return (scale * local_m + correction).to(dtype=trimmed_output.dtype)
+        return (input_surrogate + r_correction).to(dtype=trimmed_output.dtype)
 
     def to_reducer(self) -> GeMReducer:
         reducer = GeMReducer(
