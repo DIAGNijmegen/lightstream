@@ -17,19 +17,25 @@ class GeMReducer(BaseReducer):
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
         r: float | None = None,
+        r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
-        self.learnable_r = bool(learnable_r)
+
         if r is not None:
             r_init = r
 
-        init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        if self.learnable_r:
-            self.r = torch.nn.Parameter(init_r)
+        if r_parameter is not None:
+            self.r = r_parameter
+            self.learnable_r = True
         else:
-            self.register_buffer("r", init_r)
+            self.learnable_r = bool(learnable_r)
+            init_r = torch.tensor(float(r_init), dtype=torch.float32)
+            if self.learnable_r:
+                self.r = torch.nn.Parameter(init_r)
+            else:
+                self.register_buffer("r", init_r)
 
     @property
     def current_r(self) -> torch.Tensor:

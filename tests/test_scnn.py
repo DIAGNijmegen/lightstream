@@ -391,6 +391,20 @@ def test_gem_reducer_legacy_r_constructor_registers_learnable_parameter():
     assert dict(reducer.named_parameters())["r"] is reducer.r
 
 
+def test_gem_reducer_accepts_shared_r_parameter():
+    shared_r = torch.nn.Parameter(torch.tensor(3.5))
+
+    first = GeMReducer(r_parameter=shared_r)
+    second = GeMReducer(r_parameter=shared_r, r_init=1.0, learnable_r=False, r=2.0)
+
+    assert first.r is shared_r
+    assert second.r is shared_r
+    assert first.learnable_r is True
+    assert second.learnable_r is True
+    assert dict(first.named_parameters())["r"] is shared_r
+    assert dict(second.named_parameters())["r"] is shared_r
+
+
 def test_scnn_mixed_head_reducer_mapping_stable():
     torch.manual_seed(61)
     model = MixedHeadsNet().eval()
