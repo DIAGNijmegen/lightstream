@@ -77,6 +77,25 @@ class GeMHeadNet(nn.Module):
         return self.gem_head(feat)
 
 
+class SharedRGeMNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.r = nn.Parameter(torch.tensor(4.0))
+        self.red1 = GeMReducer(r_parameter=self.r)
+        self.red2 = GeMReducer(r_parameter=self.r)
+        self.red3 = GeMReducer(r_parameter=self.r)
+        self.red4 = GeMReducer(r_parameter=self.r)
+
+    def forward(self, x, mask=None):
+        x = x.clamp_min(1e-3)
+        return (
+            self.red1(x, mask=mask),
+            self.red2(x + 0.1, mask=mask),
+            self.red3(x + 0.2, mask=mask),
+            self.red4(x + 0.3, mask=mask),
+        )
+
+
 class AttentionGeMHeadNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -371,6 +390,65 @@ def test_scnn_gem_conversion_forward_backward_parity(learnable_r):
         assert "gem_head.1.r" in stream_parameters
         assert stream_grads["gem_head.1.r"] is not None
         assert torch.allclose(stream_grads["gem_head.1.r"], reference.gem_head[1].r.grad, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_shared_r_gem_reducers_forward_backward_parity():
+    torch.manual_seed(59)
+    model = SharedRGeMNet().eval()
+    reference = SharedRGeMNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    assert model.red1.r is model.r
+    assert model.red2.r is model.r
+    assert model.red3.r is model.r
+    assert model.red4.r is model.r
+
+    image = (torch.rand(1, 3, 9, 11) + 0.05).requires_grad_(True)
+    ref_image = image.detach().clone().requires_grad_(True)
+    mask = torch.rand(9, 11) > 0.2
+
+    ref_out = reference(ref_image, mask=mask)
+    ref_grad = tuple(torch.full_like(out, 0.13 + 0.07 * idx) for idx, out in enumerate(ref_out))
+    torch.autograd.backward(ref_out, ref_grad)
+
+    scnn = _make_streaming(model, tile_size=4)
+    stream = scnn.stream_module
+
+    assert isinstance(stream.red1, StreamingGeMReducer)
+    assert isinstance(stream.red2, StreamingGeMReducer)
+    assert isinstance(stream.red3, StreamingGeMReducer)
+    assert isinstance(stream.red4, StreamingGeMReducer)
+    assert stream.red1.r is stream.red2.r
+    assert stream.red1.r is stream.red3.r
+    assert stream.red1.r is stream.red4.r
+
+    r_param_ids = {
+        id(module.r)
+        for module in [stream.red1, stream.red2, stream.red3, stream.red4]
+    }
+    assert len(r_param_ids) == 1
+
+    stream_out = scnn.forward(image.detach().clone(), mask=mask)
+    for actual, expected in zip(stream_out, ref_out):
+        assert torch.allclose(actual, expected.detach(), atol=1e-5, rtol=1e-4)
+
+    scnn.backward(image.detach().clone(), tuple(grad.detach().clone() for grad in ref_grad), mask=mask)
+    assert stream.red1.r.grad is not None
+    assert reference.r.grad is not None
+    assert torch.allclose(stream.red1.r.grad, reference.r.grad, atol=1e-5, rtol=1e-4)
+
+    input_scnn = _make_streaming(SharedRGeMNet().eval(), tile_size=4)
+    input_scnn.stream_module.load_state_dict(reference.state_dict())
+    input_scnn.gather_input_gradient = True
+    input_scnn._remove_hooks()
+    input_scnn._add_hooks_for_streaming()
+    scnn_image = image.detach().clone()
+    input_stream_out = input_scnn.forward(scnn_image, mask=mask)
+    for actual, expected in zip(input_stream_out, ref_out):
+        assert torch.allclose(actual, expected.detach(), atol=1e-5, rtol=1e-4)
+    input_scnn.backward(scnn_image, tuple(grad.detach().clone() for grad in ref_grad), mask=mask)
+    assert torch.allclose(input_scnn.saliency_map, ref_image.grad, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(input_scnn.stream_module.red1.r.grad, reference.r.grad, atol=1e-5, rtol=1e-4)
 
 
 def test_gem_reducer_learnable_r_constructor_registers_parameter():
