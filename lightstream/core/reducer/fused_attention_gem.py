@@ -137,6 +137,7 @@ class FusedAttentionGeMReducer(BaseReducer):
             branch = (weights * x_pow).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
             branch_means.append(torch.where(any_valid, branch, torch.zeros_like(branch)))
 
+        attention_mean = aw[0] * branch_means[0] + aw[1] * branch_means[1] + aw[2] * branch_means[2]
         if self.uniform_attention_eps:
             if mask_nchw is not None:
                 valid = mask_nchw.to(dtype=acc_dtype)
@@ -144,10 +145,11 @@ class FusedAttentionGeMReducer(BaseReducer):
                 uniform_mean = (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / uniform_z
             else:
                 uniform_mean = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
-            branch_means = [(1.0 - self.uniform_attention_eps) * branch + self.uniform_attention_eps * uniform_mean for branch in branch_means]
+            mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
+        else:
+            mixed_mean = attention_mean
 
-        weighted_mean = aw[0] * branch_means[0] + aw[1] * branch_means[1] + aw[2] * branch_means[2]
-        return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=y1.dtype)
+        return mixed_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=y1.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
         reducer = StreamingFusedAttentionGeMReducer(
@@ -332,13 +334,13 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
         branch_means = self.running_shat.to(dtype=acc_dtype) / self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
-        if self.uniform_attention_eps:
-            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
-            branch_means = (1.0 - self.uniform_attention_eps) * branch_means + self.uniform_attention_eps * uniform_mean[:, None]
         # Sum_j attention_weights[j] * E_{softmax(att_j)}[fused_y ** r],
         # which is equivalent to GeM over fused_y weighted by
         # fused_a = sum_j attention_weights[j] * softmax(att_j).
         weighted_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        if self.uniform_attention_eps:
+            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
+            weighted_mean = (1.0 - self.uniform_attention_eps) * weighted_mean + self.uniform_attention_eps * uniform_mean
         output_dtype = self._stream_output_dtype or self.running_shat.dtype
         return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=output_dtype)
 
@@ -346,16 +348,17 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
         attention_branch_means = self.running_shat.to(dtype=acc_dtype) / zhat
+        aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
+        attention_mean = (attention_branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
         if self.uniform_attention_eps:
             uniform_count = self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
             uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / uniform_count
-            branch_means = (1.0 - self.uniform_attention_eps) * attention_branch_means + self.uniform_attention_eps * uniform_mean[:, None]
+            weighted_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         else:
             uniform_count = None
             uniform_mean = None
-            branch_means = attention_branch_means
-        aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
-        weighted_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+            weighted_mean = attention_mean
+        branch_means = attention_branch_means
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
             "m": self.running_m.to(dtype=acc_dtype),
@@ -409,13 +412,16 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         ).reshape(n, branches, 1, 1, 1)
 
         branch_terms = local_s_over_z - attention_branch_means.detach() * local_z_over_z
+        attention_replay_term = (branch_terms * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
         if self.uniform_attention_eps:
             uniform_mean = global_context["uniform_mean"].to(device=fused_y.device, dtype=acc_dtype)
             uniform_count = global_context["uniform_count"].to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
             uniform_replay_term = streaming_reduce_tile(x_pow - uniform_mean.detach(), valid_mask, uniform_count)
-            branch_terms = (1.0 - self.uniform_attention_eps) * branch_terms + self.uniform_attention_eps * uniform_replay_term[:, None]
+            replay_term = (1.0 - self.uniform_attention_eps) * attention_replay_term + self.uniform_attention_eps * uniform_replay_term
+        else:
+            replay_term = attention_replay_term
         scale = (1.0 / r) * weighted_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
-        surrogate = scale.detach() * (branch_terms * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        surrogate = scale.detach() * replay_term
         return surrogate.to(dtype=fused_y.dtype)
 
     def to_reducer(self) -> FusedAttentionGeMReducer:
