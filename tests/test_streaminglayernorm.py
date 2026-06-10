@@ -4,7 +4,7 @@ import types
 import pytest
 import torch
 
-from lightstream.core.scnn import ChannelLayerNorm
+from lightstream.core.scnn import ChannelLayerNorm, StreamingChannelLayerNorm
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm as ImportedChannelLayerNorm
 
 
@@ -36,6 +36,7 @@ def test_channel_layer_norm_rejects_channel_mismatch():
 
 def test_channel_layer_norm_is_public_from_scnn_package():
     assert ImportedChannelLayerNorm is ChannelLayerNorm
+    assert StreamingChannelLayerNorm.__name__ == "StreamingChannelLayerNorm"
 
 
 def test_constructor_considers_only_channel_layer_norm_streamable(monkeypatch):
