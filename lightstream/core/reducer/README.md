@@ -138,9 +138,29 @@ print(y.shape)  # torch.Size([2, 256, 1, 1])
 
 Under `use_streaming=True`, SCNN will call `reducer.to_streaming()` so tiled execution uses the corresponding `StreamingGeMReducer` implementation.
 
-## AttentionGeM examples
+## AttentionGeM
 
-These examples show generalized ordered inputs in both offline and SCNN-streaming contexts.
+`AttentionGeMReducer` reduces a value tensor `x` with attention logits over the same spatial domain. Its exact input ordering is:
+
+```python
+(x, att_logits)
+```
+
+`att_logits` may be `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`. Channel-wise logits are averaged to one spatial logit field before normalization. The reducer converts logits to a globally normalized softmax over valid spatial positions, applies that attention to `x.clamp_min(eps) ** r`, and finally applies the GeM root.
+
+### Uniform attention mixing
+
+`uniform_attention_eps` controls an optional blend between learned attention and a uniform distribution over valid spatial locations. It is validated as a finite value in `[0, 1]` and defaults to `0.0`, preserving pure attention behavior.
+
+For each valid spatial position `i`, let `a_i` be the softmax-normalized attention weight after masking. The mixed weight is:
+
+```text
+a_prime_i = (1 - eps) * a_i + eps / N_valid
+```
+
+where `eps` is `uniform_attention_eps`. Invalid positions receive zero contribution. Masks define `N_valid`: with `mask`, `N_valid` is the count of `True` positions in the reducer's spatial domain; without a mask, `N_valid = H * W`. Thus `uniform_attention_eps=1.0` is equivalent to masked/unmasked uniform GeM over the valid positions, while intermediate values keep a learned-attention term.
+
+The same semantics are used by `StreamingAttentionGeMReducer`: streaming accumulation tracks both the attention numerator/denominator and the valid uniform sum/count so tiled forward and backward replay match full-frame reduction.
 
 ### Non-streaming AttentionGeM
 
@@ -149,10 +169,10 @@ import torch
 from lightstream.core.reducer import AttentionGeMReducer
 
 x = torch.randn(2, 256, 20, 20)
-attn = torch.sigmoid(torch.randn(2, 1, 20, 20))
+att_logits = torch.randn(2, 1, 20, 20)
 
-reducer = AttentionGeMReducer(r_init=3.0, learnable_r=True)
-y = reducer(x, attn)  # forward(*inputs, mask=None), ordered as (x, attn)
+reducer = AttentionGeMReducer(r_init=3.0, uniform_attention_eps=0.05)
+y = reducer(x, att_logits)  # forward(*inputs, mask=None), ordered as (x, att_logits)
 
 print(y.shape)  # torch.Size([2, 256, 1, 1])
 ```
@@ -162,18 +182,12 @@ print(y.shape)  # torch.Size([2, 256, 1, 1])
 ```python
 from lightstream.core.reducer import AttentionGeMReducer
 
-reducer = AttentionGeMReducer(r_init=3.0, learnable_r=True)
+reducer = AttentionGeMReducer(r_init=3.0, uniform_attention_eps=0.05)
 streaming_reducer = reducer.to_streaming()
 
-# Runtime/tile orchestration must preserve ordered inputs: (x_tile, attn_tile)
-streaming_reducer.reduce_tile(
-    x_tile,
-    attn_tile,
-    valid_mask=tile_valid_mask,
-)
+# Runtime/tile orchestration must preserve ordered inputs: (x_tile, att_logits_tile).
+# SCNN calls accumulate_stream_tile/finalize internally; users typically do not.
 ```
-
-If AttentionGeM tracks extra attention-denominator state, that state must be accumulated/finalized and replayed exactly as in full-frame mode.
 
 
 ## FusedAttentionGeM
@@ -184,11 +198,20 @@ If AttentionGeM tracks extra attention-denominator state, that state must be acc
 (y1, y2, y3, att_logits1, att_logits2, att_logits3)
 ```
 
-The reducer first fuses the three value maps with the constant `value_weights` buffer, then applies GeM to that fused value field. Each attention-logit map is independently converted into a full-frame, globally normalized softmax distribution (respecting any spatial mask). The three normalized attention-branch means are then fused with the constant `attention_weights` buffer. In other words, `attention_weights` combine already normalized attention distributions/contributions; they do **not** fuse raw logits before softmax.
+The reducer first fuses the three value maps with the constant `value_weights` buffer, then applies GeM to that fused value field. Each attention-logit map is independently converted into a full-frame, globally normalized softmax distribution (respecting any spatial mask). The three normalized attention branches are then fused with the constant `attention_weights` buffer. In other words, `attention_weights` combine already normalized attention distributions/contributions; they do **not** fuse raw logits before softmax.
+
+`uniform_attention_eps` has the same valid-position definition as regular `AttentionGeMReducer`, but the uniform mix is applied **after** branch fusion, not per branch. Equivalently, form the fused attention weight first:
+
+```text
+a_i = sum_j attention_weights[j] * softmax(att_logits_j)_i
+a_prime_i = (1 - eps) * a_i + eps / N_valid
+```
+
+Again, masks define `N_valid`; without a mask, `N_valid = H * W`. This post-fusion rule means the uniform term is added once to the fused attention distribution rather than separately to each attention branch.
 
 Both `value_weights` and `attention_weights` are registered as non-trainable buffers, alongside the non-trainable GeM exponent `r`. They are included in module state and copied by `to_streaming()`, but they are not optimized during training.
 
-SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which keeps the public six-input reducer API but exposes a compact two-tensor internal payload `(fused_y, att_logits_stacked)`, where the stacked logits use shape `[N, 3, H, W]` for tiled accumulation and backward replay.
+SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which keeps the public six-input reducer API but exposes a compact two-tensor internal payload `(fused_y, att_logits_stacked)`, where the stacked logits use shape `[N, 3, H, W]` for tiled accumulation and backward replay. The streaming implementation tracks per-branch softmax state plus one fused valid uniform sum/count, preserving the post-branch-fusion uniform-mix semantics in forward and backward replay.
 
 ## Extension guide: custom reducers
 
