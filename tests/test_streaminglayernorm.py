@@ -119,6 +119,51 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
     torch.testing.assert_close(restored.norm.bias, module.norm.bias)
 
 
+def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
+    from lightstream.core.scnn.scnn import StreamingCNN
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.scnn.utils import Lost
+
+    norm = ChannelLayerNorm(3)
+    model = torch.nn.Sequential(torch.nn.Sequential(norm))
+    stats = {
+        "grad_lost": Lost(2, 3, 4, 5),
+        "output_stride": torch.tensor([1, 2, 2]),
+    }
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._module_stats = {norm: stats}
+    scnn._streaming_reducers = []
+
+    converted = scnn._convert_modules_for_streaming(model)
+
+    streaming_norm = converted[0][0]
+    assert isinstance(streaming_norm, StreamingChannelLayerNorm)
+    assert streaming_norm.grad_lost == stats["grad_lost"]
+    torch.testing.assert_close(streaming_norm.output_stride, stats["output_stride"])
+    assert scnn._module_stats == {streaming_norm: stats}
+
+
+def test_scnn_resets_streaming_channel_layer_norm_and_preserves_stats():
+    from lightstream.core.scnn.scnn import StreamingCNN
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.scnn.utils import Lost
+
+    streaming_norm = StreamingChannelLayerNorm(3)
+    model = torch.nn.Sequential(streaming_norm)
+    stats = {
+        "grad_lost": Lost(1, 1, 1, 1),
+        "output_stride": torch.tensor([1, 4, 4]),
+    }
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._module_stats = {streaming_norm: stats}
+
+    restored = scnn._reset_converted_modules(model)
+
+    norm = restored[0]
+    assert isinstance(norm, ChannelLayerNorm)
+    assert scnn._module_stats == {norm: stats}
+
+
 def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_backward():
     from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
 
