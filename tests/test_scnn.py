@@ -65,6 +65,22 @@ def test_fused_attention_gem_uniform_attention_eps_conversion_round_trip_preserv
     assert reducer.uniform_attention_eps == pytest.approx(0.125)
 
 
+def test_attention_gem_uniform_attention_eps_mixes_attention_and_uniform_valid_means():
+    x = torch.tensor([[[[1.0, 2.0], [4.0, 8.0]]]])
+    logits = torch.tensor([[[[0.0, 2.0], [-3.0, 10.0]]]])
+    mask = torch.tensor([[True, False], [True, True]])
+    reducer = AttentionGeMReducer(r_init=1.0, eps=1e-6, uniform_attention_eps=0.25)
+
+    actual = reducer(x, logits, mask=mask)
+
+    valid_x = torch.tensor([1.0, 4.0, 8.0])
+    valid_logits = torch.tensor([0.0, -3.0, 10.0])
+    attention_mean = (torch.softmax(valid_logits, dim=0) * valid_x).sum().view(1, 1, 1, 1)
+    uniform_mean = valid_x.mean().view(1, 1, 1, 1)
+    expected = 0.75 * attention_mean + 0.25 * uniform_mean
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_attention_gem_uniform_attention_eps_default_matches_explicit_zero():
     torch.manual_seed(133)
     x = torch.rand(2, 3, 4, 5) + 0.05
@@ -88,6 +104,38 @@ def test_attention_gem_uniform_attention_eps_default_matches_explicit_zero():
         atol=0,
         rtol=0,
     )
+
+
+def test_fused_attention_gem_uniform_attention_eps_adds_uniform_term_after_branch_fusion():
+    y1 = torch.tensor([[[[1.0, 2.0], [4.0, 8.0]]]])
+    y2 = torch.tensor([[[[3.0, 5.0], [7.0, 11.0]]]])
+    y3 = torch.tensor([[[[13.0, 17.0], [19.0, 23.0]]]])
+    logits = (
+        torch.tensor([[[[0.0, 1.0], [2.0, 3.0]]]]),
+        torch.tensor([[[[3.0, 2.0], [1.0, 0.0]]]]),
+        torch.tensor([[[[0.5, -0.5], [1.5, -1.5]]]]),
+    )
+    value_weights = (0.5, 0.25, 0.25)
+    attention_weights = (0.2, 0.3, 1.0)
+    reducer = FusedAttentionGeMReducer(
+        r_init=1.0,
+        eps=1e-6,
+        value_weights=value_weights,
+        attention_weights=attention_weights,
+        uniform_attention_eps=0.4,
+    )
+
+    actual = reducer(y1, y2, y3, *logits)
+
+    fused_y = value_weights[0] * y1 + value_weights[1] * y2 + value_weights[2] * y3
+    branch_means = [
+        (torch.softmax(logit.flatten(), dim=0) * fused_y.flatten()).sum().view(1, 1, 1, 1)
+        for logit in logits
+    ]
+    attention_mean = sum(weight * branch for weight, branch in zip(attention_weights, branch_means))
+    uniform_mean = fused_y.mean(dim=(-2, -1), keepdim=True)
+    expected = 0.6 * attention_mean + 0.4 * uniform_mean
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 class AllReducerHeadsNet(nn.Module):

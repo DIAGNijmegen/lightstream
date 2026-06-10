@@ -88,19 +88,21 @@ class AttentionGeMReducer(BaseReducer):
 
         z = exp_shifted.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
         weights = exp_shifted / z.clamp_min(self.eps)
-        weighted = (weights * x_pow).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        attention_mean = (weights * x_pow).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
         if self.uniform_attention_eps:
             if mask is not None:
                 valid = mask_nchw.to(dtype=acc_dtype)
                 uniform_z = valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(self.eps)
-                uniform_weighted = (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / uniform_z
+                uniform_mean = (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / uniform_z
             else:
-                uniform_weighted = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
-            weighted = (1.0 - self.uniform_attention_eps) * weighted + self.uniform_attention_eps * uniform_weighted
+                uniform_mean = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+            mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
+        else:
+            mixed_mean = attention_mean
 
         # If a sample is fully masked, return a numerically safe zero contribution.
-        weighted = torch.where(any_valid, weighted, torch.zeros_like(weighted))
-        y = weighted.clamp_min(self.eps).pow(1.0 / self.current_r.to(device=x.device, dtype=acc_dtype))
+        mixed_mean = torch.where(any_valid, mixed_mean, torch.zeros_like(mixed_mean))
+        y = mixed_mean.clamp_min(self.eps).pow(1.0 / self.current_r.to(device=x.device, dtype=acc_dtype))
         return y.to(dtype=x.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
