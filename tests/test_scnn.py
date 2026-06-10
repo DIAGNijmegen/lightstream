@@ -11,12 +11,83 @@ from lightstream.core.reducer import (
     FusedAttentionGeMReducer,
     GeMReducer,
     MeanReducer,
+    StreamingAttentionGeMReducer,
     StreamingFusedAttentionGeMReducer,
     StreamingGeMReducer,
     StreamingMeanReducer,
     StreamingSumReducer,
     SumReducer,
 )
+
+
+@pytest.mark.parametrize(
+    "reducer_cls",
+    [
+        AttentionGeMReducer,
+        StreamingAttentionGeMReducer,
+        FusedAttentionGeMReducer,
+        StreamingFusedAttentionGeMReducer,
+    ],
+)
+@pytest.mark.parametrize("bad_eps", [-0.01, 1.01, float("inf"), float("nan")])
+def test_attention_gem_uniform_attention_eps_validation(reducer_cls, bad_eps):
+    with pytest.raises(ValueError, match="uniform_attention_eps"):
+        reducer_cls(uniform_attention_eps=bad_eps)
+
+
+def test_attention_gem_uniform_attention_eps_conversion_round_trip_preserves_value():
+    reducer = AttentionGeMReducer(r_init=2.25, eps=1e-5, uniform_attention_eps=0.125)
+
+    streaming = reducer.to_streaming()
+    round_tripped = streaming.to_reducer()
+
+    assert isinstance(streaming, StreamingAttentionGeMReducer)
+    assert streaming.uniform_attention_eps == pytest.approx(0.125)
+    assert round_tripped.uniform_attention_eps == pytest.approx(0.125)
+    assert reducer.uniform_attention_eps == pytest.approx(0.125)
+
+
+def test_fused_attention_gem_uniform_attention_eps_conversion_round_trip_preserves_value():
+    reducer = FusedAttentionGeMReducer(
+        r_init=2.25,
+        eps=1e-5,
+        value_weights=(0.2, 0.5, 0.3),
+        attention_weights=(0.1, 0.7, 0.2),
+        uniform_attention_eps=0.125,
+    )
+
+    streaming = reducer.to_streaming()
+    round_tripped = streaming.to_reducer()
+
+    assert isinstance(streaming, StreamingFusedAttentionGeMReducer)
+    assert streaming.uniform_attention_eps == pytest.approx(0.125)
+    assert round_tripped.uniform_attention_eps == pytest.approx(0.125)
+    assert reducer.uniform_attention_eps == pytest.approx(0.125)
+
+
+def test_attention_gem_uniform_attention_eps_default_matches_explicit_zero():
+    torch.manual_seed(133)
+    x = torch.rand(2, 3, 4, 5) + 0.05
+    logits = torch.randn(2, 1, 4, 5)
+    y1 = torch.rand(2, 3, 4, 5) + 0.05
+    y2 = torch.rand(2, 3, 4, 5) + 0.05
+    y3 = torch.rand(2, 3, 4, 5) + 0.05
+    logits_triplet = [torch.randn(2, 1, 4, 5) for _ in range(3)]
+
+    default_attention = AttentionGeMReducer(r_init=2.0, eps=1e-6)
+    zero_attention = AttentionGeMReducer(r_init=2.0, eps=1e-6, uniform_attention_eps=0.0)
+    default_fused = FusedAttentionGeMReducer(r_init=2.0, eps=1e-6)
+    zero_fused = FusedAttentionGeMReducer(r_init=2.0, eps=1e-6, uniform_attention_eps=0.0)
+
+    assert default_attention.uniform_attention_eps == 0.0
+    assert default_fused.uniform_attention_eps == 0.0
+    assert torch.allclose(default_attention(x, logits), zero_attention(x, logits), atol=0, rtol=0)
+    assert torch.allclose(
+        default_fused(y1, y2, y3, *logits_triplet),
+        zero_fused(y1, y2, y3, *logits_triplet),
+        atol=0,
+        rtol=0,
+    )
 
 
 class AllReducerHeadsNet(nn.Module):
