@@ -262,24 +262,25 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
         attention_mean = self.running_shat.to(dtype=acc_dtype) / zhat
-        if self.uniform_attention_eps:
-            uniform_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
-            uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / uniform_count
-            mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
-        else:
-            uniform_count = None
-            uniform_mean = None
-            mean = attention_mean
+        valid_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+        uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / valid_count
+        final_mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
+            # Existing softmax normalization state.
             "m": self.running_m.to(dtype=acc_dtype),
             "zhat": zhat,
+            # Distinct backward means/counts used by replay.
             "attention_mean": attention_mean,
-            "mean": mean,
             "uniform_mean": uniform_mean,
-            "uniform_count": uniform_count,
-            "y": mean.clamp_min(self.eps).pow(1.0 / r),
+            "final_mixed_mean": final_mixed_mean,
+            "valid_count": valid_count,
+            "uniform_attention_eps": float(self.uniform_attention_eps),
             "r": r,
+            # Backward-compatible aliases for older callers/tests.
+            "mean": final_mixed_mean,
+            "uniform_count": valid_count,
+            "y": final_mixed_mean.clamp_min(self.eps).pow(1.0 / r),
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
@@ -293,8 +294,11 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         m = global_context["m"].to(device=x_tile.device, dtype=acc_dtype)
         zhat = global_context["zhat"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
 
-        attention_mean = global_context.get("attention_mean", global_context["mean"]).to(device=x_tile.device, dtype=acc_dtype)
-        global_mean = global_context["mean"].to(device=x_tile.device, dtype=acc_dtype)
+        attention_mean_tensor = global_context["attention_mean"] if "attention_mean" in global_context else global_context["mean"]
+        final_mixed_mean_tensor = global_context["final_mixed_mean"] if "final_mixed_mean" in global_context else global_context["mean"]
+        attention_mean = attention_mean_tensor.to(device=x_tile.device, dtype=acc_dtype)
+        final_mixed_mean = final_mixed_mean_tensor.to(device=x_tile.device, dtype=acc_dtype)
+        uniform_attention_eps = float(global_context.get("uniform_attention_eps", self.uniform_attention_eps))
 
         valid4d = valid_mask[None, None].to(device=x_tile.device, dtype=torch.bool)
         x_pow = x.pow(r)
@@ -303,18 +307,19 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         weights_unnorm = torch.exp(logits - m)
         weights_unnorm = torch.where(valid4d, weights_unnorm, torch.zeros_like(weights_unnorm))
         centered_x_pow = x_pow - attention_mean.detach()
-        replay_term = streaming_reduce_tile(weights_unnorm * centered_x_pow, valid_mask, zhat)
-        if self.uniform_attention_eps:
-            uniform_mean = global_context["uniform_mean"].to(device=x_tile.device, dtype=acc_dtype)
-            uniform_count = global_context["uniform_count"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
-            uniform_replay_term = streaming_reduce_tile(x_pow - uniform_mean.detach(), valid_mask, uniform_count)
-            replay_term = (1.0 - self.uniform_attention_eps) * replay_term + self.uniform_attention_eps * uniform_replay_term
+        attention_replay_term = streaming_reduce_tile(weights_unnorm * centered_x_pow, valid_mask, zhat)
+        replay_term = (1.0 - uniform_attention_eps) * attention_replay_term
+        if uniform_attention_eps:
+            valid_count_tensor = global_context["valid_count"] if "valid_count" in global_context else global_context["uniform_count"]
+            valid_count = valid_count_tensor.to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
+            uniform_value_term = streaming_reduce_tile(x_pow, valid_mask, None) / valid_count
+            replay_term = replay_term + uniform_attention_eps * uniform_value_term
 
         # Backward replay uses this as a surrogate for the derivative of the
         # finalized global reducer output y = (global_S / global_Z) ** (1/r).
         # Do not finalize each tile independently; the summed tile gradients must
         # match the gradient of that single global expression.
-        scale = (1.0 / r) * global_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+        scale = (1.0 / r) * final_mixed_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
         surrogate = scale.detach() * replay_term
         return surrogate.to(dtype=x_tile.dtype)
 

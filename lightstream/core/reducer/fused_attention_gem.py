@@ -357,26 +357,27 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         attention_branch_means = self.running_shat.to(dtype=acc_dtype) / zhat
         aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
         attention_mean = (attention_branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
-        if self.uniform_attention_eps:
-            uniform_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
-            uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / uniform_count
-            weighted_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
-        else:
-            uniform_count = None
-            uniform_mean = None
-            weighted_mean = attention_mean
-        branch_means = attention_branch_means
+        valid_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+        uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / valid_count
+        final_mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
+            # Existing per-branch softmax normalization state.
             "m": self.running_m.to(dtype=acc_dtype),
             "zhat": zhat,
+            # Keep per-branch attention means separate from the fused pure-attention mean.
             "attention_branch_means": attention_branch_means,
-            "branch_means": branch_means,
+            "branch_means": attention_branch_means,
+            "attention_mean": attention_mean,
             "uniform_mean": uniform_mean,
-            "uniform_count": uniform_count,
-            "weighted_mean": weighted_mean,
+            "final_mixed_mean": final_mixed_mean,
+            "valid_count": valid_count,
+            "uniform_attention_eps": float(self.uniform_attention_eps),
             "r": r,
             "attention_weights": aw,
+            # Backward-compatible aliases for older callers/tests.
+            "uniform_count": valid_count,
+            "weighted_mean": final_mixed_mean,
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
@@ -394,8 +395,11 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         r = global_context["r"].to(device=fused_y.device, dtype=acc_dtype)
         m = global_context["m"].to(device=fused_y.device, dtype=acc_dtype)
         zhat = global_context["zhat"].to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
-        attention_branch_means = global_context.get("attention_branch_means", global_context["branch_means"]).to(device=fused_y.device, dtype=acc_dtype)
-        weighted_mean = global_context["weighted_mean"].to(device=fused_y.device, dtype=acc_dtype)
+        attention_branch_means_tensor = global_context["attention_branch_means"] if "attention_branch_means" in global_context else global_context["branch_means"]
+        final_mixed_mean_tensor = global_context["final_mixed_mean"] if "final_mixed_mean" in global_context else global_context["weighted_mean"]
+        attention_branch_means = attention_branch_means_tensor.to(device=fused_y.device, dtype=acc_dtype)
+        final_mixed_mean = final_mixed_mean_tensor.to(device=fused_y.device, dtype=acc_dtype)
+        uniform_attention_eps = float(global_context.get("uniform_attention_eps", self.uniform_attention_eps))
 
         x_pow = fused_y.to(acc_dtype).clamp_min(self.eps).pow(r)
         logits = logits_stacked.to(device=fused_y.device, dtype=acc_dtype)[:, :, None]
@@ -420,14 +424,13 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
 
         branch_terms = local_s_over_z - attention_branch_means.detach() * local_z_over_z
         attention_replay_term = (branch_terms * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
-        if self.uniform_attention_eps:
-            uniform_mean = global_context["uniform_mean"].to(device=fused_y.device, dtype=acc_dtype)
-            uniform_count = global_context["uniform_count"].to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
-            uniform_replay_term = streaming_reduce_tile(x_pow - uniform_mean.detach(), valid_mask, uniform_count)
-            replay_term = (1.0 - self.uniform_attention_eps) * attention_replay_term + self.uniform_attention_eps * uniform_replay_term
-        else:
-            replay_term = attention_replay_term
-        scale = (1.0 / r) * weighted_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+        replay_term = (1.0 - uniform_attention_eps) * attention_replay_term
+        if uniform_attention_eps:
+            valid_count_tensor = global_context["valid_count"] if "valid_count" in global_context else global_context["uniform_count"]
+            valid_count = valid_count_tensor.to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
+            uniform_value_term = streaming_reduce_tile(x_pow, valid_mask, None) / valid_count
+            replay_term = replay_term + uniform_attention_eps * uniform_value_term
+        scale = (1.0 / r) * final_mixed_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
         surrogate = scale.detach() * replay_term
         return surrogate.to(dtype=fused_y.dtype)
 
