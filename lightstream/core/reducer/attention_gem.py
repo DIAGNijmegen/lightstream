@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+
+
+def _validate_uniform_attention_eps(uniform_attention_eps: float) -> float:
+    value = float(uniform_attention_eps)
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError("uniform_attention_eps must be finite and between 0 and 1 inclusive.")
+    return value
 
 
 def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -35,10 +44,11 @@ def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 class AttentionGeMReducer(BaseReducer):
     """Apply attention-weighted global GeM reduction on NCHW tensors."""
 
-    def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None):
+    def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None, uniform_attention_eps: float = 0.0):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
+        self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
 
     @property
@@ -79,6 +89,14 @@ class AttentionGeMReducer(BaseReducer):
         z = exp_shifted.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
         weights = exp_shifted / z.clamp_min(self.eps)
         weighted = (weights * x_pow).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        if self.uniform_attention_eps:
+            if mask is not None:
+                valid = mask_nchw.to(dtype=acc_dtype)
+                uniform_z = valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(self.eps)
+                uniform_weighted = (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / uniform_z
+            else:
+                uniform_weighted = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+            weighted = (1.0 - self.uniform_attention_eps) * weighted + self.uniform_attention_eps * uniform_weighted
 
         # If a sample is fully masked, return a numerically safe zero contribution.
         weighted = torch.where(any_valid, weighted, torch.zeros_like(weighted))
@@ -90,6 +108,7 @@ class AttentionGeMReducer(BaseReducer):
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            uniform_attention_eps=self.uniform_attention_eps,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
@@ -98,13 +117,16 @@ class AttentionGeMReducer(BaseReducer):
 class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
     """Streaming attention-weighted global GeM reducer with stable softmax accumulation."""
 
-    def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None):
+    def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None, uniform_attention_eps: float = 0.0):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
+        self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("running_m", torch.zeros(0), persistent=False)
         self.register_buffer("running_zhat", torch.zeros(0), persistent=False)
         self.register_buffer("running_shat", torch.zeros(0), persistent=False)
+        self.register_buffer("running_uniform_sum", torch.zeros(0), persistent=False)
+        self.register_buffer("running_uniform_count", torch.zeros(0), persistent=False)
 
     @property
     def current_r(self) -> torch.Tensor:
@@ -180,6 +202,8 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_m = torch.full((batch_size, 1, 1, 1), torch.finfo(accumulator_dtype).min, device=device, dtype=accumulator_dtype)
         self.running_zhat = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
         self.running_shat = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_uniform_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_uniform_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
 
     def accumulate_valid_tile(self, tile, valid_mask: torch.Tensor) -> None:
         x_tile, logits_tile = self._parse_multi_input_payload(tile)
@@ -209,6 +233,10 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_zhat = self.running_zhat.to(dtype=acc_dtype) * alpha_prev + z_tile * alpha_tile
         self.running_shat = self.running_shat.to(dtype=acc_dtype) * alpha_prev + s_tile * alpha_tile
         self.running_m = m_new
+        if self.uniform_attention_eps:
+            valid = valid4d.to(dtype=acc_dtype)
+            self.running_uniform_sum = self.running_uniform_sum.to(dtype=acc_dtype) + (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+            self.running_uniform_count = self.running_uniform_count.to(dtype=acc_dtype) + valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
 
     def finalize_from_state(self) -> torch.Tensor:
         if self.running_shat.numel() == 0:
@@ -216,17 +244,31 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         weighted_mean = self.running_shat.to(dtype=acc_dtype) / self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
+        if self.uniform_attention_eps:
+            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
+            weighted_mean = (1.0 - self.uniform_attention_eps) * weighted_mean + self.uniform_attention_eps * uniform_mean
         return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=self.running_shat.dtype)
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
-        mean = self.running_shat.to(dtype=acc_dtype) / zhat
+        attention_mean = self.running_shat.to(dtype=acc_dtype) / zhat
+        if self.uniform_attention_eps:
+            uniform_count = self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
+            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / uniform_count
+            mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
+        else:
+            uniform_count = None
+            uniform_mean = None
+            mean = attention_mean
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
             "m": self.running_m.to(dtype=acc_dtype),
             "zhat": zhat,
+            "attention_mean": attention_mean,
             "mean": mean,
+            "uniform_mean": uniform_mean,
+            "uniform_count": uniform_count,
             "y": mean.clamp_min(self.eps).pow(1.0 / r),
             "r": r,
         }
@@ -242,6 +284,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         m = global_context["m"].to(device=x_tile.device, dtype=acc_dtype)
         zhat = global_context["zhat"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
 
+        attention_mean = global_context.get("attention_mean", global_context["mean"]).to(device=x_tile.device, dtype=acc_dtype)
         global_mean = global_context["mean"].to(device=x_tile.device, dtype=acc_dtype)
 
         valid4d = valid_mask[None, None].to(device=x_tile.device, dtype=torch.bool)
@@ -250,9 +293,13 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         logits = torch.where(valid4d, logits, torch.full_like(logits, neg_inf))
         weights_unnorm = torch.exp(logits - m)
         weights_unnorm = torch.where(valid4d, weights_unnorm, torch.zeros_like(weights_unnorm))
-        centered_x_pow = x_pow - global_mean.detach()
+        centered_x_pow = x_pow - attention_mean.detach()
         replay_term = streaming_reduce_tile(weights_unnorm * centered_x_pow, valid_mask, zhat)
-
+        if self.uniform_attention_eps:
+            uniform_mean = global_context["uniform_mean"].to(device=x_tile.device, dtype=acc_dtype)
+            uniform_count = global_context["uniform_count"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
+            uniform_replay_term = streaming_reduce_tile(x_pow - uniform_mean.detach(), valid_mask, uniform_count)
+            replay_term = (1.0 - self.uniform_attention_eps) * replay_term + self.uniform_attention_eps * uniform_replay_term
 
         # Backward replay uses this as a surrogate for the derivative of the
         # finalized global reducer output y = (global_S / global_Z) ** (1/r).
@@ -267,6 +314,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            uniform_attention_eps=self.uniform_attention_eps,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
