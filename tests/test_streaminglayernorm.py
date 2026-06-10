@@ -224,3 +224,17 @@ def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
     assert streaming.weight is None
     assert streaming.bias is None
     torch.testing.assert_close(x_streaming.grad, x.grad)
+
+
+def test_backward_streaming_module_predicate_includes_existing_and_layer_norm_types(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+
+    from lightstream.core.scnn.scnn import _is_backward_streaming_module
+    from lightstream.core.scnn.streamingconv import StreamingConv2d
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+
+    assert _is_backward_streaming_module(StreamingConv2d(3, 3, kernel_size=1))
+    assert _is_backward_streaming_module(StreamingUpsample2d(scale_factor=2.0, mode="bilinear"))
+    assert _is_backward_streaming_module(StreamingChannelLayerNorm(3))
+    assert not _is_backward_streaming_module(torch.nn.ReLU())
