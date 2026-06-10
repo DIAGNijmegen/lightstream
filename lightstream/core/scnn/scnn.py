@@ -17,12 +17,19 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
 logger = logging.getLogger(__name__)
 
 _triple = _ntuple(3)
+
+
+def _is_pointwise_channel_norm(module):
+    """Return True for channel-only normalization layers that preserve spatial support."""
+    return isinstance(module, ChannelLayerNorm)
+
 
 @dataclass(frozen=True)
 class ForwardContext:
@@ -1558,10 +1565,12 @@ class StreamingCNN(torch.nn.Module):
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
-            if isinstance(mod, forward_modules):
+            register_forward = isinstance(mod, forward_modules) or _is_pointwise_channel_norm(mod)
+            register_backward = back_modules and (isinstance(mod, back_modules) or _is_pointwise_channel_norm(mod))
+            if register_forward:
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
-                if back_modules and isinstance(mod, back_modules):
+                if register_backward:
                     back_handle = mod.register_full_backward_hook(backward_hook)
                     self._hooks.append(back_handle)
 
@@ -1589,15 +1598,21 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
-            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_pointwise_norm = _is_pointwise_channel_norm(module)
+        if is_pointwise_norm:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            padding = torch.tensor([0, 0, 0])
+        elif not is_upsample:
+            stride, kernel_size, padding = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
         else:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
+            padding = torch.tensor([0, 0, 0])
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
-            if (not is_upsample) and (
+            if (not is_upsample and not is_pointwise_norm) and (
                 isinstance(module, (torch.nn.MaxPool2d))
                 or (stride[0] > 1 and stride[0] > kernel_size[0])
                 or (stride[1] > 1 and stride[1] > kernel_size[1])
@@ -1621,8 +1636,10 @@ class StreamingCNN(torch.nn.Module):
 
                 output[0] = new_output.type(self.dtype)
 
-            # Sum all dimensions (useful for DenseNet like networks)
-            lost = self._non_max_border_amount(output)
+            # Sum all dimensions (useful for DenseNet like networks). Channel-only
+            # normalization preserves spatial support, but constant setup tensors can
+            # make its actual output all zeros, so derive validity from its input.
+            lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
@@ -1630,7 +1647,13 @@ class StreamingCNN(torch.nn.Module):
                 :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
+            module_stats = {
+                "lost": lost,
+                "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
+                "kernel_size": kernel_size,
+                "padding": padding,
+                "module": module,
+            }
             self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt
@@ -1651,18 +1674,30 @@ class StreamingCNN(torch.nn.Module):
             else:
                 output_stride = prev_output_stride
 
-            module_stats["output_stride"] = output_stride.clone().detach()
+            output_stride = output_stride.clone().detach()
+            output_stride[0] = 1
+            module_stats["output_stride"] = output_stride
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
-            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_pointwise_norm = _is_pointwise_channel_norm(module)
+        if is_pointwise_norm:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            _padding = torch.tensor([0, 0, 0])
+        elif not is_upsample:
+            stride, kernel_size, _padding = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        else:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            _padding = torch.tensor([0, 0, 0])
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
-            # on groups of channels
-            f_grad = torch.sum(grad_in[0], dim=1)[0]
+            # on groups of channels. Channel-only normalization is pointwise in space,
+            # so derive validity from grad_out instead of its value-dependent grad_in.
+            f_grad = torch.sum(grad_out[0] if is_pointwise_norm else grad_in[0], dim=1)[0]
             if isinstance(module, (torch.nn.MaxPool2d)):
                 # MaxPool shifts indices around, which break the calculation to
                 # find valid gradient values. To fix this we do an average pool
@@ -1710,8 +1745,9 @@ class StreamingCNN(torch.nn.Module):
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
             # When kernel_size > stride we have some _overlap_ of gradients,
-            # this overlap makes extra positions in the input gradient invalid
-            if (not is_upsample) and (
+            # this overlap makes extra positions in the input gradient invalid.
+            # Pointwise channel normalization has no additional spatial loss.
+            if (not is_upsample and not is_pointwise_norm) and (
                 (stride[0] > 1 and kernel_size[0] > stride[0])
                 or (stride[1] > 1 and kernel_size[1] > stride[1])
                 or (stride[2] > 1 and kernel_size[2] > stride[2])

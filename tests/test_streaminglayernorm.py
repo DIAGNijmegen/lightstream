@@ -55,3 +55,34 @@ def test_constructor_considers_only_channel_layer_norm_streamable(monkeypatch):
 
     assert ChannelLayerNorm in constructor.keep_modules
     assert torch.nn.LayerNorm not in constructor.keep_modules
+
+
+def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+
+    from lightstream.core.scnn.scnn import StreamingCNN
+    from lightstream.core.scnn.utils import Lost
+
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 3, kernel_size=3, padding=1, bias=False),
+        ChannelLayerNorm(3),
+        torch.nn.Conv2d(3, 3, kernel_size=1, bias=False),
+    ).eval()
+
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, 6, 6),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+    norm = scnn.stream_module[1]
+    stats = scnn._module_stats[norm]
+
+    assert stats["stride"].tolist() == [1, 1, 1]
+    assert stats["lost"] == Lost(1, 1, 1, 1)
+    assert stats["grad_lost"] == Lost(1, 1, 1, 1)
+    assert stats["output_stride"].tolist() == [1, 1, 1]
