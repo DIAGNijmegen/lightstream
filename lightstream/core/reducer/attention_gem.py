@@ -127,6 +127,9 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.register_buffer("running_m", torch.zeros(0), persistent=False)
         self.register_buffer("running_zhat", torch.zeros(0), persistent=False)
         self.register_buffer("running_shat", torch.zeros(0), persistent=False)
+        self.register_buffer("running_valid_x_pow_sum", torch.zeros(0), persistent=False)
+        self.register_buffer("running_valid_count", torch.zeros(0), persistent=False)
+        # Backward-compatible aliases for the uniform-mixing path.
         self.register_buffer("running_uniform_sum", torch.zeros(0), persistent=False)
         self.register_buffer("running_uniform_count", torch.zeros(0), persistent=False)
 
@@ -204,8 +207,10 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_m = torch.full((batch_size, 1, 1, 1), torch.finfo(accumulator_dtype).min, device=device, dtype=accumulator_dtype)
         self.running_zhat = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
         self.running_shat = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
-        self.running_uniform_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
-        self.running_uniform_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_valid_x_pow_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_valid_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_uniform_sum = self.running_valid_x_pow_sum
+        self.running_uniform_count = self.running_valid_count
 
     def accumulate_valid_tile(self, tile, valid_mask: torch.Tensor) -> None:
         x_tile, logits_tile = self._parse_multi_input_payload(tile)
@@ -235,29 +240,31 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_zhat = self.running_zhat.to(dtype=acc_dtype) * alpha_prev + z_tile * alpha_tile
         self.running_shat = self.running_shat.to(dtype=acc_dtype) * alpha_prev + s_tile * alpha_tile
         self.running_m = m_new
-        if self.uniform_attention_eps:
-            valid = valid4d.to(dtype=acc_dtype)
-            self.running_uniform_sum = self.running_uniform_sum.to(dtype=acc_dtype) + (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
-            self.running_uniform_count = self.running_uniform_count.to(dtype=acc_dtype) + valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        valid = valid4d.to(dtype=acc_dtype)
+        valid_x_pow_sum = self.running_valid_x_pow_sum.to(dtype=acc_dtype) + (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        valid_count = self.running_valid_count.to(dtype=acc_dtype) + valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        self.running_valid_x_pow_sum = valid_x_pow_sum
+        self.running_valid_count = valid_count
+        self.running_uniform_sum = valid_x_pow_sum
+        self.running_uniform_count = valid_count
 
     def finalize_from_state(self) -> torch.Tensor:
         if self.running_shat.numel() == 0:
             raise RuntimeError("StreamingAttentionGeMReducer state is empty, accumulate_stream_tile() was not called.")
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
-        weighted_mean = self.running_shat.to(dtype=acc_dtype) / self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
-        if self.uniform_attention_eps:
-            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
-            weighted_mean = (1.0 - self.uniform_attention_eps) * weighted_mean + self.uniform_attention_eps * uniform_mean
-        return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=self.running_shat.dtype)
+        attention_mean = self.running_shat.to(dtype=acc_dtype) / self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
+        uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+        mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
+        return mixed_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=self.running_shat.dtype)
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
         attention_mean = self.running_shat.to(dtype=acc_dtype) / zhat
         if self.uniform_attention_eps:
-            uniform_count = self.running_uniform_count.to(dtype=acc_dtype).clamp_min(self.eps)
-            uniform_mean = self.running_uniform_sum.to(dtype=acc_dtype) / uniform_count
+            uniform_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+            uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / uniform_count
             mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         else:
             uniform_count = None
