@@ -239,3 +239,102 @@ def test_backward_streaming_module_predicate_includes_existing_and_layer_norm_ty
     assert _is_backward_streaming_module(StreamingUpsample2d(scale_factor=2.0, mode="bilinear"))
     assert _is_backward_streaming_module(StreamingChannelLayerNorm(3))
     assert not _is_backward_streaming_module(torch.nn.ReLU())
+
+
+class SmallChannelLayerNormNet(torch.nn.Module):
+    def __init__(self, elementwise_affine: bool = True):
+        super().__init__()
+        self.upstream = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=True)
+        self.norm = ChannelLayerNorm(4, eps=1e-5, elementwise_affine=elementwise_affine)
+        self.activation = torch.nn.GELU()
+        self.downstream = torch.nn.Conv2d(4, 2, kernel_size=3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.upstream(x)
+        x = self.norm(x)
+        x = self.activation(x)
+        return self.downstream(x)
+
+
+def _make_channel_norm_scnn(model: torch.nn.Module, *, tile_size: int, saliency: bool = False):
+    try:
+        import numpy  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["numpy"] = types.ModuleType("numpy")
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    return StreamingCNN(
+        model,
+        tile_shape=(1, 3, tile_size, tile_size),
+        verbose=False,
+        deterministic=True,
+        saliency=saliency,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+
+def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
+    torch.manual_seed(202)
+    model = SmallChannelLayerNormNet(elementwise_affine=elementwise_affine).eval()
+    reference = SmallChannelLayerNormNet(elementwise_affine=elementwise_affine).eval()
+    reference.load_state_dict(model.state_dict())
+
+    # Odd image dimensions with this tile size make the SCNN pass use overlapping
+    # tiles; this is the case that would double-count affine gradients if
+    # seen_indices tracking regressed.
+    image = torch.randn(1, 3, 13, 11)
+    upstream_grad = torch.randn(1, 2, 13, 11)
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_output = reference(ref_image)
+    torch.autograd.backward(ref_output, upstream_grad)
+
+    scnn = _make_channel_norm_scnn(model, tile_size=8)
+    assert isinstance(scnn.stream_module.norm, StreamingChannelLayerNorm)
+    assert scnn.stream_module.norm.elementwise_affine is elementwise_affine
+
+    stream_output = scnn.forward(image.detach().clone())
+    assert len(scnn._last_forward_tiles) > 1
+    assert any(y > 0 for y, _, _ in scnn._last_forward_tiles)
+    assert any(x > 0 for _, x, _ in scnn._last_forward_tiles)
+    torch.testing.assert_close(stream_output, ref_output.detach(), atol=1e-5, rtol=1e-4)
+
+    scnn.backward(image.detach().clone(), upstream_grad.detach().clone())
+
+    stream_module = scnn.stream_module
+    torch.testing.assert_close(stream_module.upstream.weight.grad, reference.upstream.weight.grad, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(stream_module.upstream.bias.grad, reference.upstream.bias.grad, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(stream_module.downstream.weight.grad, reference.downstream.weight.grad, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(stream_module.downstream.bias.grad, reference.downstream.bias.grad, atol=1e-5, rtol=1e-4)
+
+    if elementwise_affine:
+        torch.testing.assert_close(stream_module.norm.weight.grad, reference.norm.norm.weight.grad, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(stream_module.norm.bias.grad, reference.norm.norm.bias.grad, atol=1e-5, rtol=1e-4)
+    else:
+        assert stream_module.norm.weight is None
+        assert stream_module.norm.bias is None
+        assert not any(name.startswith("norm.") for name, _ in stream_module.named_parameters())
+
+
+def test_scnn_channel_layer_norm_forward_backward_parity():
+    _assert_channel_norm_scnn_parity(elementwise_affine=True)
+
+
+def test_scnn_channel_layer_norm_elementwise_affine_false_forward_backward_parity():
+    _assert_channel_norm_scnn_parity(elementwise_affine=False)
+
+
+def test_streaming_channel_layer_norm_rejects_non_4d_input():
+    module = StreamingChannelLayerNorm(3)
+
+    with pytest.raises(ValueError, match="expects 4D NCHW input"):
+        module(torch.randn(2, 3, 5))
+
+
+def test_streaming_channel_layer_norm_rejects_channel_mismatch():
+    module = StreamingChannelLayerNorm(3)
+
+    with pytest.raises(ValueError, match="expected 3 channels"):
+        module(torch.randn(2, 4, 5, 7))
