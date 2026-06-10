@@ -17,7 +17,7 @@ import torch.nn.functional
 from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm, StreamingChannelLayerNorm
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -28,7 +28,7 @@ _triple = _ntuple(3)
 
 def _is_pointwise_channel_norm(module):
     """Return True for channel-only normalization layers that preserve spatial support."""
-    return isinstance(module, ChannelLayerNorm)
+    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm))
 
 
 @dataclass(frozen=True)
@@ -547,6 +547,15 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, ChannelLayerNorm):
+            mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+            if module in self._module_stats:
+                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
+                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+            del module
+            return mod
         elif isinstance(module, BaseReducer):
             mod = module.to_streaming()
             self._streaming_reducers.append(mod)
@@ -569,6 +578,16 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingChannelLayerNorm):
+            mod = module.to_channel_layer_norm()
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -1115,7 +1134,7 @@ class StreamingCNN(torch.nn.Module):
             tile = tile.to(self.device, non_blocking=True)
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingChannelLayerNorm)):
                 mod.input_loc = input_loc
 
         if self.should_normalize:
@@ -1369,7 +1388,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingChannelLayerNorm)):
                 mod.input_loc = None
                 mod.reset()
 

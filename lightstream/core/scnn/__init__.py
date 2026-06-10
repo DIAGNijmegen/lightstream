@@ -1,3 +1,3 @@
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm, StreamingChannelLayerNorm
 
-__all__ = ["ChannelLayerNorm"]
+__all__ = ["ChannelLayerNorm", "StreamingChannelLayerNorm"]
