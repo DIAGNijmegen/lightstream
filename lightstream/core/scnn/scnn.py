@@ -26,9 +26,17 @@ logger = logging.getLogger(__name__)
 _triple = _ntuple(3)
 
 
+BACKWARD_STREAMING_MODULE_TYPES = (StreamingConv2d, StreamingUpsample2d, StreamingChannelLayerNorm)
+
+
 def _is_pointwise_channel_norm(module):
     """Return True for channel-only normalization layers that preserve spatial support."""
     return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm))
+
+
+def _is_backward_streaming_module(module):
+    """Return True for streaming modules that need backward tile location state."""
+    return isinstance(module, BACKWARD_STREAMING_MODULE_TYPES)
 
 
 @dataclass(frozen=True)
@@ -1140,7 +1148,7 @@ class StreamingCNN(torch.nn.Module):
             tile = tile.to(self.device, non_blocking=True)
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingChannelLayerNorm)):
+            if _is_backward_streaming_module(mod):
                 mod.input_loc = input_loc
 
         if self.should_normalize:
@@ -1394,7 +1402,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d, StreamingChannelLayerNorm)):
+            if _is_backward_streaming_module(mod):
                 mod.input_loc = None
                 mod.reset()
 
