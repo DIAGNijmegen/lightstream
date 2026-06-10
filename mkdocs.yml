@@ -17,6 +17,7 @@ nav:
       streaming: modules/streamingmodule.md
       imagenet: modules/imagenettemplate.md
       constructor: modules/constructor.md
+      scnn: modules/scnn.md
 
 
 theme:
