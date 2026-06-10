@@ -20,7 +20,22 @@ Before implementing a streaming version of your model, make sure that the follow
 
 - Your model is at least partly a CNN
 - Within the CNN, fully connected layers or global pooling layers are not used. This also means it should not have Squeeze and Excite (SE) blocks, since these are global operations, rather than local.
-    - A small exception to this are normalization layers. If your model contains any, they must be set to `eval()` both during inference **and** training. Since most normalization require the entire input to correctly calculate means and standard deviations, they will theoretically not work with streaming during training. During inference, the means and standard deviations can be applied tile-wise.
+    - Most normalization layers are not streamable during training because they can depend on spatial or other global context to calculate statistics such as means and standard deviations. If your model contains such normalization layers, they must be set to `eval()` both during inference **and** training. During inference, frozen means and standard deviations can be applied tile-wise.
+    - `ChannelLayerNorm` is the supported exception for trainable normalization in streamed CNNs. It normalizes only the channel dimension independently at each spatial position, so it does not mix information across height or width locations.
+    - Raw `torch.nn.LayerNorm` (`nn.LayerNorm`) is not automatically converted because its `normalized_shape` may include spatial dimensions. Use `ChannelLayerNorm(num_channels)` when you want per-position channel normalization that SCNN can convert automatically to `StreamingChannelLayerNorm`.
+
+```python
+import torch.nn as nn
+
+from lightstream.core.scnn import ChannelLayerNorm
+
+num_channels = 64
+streamable_block = nn.Sequential(
+    nn.Conv2d(3, num_channels, kernel_size=3, padding=1),
+    ChannelLayerNorm(num_channels),
+    nn.GELU(),
+)
+```
 
 
 ## Splitting and creating the model(s)
