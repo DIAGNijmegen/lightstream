@@ -86,3 +86,96 @@ def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
     assert stats["lost"] == Lost(1, 1, 1, 1)
     assert stats["grad_lost"] == Lost(1, 1, 1, 1)
     assert stats["output_stride"].tolist() == [1, 1, 1]
+
+
+def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metadata():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+
+    module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True).to(dtype=torch.float64)
+    module.norm.weight.data.copy_(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
+    module.norm.bias.data.copy_(torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64))
+    module.norm.weight.requires_grad = False
+    module.norm.bias.requires_grad = True
+
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    assert streaming.num_channels == module.num_channels
+    assert streaming.eps == module.norm.eps
+    assert streaming.elementwise_affine == module.norm.elementwise_affine
+    assert streaming.weight.dtype == module.norm.weight.dtype
+    assert streaming.weight.device == module.norm.weight.device
+    assert streaming.weight.requires_grad == module.norm.weight.requires_grad
+    assert streaming.bias.requires_grad == module.norm.bias.requires_grad
+    torch.testing.assert_close(streaming.weight, module.norm.weight)
+    torch.testing.assert_close(streaming.bias, module.norm.bias)
+
+    restored = streaming.to_channel_layer_norm()
+    assert restored.num_channels == module.num_channels
+    assert restored.norm.eps == module.norm.eps
+    assert restored.norm.elementwise_affine == module.norm.elementwise_affine
+    assert restored.norm.weight.requires_grad == module.norm.weight.requires_grad
+    assert restored.norm.bias.requires_grad == module.norm.bias.requires_grad
+    torch.testing.assert_close(restored.norm.weight, module.norm.weight)
+    torch.testing.assert_close(restored.norm.bias, module.norm.bias)
+
+
+def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_backward():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+
+    torch.manual_seed(11)
+    module = ChannelLayerNorm(4, eps=1e-5, elementwise_affine=True)
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    x = torch.randn(2, 4, 3, 5, requires_grad=True)
+    x_streaming = x.detach().clone().requires_grad_(True)
+    grad = torch.randn(2, 4, 3, 5)
+
+    module(x).backward(grad)
+    streaming(x_streaming).backward(grad)
+
+    torch.testing.assert_close(x_streaming.grad, x.grad)
+    torch.testing.assert_close(streaming.weight.grad, module.norm.weight.grad)
+    torch.testing.assert_close(streaming.bias.grad, module.norm.bias.grad)
+
+
+def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.scnn.utils import Box, Lost, Sides
+
+    torch.manual_seed(13)
+    streaming = StreamingChannelLayerNorm(3, eps=1e-5, elementwise_affine=True)
+    streaming.grad_lost = Lost(top=1, left=1, bottom=1, right=0)
+    streaming.input_loc = Box(y=0, height=4, x=0, width=5, sides=Sides(left=1, top=1, right=0, bottom=0))
+    streaming.output_stride = torch.tensor([1, 1, 1])
+
+    x = torch.randn(2, 3, 4, 5, requires_grad=True)
+    grad = torch.randn(2, 3, 4, 5)
+    streaming(x).backward(grad)
+
+    with torch.no_grad():
+        centered = x - x.mean(dim=1, keepdim=True)
+        x_hat = centered * torch.rsqrt(centered.pow(2).mean(dim=1, keepdim=True) + streaming.eps)
+        expected_grad_weight = (grad[:, :, :3, :] * x_hat[:, :, :3, :]).sum(dim=(0, 2, 3))
+        expected_grad_bias = grad[:, :, :3, :].sum(dim=(0, 2, 3))
+
+    torch.testing.assert_close(streaming.weight.grad, expected_grad_weight)
+    torch.testing.assert_close(streaming.bias.grad, expected_grad_bias)
+
+
+def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+
+    torch.manual_seed(17)
+    module = ChannelLayerNorm(3, elementwise_affine=False)
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    x = torch.randn(2, 3, 4, 4, requires_grad=True)
+    x_streaming = x.detach().clone().requires_grad_(True)
+    grad = torch.randn(2, 3, 4, 4)
+
+    module(x).backward(grad)
+    streaming(x_streaming).backward(grad)
+
+    assert streaming.weight is None
+    assert streaming.bias is None
+    torch.testing.assert_close(x_streaming.grad, x.grad)
