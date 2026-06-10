@@ -550,10 +550,16 @@ class StreamingCNN(torch.nn.Module):
         elif isinstance(module, ChannelLayerNorm):
             mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
             if module in self._module_stats:
-                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
-                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
-                self._module_stats[mod] = self._module_stats[module]
+                stats = self._module_stats[module]
+                if "grad_lost" in stats:
+                    mod.grad_lost = stats["grad_lost"]
+                if "output_stride" in stats:
+                    mod.output_stride = stats["output_stride"]
+                self._module_stats[mod] = stats
                 del self._module_stats[module]
+            # ChannelLayerNorm wraps a torch.nn.LayerNorm child internally; the
+            # streaming replacement owns equivalent parameters directly, so treat
+            # the wrapper as a leaf while parent modules continue recursing.
             del module
             return mod
         elif isinstance(module, BaseReducer):
