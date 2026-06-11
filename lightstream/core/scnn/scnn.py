@@ -689,10 +689,14 @@ class StreamingCNN(torch.nn.Module):
                 if mod.bias is not None:
                     torch.nn.init.constant_(mod.bias, 0)
 
-
+        # Only BatchNorm has running statistics that can be frozen into a
+        # deterministic affine-like transform while gathering tile statistics.
+        # ChannelLayerNorm/LayerNorm computes per-sample channel statistics from
+        # the current tensor, and its default affine parameters are already
+        # weight=1 and bias=0; changing those parameters does not prevent
+        # constant setup tensors from producing zero LayerNorm input gradients.
         for m in self.stream_module.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
-                # Perhaps change to torch.nn.init.ones_(m.weight) and zeros?
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
                 m.eval()

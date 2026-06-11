@@ -78,6 +78,35 @@ def test_convert_to_identity_skips_children_of_kept_channel_layer_norm(monkeypat
     assert isinstance(model[0][1], torch.nn.Identity)
 
 
+def test_constant_statistics_setup_does_not_reinitialize_channel_layer_norm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 3, kernel_size=3, padding=1, bias=False),
+        torch.nn.BatchNorm2d(3),
+        ChannelLayerNorm(3),
+    ).eval()
+    with torch.no_grad():
+        model[1].weight.copy_(torch.tensor([2.0, 3.0, 4.0]))
+        model[1].bias.copy_(torch.tensor([0.5, 0.25, -0.5]))
+        model[2].norm.weight.copy_(torch.tensor([1.5, 2.5, 3.5]))
+        model[2].norm.bias.copy_(torch.tensor([-1.0, 0.0, 1.0]))
+
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    torch.nn.Module.__init__(scnn)
+    scnn.stream_module = model
+
+    StreamingCNN._reset_parameters_to_constant(scnn)
+
+    torch.testing.assert_close(model[1].weight, torch.ones(3))
+    torch.testing.assert_close(model[1].bias, torch.zeros(3))
+    assert model[1].training is False
+    torch.testing.assert_close(model[2].norm.weight, torch.tensor([1.5, 2.5, 3.5]))
+    torch.testing.assert_close(model[2].norm.bias, torch.tensor([-1.0, 0.0, 1.0]))
+
+
 def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
     monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
 
