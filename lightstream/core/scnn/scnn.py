@@ -572,9 +572,10 @@ class StreamingCNN(torch.nn.Module):
                     mod.output_stride = stats["output_stride"]
                 self._module_stats[mod] = stats
                 del self._module_stats[module]
-            # ChannelLayerNorm wraps a torch.nn.LayerNorm child internally; the
-            # streaming replacement owns equivalent parameters directly, so treat
-            # the wrapper as a leaf while parent modules continue recursing.
+            # ChannelLayerNorm and StreamingChannelLayerNorm both wrap a
+            # torch.nn.LayerNorm child internally. Treat the wrapper as a leaf
+            # while parent modules continue recursing so conversion preserves
+            # compatible state-dict keys like ``norm.weight`` and ``norm.bias``.
             del module
             return mod
         elif isinstance(module, BaseReducer):
