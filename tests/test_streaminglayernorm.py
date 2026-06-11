@@ -190,8 +190,9 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
     assert streaming.weight.device == module.norm.weight.device
     assert streaming.weight.requires_grad == module.norm.weight.requires_grad
     assert streaming.bias.requires_grad == module.norm.bias.requires_grad
-    torch.testing.assert_close(streaming.weight, module.norm.weight)
-    torch.testing.assert_close(streaming.bias, module.norm.bias)
+    assert list(streaming.named_parameters()) == [("norm.weight", streaming.norm.weight), ("norm.bias", streaming.norm.bias)]
+    torch.testing.assert_close(streaming.norm.weight, module.norm.weight)
+    torch.testing.assert_close(streaming.norm.bias, module.norm.bias)
 
     restored = streaming.to_channel_layer_norm()
     assert restored.num_channels == module.num_channels
@@ -316,8 +317,8 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
     streaming(x_streaming).backward(grad)
 
     torch.testing.assert_close(x_streaming.grad, x.grad)
-    torch.testing.assert_close(streaming.weight.grad, module.norm.weight.grad)
-    torch.testing.assert_close(streaming.bias.grad, module.norm.bias.grad)
+    torch.testing.assert_close(streaming.norm.weight.grad, module.norm.weight.grad)
+    torch.testing.assert_close(streaming.norm.bias.grad, module.norm.bias.grad)
 
 
 def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
@@ -340,8 +341,8 @@ def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region(
         expected_grad_weight = (grad[:, :, :3, :] * x_hat[:, :, :3, :]).sum(dim=(0, 2, 3))
         expected_grad_bias = grad[:, :, :3, :].sum(dim=(0, 2, 3))
 
-    torch.testing.assert_close(streaming.weight.grad, expected_grad_weight)
-    torch.testing.assert_close(streaming.bias.grad, expected_grad_bias)
+    torch.testing.assert_close(streaming.norm.weight.grad, expected_grad_weight)
+    torch.testing.assert_close(streaming.norm.bias.grad, expected_grad_bias)
 
 
 def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
@@ -358,8 +359,9 @@ def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
     module(x).backward(grad)
     streaming(x_streaming).backward(grad)
 
-    assert streaming.weight is None
-    assert streaming.bias is None
+    assert streaming.norm.weight is None
+    assert streaming.norm.bias is None
+    assert dict(streaming.named_parameters()) == {}
     torch.testing.assert_close(x_streaming.grad, x.grad)
 
 
@@ -446,12 +448,12 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     torch.testing.assert_close(stream_module.downstream.bias.grad, reference.downstream.bias.grad, atol=1e-5, rtol=1e-4)
 
     if elementwise_affine:
-        torch.testing.assert_close(stream_module.norm.weight.grad, reference.norm.norm.weight.grad, atol=1e-5, rtol=1e-4)
-        torch.testing.assert_close(stream_module.norm.bias.grad, reference.norm.norm.bias.grad, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(stream_module.norm.norm.weight.grad, reference.norm.norm.weight.grad, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(stream_module.norm.norm.bias.grad, reference.norm.norm.bias.grad, atol=1e-5, rtol=1e-4)
     else:
-        assert stream_module.norm.weight is None
-        assert stream_module.norm.bias is None
-        assert not any(name.startswith("norm.") for name, _ in stream_module.named_parameters())
+        assert stream_module.norm.norm.weight is None
+        assert stream_module.norm.norm.bias is None
+        assert not any(name.startswith("norm.norm.") for name, _ in stream_module.named_parameters())
 
 
 def test_scnn_channel_layer_norm_forward_backward_parity():
