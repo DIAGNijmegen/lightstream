@@ -145,16 +145,19 @@ class StreamingChannelLayerNorm(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
 
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(num_channels))
-            self.bias = nn.Parameter(torch.zeros(num_channels))
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
+        self.norm = nn.LayerNorm(num_channels, eps=eps, elementwise_affine=elementwise_affine)
 
         self.grad_lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1, 1, 1])
         self.reset()
+
+    @property
+    def weight(self) -> nn.Parameter | None:
+        return self.norm.weight
+
+    @property
+    def bias(self) -> nn.Parameter | None:
+        return self.norm.bias
 
     def reset(self):
         self.seen_indices = Box(0, 0, 0, 0, None)
@@ -171,10 +174,13 @@ class StreamingChannelLayerNorm(nn.Module):
                 f"got {x.shape[1]} channels for input shape {tuple(x.shape)}."
             )
 
+        weight = self.norm.weight if self.elementwise_affine else None
+        bias = self.norm.bias if self.elementwise_affine else None
+
         return channel_layer_norm(
             x,
-            self.weight,
-            self.bias,
+            weight,
+            bias,
             self.num_channels,
             self.eps,
             self.grad_lost,
