@@ -16,6 +16,7 @@ class ChannelLayerNorm(nn.Module):
         self.num_channels = num_channels
         self.eps = eps
         self.elementwise_affine = elementwise_affine
+        self._streaming_statistics_passthrough = False
         self.norm = nn.LayerNorm(num_channels, eps=eps, elementwise_affine=elementwise_affine)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -26,6 +27,8 @@ class ChannelLayerNorm(nn.Module):
                 f"ChannelLayerNorm expected {self.num_channels} channels at dimension 1, "
                 f"got {x.shape[1]} channels for input shape {tuple(x.shape)}."
             )
+        if self._streaming_statistics_passthrough:
+            return x
 
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
