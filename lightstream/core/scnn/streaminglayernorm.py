@@ -201,19 +201,17 @@ class StreamingChannelLayerNorm(nn.Module):
         if module.elementwise_affine:
             mod = mod.to(module.norm.weight.device, non_blocking=True)
             mod = mod.to(module.norm.weight.dtype)
-            mod.weight.data.copy_(module.norm.weight.data)
-            mod.bias.data.copy_(module.norm.bias.data)
-            mod.weight.requires_grad = module.norm.weight.requires_grad
-            mod.bias.requires_grad = module.norm.bias.requires_grad
+            mod.norm.weight.requires_grad = module.norm.weight.requires_grad
+            mod.norm.bias.requires_grad = module.norm.bias.requires_grad
+        mod.norm.load_state_dict(module.norm.state_dict())
         return mod
 
     def to_channel_layer_norm(self) -> ChannelLayerNorm:
         mod = ChannelLayerNorm(self.num_channels, self.eps, self.elementwise_affine)
         if self.elementwise_affine:
-            mod = mod.to(self.weight.device, non_blocking=True)
-            mod = mod.to(self.weight.dtype)
-            mod.norm.weight.data.copy_(self.weight.data)
-            mod.norm.bias.data.copy_(self.bias.data)
-            mod.norm.weight.requires_grad = self.weight.requires_grad
-            mod.norm.bias.requires_grad = self.bias.requires_grad
+            mod = mod.to(self.norm.weight.device, non_blocking=True)
+            mod = mod.to(self.norm.weight.dtype)
+            mod.norm.weight.requires_grad = self.norm.weight.requires_grad
+            mod.norm.bias.requires_grad = self.norm.bias.requires_grad
+        mod.norm.load_state_dict(self.norm.state_dict())
         return mod
