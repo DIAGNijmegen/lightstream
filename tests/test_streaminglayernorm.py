@@ -20,6 +20,40 @@ def test_channel_layer_norm_matches_nhwc_layer_norm():
     torch.testing.assert_close(module(x), expected)
 
 
+def test_channel_layer_norm_statistics_passthrough_returns_input_identity():
+    torch.manual_seed(8)
+    module = ChannelLayerNorm(3, eps=1e-6, elementwise_affine=True)
+    x = torch.randn(2, 3, 5, 7)
+
+    normal_output = module(x)
+    module._streaming_statistics_passthrough = True
+    passthrough_output = module(x)
+    module._streaming_statistics_passthrough = False
+
+    assert passthrough_output is x
+    torch.testing.assert_close(passthrough_output, x)
+    assert not torch.allclose(normal_output, x)
+    torch.testing.assert_close(module(x), normal_output)
+
+
+def test_scnn_toggles_channel_layer_norm_statistics_passthrough(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    norm = ChannelLayerNorm(3)
+    model = torch.nn.Sequential(norm)
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    torch.nn.Module.__init__(scnn)
+    scnn.stream_module = model
+
+    scnn._set_channel_layer_norm_statistics_passthrough(True)
+    assert norm._streaming_statistics_passthrough is True
+
+    scnn._set_channel_layer_norm_statistics_passthrough(False)
+    assert norm._streaming_statistics_passthrough is False
+
+
 def test_channel_layer_norm_rejects_non_4d_input():
     module = ChannelLayerNorm(3)
 

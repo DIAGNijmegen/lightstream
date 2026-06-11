@@ -244,6 +244,7 @@ class StreamingCNN(torch.nn.Module):
         # Add hooks to each layer to gather statistics
         self._add_hooks_for_statistics()
         self._set_reducer_passthrough(True)
+        self._set_channel_layer_norm_statistics_passthrough(True)
 
         # We need to temporary store statistics per layer to keep track of the
         # total output stride at each layer
@@ -271,6 +272,7 @@ class StreamingCNN(torch.nn.Module):
         # during lightstream
         self._remove_hooks()
         self._set_reducer_passthrough(False)
+        self._set_channel_layer_norm_statistics_passthrough(False)
         #
         self._restore_parameters(state_dict)
         self._capture_public_output_spec()
@@ -302,6 +304,11 @@ class StreamingCNN(torch.nn.Module):
         for mod in self.stream_module.modules():
             if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
+
+    def _set_channel_layer_norm_statistics_passthrough(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, ChannelLayerNorm):
+                mod._streaming_statistics_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
         # Forward pass with grads enabled
