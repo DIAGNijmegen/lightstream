@@ -188,6 +188,9 @@ class StreamingConstructor:
         """
 
         for n, module in model.named_children():
+            if isinstance(module, tuple(self.keep_modules)):
+                continue
+
             if len(list(module.children())) > 0:
                 # compound module, go inside it
                 self.convert_to_identity(module)
@@ -195,12 +198,11 @@ class StreamingConstructor:
 
             # if new module is assigned to a variable, e.g. new = nn.Identity(), then it's considered a duplicate in
             # module.named_children used later. Instead, we use in-place assignment, so each new module is unique
-            if not isinstance(module, tuple(self.keep_modules)):
-                try:
-                    n = int(n)
-                    model[n] = torch.nn.Identity()
-                except ValueError:
-                    setattr(model, str(n), torch.nn.Identity())
+            try:
+                n = int(n)
+                model[n] = torch.nn.Identity()
+            except ValueError:
+                setattr(model, str(n), torch.nn.Identity())
 
     def restore_model_layers(self, model_ref: nn.Module, model_rep: nn.Module) -> None:
         """Restore model layers from Identity to what they were before

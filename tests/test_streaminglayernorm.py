@@ -58,6 +58,26 @@ def test_constructor_considers_only_channel_layer_norm_streamable(monkeypatch):
     assert torch.nn.LayerNorm not in constructor.keep_modules
 
 
+def test_convert_to_identity_skips_children_of_kept_channel_layer_norm(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+    from lightstream.core.constructor import StreamingConstructor
+
+    model = torch.nn.Sequential(
+        torch.nn.Sequential(
+            ChannelLayerNorm(3, eps=1e-6),
+            torch.nn.ReLU(),
+        ),
+    )
+    constructor = StreamingConstructor(model, tile_size=32, verbose=False, statistics_on_cpu=True)
+
+    constructor.convert_to_identity(model)
+
+    assert isinstance(model[0][0], ChannelLayerNorm)
+    assert isinstance(model[0][0].norm, torch.nn.LayerNorm)
+    assert model[0][0].norm.eps == 1e-6
+    assert isinstance(model[0][1], torch.nn.Identity)
+
+
 def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
     monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
 
