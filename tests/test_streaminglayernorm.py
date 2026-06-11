@@ -8,6 +8,22 @@ from lightstream.core.scnn import ChannelLayerNorm, StreamingChannelLayerNorm
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm as ImportedChannelLayerNorm
 
 
+def _channel_layer_norm_affine_keys(module: torch.nn.Module) -> set[str]:
+    return {key for key in module.state_dict() if key.endswith(("norm.weight", "norm.bias"))}
+
+
+def _assert_channel_layer_norm_state_keys_compatible(
+    original: torch.nn.Module, converted: torch.nn.Module, *, prefix: str = ""
+) -> None:
+    expected_keys = {f"{prefix}norm.weight", f"{prefix}norm.bias"}
+    assert _channel_layer_norm_affine_keys(original) == expected_keys
+    assert _channel_layer_norm_affine_keys(converted) == expected_keys
+
+
+def _assert_no_channel_layer_norm_affine_keys(module: torch.nn.Module) -> None:
+    assert _channel_layer_norm_affine_keys(module) == set()
+
+
 def test_channel_layer_norm_matches_nhwc_layer_norm():
     torch.manual_seed(7)
     module = ChannelLayerNorm(3, eps=1e-6, elementwise_affine=True)
@@ -183,6 +199,10 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
 
     streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
 
+    _assert_channel_layer_norm_state_keys_compatible(module, streaming)
+    assert set(streaming.state_dict()) == {"norm.weight", "norm.bias"}
+    assert set(dict(streaming.named_parameters())) == {"norm.weight", "norm.bias"}
+
     assert streaming.num_channels == module.num_channels
     assert streaming.eps == module.eps
     assert streaming.elementwise_affine == module.elementwise_affine
@@ -194,6 +214,7 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
     torch.testing.assert_close(streaming.bias, module.norm.bias)
 
     restored = streaming.to_channel_layer_norm()
+    _assert_channel_layer_norm_state_keys_compatible(module, restored)
     assert restored.num_channels == module.num_channels
     assert restored.eps == module.eps
     assert restored.elementwise_affine == module.elementwise_affine
@@ -220,6 +241,10 @@ def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadat
     module.norm = torch.nn.LayerNorm(3, eps=1e-2, elementwise_affine=True)
 
     streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    _assert_channel_layer_norm_state_keys_compatible(module, streaming)
+    assert set(streaming.state_dict()) == {"norm.weight", "norm.bias"}
+    assert set(dict(streaming.named_parameters())) == {"norm.weight", "norm.bias"}
 
     assert streaming.num_channels == module.num_channels
     assert streaming.eps == module.eps
@@ -286,6 +311,7 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
     torch.manual_seed(11)
     module = ChannelLayerNorm(4, eps=1e-5, elementwise_affine=True)
     streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+    _assert_channel_layer_norm_state_keys_compatible(module, streaming)
 
     x = torch.randn(2, 4, 3, 5, requires_grad=True)
     x_streaming = x.detach().clone().requires_grad_(True)
@@ -295,8 +321,11 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
     streaming(x_streaming).backward(grad)
 
     torch.testing.assert_close(x_streaming.grad, x.grad)
-    torch.testing.assert_close(streaming.weight.grad, module.norm.weight.grad)
-    torch.testing.assert_close(streaming.bias.grad, module.norm.bias.grad)
+    reference_grads = {name: param.grad for name, param in module.named_parameters()}
+    streaming_grads = {name: param.grad for name, param in streaming.named_parameters()}
+    assert streaming_grads.keys() == reference_grads.keys() == {"norm.weight", "norm.bias"}
+    for name in reference_grads:
+        torch.testing.assert_close(streaming_grads[name], reference_grads[name])
 
 
 def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
@@ -305,6 +334,7 @@ def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region(
 
     torch.manual_seed(13)
     streaming = StreamingChannelLayerNorm(3, eps=1e-5, elementwise_affine=True)
+    assert set(streaming.state_dict()) == {"norm.weight", "norm.bias"}
     streaming.grad_lost = Lost(top=1, left=1, bottom=1, right=0)
     streaming.input_loc = Box(y=0, height=4, x=0, width=5, sides=Sides(left=1, top=1, right=0, bottom=0))
     streaming.output_stride = torch.tensor([1, 1, 1])
@@ -329,6 +359,11 @@ def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
     torch.manual_seed(17)
     module = ChannelLayerNorm(3, elementwise_affine=False)
     streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    _assert_no_channel_layer_norm_affine_keys(module)
+    _assert_no_channel_layer_norm_affine_keys(streaming)
+    assert set(dict(module.named_parameters())) == set()
+    assert set(dict(streaming.named_parameters())) == set()
 
     x = torch.randn(2, 3, 4, 4, requires_grad=True)
     x_streaming = x.detach().clone().requires_grad_(True)
@@ -408,6 +443,12 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
 
     scnn = _make_channel_norm_scnn(model, tile_size=8)
     assert isinstance(scnn.stream_module.norm, StreamingChannelLayerNorm)
+    if elementwise_affine:
+        _assert_channel_layer_norm_state_keys_compatible(reference, scnn.stream_module, prefix="norm.")
+    else:
+        _assert_no_channel_layer_norm_affine_keys(reference)
+        _assert_no_channel_layer_norm_affine_keys(scnn.stream_module)
+
     assert scnn.stream_module.norm.elementwise_affine is elementwise_affine
 
     stream_output = scnn.forward(image.detach().clone())
@@ -419,18 +460,21 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     scnn.backward(image.detach().clone(), upstream_grad.detach().clone())
 
     stream_module = scnn.stream_module
-    torch.testing.assert_close(stream_module.upstream.weight.grad, reference.upstream.weight.grad, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(stream_module.upstream.bias.grad, reference.upstream.bias.grad, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(stream_module.downstream.weight.grad, reference.downstream.weight.grad, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(stream_module.downstream.bias.grad, reference.downstream.bias.grad, atol=1e-5, rtol=1e-4)
+    reference_grads = {name: param.grad for name, param in reference.named_parameters()}
+    streaming_grads = {name: param.grad for name, param in stream_module.named_parameters()}
+    assert streaming_grads.keys() == reference_grads.keys()
+    for name in reference_grads:
+        torch.testing.assert_close(streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4)
 
     if elementwise_affine:
-        torch.testing.assert_close(stream_module.norm.weight.grad, reference.norm.norm.weight.grad, atol=1e-5, rtol=1e-4)
-        torch.testing.assert_close(stream_module.norm.bias.grad, reference.norm.norm.bias.grad, atol=1e-5, rtol=1e-4)
+        assert {"norm.norm.weight", "norm.norm.bias"}.issubset(streaming_grads)
     else:
         assert stream_module.norm.weight is None
         assert stream_module.norm.bias is None
-        assert not any(name.startswith("norm.") for name, _ in stream_module.named_parameters())
+        assert "norm.norm.weight" not in streaming_grads
+        assert "norm.norm.bias" not in streaming_grads
+        _assert_no_channel_layer_norm_affine_keys(reference)
+        _assert_no_channel_layer_norm_affine_keys(stream_module)
 
 
 def test_scnn_channel_layer_norm_forward_backward_parity():
