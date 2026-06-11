@@ -14,6 +14,8 @@ class ChannelLayerNorm(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6, elementwise_affine: bool = True):
         super().__init__()
         self.num_channels = num_channels
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
         self.norm = nn.LayerNorm(num_channels, eps=eps, elementwise_affine=elementwise_affine)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -180,8 +182,14 @@ class StreamingChannelLayerNorm(nn.Module):
 
     @classmethod
     def from_channel_layer_norm(cls, module: ChannelLayerNorm) -> "StreamingChannelLayerNorm":
-        mod = cls(module.num_channels, module.norm.eps, module.norm.elementwise_affine)
-        if module.norm.elementwise_affine:
+        if not isinstance(module.norm, nn.LayerNorm):
+            raise TypeError(
+                "StreamingChannelLayerNorm.from_channel_layer_norm expected "
+                f"module.norm to be nn.LayerNorm, got {type(module.norm).__name__}."
+            )
+
+        mod = cls(module.num_channels, module.eps, module.elementwise_affine)
+        if module.elementwise_affine:
             mod = mod.to(module.norm.weight.device, non_blocking=True)
             mod = mod.to(module.norm.weight.dtype)
             mod.weight.data.copy_(module.norm.weight.data)
