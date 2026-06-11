@@ -36,7 +36,6 @@ def _compare_grads(stream_grads: dict[str, torch.Tensor], normal_grads: dict[str
         print(
             f"{name}: "
             f"mean abs diff={diff.mean().item():.6e}, max abs diff={diff.max().item():.6e}, "
-
         )
 
 
@@ -107,7 +106,8 @@ def main() -> None:
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-
+    print("Network using streaming")
+    print(network)
     _zero_grads(network.stream_network.stream_module.parameters())
     stream_output = network(img)
     stream_output.requires_grad = True
@@ -121,6 +121,8 @@ def main() -> None:
 
     ## normal model
     network.stream_network.disable()
+    print("Network after disabling streaming")
+    print(network)
     normal_net = network.stream_network.stream_module
     _zero_grads(normal_net.parameters())
     img_normal = img.detach().clone().requires_grad_(True)

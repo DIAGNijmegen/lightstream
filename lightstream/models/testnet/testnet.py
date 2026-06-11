@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
+from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 
 class GatedAttention(nn.Module):
     """Convolutional implementation of Gated Attention compatible with streaming."""
@@ -76,13 +77,19 @@ class StreamingTestNet(StreamingModule):
 
         stream_net = torch.nn.Sequential(
             torch.nn.Conv2d(3, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+            ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
             GatedAttention(16,8,2))
 
