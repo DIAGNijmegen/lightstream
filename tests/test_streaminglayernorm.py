@@ -205,6 +205,27 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
     torch.testing.assert_close(restored.norm.bias, module.norm.bias)
 
 
+def test_streaming_channel_layer_norm_state_dict_matches_channel_layer_norm_keys():
+    module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True)
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    assert list(module.state_dict().keys()) == ["norm.weight", "norm.bias"]
+    assert list(streaming.state_dict().keys()) == ["norm.weight", "norm.bias"]
+
+    streaming.load_state_dict(module.state_dict())
+    torch.testing.assert_close(streaming.norm.weight, module.norm.weight)
+    torch.testing.assert_close(streaming.norm.bias, module.norm.bias)
+
+
+def test_streaming_channel_layer_norm_state_dict_without_affine_matches_channel_layer_norm_keys():
+    module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=False)
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    assert list(module.state_dict().keys()) == []
+    assert list(streaming.state_dict().keys()) == []
+    streaming.load_state_dict(module.state_dict())
+
+
 def test_channel_layer_norm_stores_constructor_metadata():
     module = ChannelLayerNorm(5, eps=1e-3, elementwise_affine=False)
 

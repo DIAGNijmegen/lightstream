@@ -144,17 +144,19 @@ class StreamingChannelLayerNorm(nn.Module):
         self.num_channels = num_channels
         self.eps = eps
         self.elementwise_affine = elementwise_affine
-
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(num_channels))
-            self.bias = nn.Parameter(torch.zeros(num_channels))
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
+        self.norm = nn.LayerNorm(num_channels, eps=eps, elementwise_affine=elementwise_affine)
 
         self.grad_lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1, 1, 1])
         self.reset()
+
+    @property
+    def weight(self) -> torch.nn.Parameter | None:
+        return self.norm.weight
+
+    @property
+    def bias(self) -> torch.nn.Parameter | None:
+        return self.norm.bias
 
     def reset(self):
         self.seen_indices = Box(0, 0, 0, 0, None)
@@ -173,8 +175,8 @@ class StreamingChannelLayerNorm(nn.Module):
 
         return channel_layer_norm(
             x,
-            self.weight,
-            self.bias,
+            self.norm.weight,
+            self.norm.bias,
             self.num_channels,
             self.eps,
             self.grad_lost,
@@ -195,19 +197,17 @@ class StreamingChannelLayerNorm(nn.Module):
         if module.elementwise_affine:
             mod = mod.to(module.norm.weight.device, non_blocking=True)
             mod = mod.to(module.norm.weight.dtype)
-            mod.weight.data.copy_(module.norm.weight.data)
-            mod.bias.data.copy_(module.norm.bias.data)
-            mod.weight.requires_grad = module.norm.weight.requires_grad
-            mod.bias.requires_grad = module.norm.bias.requires_grad
+            mod.norm.weight.requires_grad = module.norm.weight.requires_grad
+            mod.norm.bias.requires_grad = module.norm.bias.requires_grad
+        mod.norm.load_state_dict(module.norm.state_dict())
         return mod
 
     def to_channel_layer_norm(self) -> ChannelLayerNorm:
         mod = ChannelLayerNorm(self.num_channels, self.eps, self.elementwise_affine)
         if self.elementwise_affine:
-            mod = mod.to(self.weight.device, non_blocking=True)
-            mod = mod.to(self.weight.dtype)
-            mod.norm.weight.data.copy_(self.weight.data)
-            mod.norm.bias.data.copy_(self.bias.data)
-            mod.norm.weight.requires_grad = self.weight.requires_grad
-            mod.norm.bias.requires_grad = self.bias.requires_grad
+            mod = mod.to(self.norm.weight.device, non_blocking=True)
+            mod = mod.to(self.norm.weight.dtype)
+            mod.norm.weight.requires_grad = self.norm.weight.requires_grad
+            mod.norm.bias.requires_grad = self.norm.bias.requires_grad
+        mod.norm.load_state_dict(self.norm.state_dict())
         return mod
