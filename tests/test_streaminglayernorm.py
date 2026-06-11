@@ -121,8 +121,8 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
     streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
 
     assert streaming.num_channels == module.num_channels
-    assert streaming.eps == module.norm.eps
-    assert streaming.elementwise_affine == module.norm.elementwise_affine
+    assert streaming.eps == module.eps
+    assert streaming.elementwise_affine == module.elementwise_affine
     assert streaming.weight.dtype == module.norm.weight.dtype
     assert streaming.weight.device == module.norm.weight.device
     assert streaming.weight.requires_grad == module.norm.weight.requires_grad
@@ -132,13 +132,45 @@ def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metada
 
     restored = streaming.to_channel_layer_norm()
     assert restored.num_channels == module.num_channels
-    assert restored.norm.eps == module.norm.eps
-    assert restored.norm.elementwise_affine == module.norm.elementwise_affine
+    assert restored.eps == module.eps
+    assert restored.elementwise_affine == module.elementwise_affine
+    assert restored.norm.eps == module.eps
+    assert restored.norm.elementwise_affine == module.elementwise_affine
     assert restored.norm.weight.requires_grad == module.norm.weight.requires_grad
     assert restored.norm.bias.requires_grad == module.norm.bias.requires_grad
     torch.testing.assert_close(restored.norm.weight, module.norm.weight)
     torch.testing.assert_close(restored.norm.bias, module.norm.bias)
 
+
+def test_channel_layer_norm_stores_constructor_metadata():
+    module = ChannelLayerNorm(5, eps=1e-3, elementwise_affine=False)
+
+    assert module.num_channels == 5
+    assert module.eps == 1e-3
+    assert module.elementwise_affine is False
+
+
+def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadata():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+
+    module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True)
+    module.norm = torch.nn.LayerNorm(3, eps=1e-2, elementwise_affine=True)
+
+    streaming = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+
+    assert streaming.num_channels == module.num_channels
+    assert streaming.eps == module.eps
+    assert streaming.elementwise_affine == module.elementwise_affine
+
+
+def test_streaming_channel_layer_norm_conversion_rejects_replaced_norm():
+    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+
+    module = ChannelLayerNorm(3)
+    module.norm = torch.nn.Identity()
+
+    with pytest.raises(TypeError, match="module.norm to be nn.LayerNorm"):
+        StreamingChannelLayerNorm.from_channel_layer_norm(module)
 
 def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
     from lightstream.core.scnn.scnn import StreamingCNN
