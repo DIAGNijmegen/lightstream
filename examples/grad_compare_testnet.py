@@ -150,7 +150,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-
+    print(network)
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
     print(
@@ -185,6 +185,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
     network.stream_network.disable()
+    print(network)
     normal_net = network.stream_network.stream_module
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())

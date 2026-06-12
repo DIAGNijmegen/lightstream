@@ -1686,21 +1686,6 @@ class StreamingCNN(torch.nn.Module):
             # make its actual output all zeros, so derive validity from its input.
             lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
 
-            if (
-                is_upsample
-                and module.mode == "bilinear"
-                and module.align_corners in (None, False)
-                and module.scale_factor is not None
-            ):
-                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
-                if float(scale_h).is_integer() and float(scale_w).is_integer():
-                    loss_h = math.ceil(scale_h / 2.0 - 0.5)
-                    loss_w = math.ceil(scale_w / 2.0 - 0.5)
-                    lost.top += loss_h
-                    lost.bottom += loss_h
-                    lost.left += loss_w
-                    lost.right += loss_w
-
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
             output[
