@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 
 
@@ -25,3 +26,61 @@ def test_constructor_keeps_upsample_modules():
     model = torch.nn.Sequential(torch.nn.Conv2d(3, 3, 1), torch.nn.Upsample(scale_factor=2.0, mode="nearest"))
     constructor = StreamingConstructor(model, tile_size=32, verbose=False, statistics_on_cpu=True)
     assert torch.nn.Upsample in constructor.keep_modules
+
+
+def test_bilinear_upsample_statistics_add_explicit_border_loss():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+    inpt = torch.ones(1, 3, 5, 7)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    lost = scnn._module_stats[module]["lost"]
+    assert (lost.top, lost.bottom, lost.left, lost.right) == (1, 1, 1, 1)
+    assert torch.all(output[:, :, :1, :] == 0)
+    assert torch.all(output[:, :, -1:, :] == 0)
+    assert torch.all(output[:, :, :, :1] == 0)
+    assert torch.all(output[:, :, :, -1:] == 0)
+    assert torch.all(output[:, :, 1:-1, 1:-1] == 1)
+
+
+@pytest.mark.parametrize(
+    ("scale_factor", "expected_loss"),
+    [
+        (2, 1),
+        (4, 2),
+        (8, 4),
+    ],
+)
+def test_bilinear_upsample_statistics_scale_factor_loss_formula(scale_factor, expected_loss):
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=scale_factor, mode="bilinear", align_corners=False)
+    inpt = torch.ones(1, 3, 5, 5)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    lost = scnn._module_stats[module]["lost"]
+    assert (lost.top, lost.bottom, lost.left, lost.right) == (
+        expected_loss,
+        expected_loss,
+        expected_loss,
+        expected_loss,
+    )
