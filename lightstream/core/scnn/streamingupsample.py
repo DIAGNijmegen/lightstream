@@ -24,6 +24,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         grad_lost,
         seen_indices,
         output_stride,
+        pre_upsample_output_stride,
         input_loc,
     ):
         ctx.save_for_backward(inpt)
@@ -35,6 +36,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.grad_lost = grad_lost
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
+        ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.input_loc = input_loc
         return F.interpolate(
             inpt,
@@ -57,27 +59,6 @@ class StreamingUpsample2dF(torch.autograd.Function):
         lost_bottom = grad_lost.bottom if not sides.bottom else 0
         lost_left = grad_lost.left if not sides.left else 0
         lost_right = grad_lost.right if not sides.right else 0
-
-        valid_grad = grad_output[:, :, lost_top : grad_output.shape[H_DIM] - lost_bottom, lost_left : grad_output.shape[W_DIM] - lost_right]
-
-        input_loc = ctx.input_loc
-        # `ctx.output_stride` already represents this module output's stride
-        # in input-image coordinates. Using this directly keeps data_loc aligned
-        # for mixed upsample factors (e.g. 2/4/8 heads).
-        data_loc_y = int(input_loc.y // int(ctx.output_stride[1])) + lost_top
-        data_loc_x = int(input_loc.x // int(ctx.output_stride[2])) + lost_left
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-
-        new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
-
-        # Keep state monotonic for debugging/introspection, but do not deduplicate
-        # gradients at upsample level. Deduplication for parameter gradients is handled
-        # by downstream streaming conv layers.
-        seen_indices.y = updated_total_indices.y
-        seen_indices.height = updated_total_indices.height
-        seen_indices.x = updated_total_indices.x
-        seen_indices.width = updated_total_indices.width
-        seen_indices.sides = updated_total_indices.sides
 
         grad_for_interp = grad_output.clone()
         grad_for_interp[:, :, :lost_top, :] = 0
@@ -102,7 +83,31 @@ class StreamingUpsample2dF(torch.autograd.Function):
         else:
             grad_in = None
 
-        return grad_in, None, None, None, None, None, None, None, None, None
+        if grad_in is not None:
+            input_loc = ctx.input_loc
+            pre_upsample_output_stride = ctx.pre_upsample_output_stride
+            data_loc_y = int(input_loc.y // int(pre_upsample_output_stride[1]))
+            data_loc_x = int(input_loc.x // int(pre_upsample_output_stride[2]))
+            data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+            new_output_box, updated_total_indices = _new_value_indices(grad_in.shape, data_loc, seen_indices)
+
+            seen_indices.y = updated_total_indices.y
+            seen_indices.height = updated_total_indices.height
+            seen_indices.x = updated_total_indices.x
+            seen_indices.width = updated_total_indices.width
+            seen_indices.sides = updated_total_indices.sides
+
+            deduped_grad_in = torch.zeros_like(grad_in)
+            if new_output_box.height > 0 and new_output_box.width > 0:
+                y0 = new_output_box.y
+                y1 = new_output_box.y + new_output_box.height
+                x0 = new_output_box.x
+                x1 = new_output_box.x + new_output_box.width
+                deduped_grad_in[:, :, y0:y1, x0:x1] = grad_in[:, :, y0:y1, x0:x1]
+            grad_in = deduped_grad_in
+
+        return grad_in, None, None, None, None, None, None, None, None, None, None
 
 
 upsample2d = StreamingUpsample2dF.apply
@@ -138,6 +143,7 @@ class StreamingUpsample2d(nn.Module):
 
         self.grad_lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1, 1, 1])
+        self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.reset()
 
     def reset(self):
@@ -155,6 +161,7 @@ class StreamingUpsample2d(nn.Module):
             self.grad_lost,
             self.seen_indices,
             self.output_stride,
+            self.pre_upsample_output_stride,
             self.input_loc,
         )
 

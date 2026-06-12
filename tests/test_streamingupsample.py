@@ -4,6 +4,7 @@ import torch
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.scnn.utils import Box, Sides
 
 
 def test_streaming_upsample_from_torch_matches_interpolate():
@@ -84,3 +85,44 @@ def test_bilinear_upsample_statistics_scale_factor_loss_formula(scale_factor, ex
         expected_loss,
         expected_loss,
     )
+
+
+def test_streaming_upsample_backward_deduplicates_pre_upsample_coordinates():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    module.output_stride = torch.tensor([1, 1, 1])
+    module.pre_upsample_output_stride = torch.tensor([1, 2, 2])
+
+    first = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+    module(first).sum().backward()
+    assert torch.count_nonzero(first.grad).item() == first.numel()
+
+    second = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module.input_loc = Box(0, 0, 4, 0, Sides(left=0, top=0, right=0, bottom=0))
+    module(second).sum().backward()
+
+    assert torch.count_nonzero(second.grad[:, :, :, :2]).item() == 0
+    assert torch.count_nonzero(second.grad[:, :, :, 2:]).item() == second[:, :, :, 2:].numel()
+
+
+def test_upsample_statistics_store_pre_upsample_output_stride():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._stats_per_grad_fn = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+    inpt = torch.ones(1, 3, 5, 5, requires_grad=True)
+    output = module(inpt)
+
+    with torch.no_grad():
+        scnn._forward_gather_statistics_hook(module, (inpt,), output.detach().clone())
+    scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    stats = scnn._module_stats[module]
+    assert stats["output_stride"].tolist() == [1, 1, 1]
+    assert stats["pre_upsample_output_stride"].tolist() == [1, 2, 2]
