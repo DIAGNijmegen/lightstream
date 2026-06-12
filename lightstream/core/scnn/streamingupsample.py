@@ -25,6 +25,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         seen_indices,
         pre_upsample_output_stride,
         output_stride,
+        pre_upsample_output_stride,
         input_loc,
     ):
         ctx.save_for_backward(inpt)
@@ -37,6 +38,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.seen_indices = seen_indices
         ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.output_stride = output_stride
+        ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.input_loc = input_loc
         return F.interpolate(
             inpt,
@@ -106,6 +108,30 @@ class StreamingUpsample2dF(torch.autograd.Function):
         else:
             grad_in = None
 
+        if grad_in is not None:
+            input_loc = ctx.input_loc
+            pre_upsample_output_stride = ctx.pre_upsample_output_stride
+            data_loc_y = int(input_loc.y // int(pre_upsample_output_stride[1]))
+            data_loc_x = int(input_loc.x // int(pre_upsample_output_stride[2]))
+            data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
+
+            new_output_box, updated_total_indices = _new_value_indices(grad_in.shape, data_loc, seen_indices)
+
+            seen_indices.y = updated_total_indices.y
+            seen_indices.height = updated_total_indices.height
+            seen_indices.x = updated_total_indices.x
+            seen_indices.width = updated_total_indices.width
+            seen_indices.sides = updated_total_indices.sides
+
+            deduped_grad_in = torch.zeros_like(grad_in)
+            if new_output_box.height > 0 and new_output_box.width > 0:
+                y0 = new_output_box.y
+                y1 = new_output_box.y + new_output_box.height
+                x0 = new_output_box.x
+                x1 = new_output_box.x + new_output_box.width
+                deduped_grad_in[:, :, y0:y1, x0:x1] = grad_in[:, :, y0:y1, x0:x1]
+            grad_in = deduped_grad_in
+
         return grad_in, None, None, None, None, None, None, None, None, None, None
 
 
@@ -143,7 +169,7 @@ class StreamingUpsample2d(nn.Module):
         self.grad_lost = Lost(0, 0, 0, 0)
         self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.output_stride = torch.tensor([1, 1, 1])
-        self.post_upsample_output_stride = self.output_stride
+        self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.reset()
 
     def reset(self):
@@ -162,6 +188,7 @@ class StreamingUpsample2d(nn.Module):
             self.seen_indices,
             self.pre_upsample_output_stride,
             self.output_stride,
+            self.pre_upsample_output_stride,
             self.input_loc,
         )
 
