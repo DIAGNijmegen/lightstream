@@ -3,6 +3,8 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.models.testnet.segment import StreamingTestNet
 
 from lightstream.core.reducer import (
     BaseReducer,
@@ -876,3 +878,100 @@ def test_scnn_fused_attention_gem_internal_payload_count_shrinks_to_two():
         streamed = scnn.forward(image, mask=mask)
 
     assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+def _assert_non_edge_starts_match_alignment(scnn: StreamingCNN) -> None:
+    align_h, align_w = scnn._compute_internal_alignment()
+    assert align_h > 1
+    assert align_w > 1
+    for input_y, input_x, sides in scnn._last_forward_tiles:
+        if not sides.bottom:
+            assert input_y % align_h == 0
+        if not sides.right:
+            assert input_x % align_w == 0
+
+
+def test_internal_alignment_includes_pools_and_streaming_convs_for_testnet_segment_model():
+    torch.manual_seed(123)
+    model = StreamingTestNet.create_model().eval()
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, 128, 128),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+    )
+
+    alignment = scnn._compute_internal_alignment()
+    assert alignment == (8, 8)
+
+    valid_output_heights, valid_output_widths = scnn._compute_valid_output_sizes()
+    valid_input_height, valid_input_width = scnn._compute_valid_input_step(
+        valid_output_heights,
+        valid_output_widths,
+    )
+    assert valid_input_height % alignment[0] == 0
+    assert valid_input_width % alignment[1] == 0
+
+    image = torch.rand(1, 3, 224, 224)
+    scnn.forward(image)
+    _assert_non_edge_starts_match_alignment(scnn)
+
+
+class ResNetUpsamplingDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        from torchvision.models import resnet18
+
+        resnet = resnet18(weights=None)
+        self.encoder = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+        )
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
+            nn.Conv2d(128, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(8, 1, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
+def test_internal_alignment_keeps_resnet_encoder_upsampling_decoder_tile_phase():
+    torch.manual_seed(456)
+    model = ResNetUpsamplingDecoder().eval()
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, 128, 128),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=True,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+    )
+
+    alignment = scnn._compute_internal_alignment()
+    assert alignment[0] >= 8
+    assert alignment[1] >= 8
+
+    valid_output_heights, valid_output_widths = scnn._compute_valid_output_sizes()
+    valid_input_height, valid_input_width = scnn._compute_valid_input_step(
+        valid_output_heights,
+        valid_output_widths,
+    )
+    assert valid_input_height % alignment[0] == 0
+    assert valid_input_width % alignment[1] == 0
+
+    image = torch.rand(1, 3, 224, 224)
+    scnn.forward(image)
+    _assert_non_edge_starts_match_alignment(scnn)
