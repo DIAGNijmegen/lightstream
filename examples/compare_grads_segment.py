@@ -217,6 +217,8 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         diff = (stream_out - normal_out).abs()
         print(f"output{idx} forward output sum/max diff: {diff.sum().item()}, {diff.max().item()}")
 
+    output_grads = _base_output_grads(normal_outputs, target, criterion)
+
     start_normal_backward = time()
     torch.autograd.backward(normal_outputs, tuple(grad.detach().clone() for grad in output_grads))
     end_normal_backward = time() - start_normal_backward
