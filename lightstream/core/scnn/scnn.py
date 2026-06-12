@@ -579,9 +579,14 @@ class StreamingCNN(torch.nn.Module):
         elif isinstance(module, torch.nn.Upsample):
             mod = StreamingUpsample2d.from_torch_upsample(module)
             if module in self._module_stats:
-                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
-                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
-                self._module_stats[mod] = self._module_stats[module]
+                stats = self._module_stats[module]
+                mod.grad_lost = stats.get("grad_lost", Lost(0, 0, 0, 0))
+                mod.pre_upsample_output_stride = stats.get("pre_upsample_output_stride", torch.tensor([1, 1, 1]))
+                mod.output_stride = stats.get("output_stride", torch.tensor([1, 1, 1]))
+                mod.post_upsample_output_stride = stats.get("post_upsample_output_stride", mod.output_stride)
+                if "scale_factor_hw" in stats:
+                    mod.scale_factor_hw = stats["scale_factor_hw"]
+                self._module_stats[mod] = stats
                 del self._module_stats[module]
         elif isinstance(module, ChannelLayerNorm):
             mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
@@ -624,7 +629,11 @@ class StreamingCNN(torch.nn.Module):
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
+                stats["pre_upsample_output_stride"] = module.pre_upsample_output_stride
                 stats["output_stride"] = module.output_stride
+                stats["post_upsample_output_stride"] = getattr(module, "post_upsample_output_stride", module.output_stride)
+                if hasattr(module, "scale_factor_hw"):
+                    stats["scale_factor_hw"] = module.scale_factor_hw
                 self._module_stats[mod] = stats
             else:
                 self._module_stats[mod] = self._module_stats[module]
@@ -1765,8 +1774,10 @@ class StreamingCNN(torch.nn.Module):
                 prev_output_stride = torch.tensor([1, 1, 1])
 
             if is_upsample:
+                pre_upsample_output_stride = prev_output_stride.clone().detach()
                 scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
-                output_stride = self._update_output_stride_for_upsample(prev_output_stride, scale_h, scale_w)
+                output_stride = self._update_output_stride_for_upsample(pre_upsample_output_stride, scale_h, scale_w)
+                module_stats["pre_upsample_output_stride"] = pre_upsample_output_stride
                 module_stats["scale_factor_hw"] = (scale_h, scale_w)
             else:
                 output_stride = prev_output_stride
@@ -1774,6 +1785,8 @@ class StreamingCNN(torch.nn.Module):
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
+            if is_upsample:
+                module_stats["post_upsample_output_stride"] = output_stride
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
