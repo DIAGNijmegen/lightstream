@@ -493,26 +493,47 @@ class StreamingCNN(torch.nn.Module):
 
         return max(1, min(candidates_h)), max(1, min(candidates_w))
 
+    def _module_alignment_stats(self, module):
+        """Return module input-space stride stats used for tile-start alignment."""
+        stats = self._module_stats.get(module, {})
+
+        stride = stats.get("stride")
+        if stride is None:
+            stride = getattr(module, "stride", 1)
+            if stride is None:
+                stride = getattr(module, "kernel_size", 1)
+        stride = torch.as_tensor(_triple(stride), dtype=torch.long)
+
+        output_stride = stats.get("output_stride")
+        if output_stride is None:
+            output_stride = getattr(module, "output_stride", torch.tensor([1, 1, 1]))
+        output_stride = torch.as_tensor(_triple(output_stride), dtype=torch.long)
+
+        return output_stride, stride
+
     def _compute_internal_alignment(self):
-        """Compute input-space alignment constraints from internal streamed layers.
+        """Compute input-space alignment constraints from internal downsampling layers.
 
         When output heads are upsampled back to stride-1, alignment based only on
         head output stride becomes 1 and can lose the internal phase constraints
-        required by earlier strided conv layers.
+        required by earlier strided convolutions and pooling layers.
         """
 
         align_h = 1
         align_w = 1
-        for mod in self.stream_module.modules():
-            if not isinstance(mod, StreamingConv2d):
+        alignment_modules = (StreamingConv2d, torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d)
+        for module in self.stream_module.modules():
+            if not isinstance(module, alignment_modules):
                 continue
 
-            stride = _triple(mod.stride)
-            output_stride = getattr(mod, "output_stride", torch.tensor([1, 1, 1]))
-            eff_h = int(output_stride[1]) * int(stride[1])
-            eff_w = int(output_stride[2]) * int(stride[2])
-            align_h = math.lcm(align_h, max(1, eff_h))
-            align_w = math.lcm(align_w, max(1, eff_w))
+            output_stride, stride = self._module_alignment_stats(module)
+            if int(stride[1]) <= 1 and int(stride[2]) <= 1:
+                continue
+
+            effective_h = int(output_stride[1]) * int(stride[1])
+            effective_w = int(output_stride[2]) * int(stride[2])
+            align_h = math.lcm(align_h, max(1, effective_h))
+            align_w = math.lcm(align_w, max(1, effective_w))
 
         return align_h, align_w
 
@@ -783,6 +804,12 @@ class StreamingCNN(torch.nn.Module):
             1,
             valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
         )
+
+        internal_align_h, internal_align_w = self._compute_internal_alignment()
+        align_h = math.lcm(int(self._output_stride_per_output[0][1]), internal_align_h)
+        align_w = math.lcm(int(self._output_stride_per_output[0][2]), internal_align_w)
+        valid_input_height = max(align_h, (valid_input_height // align_h) * align_h)
+        valid_input_width = max(align_w, (valid_input_width // align_w) * align_w)
         return valid_input_height, valid_input_width
 
     def _compute_tile_grid(self, image_height, image_width, tile_height, tile_width, valid_input_height, valid_input_width):
@@ -817,6 +844,28 @@ class StreamingCNN(torch.nn.Module):
                 input_y = input_y if not sides.top else 0
                 input_x = input_x if not sides.left else 0
                 yield int(input_y), int(input_x), sides
+
+    def _log_and_validate_tile_start(self, input_y, input_x, sides, internal_alignment):
+        """Log tile starts and verify non-edge starts keep internal sampling phase."""
+        align_h, align_w = internal_alignment
+        logger.debug(
+            "Forward tile start: y=%s, x=%s, sides=%s, internal_alignment=(%s, %s)",
+            input_y,
+            input_x,
+            sides,
+            align_h,
+            align_w,
+        )
+        if not sides.bottom:
+            assert input_y % align_h == 0, (
+                f"Non-bottom-edge tile y-start {input_y} is not a multiple of "
+                f"internal alignment {align_h}"
+            )
+        if not sides.right:
+            assert input_x % align_w == 0, (
+                f"Non-right-edge tile x-start {input_x} is not a multiple of "
+                f"internal alignment {align_w}"
+            )
 
     def _prepare_forward_outputs(self, image, output_heights, output_widths, result_device):
         outputs = [None] * len(self._tile_output_shapes)
@@ -1230,13 +1279,15 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         self._last_forward_tiles = []
+        internal_alignment = self._compute_internal_alignment()
         logger.debug(
-            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s",
+            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s, internal_alignment=%s",
             valid_input_height,
             valid_input_width,
             n_rows,
             n_cols,
             n_rows * n_cols,
+            internal_alignment,
         )
 
         result_device = torch.device("cpu") if result_on_cpu else self.device
@@ -1275,6 +1326,7 @@ class StreamingCNN(torch.nn.Module):
             ):
                 last_sides = sides
                 self._last_forward_tiles.append((input_y, input_x, sides))
+                self._log_and_validate_tile_start(input_y, input_x, sides, internal_alignment)
                 tile, tile_outputs = self._run_forward_tile(forward_ctx.image, input_y, input_x, forward_ctx.tile_height, forward_ctx.tile_width)
 
                 self._resolve_reducer_head_map(tile_outputs)
