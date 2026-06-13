@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_bwd, custom_fwd
 
-from lightstream.core.scnn.utils import Box, Lost, _new_value_indices, H_DIM, W_DIM
+from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM
 
 
 class StreamingUpsample2dF(torch.autograd.Function):
@@ -53,7 +53,6 @@ class StreamingUpsample2dF(torch.autograd.Function):
         (inpt,) = ctx.saved_tensors
         sides = ctx.input_loc.sides
         grad_lost = ctx.grad_lost
-        seen_indices = ctx.seen_indices
 
         lost_top = grad_lost.top if not sides.top else 0
         lost_bottom = grad_lost.bottom if not sides.bottom else 0
@@ -80,29 +79,6 @@ class StreamingUpsample2dF(torch.autograd.Function):
                     recompute_scale_factor=ctx.recompute_scale_factor,
                 )
                 grad_in = torch.autograd.grad(out, inpt_grad, grad_for_interp, retain_graph=False, allow_unused=False)[0]
-
-            input_loc = ctx.input_loc
-            pre_upsample_output_stride = ctx.pre_upsample_output_stride
-            data_loc_y = int(input_loc.y // int(pre_upsample_output_stride[1]))
-            data_loc_x = int(input_loc.x // int(pre_upsample_output_stride[2]))
-            data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-
-            new_input_box, updated_total_indices = _new_value_indices(grad_in.shape, data_loc, seen_indices)
-
-            seen_indices.y = updated_total_indices.y
-            seen_indices.height = updated_total_indices.height
-            seen_indices.x = updated_total_indices.x
-            seen_indices.width = updated_total_indices.width
-            seen_indices.sides = updated_total_indices.sides
-
-            deduplicated_grad_in = torch.zeros_like(grad_in)
-            if new_input_box.height > 0 and new_input_box.width > 0:
-                y0 = new_input_box.y
-                y1 = y0 + new_input_box.height
-                x0 = new_input_box.x
-                x1 = x0 + new_input_box.width
-                deduplicated_grad_in[:, :, y0:y1, x0:x1] = grad_in[:, :, y0:y1, x0:x1]
-            grad_in = deduplicated_grad_in
         else:
             grad_in = None
 
