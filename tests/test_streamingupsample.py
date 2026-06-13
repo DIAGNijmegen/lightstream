@@ -87,7 +87,7 @@ def test_bilinear_upsample_statistics_scale_factor_loss_formula(scale_factor, ex
     )
 
 
-def test_streaming_upsample_backward_deduplicates_pre_upsample_coordinates():
+def test_streaming_upsample_backward_keeps_pre_upsample_coordinate_gradients():
     module = StreamingUpsample2d(scale_factor=2, mode="nearest")
     module.output_stride = torch.tensor([1, 1, 1])
     module.pre_upsample_output_stride = torch.tensor([1, 2, 2])
@@ -101,8 +101,7 @@ def test_streaming_upsample_backward_deduplicates_pre_upsample_coordinates():
     module.input_loc = Box(0, 0, 4, 0, Sides(left=0, top=0, right=0, bottom=0))
     module(second).sum().backward()
 
-    assert torch.count_nonzero(second.grad[:, :, :, :2]).item() == 0
-    assert torch.count_nonzero(second.grad[:, :, :, 2:]).item() == second[:, :, :, 2:].numel()
+    assert torch.count_nonzero(second.grad).item() == second.numel()
 
 
 def test_upsample_statistics_store_pre_upsample_output_stride():
