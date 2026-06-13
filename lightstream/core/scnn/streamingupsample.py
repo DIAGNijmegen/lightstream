@@ -25,7 +25,6 @@ class StreamingUpsample2dF(torch.autograd.Function):
         seen_indices,
         pre_upsample_output_stride,
         output_stride,
-        pre_upsample_output_stride,
         input_loc,
     ):
         ctx.save_for_backward(inpt)
@@ -38,7 +37,6 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.seen_indices = seen_indices
         ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.output_stride = output_stride
-        ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.input_loc = input_loc
         return F.interpolate(
             inpt,
@@ -145,7 +143,6 @@ class StreamingUpsample2d(nn.Module):
         self.grad_lost = Lost(0, 0, 0, 0)
         self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.output_stride = torch.tensor([1, 1, 1])
-        self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.reset()
 
     def reset(self):
@@ -164,7 +161,6 @@ class StreamingUpsample2d(nn.Module):
             self.seen_indices,
             self.pre_upsample_output_stride,
             self.output_stride,
-            self.pre_upsample_output_stride,
             self.input_loc,
         )
 
