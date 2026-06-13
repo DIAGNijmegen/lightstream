@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_bwd, custom_fwd
 
-from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM
+from lightstream.core.scnn.utils import Box, Lost, _new_value_indices, H_DIM, W_DIM
 
 
 class StreamingUpsample2dF(torch.autograd.Function):
@@ -59,13 +59,38 @@ class StreamingUpsample2dF(torch.autograd.Function):
         lost_left = grad_lost.left if not sides.left else 0
         lost_right = grad_lost.right if not sides.right else 0
 
-        grad_for_interp = grad_output.clone()
-        grad_for_interp[:, :, :lost_top, :] = 0
-        if lost_bottom > 0:
-            grad_for_interp[:, :, grad_output.shape[H_DIM] - lost_bottom :, :] = 0
-        grad_for_interp[:, :, :, :lost_left] = 0
-        if lost_right > 0:
-            grad_for_interp[:, :, :, grad_output.shape[W_DIM] - lost_right :] = 0
+        H = grad_output.shape[H_DIM]
+        W = grad_output.shape[W_DIM]
+        valid_grad = grad_output[:, :, lost_top : H - lost_bottom, lost_left : W - lost_right]
+
+        output_stride = ctx.output_stride
+        stride_h = int(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[1])
+        stride_w = int(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[2])
+        data_loc_y = int(ctx.input_loc.y // stride_h) + lost_top
+        data_loc_x = int(ctx.input_loc.x // stride_w) + lost_left
+        data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
+
+        new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
+
+        ctx.seen_indices.y = updated_total_indices.y
+        ctx.seen_indices.height = updated_total_indices.height
+        ctx.seen_indices.x = updated_total_indices.x
+        ctx.seen_indices.width = updated_total_indices.width
+        ctx.seen_indices.sides = updated_total_indices.sides
+
+        grad_for_interp = torch.zeros_like(grad_output)
+        if new_output_box.height > 0 and new_output_box.width > 0:
+            grad_for_interp[
+                :,
+                :,
+                lost_top + new_output_box.y : lost_top + new_output_box.y + new_output_box.height,
+                lost_left + new_output_box.x : lost_left + new_output_box.x + new_output_box.width,
+            ] = valid_grad[
+                :,
+                :,
+                new_output_box.y : new_output_box.y + new_output_box.height,
+                new_output_box.x : new_output_box.x + new_output_box.width,
+            ]
 
         if ctx.needs_input_grad[0]:
             with torch.enable_grad():
