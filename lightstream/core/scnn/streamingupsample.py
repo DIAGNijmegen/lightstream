@@ -66,6 +66,8 @@ class StreamingUpsample2dF(torch.autograd.Function):
         output_stride = ctx.output_stride
         stride_h = int(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[1])
         stride_w = int(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[2])
+        # grad_output is in post-upsample coordinates, so locating valid_grad for
+        # _new_value_indices(valid_grad.shape, ...) must use the post-upsample stride.
         data_loc_y = int(ctx.input_loc.y // stride_h) + lost_top
         data_loc_x = int(ctx.input_loc.x // stride_w) + lost_left
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
