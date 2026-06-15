@@ -6,7 +6,8 @@ many networks having padding, which will create wrong results when tiles are str
 
 However, only convolutional and local pooling layers need to be used for calculating streaming statistics
 since they will have padding. Most other modules (normalization layers, fully connected layers) are not compatible
-with streaming or will be kept on module.eval() during both training and inference.
+with streaming or will be kept on module.eval() during both training and inference. Channel-only normalization
+through ChannelLayerNorm is the supported exception because it does not mix spatial positions.
 
 """
 
@@ -16,6 +17,7 @@ import torch.nn as nn
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.reducer import BaseReducer
+from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 from typing import Any, Callable, Optional
 
 
@@ -83,6 +85,7 @@ class StreamingConstructor:
             torch.nn.MaxPool2d,
             torch.nn.MaxPool3d,
             torch.nn.Upsample,
+            ChannelLayerNorm,
             BaseReducer,
         ]
 
@@ -185,6 +188,9 @@ class StreamingConstructor:
         """
 
         for n, module in model.named_children():
+            if isinstance(module, tuple(self.keep_modules)):
+                continue
+
             if len(list(module.children())) > 0:
                 # compound module, go inside it
                 self.convert_to_identity(module)
@@ -192,12 +198,11 @@ class StreamingConstructor:
 
             # if new module is assigned to a variable, e.g. new = nn.Identity(), then it's considered a duplicate in
             # module.named_children used later. Instead, we use in-place assignment, so each new module is unique
-            if not isinstance(module, tuple(self.keep_modules)):
-                try:
-                    n = int(n)
-                    model[n] = torch.nn.Identity()
-                except ValueError:
-                    setattr(model, str(n), torch.nn.Identity())
+            try:
+                n = int(n)
+                model[n] = torch.nn.Identity()
+            except ValueError:
+                setattr(model, str(n), torch.nn.Identity())
 
     def restore_model_layers(self, model_ref: nn.Module, model_rep: nn.Module) -> None:
         """Restore model layers from Identity to what they were before

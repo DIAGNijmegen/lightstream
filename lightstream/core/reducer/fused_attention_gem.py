@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .attention_gem import _normalize_logits
+from .attention_gem import _normalize_logits, _validate_uniform_attention_eps
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
 from .utils import normalize_spatial_mask, resolve_accumulator_dtype
@@ -46,6 +46,22 @@ def _normalize_three_logits(
     )
 
 
+def _validate_stacked_logits(logits_stacked: torch.Tensor, reference: torch.Tensor) -> None:
+    if logits_stacked.ndim != 4:
+        raise ValueError(
+            f"logits_stacked must be an NCHW tensor, got shape={tuple(logits_stacked.shape)}"
+        )
+    if (
+        logits_stacked.shape[0] != reference.shape[0]
+        or logits_stacked.shape[1] != 3
+        or logits_stacked.shape[-2:] != reference.shape[-2:]
+    ):
+        raise ValueError(
+            "logits_stacked must have shape [N,3,H,W] matching fused_y; "
+            f"got logits_stacked={tuple(logits_stacked.shape)}, fused_y={tuple(reference.shape)}"
+        )
+
+
 class FusedAttentionGeMReducer(BaseReducer):
     """Fuse three value maps, then apply three globally normalized attention-GeM branches."""
 
@@ -56,10 +72,12 @@ class FusedAttentionGeMReducer(BaseReducer):
         value_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
+        uniform_attention_eps: float = 0.0,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
+        self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
@@ -81,7 +99,10 @@ class FusedAttentionGeMReducer(BaseReducer):
         logits = _normalize_three_logits(logits1, logits2, logits3, y1)
 
         if self._streaming_passthrough:
-            passthrough = tuple(t.view_as(t) for t in (y1, y2, y3, *logits))
+            vw = self.value_weights.to(device=y1.device, dtype=y1.dtype)
+            fused_y = vw[0] * y1 + vw[1] * y2 + vw[2] * y3
+            logits_stacked = torch.cat(logits, dim=1)
+            passthrough = (fused_y.view_as(fused_y), logits_stacked.view_as(logits_stacked))
             self._last_inputs = passthrough
             self._last_output = passthrough[0]
             return passthrough
@@ -116,8 +137,19 @@ class FusedAttentionGeMReducer(BaseReducer):
             branch = (weights * x_pow).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
             branch_means.append(torch.where(any_valid, branch, torch.zeros_like(branch)))
 
-        weighted_mean = aw[0] * branch_means[0] + aw[1] * branch_means[1] + aw[2] * branch_means[2]
-        return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=y1.dtype)
+        attention_mean = aw[0] * branch_means[0] + aw[1] * branch_means[1] + aw[2] * branch_means[2]
+        if self.uniform_attention_eps:
+            if mask_nchw is not None:
+                valid = mask_nchw.to(dtype=acc_dtype)
+                uniform_z = valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(self.eps)
+                uniform_mean = (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / uniform_z
+            else:
+                uniform_mean = x_pow.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+            mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
+        else:
+            mixed_mean = attention_mean
+
+        return mixed_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=y1.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
         reducer = StreamingFusedAttentionGeMReducer(
@@ -126,6 +158,7 @@ class FusedAttentionGeMReducer(BaseReducer):
             value_weights=tuple(float(x) for x in self.value_weights.detach().cpu()),
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
+            uniform_attention_eps=self.uniform_attention_eps,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))
@@ -143,15 +176,22 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         value_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
+        uniform_attention_eps: float = 0.0,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
+        self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
         self.register_buffer("running_m", torch.zeros(0), persistent=False)
         self.register_buffer("running_zhat", torch.zeros(0), persistent=False)
         self.register_buffer("running_shat", torch.zeros(0), persistent=False)
+        self.register_buffer("running_valid_x_pow_sum", torch.zeros(0), persistent=False)
+        self.register_buffer("running_valid_count", torch.zeros(0), persistent=False)
+        # Backward-compatible aliases for the uniform-mixing path.
+        self.register_buffer("running_uniform_sum", torch.zeros(0), persistent=False)
+        self.register_buffer("running_uniform_count", torch.zeros(0), persistent=False)
         self._stream_output_dtype: torch.dtype | None = None
 
     @property
@@ -169,17 +209,23 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         _validate_value_maps(y1, y2, y3)
+        vw = self.value_weights.to(device=y1.device, dtype=y1.dtype)
+        fused_y = vw[0] * y1 + vw[1] * y2 + vw[2] * y3
         logits = _normalize_three_logits(logits1, logits2, logits3, y1)
-        passthrough = tuple(t.view_as(t) for t in (y1, y2, y3, *logits))
+        logits_stacked = torch.cat(logits, dim=1)
+        passthrough = (fused_y.view_as(fused_y), logits_stacked.view_as(logits_stacked))
         self._last_inputs = passthrough
         self._last_output = passthrough[0]
         return passthrough
 
     def accumulate_stream_tile(self, trimmed_output, tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
         payload = self._parse_multi_input_payload(trimmed_output)
-        if len(payload) != 6:
-            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
-        y1 = payload[0]
+        if len(payload) != 2:
+            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
+        fused_y, logits_stacked = payload
+        if fused_y.ndim != 4:
+            raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
+        _validate_stacked_logits(logits_stacked, fused_y)
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
         seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
         new_mask = ~seen_slice
@@ -195,8 +241,8 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
                     bool(sides.left),
                     bool(sides.right),
                     bool(sides.bottom),
-                    int(y1.shape[-2]),
-                    int(y1.shape[-1]),
+                    int(fused_y.shape[-2]),
+                    int(fused_y.shape[-1]),
                     int(dst_y0),
                     int(dst_y1),
                     int(dst_x0),
@@ -209,11 +255,19 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         seen_slice |= new_mask
 
     def build_backward_pair(self, trimmed_output, gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None):
+        """Build a replay tile pair using the mask prepared by ``StreamingCNN``.
+
+        ``valid_mask`` is already overlap-safe for the backward tile, so this
+        reducer applies it locally without retaining separate mask replay state.
+        """
         payload = self._parse_multi_input_payload(trimmed_output)
-        if len(payload) != 6:
-            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
-        y1 = payload[0]
-        expected_h, expected_w = int(y1.shape[-2]), int(y1.shape[-1])
+        if len(payload) != 2:
+            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
+        fused_y, logits_stacked = payload
+        if fused_y.ndim != 4:
+            raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
+        _validate_stacked_logits(logits_stacked, fused_y)
+        expected_h, expected_w = int(fused_y.shape[-2]), int(fused_y.shape[-1])
         if self._debug_replay_enabled:
             if self._replay_assignments is None or self._replay_cursor is None:
                 raise RuntimeError("Reducer replay state is not initialized. Call start_backward_replay() first.")
@@ -235,28 +289,29 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_m = torch.full((batch_size, 3, 1, 1, 1), torch.finfo(accumulator_dtype).min, device=device, dtype=accumulator_dtype)
         self.running_zhat = torch.zeros((batch_size, 3, 1, 1, 1), device=device, dtype=accumulator_dtype)
         self.running_shat = torch.zeros((batch_size, 3, channels, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_valid_x_pow_sum = torch.zeros((batch_size, channels, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_valid_count = torch.zeros((batch_size, 1, 1, 1), device=device, dtype=accumulator_dtype)
+        self.running_uniform_sum = self.running_valid_x_pow_sum
+        self.running_uniform_count = self.running_valid_count
 
     def accumulate_valid_tile(self, tile, valid_mask: torch.Tensor) -> None:
         payload = self._parse_multi_input_payload(tile)
-        if len(payload) != 6:
-            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
-        y1, y2, y3, logits1, logits2, logits3 = payload
-        _validate_value_maps(y1, y2, y3)
+        if len(payload) != 2:
+            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
+        fused_y, logits_stacked = payload
+        if fused_y.ndim != 4:
+            raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
+        _validate_stacked_logits(logits_stacked, fused_y)
         if self.running_shat.numel() == 0:
-            self.reset_stream_state(batch_size=y1.shape[0], channels=y1.shape[1], device=y1.device, dtype=y1.dtype)
+            self.reset_stream_state(batch_size=fused_y.shape[0], channels=fused_y.shape[1], device=fused_y.device, dtype=fused_y.dtype)
 
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, y1.dtype)
-        vw = self.value_weights.to(device=y1.device, dtype=acc_dtype)
-        r = self.current_r.to(device=y1.device, dtype=acc_dtype)
-        fused_y = vw[0] * y1.to(dtype=acc_dtype) + vw[1] * y2.to(device=y1.device, dtype=acc_dtype) + vw[2] * y3.to(device=y1.device, dtype=acc_dtype)
-        x_pow = fused_y.clamp_min(self.eps).pow(r)
-        logits = torch.stack(
-            [logit.to(device=y1.device, dtype=acc_dtype) for logit in _normalize_three_logits(logits1, logits2, logits3, y1)],
-            dim=1,
-        )
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, fused_y.dtype)
+        r = self.current_r.to(device=fused_y.device, dtype=acc_dtype)
+        x_pow = fused_y.to(acc_dtype).clamp_min(self.eps).pow(r)
+        logits = logits_stacked.to(device=fused_y.device, dtype=acc_dtype)[:, :, None]
 
         neg_inf = torch.finfo(acc_dtype).min
-        valid5d = valid_mask[None, None, None].to(device=y1.device, dtype=torch.bool)
+        valid5d = valid_mask[None, None, None].to(device=fused_y.device, dtype=torch.bool)
         logits = torch.where(valid5d, logits, torch.full_like(logits, neg_inf))
 
         m_tile = logits.amax(dim=(-2, -1), keepdim=True)
@@ -272,6 +327,13 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         self.running_zhat = self.running_zhat.to(dtype=acc_dtype) * alpha_prev + z_tile * alpha_tile
         self.running_shat = self.running_shat.to(dtype=acc_dtype) * alpha_prev + s_tile * alpha_tile
         self.running_m = m_new
+        valid = valid5d[:, 0].to(dtype=acc_dtype)
+        valid_x_pow_sum = self.running_valid_x_pow_sum.to(dtype=acc_dtype) + (x_pow * valid).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        valid_count = self.running_valid_count.to(dtype=acc_dtype) + valid.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype)
+        self.running_valid_x_pow_sum = valid_x_pow_sum
+        self.running_valid_count = valid_count
+        self.running_uniform_sum = valid_x_pow_sum
+        self.running_uniform_count = valid_count
 
     def finalize_from_state(self) -> torch.Tensor:
         if self.running_shat.numel() == 0:
@@ -283,52 +345,66 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         # Sum_j attention_weights[j] * E_{softmax(att_j)}[fused_y ** r],
         # which is equivalent to GeM over fused_y weighted by
         # fused_a = sum_j attention_weights[j] * softmax(att_j).
-        weighted_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        attention_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+        mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         output_dtype = self._stream_output_dtype or self.running_shat.dtype
-        return weighted_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=output_dtype)
+        return mixed_mean.clamp_min(self.eps).pow(1.0 / r).to(dtype=output_dtype)
 
     def extra_state_for_backward(self) -> dict[str, torch.Tensor | int | float | None]:
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, self.running_shat.dtype)
         zhat = self.running_zhat.to(dtype=acc_dtype).clamp_min(self.eps)
-        branch_means = self.running_shat.to(dtype=acc_dtype) / zhat
+        attention_branch_means = self.running_shat.to(dtype=acc_dtype) / zhat
         aw = self.attention_weights.to(device=self.running_shat.device, dtype=acc_dtype)
-        weighted_mean = (branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        attention_mean = (attention_branch_means * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        valid_count = self.running_valid_count.to(dtype=acc_dtype).clamp_min(self.eps)
+        uniform_mean = self.running_valid_x_pow_sum.to(dtype=acc_dtype) / valid_count
+        final_mixed_mean = (1.0 - self.uniform_attention_eps) * attention_mean + self.uniform_attention_eps * uniform_mean
         r = self.current_r.to(device=self.running_shat.device, dtype=acc_dtype)
         return {
+            # Existing per-branch softmax normalization state.
             "m": self.running_m.to(dtype=acc_dtype),
             "zhat": zhat,
-            "branch_means": branch_means,
-            "weighted_mean": weighted_mean,
+            # Keep per-branch attention means separate from the fused pure-attention mean.
+            "attention_branch_means": attention_branch_means,
+            "branch_means": attention_branch_means,
+            "attention_mean": attention_mean,
+            "uniform_mean": uniform_mean,
+            "final_mixed_mean": final_mixed_mean,
+            "valid_count": valid_count,
+            "uniform_attention_eps": float(self.uniform_attention_eps),
             "r": r,
-            "value_weights": self.value_weights.to(device=self.running_shat.device, dtype=acc_dtype),
             "attention_weights": aw,
+            # Backward-compatible aliases for older callers/tests.
+            "uniform_count": valid_count,
+            "weighted_mean": final_mixed_mean,
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
         if valid_mask is None:
             raise ValueError("StreamingFusedAttentionGeMReducer backward replay requires a valid_mask.")
         payload = self._parse_multi_input_payload(trimmed_output)
-        if len(payload) != 6:
-            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=6, got {len(payload)}")
-        y1, y2, y3, logits1, logits2, logits3 = payload
-        _validate_value_maps(y1, y2, y3)
-        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, y1.dtype)
-        vw = global_context["value_weights"].to(device=y1.device, dtype=acc_dtype)
-        aw = global_context["attention_weights"].to(device=y1.device, dtype=acc_dtype)
-        r = global_context["r"].to(device=y1.device, dtype=acc_dtype)
-        m = global_context["m"].to(device=y1.device, dtype=acc_dtype)
-        zhat = global_context["zhat"].to(device=y1.device, dtype=acc_dtype).clamp_min(self.eps)
-        branch_means = global_context["branch_means"].to(device=y1.device, dtype=acc_dtype)
-        weighted_mean = global_context["weighted_mean"].to(device=y1.device, dtype=acc_dtype)
+        if len(payload) != 2:
+            raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
+        fused_y, logits_stacked = payload
+        if fused_y.ndim != 4:
+            raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
+        _validate_stacked_logits(logits_stacked, fused_y)
+        acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, fused_y.dtype)
+        aw = global_context["attention_weights"].to(device=fused_y.device, dtype=acc_dtype)
+        r = global_context["r"].to(device=fused_y.device, dtype=acc_dtype)
+        m = global_context["m"].to(device=fused_y.device, dtype=acc_dtype)
+        zhat = global_context["zhat"].to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
+        attention_branch_means_tensor = global_context["attention_branch_means"] if "attention_branch_means" in global_context else global_context["branch_means"]
+        final_mixed_mean_tensor = global_context["final_mixed_mean"] if "final_mixed_mean" in global_context else global_context["weighted_mean"]
+        attention_branch_means = attention_branch_means_tensor.to(device=fused_y.device, dtype=acc_dtype)
+        final_mixed_mean = final_mixed_mean_tensor.to(device=fused_y.device, dtype=acc_dtype)
+        uniform_attention_eps = float(global_context.get("uniform_attention_eps", self.uniform_attention_eps))
 
-        fused_y = vw[0] * y1.to(dtype=acc_dtype) + vw[1] * y2.to(device=y1.device, dtype=acc_dtype) + vw[2] * y3.to(device=y1.device, dtype=acc_dtype)
-        x_pow = fused_y.clamp_min(self.eps).pow(r)
-        logits = torch.stack(
-            [logit.to(device=y1.device, dtype=acc_dtype) for logit in _normalize_three_logits(logits1, logits2, logits3, y1)],
-            dim=1,
-        )
+        x_pow = fused_y.to(acc_dtype).clamp_min(self.eps).pow(r)
+        logits = logits_stacked.to(device=fused_y.device, dtype=acc_dtype)[:, :, None]
 
-        valid5d = valid_mask[None, None, None].to(device=y1.device, dtype=torch.bool)
+        valid5d = valid_mask[None, None, None].to(device=fused_y.device, dtype=torch.bool)
         neg_inf = torch.finfo(acc_dtype).min
         logits = torch.where(valid5d, logits, torch.full_like(logits, neg_inf))
         weights_unnorm = torch.exp(logits - m)
@@ -346,10 +422,17 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             zhat.reshape(n * branches, 1, 1, 1),
         ).reshape(n, branches, 1, 1, 1)
 
-        branch_terms = local_s_over_z - branch_means.detach() * local_z_over_z
-        scale = (1.0 / r) * weighted_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
-        surrogate = scale.detach() * (branch_terms * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
-        return surrogate.to(dtype=y1.dtype)
+        branch_terms = local_s_over_z - attention_branch_means.detach() * local_z_over_z
+        attention_replay_term = (branch_terms * aw.view(1, 3, 1, 1, 1)).sum(dim=1)
+        replay_term = (1.0 - uniform_attention_eps) * attention_replay_term
+        if uniform_attention_eps:
+            valid_count_tensor = global_context["valid_count"] if "valid_count" in global_context else global_context["uniform_count"]
+            valid_count = valid_count_tensor.to(device=fused_y.device, dtype=acc_dtype).clamp_min(self.eps)
+            uniform_value_term = streaming_reduce_tile(x_pow, valid_mask, None) / valid_count
+            replay_term = replay_term + uniform_attention_eps * uniform_value_term
+        scale = (1.0 / r) * final_mixed_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+        surrogate = scale.detach() * replay_term
+        return surrogate.to(dtype=fused_y.dtype)
 
     def to_reducer(self) -> FusedAttentionGeMReducer:
         reducer = FusedAttentionGeMReducer(
@@ -358,6 +441,7 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             value_weights=tuple(float(x) for x in self.value_weights.detach().cpu()),
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
+            uniform_attention_eps=self.uniform_attention_eps,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))

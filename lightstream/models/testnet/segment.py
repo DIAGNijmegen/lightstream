@@ -8,29 +8,6 @@ from torch.nn import Sequential
 from lightstream.modules.streaming import StreamingModule
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 
-class GatedAttention(nn.Module):
-    """Convolutional implementation of Gated Attention compatible with streaming."""
-
-    def __init__(self, in_channels: int, hidden_channels: int, n_classes: int, scale_factor: int=1):
-        super(GatedAttention, self).__init__()
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.out_channels = n_classes
-
-        self.sigmoid_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Sigmoid()])
-        self.tanh_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Tanh()])
-
-        self.att_logits = nn.Conv2d(hidden_channels, n_classes, kernel_size=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        sigmoid_att = self.sigmoid_branch(x)
-        tanh_att = self.tanh_branch(x)
-
-        dot_product = sigmoid_att * tanh_att
-
-        att_logits = self.att_logits(dot_product)
-        return att_logits
-
 
 class StreamingTestNet(StreamingModule):
     def __init__(
@@ -46,7 +23,6 @@ class StreamingTestNet(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
     ):
-
         stream_network = self.create_model()
 
         if mean is None:
@@ -55,7 +31,9 @@ class StreamingTestNet(StreamingModule):
             std = [1, 1, 1]
 
         if tile_cache_path is None:
-            tile_cache_path = Path.cwd() / Path(f"testnet_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}")
+            tile_cache_path = Path.cwd() / Path(
+                f"testnet_tile_cache_1_3_{str(tile_size)}_{str(tile_size)}"
+            )
 
         super().__init__(
             stream_network,
@@ -71,36 +49,66 @@ class StreamingTestNet(StreamingModule):
             std=std,
             add_keep_modules=[nn.BatchNorm2d],
         )
+
     @staticmethod
     def create_model():
-        padding = 0
+        padding = 1
 
-        stream_net = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
+        encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 16, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
             ChannelLayerNorm(16),
-            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
-            ChannelLayerNorm(16),
+            torch.nn.Conv2d(16, 32, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(32),
             torch.nn.MaxPool2d(2),
-            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
-            ChannelLayerNorm(16),
-            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
-            ChannelLayerNorm(16),
+            torch.nn.Conv2d(32, 64, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(64),
+            torch.nn.Conv2d(64, 128, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(128),
             torch.nn.MaxPool2d(2),
-            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
-            ChannelLayerNorm(16),
-            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
-            ChannelLayerNorm(16),
+            torch.nn.Conv2d(128, 256, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(256),
+            torch.nn.Conv2d(256, 256, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(256),
             torch.nn.MaxPool2d(2),
-            GatedAttention(16,8,2))
+        )
+
+        decoder = torch.nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            torch.nn.Conv2d(256, 256, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(256, 128, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            torch.nn.Conv2d(128, 128, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(128, 64, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            torch.nn.Conv2d(64, 64, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 32, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+        )
+
+        classifier = torch.nn.Conv2d(32, 1, kernel_size=3, padding=1)
+
+        stream_net = torch.nn.Sequential(encoder, decoder, classifier)
 
         return stream_net
 
+
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
-    dtype=torch.float32
+    dtype = torch.float64
     img = torch.rand((1, 3, 4800, 4800)).to("cuda", dtype=dtype)
     network = StreamingTestNet(
-        3200,
+        1920,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,

@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_bwd, custom_fwd
 
-from lightstream.core.scnn.utils import Box, Lost, _new_value_indices, H_DIM, W_DIM
+from lightstream.core.scnn.utils import Box, Lost, H_DIM, W_DIM
+
 
 
 class StreamingUpsample2dF(torch.autograd.Function):
@@ -22,7 +23,10 @@ class StreamingUpsample2dF(torch.autograd.Function):
         align_corners,
         recompute_scale_factor,
         grad_lost,
+        backward_valid_lost,
+        upsample_backward_input_lost,
         seen_indices,
+        pre_upsample_output_stride,
         output_stride,
         input_loc,
     ):
@@ -33,7 +37,10 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.align_corners = align_corners
         ctx.recompute_scale_factor = recompute_scale_factor
         ctx.grad_lost = grad_lost
+        ctx.backward_valid_lost = backward_valid_lost
+        ctx.upsample_backward_input_lost = upsample_backward_input_lost
         ctx.seen_indices = seen_indices
+        ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
         return F.interpolate(
@@ -50,42 +57,11 @@ class StreamingUpsample2dF(torch.autograd.Function):
     def backward(ctx, grad_output):
         (inpt,) = ctx.saved_tensors
         sides = ctx.input_loc.sides
-        grad_lost = ctx.grad_lost
-        seen_indices = ctx.seen_indices
-
-        lost_top = grad_lost.top if not sides.top else 0
-        lost_bottom = grad_lost.bottom if not sides.bottom else 0
-        lost_left = grad_lost.left if not sides.left else 0
-        lost_right = grad_lost.right if not sides.right else 0
-
-        valid_grad = grad_output[:, :, lost_top : grad_output.shape[H_DIM] - lost_bottom, lost_left : grad_output.shape[W_DIM] - lost_right]
-
-        input_loc = ctx.input_loc
-        # `ctx.output_stride` already represents this module output's stride
-        # in input-image coordinates. Using this directly keeps data_loc aligned
-        # for mixed upsample factors (e.g. 2/4/8 heads).
-        data_loc_y = int(input_loc.y // int(ctx.output_stride[1])) + lost_top
-        data_loc_x = int(input_loc.x // int(ctx.output_stride[2])) + lost_left
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-
-        new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
-
-        # Keep state monotonic for debugging/introspection, but do not deduplicate
-        # gradients at upsample level. Deduplication for parameter gradients is handled
-        # by downstream streaming conv layers.
-        seen_indices.y = updated_total_indices.y
-        seen_indices.height = updated_total_indices.height
-        seen_indices.x = updated_total_indices.x
-        seen_indices.width = updated_total_indices.width
-        seen_indices.sides = updated_total_indices.sides
-
-        grad_for_interp = grad_output.clone()
-        grad_for_interp[:, :, :lost_top, :] = 0
-        if lost_bottom > 0:
-            grad_for_interp[:, :, grad_output.shape[H_DIM] - lost_bottom :, :] = 0
-        grad_for_interp[:, :, :, :lost_left] = 0
-        if lost_right > 0:
-            grad_for_interp[:, :, :, grad_output.shape[W_DIM] - lost_right :] = 0
+        upsample_backward_input_lost = (
+            ctx.upsample_backward_input_lost
+            if ctx.upsample_backward_input_lost is not None
+            else ctx.backward_valid_lost or Lost(0, 0, 0, 0)
+        )
 
         if ctx.needs_input_grad[0]:
             with torch.enable_grad():
@@ -98,11 +74,32 @@ class StreamingUpsample2dF(torch.autograd.Function):
                     align_corners=ctx.align_corners,
                     recompute_scale_factor=ctx.recompute_scale_factor,
                 )
-                grad_in = torch.autograd.grad(out, inpt_grad, grad_for_interp, retain_graph=False, allow_unused=False)[0]
+                grad_in = torch.autograd.grad(out, inpt_grad, grad_output, retain_graph=False, allow_unused=False)[0]
         else:
             grad_in = None
 
-        return grad_in, None, None, None, None, None, None, None, None, None
+        if grad_in is not None:
+            # Upsample backward maps a high-resolution gradient tile onto the
+            # low-resolution input lattice.  Statistics gathering computes how
+            # much of that low-resolution lattice lacks complete support for
+            # each border, so crop/zero in low-resolution coordinates here.
+            # Do not reuse the high-resolution grad_output loss directly: its
+            # units differ from grad_in after interpolation backward.
+            input_lost_top = upsample_backward_input_lost.top if not sides.top else 0
+            input_lost_bottom = upsample_backward_input_lost.bottom if not sides.bottom else 0
+            input_lost_left = upsample_backward_input_lost.left if not sides.left else 0
+            input_lost_right = upsample_backward_input_lost.right if not sides.right else 0
+
+            h_end = grad_in.shape[H_DIM] - input_lost_bottom
+            w_end = grad_in.shape[W_DIM] - input_lost_right
+            masked_grad_in = torch.zeros_like(grad_in)
+            if h_end > input_lost_top and w_end > input_lost_left:
+                masked_grad_in[:, :, input_lost_top:h_end, input_lost_left:w_end] = grad_in[
+                    :, :, input_lost_top:h_end, input_lost_left:w_end
+                ]
+            grad_in = masked_grad_in
+
+        return grad_in, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 upsample2d = StreamingUpsample2dF.apply
@@ -137,7 +134,14 @@ class StreamingUpsample2d(nn.Module):
         self.recompute_scale_factor = recompute_scale_factor
 
         self.grad_lost = Lost(0, 0, 0, 0)
+        self.scale_factor_hw = None
+        self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.output_stride = torch.tensor([1, 1, 1])
+        self.post_upsample_output_stride = self.output_stride
+        self.side_aware_grad_lost = None
+        self.backward_valid_lost = Lost(0, 0, 0, 0)
+        self.upsample_backward_input_lost = None
+        self.upsample_forward_output_lost = None
         self.reset()
 
     def reset(self):
@@ -153,7 +157,10 @@ class StreamingUpsample2d(nn.Module):
             self.align_corners,
             self.recompute_scale_factor,
             self.grad_lost,
+            self.backward_valid_lost,
+            self.upsample_backward_input_lost,
             self.seen_indices,
+            self.pre_upsample_output_stride,
             self.output_stride,
             self.input_loc,
         )

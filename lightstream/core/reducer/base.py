@@ -304,6 +304,10 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         trimmed_output : torch.Tensor | Sequence[torch.Tensor]
             Tile payload for backward replay. Accepts legacy single-input tensor
             or structured tuple/list for multi-input reducers.
+        valid_mask : torch.Tensor | None, default=None
+            Overlap-safe validity mask supplied by ``StreamingCNN`` for this
+            replay tile. Reducers consume it directly and do not own separate
+            backward mask replay state.
         """
         tile_payload = self._parse_single_input_payload(trimmed_output)
         expected_h = int(tile_payload.shape[-2])

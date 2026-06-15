@@ -14,15 +14,47 @@ import torch.autograd
 import torch.backends
 import torch.nn.functional
 
-from lightstream.core.scnn.utils import Sides, Box, Lost, _ntuple, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
+from lightstream.core.scnn.utils import (
+    Sides,
+    Box,
+    Lost,
+    _ntuple,
+    _new_value_indices,
+    B_DIM,
+    C_DIM,
+    H_DIM,
+    W_DIM,
+)
 from lightstream.core.scnn.streamingconv import StreamingConv2d
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.scnn.streaminglayernorm import (
+    ChannelLayerNorm,
+    StreamingChannelLayerNorm,
+)
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
 logger = logging.getLogger(__name__)
 
 _triple = _ntuple(3)
+
+
+BACKWARD_STREAMING_MODULE_TYPES = (
+    StreamingConv2d,
+    StreamingUpsample2d,
+    StreamingChannelLayerNorm,
+)
+
+
+def _is_pointwise_channel_norm(module):
+    """Return True for channel-only normalization layers that preserve spatial support."""
+    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm))
+
+
+def _is_backward_streaming_module(module):
+    """Return True for streaming modules that need backward tile location state."""
+    return isinstance(module, BACKWARD_STREAMING_MODULE_TYPES)
+
 
 @dataclass(frozen=True)
 class ForwardContext:
@@ -142,6 +174,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
         self.debug_reducer_replay = False
         self.debug_forward_sentinel_check = False
+        self.debug_backward_tile_alignment = False
         self._hooks = []
         self._last_forward_tiles = []
         self._streaming_reducers = []
@@ -223,12 +256,16 @@ class StreamingCNN(torch.nn.Module):
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
         state_dict = self._save_parameters()
-        (old_deterministic_flag, old_benchmark_flag) = self._set_cudnn_flags_to_determistic()
+        (
+            old_deterministic_flag,
+            old_benchmark_flag,
+        ) = self._set_cudnn_flags_to_determistic()
         self._reset_parameters_to_constant()
 
         # Add hooks to each layer to gather statistics
         self._add_hooks_for_statistics()
         self._set_reducer_passthrough(True)
+        self._set_channel_layer_norm_statistics_passthrough(True)
 
         # We need to temporary store statistics per layer to keep track of the
         # total output stride at each layer
@@ -256,6 +293,7 @@ class StreamingCNN(torch.nn.Module):
         # during lightstream
         self._remove_hooks()
         self._set_reducer_passthrough(False)
+        self._set_channel_layer_norm_statistics_passthrough(False)
         #
         self._restore_parameters(state_dict)
         self._capture_public_output_spec()
@@ -287,6 +325,11 @@ class StreamingCNN(torch.nn.Module):
         for mod in self.stream_module.modules():
             if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
+
+    def _set_channel_layer_norm_statistics_passthrough(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, ChannelLayerNorm):
+                mod._streaming_statistics_passthrough = enabled
 
     def _gather_backward_statistics(self, tile):
         # Forward pass with grads enabled
@@ -388,7 +431,6 @@ class StreamingCNN(torch.nn.Module):
             return values, index
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
-
     def _reducer_aux_indices(self) -> set[int]:
         aux_indices = set()
         for reducer_head, indices in self._reducer_input_indices.items():
@@ -398,11 +440,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _public_output_indices(self) -> list[int]:
         reducer_aux_indices = self._reducer_aux_indices()
-        return [
-            idx
-            for idx in range(len(self._tile_output_shapes))
-            if idx not in reducer_aux_indices
-        ]
+        return [idx for idx in range(len(self._tile_output_shapes)) if idx not in reducer_aux_indices]
 
     def _public_output_debug_context(self, public_indices, reducer_aux_indices=None) -> str:
         if reducer_aux_indices is None:
@@ -428,9 +466,7 @@ class StreamingCNN(torch.nn.Module):
         for idx in public_indices:
             output = outputs[idx]
             if output is None:
-                raise RuntimeError(
-                    f"Public output head {idx} was not populated during streaming forward; {context}"
-                )
+                raise RuntimeError(f"Public output head {idx} was not populated during streaming forward; {context}")
             if getattr(self, "debug_forward_sentinel_check", False) and torch.all(output == 999):
                 raise RuntimeError(
                     f"Public output head {idx} still contains only the unstitched sentinel value 999; {context}"
@@ -447,7 +483,14 @@ class StreamingCNN(torch.nn.Module):
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
     def _compute_internal_safe_input_step(self):
-        """Compute conservative input-step bounds from per-layer backward stats."""
+        """Compute conservative input-step bounds from per-layer lost-region stats.
+
+        Upsampling layers report two different losses in layer-local coordinates:
+        forward loss is measured on the high-resolution upsample output, while
+        backward input loss is measured on the low-resolution gradient input.
+        Convert both to input-image coordinates before comparing them to the
+        input tile size so tile overlap covers the largest lost border.
+        """
         candidates_h = []
         candidates_w = []
 
@@ -462,6 +505,67 @@ class StreamingCNN(torch.nn.Module):
                 if step_h > 0 and step_w > 0:
                     candidates_h.append(step_h)
                     candidates_w.append(step_w)
+            elif isinstance(mod, StreamingUpsample2d):
+                stats = self._module_stats.get(mod, {})
+                forward_lost = stats.get("lost")
+                backward_input_lost = stats.get(
+                    "upsample_backward_input_lost",
+                    getattr(mod, "upsample_backward_input_lost", None),
+                )
+                pre_upsample_output_stride = torch.as_tensor(
+                    getattr(mod, "pre_upsample_output_stride", torch.tensor([1, 1, 1])),
+                    dtype=torch.long,
+                )
+                post_upsample_output_stride = torch.as_tensor(
+                    getattr(
+                        mod,
+                        "post_upsample_output_stride",
+                        getattr(mod, "output_stride", torch.tensor([1, 1, 1])),
+                    ),
+                    dtype=torch.long,
+                )
+
+                upsample_candidates_h = []
+                upsample_candidates_w = []
+                if forward_lost is not None:
+                    step_h = self.tile_shape[H_DIM] - int(forward_lost.top + forward_lost.bottom) * int(
+                        post_upsample_output_stride[1]
+                    )
+                    step_w = self.tile_shape[W_DIM] - int(forward_lost.left + forward_lost.right) * int(
+                        post_upsample_output_stride[2]
+                    )
+                    if step_h > 0 and step_w > 0:
+                        candidates_h.append(step_h)
+                        candidates_w.append(step_w)
+                        upsample_candidates_h.append(step_h)
+                        upsample_candidates_w.append(step_w)
+                if backward_input_lost is not None:
+                    step_h = self.tile_shape[H_DIM] - int(backward_input_lost.top + backward_input_lost.bottom) * int(
+                        pre_upsample_output_stride[1]
+                    )
+                    step_w = self.tile_shape[W_DIM] - int(backward_input_lost.left + backward_input_lost.right) * int(
+                        pre_upsample_output_stride[2]
+                    )
+                    if step_h > 0 and step_w > 0:
+                        candidates_h.append(step_h)
+                        candidates_w.append(step_w)
+                        upsample_candidates_h.append(step_h)
+                        upsample_candidates_w.append(step_w)
+                if upsample_candidates_h and upsample_candidates_w:
+                    logger.debug(
+                        "Upsample safe tile step: %s",
+                        {
+                            "module": mod,
+                            "forward_lost": forward_lost,
+                            "backward_input_lost": backward_input_lost,
+                            "pre_upsample_output_stride": pre_upsample_output_stride,
+                            "post_upsample_output_stride": post_upsample_output_stride,
+                            "safe_tile_step": (
+                                min(upsample_candidates_h),
+                                min(upsample_candidates_w),
+                            ),
+                        },
+                    )
 
         # Fallback to global backward-safe span if per-layer stats are unavailable
         grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
@@ -471,26 +575,52 @@ class StreamingCNN(torch.nn.Module):
 
         return max(1, min(candidates_h)), max(1, min(candidates_w))
 
+    def _module_alignment_stats(self, module):
+        """Return module input-space stride stats used for tile-start alignment."""
+        stats = self._module_stats.get(module, {})
+
+        stride = stats.get("stride")
+        if stride is None:
+            stride = getattr(module, "stride", 1)
+            if stride is None:
+                stride = getattr(module, "kernel_size", 1)
+        stride = torch.as_tensor(_triple(stride), dtype=torch.long)
+
+        output_stride = stats.get("output_stride")
+        if output_stride is None:
+            output_stride = getattr(module, "output_stride", torch.tensor([1, 1, 1]))
+        output_stride = torch.as_tensor(_triple(output_stride), dtype=torch.long)
+
+        return output_stride, stride
+
     def _compute_internal_alignment(self):
-        """Compute input-space alignment constraints from internal streamed layers.
+        """Compute input-space alignment constraints from internal downsampling layers.
 
         When output heads are upsampled back to stride-1, alignment based only on
         head output stride becomes 1 and can lose the internal phase constraints
-        required by earlier strided conv layers.
+        required by earlier strided convolutions and pooling layers.
         """
 
         align_h = 1
         align_w = 1
-        for mod in self.stream_module.modules():
-            if not isinstance(mod, StreamingConv2d):
+        alignment_modules = (
+            StreamingConv2d,
+            torch.nn.Conv2d,
+            torch.nn.MaxPool2d,
+            torch.nn.AvgPool2d,
+        )
+        for module in self.stream_module.modules():
+            if not isinstance(module, alignment_modules):
                 continue
 
-            stride = _triple(mod.stride)
-            output_stride = getattr(mod, "output_stride", torch.tensor([1, 1, 1]))
-            eff_h = int(output_stride[1]) * int(stride[1])
-            eff_w = int(output_stride[2]) * int(stride[2])
-            align_h = math.lcm(align_h, max(1, eff_h))
-            align_w = math.lcm(align_w, max(1, eff_w))
+            output_stride, stride = self._module_alignment_stats(module)
+            if int(stride[1]) <= 1 and int(stride[2]) <= 1:
+                continue
+
+            effective_h = int(output_stride[1]) * int(stride[1])
+            effective_w = int(output_stride[2]) * int(stride[2])
+            align_h = math.lcm(align_h, max(1, effective_h))
+            align_w = math.lcm(align_w, max(1, effective_w))
 
         return align_h, align_w
 
@@ -536,10 +666,56 @@ class StreamingCNN(torch.nn.Module):
         elif isinstance(module, torch.nn.Upsample):
             mod = StreamingUpsample2d.from_torch_upsample(module)
             if module in self._module_stats:
-                mod.grad_lost = self._module_stats[module].get("grad_lost", Lost(0, 0, 0, 0))
-                mod.output_stride = self._module_stats[module].get("output_stride", torch.tensor([1, 1, 1]))
+                stats = self._module_stats[module]
+                mod.grad_lost = stats.get("grad_lost", Lost(0, 0, 0, 0))
+                mod.output_stride = stats.get(
+                    "post_upsample_output_stride",
+                    stats.get("output_stride", torch.tensor([1, 1, 1])),
+                )
+                mod.pre_upsample_output_stride = stats.get("pre_upsample_output_stride")
+                if mod.pre_upsample_output_stride is None:
+                    scale_h, scale_w = stats.get("scale_factor_hw", (mod.scale_factor, mod.scale_factor))
+                    if isinstance(scale_h, tuple):
+                        scale_h, scale_w = scale_h[-2], scale_h[-1]
+                    if scale_h is None or scale_w is None:
+                        scale_h, scale_w = 1.0, 1.0
+                    mod.pre_upsample_output_stride = mod.output_stride.clone().detach().to(torch.float32)
+                    mod.pre_upsample_output_stride[1] *= float(scale_h)
+                    mod.pre_upsample_output_stride[2] *= float(scale_w)
+                    mod.pre_upsample_output_stride = torch.round(mod.pre_upsample_output_stride).to(torch.long)
+                    mod.pre_upsample_output_stride[0] = 1
+                    stats["pre_upsample_output_stride"] = mod.pre_upsample_output_stride
+                stats.setdefault("post_upsample_output_stride", mod.output_stride)
+                for key in (
+                    "scale_factor_hw",
+                    "pre_upsample_output_stride",
+                    "post_upsample_output_stride",
+                    "grad_lost",
+                    "side_aware_grad_lost",
+                    "backward_valid_lost",
+                    "upsample_backward_input_lost",
+                    "upsample_forward_output_lost",
+                ):
+                    if key in stats and hasattr(mod, key):
+                        setattr(mod, key, stats[key])
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, ChannelLayerNorm):
+            mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+            if module in self._module_stats:
+                stats = self._module_stats[module]
+                if "grad_lost" in stats:
+                    mod.grad_lost = stats["grad_lost"]
+                if "output_stride" in stats:
+                    mod.output_stride = stats["output_stride"]
+                self._module_stats[mod] = stats
+                del self._module_stats[module]
+            # ChannelLayerNorm and StreamingChannelLayerNorm both wrap a
+            # torch.nn.LayerNorm child internally. Treat the wrapper as a leaf
+            # while parent modules continue recursing so conversion preserves
+            # compatible state-dict keys like ``norm.weight`` and ``norm.bias``.
+            del module
+            return mod
         elif isinstance(module, BaseReducer):
             mod = module.to_streaming()
             self._streaming_reducers.append(mod)
@@ -565,6 +741,26 @@ class StreamingCNN(torch.nn.Module):
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
+                stats["pre_upsample_output_stride"] = module.pre_upsample_output_stride
+                stats["output_stride"] = module.output_stride
+                stats["post_upsample_output_stride"] = module.output_stride
+                stats["backward_valid_lost"] = module.backward_valid_lost
+                stats["upsample_backward_input_lost"] = module.upsample_backward_input_lost
+                stats["upsample_forward_output_lost"] = module.upsample_forward_output_lost
+                if module.scale_factor is not None:
+                    sf = module.scale_factor
+                    stats["scale_factor_hw"] = (
+                        (float(sf[-2]), float(sf[-1])) if isinstance(sf, tuple) else (float(sf), float(sf))
+                    )
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingChannelLayerNorm):
+            mod = module.to_channel_layer_norm()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
                 stats["output_stride"] = module.output_stride
                 self._module_stats[mod] = stats
             else:
@@ -576,7 +772,6 @@ class StreamingCNN(torch.nn.Module):
             mod.add_module(name, self._reset_converted_modules(child))
         del module
         return mod
-
 
     def _validate_reducer_head_map_resolved(self):
         if not self._streaming_reducers:
@@ -611,7 +806,9 @@ class StreamingCNN(torch.nn.Module):
             reducer_inputs = getattr(reducer, "_last_inputs", None)
             if reducer_inputs is not None:
                 if not isinstance(reducer_inputs, (tuple, list)):
-                    raise RuntimeError(f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}")
+                    raise RuntimeError(
+                        f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}"
+                    )
                 input_indices = []
                 for input_pos, inp in enumerate(reducer_inputs):
                     idx = output_id_to_index.get(id(inp))
@@ -649,10 +846,14 @@ class StreamingCNN(torch.nn.Module):
                 if mod.bias is not None:
                     torch.nn.init.constant_(mod.bias, 0)
 
-
+        # Only BatchNorm has running statistics that can be frozen into a
+        # deterministic affine-like transform while gathering tile statistics.
+        # ChannelLayerNorm/LayerNorm computes per-sample channel statistics from
+        # the current tensor, and its default affine parameters are already
+        # weight=1 and bias=0; changing those parameters does not prevent
+        # constant setup tensors from producing zero LayerNorm input gradients.
         for m in self.stream_module.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
-                # Perhaps change to torch.nn.init.ones_(m.weight) and zeros?
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
                 m.eval()
@@ -705,11 +906,13 @@ class StreamingCNN(torch.nn.Module):
     def _compute_full_output_sizes(self, image):
         """Return per-head output sizes for the fully stitched image output."""
         output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1]) + tile_shape[H_DIM]
+            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1])
+            + tile_shape[H_DIM]
             for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
         output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2]) + tile_shape[W_DIM]
+            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2])
+            + tile_shape[W_DIM]
             for idx, tile_shape in enumerate(self._tile_output_shapes)
         ]
         return output_heights, output_widths
@@ -731,9 +934,26 @@ class StreamingCNN(torch.nn.Module):
             1,
             valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
         )
+        grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
+        valid_input_height = min(valid_input_height, int(grad_safe_h))
+        valid_input_width = min(valid_input_width, int(grad_safe_w))
+
+        internal_align_h, internal_align_w = self._compute_internal_alignment()
+        align_h = math.lcm(int(self._output_stride_per_output[0][1]), internal_align_h)
+        align_w = math.lcm(int(self._output_stride_per_output[0][2]), internal_align_w)
+        valid_input_height = max(align_h, (valid_input_height // align_h) * align_h)
+        valid_input_width = max(align_w, (valid_input_width // align_w) * align_w)
         return valid_input_height, valid_input_width
 
-    def _compute_tile_grid(self, image_height, image_width, tile_height, tile_width, valid_input_height, valid_input_width):
+    def _compute_tile_grid(
+        self,
+        image_height,
+        image_width,
+        tile_height,
+        tile_width,
+        valid_input_height,
+        valid_input_width,
+    ):
         """Compute tiling grid shape for a given image and tile step."""
         n_rows = math.ceil(float(max(1, image_height - tile_height)) / float(valid_input_height)) + 1
         n_cols = math.ceil(float(max(1, image_width - tile_width)) / float(valid_input_width)) + 1
@@ -744,7 +964,16 @@ class StreamingCNN(torch.nn.Module):
             n_rows = 1
         return n_rows, n_cols
 
-    def _iter_input_tiles(self, image, n_rows, n_cols, valid_input_height, valid_input_width, tile_height, tile_width):
+    def _iter_input_tiles(
+        self,
+        image,
+        n_rows,
+        n_cols,
+        valid_input_height,
+        valid_input_width,
+        tile_height,
+        tile_width,
+    ):
         """Yield input-space tile coordinates with border-aware side markers."""
         for row in range(n_rows):
             for col in range(n_cols):
@@ -766,6 +995,48 @@ class StreamingCNN(torch.nn.Module):
                 input_x = input_x if not sides.left else 0
                 yield int(input_y), int(input_x), sides
 
+    def _log_and_validate_tile_start(self, input_y, input_x, sides, internal_alignment):
+        """Log tile starts and verify non-edge starts keep internal sampling phase."""
+        align_h, align_w = internal_alignment
+        logger.debug(
+            "Forward tile start: y=%s, x=%s, sides=%s, internal_alignment=(%s, %s)",
+            input_y,
+            input_x,
+            sides,
+            align_h,
+            align_w,
+        )
+        if not sides.bottom:
+            assert input_y % align_h == 0, (
+                f"Non-bottom-edge tile y-start {input_y} is not a multiple of " f"internal alignment {align_h}"
+            )
+        if not sides.right:
+            assert input_x % align_w == 0, (
+                f"Non-right-edge tile x-start {input_x} is not a multiple of " f"internal alignment {align_w}"
+            )
+
+    def _tile_start_list(self, tile_iter):
+        """Return input-space tile starts for compact forward/backward diagnostics."""
+        return [(int(input_y), int(input_x)) for input_y, input_x, _ in tile_iter]
+
+    def _log_forward_tile_starts(self):
+        logger.debug("forward tile starts: %s", self._tile_start_list(self._last_forward_tiles))
+
+    def _log_backward_tile_starts(self, tile_iter):
+        logger.debug("backward tile starts: %s", self._tile_start_list(tile_iter))
+
+    def _validate_backward_tile_iter_matches_forward(self, tile_iter):
+        """Assert in debug mode that backward replays the exact forward tile starts."""
+        if not __debug__ or not self._last_forward_tiles:
+            return
+
+        forward_starts = self._tile_start_list(self._last_forward_tiles)
+        backward_starts = self._tile_start_list(tile_iter)
+        assert backward_starts == forward_starts, (
+            "Backward tile starts differ from forward tile starts: "
+            f"forward={forward_starts}, backward={backward_starts}"
+        )
+
     def _prepare_forward_outputs(self, image, output_heights, output_widths, result_device):
         outputs = [None] * len(self._tile_output_shapes)
 
@@ -779,7 +1050,12 @@ class StreamingCNN(torch.nn.Module):
                 if outputs[idx] is not None:
                     continue
                 outputs[idx] = torch.empty(
-                    (image.shape[0], self._tile_output_shapes[idx][1], output_heights[idx], output_widths[idx]),
+                    (
+                        image.shape[0],
+                        self._tile_output_shapes[idx][1],
+                        output_heights[idx],
+                        output_widths[idx],
+                    ),
                     dtype=self.dtype,
                     device=result_device,
                 ).fill_(999)
@@ -839,7 +1115,16 @@ class StreamingCNN(torch.nn.Module):
 
         outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
 
-    def _build_head_output_window(self, head_idx, tile_input_y, tile_input_x, sides, output_heights, output_widths, head_grad):
+    def _build_head_output_window(
+        self,
+        head_idx,
+        tile_input_y,
+        tile_input_x,
+        sides,
+        output_heights,
+        output_widths,
+        head_grad,
+    ):
         head_stride = self._output_stride_per_output[head_idx]
         head_tile_height = self._tile_output_shapes[head_idx][H_DIM]
         head_tile_width = self._tile_output_shapes[head_idx][W_DIM]
@@ -934,7 +1219,13 @@ class StreamingCNN(torch.nn.Module):
         common_x1 = min(int(loc.x) + int(tensor.shape[W_DIM]) for _, loc, tensor in payload_entries)
         if common_y1 <= common_y0 or common_x1 <= common_x0:
             boxes = [
-                (idx, int(loc.y), int(loc.y) + int(tensor.shape[H_DIM]), int(loc.x), int(loc.x) + int(tensor.shape[W_DIM]))
+                (
+                    idx,
+                    int(loc.y),
+                    int(loc.y) + int(tensor.shape[H_DIM]),
+                    int(loc.x),
+                    int(loc.x) + int(tensor.shape[W_DIM]),
+                )
                 for idx, loc, tensor in payload_entries
             ]
             raise RuntimeError(f"Reducer head {head_idx} inputs have no common valid intersection: boxes={boxes}")
@@ -977,7 +1268,9 @@ class StreamingCNN(torch.nn.Module):
         user_mask,
     ):
         if not isinstance(trimmed_payload, (tuple, list)) or len(trimmed_payload) == 0:
-            raise RuntimeError(f"Reducer head {head_idx} expects non-empty tuple/list payload, got {type(trimmed_payload)}")
+            raise RuntimeError(
+                f"Reducer head {head_idx} expects non-empty tuple/list payload, got {type(trimmed_payload)}"
+            )
         ref = trimmed_payload[0]
         for i, t in enumerate(trimmed_payload):
             if t.ndim != 4:
@@ -1024,7 +1317,11 @@ class StreamingCNN(torch.nn.Module):
                 expected_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
                 if expected_indices[0] != head_idx:
                     continue
-                reducer_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+                (
+                    reducer_payload,
+                    _common_loc,
+                    common_dst_box,
+                ) = self._build_common_aligned_reducer_payload(
                     head_idx=head_idx,
                     tile_outputs=tile_outputs,
                     ordered_indices=expected_indices,
@@ -1054,6 +1351,24 @@ class StreamingCNN(torch.nn.Module):
         valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // int(self.output_stride[2])
         valid_grad_width *= int(self.output_stride[2])
 
+        internal_align_h, internal_align_w = self._compute_internal_alignment()
+        valid_grad_height = max(
+            internal_align_h,
+            (valid_grad_height // internal_align_h) * internal_align_h,
+        )
+        valid_grad_width = max(
+            internal_align_w,
+            (valid_grad_width // internal_align_w) * internal_align_w,
+        )
+
+        logger.debug(
+            "Backward single-head tiling step: valid_grad_height=%s, valid_grad_width=%s, internal_alignment=(%s, %s)",
+            valid_grad_height,
+            valid_grad_width,
+            internal_align_h,
+            internal_align_w,
+        )
+
         n_rows = math.ceil(float(image.shape[H_DIM] - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(image.shape[W_DIM] - grad_lost.left - grad_lost.right) / float(valid_grad_width))
 
@@ -1079,13 +1394,42 @@ class StreamingCNN(torch.nn.Module):
                 if sides_right:
                     output_x = max(base_grad.shape[W_DIM] - output_width, 0)
 
-                input_y = output_y * int(self.output_stride[1])
-                input_x = output_x * int(self.output_stride[2])
-                tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+                input_y = int(output_y * int(self.output_stride[1]))
+                input_x = int(output_x * int(self.output_stride[2]))
+                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
+                logger.debug(
+                    "Backward single-head tile start: y=%s, x=%s, sides=%s, internal_alignment=(%s, %s)",
+                    input_y,
+                    input_x,
+                    sides,
+                    internal_align_h,
+                    internal_align_w,
+                )
+                if getattr(self, "debug_backward_tile_alignment", False) or logger.isEnabledFor(logging.DEBUG):
+                    if not sides.bottom:
+                        assert input_y % internal_align_h == 0, (
+                            f"Backward single-head non-bottom-edge tile y-start {input_y} "
+                            f"is not a multiple of internal alignment {internal_align_h}"
+                        )
+                    if not sides.right:
+                        assert input_x % internal_align_w == 0, (
+                            f"Backward single-head non-right-edge tile x-start {input_x} "
+                            f"is not a multiple of internal alignment {internal_align_w}"
+                        )
+                tile_iter.append((input_y, input_x, sides))
 
         return tile_iter
 
-    def _prepare_backward_tile_iter_multi_head(self, image, n_rows, n_cols, valid_input_height, valid_input_width, tile_height, tile_width):
+    def _prepare_backward_tile_iter_multi_head(
+        self,
+        image,
+        n_rows,
+        n_cols,
+        valid_input_height,
+        valid_input_width,
+        tile_height,
+        tile_width,
+    ):
         return list(
             self._iter_input_tiles(
                 image=image,
@@ -1100,7 +1444,12 @@ class StreamingCNN(torch.nn.Module):
 
     def _run_backward_tile(self, backward_ctx, input_y, input_x, sides):
         input_loc = Box(input_y, backward_ctx.tile_height, input_x, backward_ctx.tile_width, sides)
-        tile = backward_ctx.image[:, :, input_y : input_y + backward_ctx.tile_height, input_x : input_x + backward_ctx.tile_width]
+        tile = backward_ctx.image[
+            :,
+            :,
+            input_y : input_y + backward_ctx.tile_height,
+            input_x : input_x + backward_ctx.tile_width,
+        ]
 
         self._saved_tensors = {}
 
@@ -1108,7 +1457,7 @@ class StreamingCNN(torch.nn.Module):
             tile = tile.to(self.device, non_blocking=True)
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if _is_backward_streaming_module(mod):
                 mod.input_loc = input_loc
 
         if self.should_normalize:
@@ -1164,7 +1513,9 @@ class StreamingCNN(torch.nn.Module):
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
-        valid_input_height, valid_input_width = self._compute_valid_input_step(valid_output_heights, valid_output_widths)
+        valid_input_height, valid_input_width = self._compute_valid_input_step(
+            valid_output_heights, valid_output_widths
+        )
         n_rows, n_cols = self._compute_tile_grid(
             image_height=image.shape[H_DIM],
             image_width=image.shape[W_DIM],
@@ -1178,13 +1529,15 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
         self._last_forward_tiles = []
+        internal_alignment = self._compute_internal_alignment()
         logger.debug(
-            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s",
+            "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s, internal_alignment=%s",
             valid_input_height,
             valid_input_width,
             n_rows,
             n_cols,
             n_rows * n_cols,
+            internal_alignment,
         )
 
         result_device = torch.device("cpu") if result_on_cpu else self.device
@@ -1223,7 +1576,14 @@ class StreamingCNN(torch.nn.Module):
             ):
                 last_sides = sides
                 self._last_forward_tiles.append((input_y, input_x, sides))
-                tile, tile_outputs = self._run_forward_tile(forward_ctx.image, input_y, input_x, forward_ctx.tile_height, forward_ctx.tile_width)
+                self._log_and_validate_tile_start(input_y, input_x, sides, internal_alignment)
+                tile, tile_outputs = self._run_forward_tile(
+                    forward_ctx.image,
+                    input_y,
+                    input_x,
+                    forward_ctx.tile_height,
+                    forward_ctx.tile_width,
+                )
 
                 self._resolve_reducer_head_map(tile_outputs)
                 allocate_non_reducer_outputs()
@@ -1254,9 +1614,10 @@ class StreamingCNN(torch.nn.Module):
                 )
                 del tile
 
-        assert last_sides is not None and last_sides.bottom and last_sides.right, (
-            "It seems like we could not reconstruct all output"
-        )
+        assert (
+            last_sides is not None and last_sides.bottom and last_sides.right
+        ), "It seems like we could not reconstruct all output"
+        self._log_forward_tile_starts()
 
         self._validate_reducer_head_map_resolved()
 
@@ -1292,7 +1653,9 @@ class StreamingCNN(torch.nn.Module):
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
-        valid_input_height, valid_input_width = self._compute_valid_input_step(valid_output_heights, valid_output_widths)
+        valid_input_height, valid_input_width = self._compute_valid_input_step(
+            valid_output_heights, valid_output_widths
+        )
         n_rows, n_cols = self._compute_tile_grid(
             image_height=image.shape[H_DIM],
             image_width=image.shape[W_DIM],
@@ -1317,8 +1680,12 @@ class StreamingCNN(torch.nn.Module):
         for public_grad, internal_idx in zip(grad_tensors, public_indices):
             internal_grad_tensors[internal_idx] = public_grad
 
-        if len(self._tile_output_shapes) == 1:
-            tile_iter = self._prepare_backward_tile_iter_single_head(image, internal_grad_tensors, tile_height, tile_width)
+        if len(self._tile_output_shapes) == 1 and self._last_forward_tiles:
+            tile_iter = list(self._last_forward_tiles)
+        elif len(self._tile_output_shapes) == 1:
+            tile_iter = self._prepare_backward_tile_iter_single_head(
+                image, internal_grad_tensors, tile_height, tile_width
+            )
         else:
             tile_iter = self._prepare_backward_tile_iter_multi_head(
                 image=image,
@@ -1329,6 +1696,9 @@ class StreamingCNN(torch.nn.Module):
                 tile_height=tile_height,
                 tile_width=tile_width,
             )
+
+        self._log_backward_tile_starts(tile_iter)
+        self._validate_backward_tile_iter_matches_forward(tile_iter)
 
         self._validate_reducer_lifecycle_for_backward()
 
@@ -1344,7 +1714,6 @@ class StreamingCNN(torch.nn.Module):
         if self.debug_reducer_replay:
             for reducer in self._reducer_head_map.values():
                 reducer.start_backward_replay()
-
 
         last_sides = None
         for input_y, input_x, sides in tile_iter:
@@ -1363,13 +1732,13 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
 
         for mod in self.stream_module.modules():
-            if isinstance(mod, (StreamingConv2d, StreamingUpsample2d)):
+            if _is_backward_streaming_module(mod):
                 mod.input_loc = None
                 mod.reset()
 
-        assert last_sides is not None and last_sides.right and last_sides.bottom, (
-            "It seems like we could not reconstruct all output"
-        )
+        assert (
+            last_sides is not None and last_sides.right and last_sides.bottom
+        ), "It seems like we could not reconstruct all output"
 
     def _build_head_backward_pair(
         self,
@@ -1437,7 +1806,10 @@ class StreamingCNN(torch.nn.Module):
             head_lost.left : gradient.shape[W_DIM] - head_lost.right,
         ]
 
-        if trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM] or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]:
+        if (
+            trimmed_grad.shape[H_DIM] != trimmed_output.shape[H_DIM]
+            or trimmed_grad.shape[W_DIM] != trimmed_output.shape[W_DIM]
+        ):
             assert image.shape[H_DIM] < self.tile_shape[H_DIM] or image.shape[W_DIM] < self.tile_shape[W_DIM]
             trimmed_grad = trimmed_grad[:, :, 0 : trimmed_output.shape[H_DIM], 0 : trimmed_output.shape[W_DIM]]
 
@@ -1466,7 +1838,11 @@ class StreamingCNN(torch.nn.Module):
                 int(output_x + trimmed_output.shape[W_DIM]),
             )
         else:
-            trimmed_payload, _common_loc, common_dst_box = self._build_common_aligned_reducer_payload(
+            (
+                trimmed_payload,
+                _common_loc,
+                common_dst_box,
+            ) = self._build_common_aligned_reducer_payload(
                 head_idx=head_idx,
                 tile_outputs=tile_outputs,
                 ordered_indices=ordered_indices,
@@ -1555,14 +1931,21 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d, torch.nn.Upsample),
+        forward_modules=(
+            torch.nn.Conv2d,
+            torch.nn.MaxPool2d,
+            torch.nn.AvgPool2d,
+            torch.nn.Upsample,
+        ),
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
-            if isinstance(mod, forward_modules):
+            register_forward = isinstance(mod, forward_modules) or _is_pointwise_channel_norm(mod)
+            register_backward = back_modules and (isinstance(mod, back_modules) or _is_pointwise_channel_norm(mod))
+            if register_forward:
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
-                if back_modules and isinstance(mod, back_modules):
+                if register_backward:
                     back_handle = mod.register_full_backward_hook(backward_hook)
                     self._hooks.append(back_handle)
 
@@ -1590,15 +1973,25 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
-            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_pointwise_norm = _is_pointwise_channel_norm(module)
+        if is_pointwise_norm:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            padding = torch.tensor([0, 0, 0])
+        elif not is_upsample:
+            stride, kernel_size, padding = (
+                _triple(module.stride),
+                _triple(module.kernel_size),
+                _triple(module.padding),
+            )
         else:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
+            padding = torch.tensor([0, 0, 0])
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
-            if (not is_upsample) and (
+            if (not is_upsample and not is_pointwise_norm) and (
                 isinstance(module, (torch.nn.MaxPool2d))
                 or (stride[0] > 1 and stride[0] > kernel_size[0])
                 or (stride[1] > 1 and stride[1] > kernel_size[1])
@@ -1622,16 +2015,32 @@ class StreamingCNN(torch.nn.Module):
 
                 output[0] = new_output.type(self.dtype)
 
-            # Sum all dimensions (useful for DenseNet like networks)
-            lost = self._non_max_border_amount(output)
+            # Sum all dimensions (useful for DenseNet like networks). Channel-only
+            # normalization preserves spatial support, but constant setup tensors can
+            # make its actual output all zeros, so derive validity from its input.
+
+            lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
             output[
-                :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
+                :,
+                :,
+                lost.top : output[0, 0].shape[0] - lost.bottom,
+                lost.left : output[0, 0].shape[1] - lost.right,
             ] = 1
 
-            module_stats = {"lost": lost, "stride": stride if not is_upsample else torch.tensor([1, 1, 1]), "module": module}
+            module_stats = {
+                "lost": lost,
+                "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
+                "kernel_size": kernel_size,
+                "padding": padding,
+                "module": module,
+            }
+            if is_upsample:
+                module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
+                module_stats["upsample_forward_output_lost"] = module_stats["lost"]
+
             self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt
@@ -1641,29 +2050,98 @@ class StreamingCNN(torch.nn.Module):
 
             p_stats = self._prev_stats(output)
             if p_stats:
-                prev_output_stride = p_stats["output_stride"] * p_stats["stride"].clone().detach() if isinstance(p_stats["stride"], torch.Tensor) else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                prev_output_stride = (
+                    p_stats["output_stride"] * p_stats["stride"].clone().detach()
+                    if isinstance(p_stats["stride"], torch.Tensor)
+                    else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                )
             else:
                 prev_output_stride = torch.tensor([1, 1, 1])
 
             if is_upsample:
+                pre_upsample_output_stride = prev_output_stride.clone().detach()
                 scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
                 output_stride = self._update_output_stride_for_upsample(prev_output_stride, scale_h, scale_w)
+                pre_upsample_output_stride = output_stride.clone().detach().to(torch.float32)
+                pre_upsample_output_stride[1] *= scale_h
+                pre_upsample_output_stride[2] *= scale_w
+                pre_upsample_output_stride = torch.round(pre_upsample_output_stride).to(torch.long)
+                pre_upsample_output_stride[0] = 1
                 module_stats["scale_factor_hw"] = (scale_h, scale_w)
+                module_stats["pre_upsample_output_stride"] = pre_upsample_output_stride
             else:
                 output_stride = prev_output_stride
 
-            module_stats["output_stride"] = output_stride.clone().detach()
+            output_stride = output_stride.clone().detach()
+            output_stride[0] = 1
+            module_stats["output_stride"] = output_stride
+            if is_upsample:
+                module_stats["post_upsample_output_stride"] = output_stride
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
+    def _bilinear_upsample_backward_input_valid_mask(self, grad_output, grad_input, grad_lost, scale_h, scale_w):
+        """Return low-resolution grad-input cells with complete valid high-resolution support."""
+        out_h, out_w = int(grad_output.shape[H_DIM]), int(grad_output.shape[W_DIM])
+        in_h, in_w = int(grad_input.shape[H_DIM]), int(grad_input.shape[W_DIM])
+        device = grad_output.device
+
+        high_valid_y0 = int(grad_lost.top)
+        high_valid_y1 = out_h - int(grad_lost.bottom)
+        high_valid_x0 = int(grad_lost.left)
+        high_valid_x1 = out_w - int(grad_lost.right)
+
+        def contributing_outputs(input_idx, out_size, scale):
+            outputs = []
+            for out_idx in range(out_size):
+                src = (float(out_idx) + 0.5) / float(scale) - 0.5
+                lo = math.floor(src)
+                hi = math.ceil(src)
+                if input_idx == lo or input_idx == hi:
+                    outputs.append(out_idx)
+            return outputs
+
+        y_valid = []
+        for in_y in range(in_h):
+            outputs = contributing_outputs(in_y, out_h, scale_h)
+            y_valid.append(bool(outputs) and all(high_valid_y0 <= out_y < high_valid_y1 for out_y in outputs))
+
+        x_valid = []
+        for in_x in range(in_w):
+            outputs = contributing_outputs(in_x, out_w, scale_w)
+            x_valid.append(bool(outputs) and all(high_valid_x0 <= out_x < high_valid_x1 for out_x in outputs))
+
+        valid_mask = torch.zeros((in_h, in_w), dtype=torch.bool, device=device)
+        for in_y, valid_y in enumerate(y_valid):
+            if not valid_y:
+                continue
+            for in_x, valid_x in enumerate(x_valid):
+                if valid_x:
+                    valid_mask[in_y, in_x] = True
+        return valid_mask
+
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
-        if not is_upsample:
-            stride, kernel_size, _ = (_triple(module.stride), _triple(module.kernel_size), _triple(module.padding))
+        is_pointwise_norm = _is_pointwise_channel_norm(module)
+        if is_pointwise_norm:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            _padding = torch.tensor([0, 0, 0])
+        elif not is_upsample:
+            stride, kernel_size, _padding = (
+                _triple(module.stride),
+                _triple(module.kernel_size),
+                _triple(module.padding),
+            )
+        else:
+            stride = torch.tensor([1, 1, 1])
+            kernel_size = torch.tensor([1, 1, 1])
+            _padding = torch.tensor([0, 0, 0])
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
-            # on groups of channels
-            f_grad = torch.sum(grad_in[0], dim=1)[0]
+            # on groups of channels. Channel-only normalization is pointwise in space,
+            # so derive validity from grad_out instead of its value-dependent grad_in.
+            f_grad = torch.sum(grad_out[0] if is_pointwise_norm else grad_in[0], dim=1)[0]
             if isinstance(module, (torch.nn.MaxPool2d)):
                 # MaxPool shifts indices around, which break the calculation to
                 # find valid gradient values. To fix this we do an average pool
@@ -1679,7 +2157,14 @@ class StreamingCNN(torch.nn.Module):
 
                 if module.padding != 0:
                     padded_inpt = torch.nn.functional.pad(
-                        inpt[0], [module.padding, module.padding, module.padding, module.padding], value=-1
+                        inpt[0],
+                        [
+                            module.padding,
+                            module.padding,
+                            module.padding,
+                            module.padding,
+                        ],
+                        value=-1,
                     )
 
                 new_outpt = torch.nn.functional.avg_pool2d(padded_inpt, kernel_size[1:], stride[1:])[0]
@@ -1708,11 +2193,26 @@ class StreamingCNN(torch.nn.Module):
             self._print_verbose(module, "\n", grad_lost)
             self._module_stats[module]["grad_lost"] = grad_lost
 
+            if is_upsample and module.mode == "bilinear" and getattr(module, "align_corners", None) in (None, False):
+                scale_h, scale_w = self._resolve_upsample_scale(module, grad_in, grad_out[0])
+                input_valid_mask = self._bilinear_upsample_backward_input_valid_mask(
+                    grad_out[0], grad_in[0], grad_lost, scale_h, scale_w
+                )
+                input_lost_probe = input_valid_mask[None, None].expand(
+                    grad_in[0].shape[B_DIM],
+                    grad_in[0].shape[C_DIM],
+                    *input_valid_mask.shape,
+                )
+                self._module_stats[module]["upsample_backward_input_lost"] = self._non_max_border_amount(
+                    input_lost_probe.to(dtype=self.dtype) * 10 - 1
+                )
+
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
             # When kernel_size > stride we have some _overlap_ of gradients,
-            # this overlap makes extra positions in the input gradient invalid
-            if (not is_upsample) and (
+            # this overlap makes extra positions in the input gradient invalid.
+            # Pointwise channel normalization has no additional spatial loss.
+            if (not is_upsample and not is_pointwise_norm) and (
                 (stride[0] > 1 and kernel_size[0] > stride[0])
                 or (stride[1] > 1 and kernel_size[1] > stride[1])
                 or (stride[2] > 1 and kernel_size[2] > stride[2])
@@ -1729,10 +2229,25 @@ class StreamingCNN(torch.nn.Module):
             new_grad_in = valid_grad[None].expand(grad_in[0].shape[1], *valid_grad.shape)[None]
             new_grad_in = new_grad_in.type(self.dtype) * 10 - 1
             new_grad_in_lost = self._non_max_border_amount(new_grad_in)
+            self._module_stats[module]["backward_valid_lost"] = new_grad_in_lost
+            self._module_stats[module]["side_aware_grad_lost"] = {
+                "interior": grad_lost,
+                "top": Lost(0, grad_lost.left, grad_lost.bottom, grad_lost.right),
+                "bottom": Lost(grad_lost.top, grad_lost.left, 0, grad_lost.right),
+                "left": Lost(grad_lost.top, 0, grad_lost.bottom, grad_lost.right),
+                "right": Lost(grad_lost.top, grad_lost.left, grad_lost.bottom, 0),
+            }
 
             return (new_grad_in, *grad_in[1:])
 
-    def _backward_saliency_hook(self, module: StreamingConv2d, grad_in, grad_out, is_bias=False, change_grad=True):
+    def _backward_saliency_hook(
+        self,
+        module: StreamingConv2d,
+        grad_in,
+        grad_out,
+        is_bias=False,
+        change_grad=True,
+    ):
         stride: List[int] = _triple(module.stride)  # type:ignore
 
         # Trim gradient of invalid values
@@ -1746,7 +2261,12 @@ class StreamingCNN(torch.nn.Module):
         lost = Lost(lost_top, lost_left, lost_bottom, lost_right)
 
         grad = grad_out[0]
-        valid_grad = grad[:, :, lost_top : grad.shape[H_DIM] - lost_bottom, lost_left : grad.shape[W_DIM] - lost_right]
+        valid_grad = grad[
+            :,
+            :,
+            lost_top : grad.shape[H_DIM] - lost_bottom,
+            lost_left : grad.shape[W_DIM] - lost_right,
+        ]
 
         output_stride = module.output_stride * torch.tensor(stride)
         input_loc = module.input_loc

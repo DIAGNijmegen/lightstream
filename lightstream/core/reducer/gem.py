@@ -15,13 +15,27 @@ class GeMReducer(BaseReducer):
         r_init: float = 4.0,
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
+        learnable_r: bool = False,
+        r: float | None = None,
+        r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
 
-        init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        self.register_buffer("r", init_r)
+        if r is not None:
+            r_init = r
+
+        if r_parameter is not None:
+            self.r = r_parameter
+            self.learnable_r = True
+        else:
+            self.learnable_r = bool(learnable_r)
+            init_r = torch.tensor(float(r_init), dtype=torch.float32)
+            if self.learnable_r:
+                self.r = torch.nn.Parameter(init_r)
+            else:
+                self.register_buffer("r", init_r)
 
     @property
     def current_r(self) -> torch.Tensor:
@@ -54,12 +68,21 @@ class GeMReducer(BaseReducer):
         return y.to(dtype=x.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
+        if self.learnable_r:
+            return StreamingGeMReducer(
+                eps=self.eps,
+                accumulator_dtype=self.accumulator_dtype,
+                r_parameter=self.r,
+            )
+
         reducer = StreamingGeMReducer(
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            learnable_r=False,
         )
-        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        with torch.no_grad():
+            reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
 
 
@@ -71,13 +94,29 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         r_init: float = 4.0,
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
+        learnable_r: bool = False,
+        r: float | None = None,
+        r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
-        init_r = torch.tensor(float(r_init), dtype=torch.float32)
-        self.register_buffer("r", init_r)
+
+        if r is not None:
+            r_init = r
+
+        if r_parameter is not None:
+            self.r = r_parameter
+            self.learnable_r = True
+        else:
+            self.learnable_r = bool(learnable_r)
+            init_r = torch.tensor(float(r_init), dtype=torch.float32)
+            if self.learnable_r:
+                self.r = torch.nn.Parameter(init_r)
+            else:
+                self.register_buffer("r", init_r)
 
         self.register_buffer("running_q", torch.zeros(0), persistent=False)
+        self._r_correction_emitted = False
 
     @property
     def current_r(self) -> torch.Tensor:
@@ -127,9 +166,14 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         return {
             "normalization": n,
             "r": r,
+            "s": s,
             "m": m,
             "q": self.running_q.to(dtype=acc_dtype),
         }
+
+    def start_backward_replay(self):
+        super().start_backward_replay()
+        self._r_correction_emitted = False
 
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
         if valid_mask is None:
@@ -141,18 +185,45 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         r = global_context["r"].to(device=trimmed_output.device, dtype=acc_dtype)
         n = global_context["normalization"].to(device=trimmed_output.device, dtype=acc_dtype).clamp_min(1)
 
-        x_pow = x_clamped.pow(r)
+        x_pow = x_clamped.pow(r.detach())
         local_m = streaming_reduce_tile(x_pow, valid_mask, n)
 
-        global_m = global_context["m"].to(device=trimmed_output.device, dtype=acc_dtype)
-        scale = (1.0 / r) * global_m.clamp_min(self.eps).pow(1.0 / r - 1.0)
-        return (scale.detach() * local_m).to(dtype=trimmed_output.dtype)
+        global_m = global_context["m"].to(device=trimmed_output.device, dtype=acc_dtype).clamp_min(self.eps)
+        scale = ((1.0 / r) * global_m.pow(1.0 / r - 1.0)).detach()
+        input_surrogate = scale * local_m
+
+        s = global_context["s"].to(device=trimmed_output.device, dtype=acc_dtype)
+        q = global_context["q"].to(device=trimmed_output.device, dtype=acc_dtype)
+        y = global_m.pow(1.0 / r)
+        dr_per_output = (
+            y
+            * (
+                q / (r * s.clamp_min(self.eps))
+                - global_m.log() / (r * r)
+            )
+        ).detach()
+        r_correction = (r - r.detach()) * dr_per_output
+        if self._r_correction_emitted:
+            r_correction = torch.zeros_like(input_surrogate)
+        else:
+            self._r_correction_emitted = True
+
+        return (input_surrogate + r_correction).to(dtype=trimmed_output.dtype)
 
     def to_reducer(self) -> GeMReducer:
+        if self.learnable_r:
+            return GeMReducer(
+                eps=self.eps,
+                accumulator_dtype=self.accumulator_dtype,
+                r_parameter=self.r,
+            )
+
         reducer = GeMReducer(
             r_init=float(self.current_r.detach().item()),
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
+            learnable_r=False,
         )
-        reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
+        with torch.no_grad():
+            reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
