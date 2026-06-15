@@ -95,17 +95,54 @@ class StreamingUpsample2dF(torch.autograd.Function):
             support_end = math.ceil(scale * (float(end) + 0.5) - 0.5)
             return max(0, support_start), min(out_size, support_end)
 
-        support_top, support_bottom = _bilinear_backward_support(
-            owned_lowres_box.y, owned_lowres_box.height, inpt.shape[H_DIM], H
-        )
-        support_left, support_right = _bilinear_backward_support(
-            owned_lowres_box.x, owned_lowres_box.width, inpt.shape[W_DIM], W
+        valid_top = lost_top
+        valid_bottom = H - lost_bottom
+        valid_left = lost_left
+        valid_right = W - lost_right
+
+        low_y0 = owned_lowres_box.y
+        low_y1 = owned_lowres_box.y + owned_lowres_box.height
+        low_x0 = owned_lowres_box.x
+        low_x1 = owned_lowres_box.x + owned_lowres_box.width
+
+        while low_y0 < low_y1:
+            support_top, _ = _bilinear_backward_support(low_y0, 1, inpt.shape[H_DIM], H)
+            if support_top >= valid_top:
+                break
+            low_y0 += 1
+
+        while low_y0 < low_y1:
+            _, support_bottom = _bilinear_backward_support(low_y1 - 1, 1, inpt.shape[H_DIM], H)
+            if support_bottom <= valid_bottom:
+                break
+            low_y1 -= 1
+
+        while low_x0 < low_x1:
+            support_left, _ = _bilinear_backward_support(low_x0, 1, inpt.shape[W_DIM], W)
+            if support_left >= valid_left:
+                break
+            low_x0 += 1
+
+        while low_x0 < low_x1:
+            _, support_right = _bilinear_backward_support(low_x1 - 1, 1, inpt.shape[W_DIM], W)
+            if support_right <= valid_right:
+                break
+            low_x1 -= 1
+
+        complete_lowres_box = Box(
+            low_y0,
+            max(0, low_y1 - low_y0),
+            low_x0,
+            max(0, low_x1 - low_x0),
+            owned_lowres_box.sides,
         )
 
-        support_top = max(support_top, lost_top)
-        support_bottom = min(support_bottom, H - lost_bottom)
-        support_left = max(support_left, lost_left)
-        support_right = min(support_right, W - lost_right)
+        support_top, support_bottom = _bilinear_backward_support(
+            complete_lowres_box.y, complete_lowres_box.height, inpt.shape[H_DIM], H
+        )
+        support_left, support_right = _bilinear_backward_support(
+            complete_lowres_box.x, complete_lowres_box.width, inpt.shape[W_DIM], W
+        )
 
         grad_for_interp = torch.zeros_like(grad_output)
         if support_bottom > support_top and support_right > support_left:
@@ -130,17 +167,17 @@ class StreamingUpsample2dF(torch.autograd.Function):
 
         if grad_in is not None:
             masked_grad_in = torch.zeros_like(grad_in)
-            if owned_lowres_box.height > 0 and owned_lowres_box.width > 0:
+            if complete_lowres_box.height > 0 and complete_lowres_box.width > 0:
                 masked_grad_in[
                     :,
                     :,
-                    owned_lowres_box.y : owned_lowres_box.y + owned_lowres_box.height,
-                    owned_lowres_box.x : owned_lowres_box.x + owned_lowres_box.width,
+                    complete_lowres_box.y : complete_lowres_box.y + complete_lowres_box.height,
+                    complete_lowres_box.x : complete_lowres_box.x + complete_lowres_box.width,
                 ] = grad_in[
                     :,
                     :,
-                    owned_lowres_box.y : owned_lowres_box.y + owned_lowres_box.height,
-                    owned_lowres_box.x : owned_lowres_box.x + owned_lowres_box.width,
+                    complete_lowres_box.y : complete_lowres_box.y + complete_lowres_box.height,
+                    complete_lowres_box.x : complete_lowres_box.x + complete_lowres_box.width,
                 ]
             grad_in = masked_grad_in
 
