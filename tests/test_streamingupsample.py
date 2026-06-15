@@ -4,7 +4,7 @@ import torch
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.scnn.utils import Box, Sides
+from lightstream.core.scnn.utils import Box, Lost, Sides
 
 
 def test_streaming_upsample_from_torch_matches_interpolate():
@@ -102,6 +102,24 @@ def test_streaming_upsample_backward_keeps_pre_upsample_coordinate_gradients():
     module(second).sum().backward()
 
     assert torch.count_nonzero(second.grad).item() == second.numel()
+
+
+def test_bilinear_upsample_backward_drops_incomplete_support_cells(caplog):
+    module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
+    module.grad_lost = Lost(top=0, left=0, bottom=1, right=1)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+
+    x = torch.ones(1, 1, 3, 3, requires_grad=True)
+
+    with caplog.at_level("DEBUG", logger="lightstream.core.scnn.streamingupsample"):
+        module(x).sum().backward()
+
+    expected = torch.tensor(
+        [[[[4.0, 4.0, 0.0], [4.0, 4.0, 0.0], [0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(x.grad, expected)
+    assert module.seen_indices == Box(0, 2, 2, 0, None)
+    assert "dropped candidate low-res cells with incomplete high-res support" in caplog.text
 
 
 def test_upsample_statistics_store_pre_upsample_output_stride():
