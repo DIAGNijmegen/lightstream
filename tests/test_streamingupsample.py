@@ -204,3 +204,51 @@ def test_upsample_backward_statistics_store_backward_valid_lost():
     scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
 
     assert scnn._module_stats[module]["backward_valid_lost"] == Lost(0, 0, 0, 0)
+
+
+def test_safe_input_step_accounts_for_upsample_forward_and_backward_lost_regions():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.tile_shape = (1, 1, 64, 64)
+    scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
+    module.grad_lost = Lost(top=3, left=5, bottom=7, right=11)
+    module.upsample_backward_input_lost = Lost(top=2, left=4, bottom=6, right=8)
+    module.pre_upsample_output_stride = torch.tensor([1, 4, 4])
+    module.output_stride = torch.tensor([1, 2, 2])
+    module.post_upsample_output_stride = module.output_stride
+    scnn.stream_module = torch.nn.Sequential(module)
+    scnn._module_stats = {module: {"lost": Lost(top=3, left=5, bottom=7, right=11)}}
+
+    safe_h, safe_w = scnn._compute_internal_safe_input_step()
+
+    # Forward loss is in post-upsample output coordinates:
+    #   H: 64 - (3 + 7) * 2 = 44
+    #   W: 64 - (5 + 11) * 2 = 32
+    # Backward input loss is in pre-upsample low-resolution coordinates:
+    #   H: 64 - (2 + 6) * 4 = 32
+    #   W: 64 - (4 + 8) * 4 = 16
+    assert (safe_h, safe_w) == (32, 16)
+
+
+def test_single_output_valid_input_step_is_reduced_by_upsample_safe_step_without_losing_alignment():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.tile_shape = (1, 1, 64, 64)
+    scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_shapes = [(1, 1, 32, 32)]
+    scnn._output_stride_per_output = [torch.tensor([1, 2, 2])]
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
+    module.grad_lost = Lost(top=0, left=0, bottom=0, right=0)
+    module.upsample_backward_input_lost = Lost(top=3, left=3, bottom=3, right=3)
+    module.pre_upsample_output_stride = torch.tensor([1, 4, 4])
+    module.output_stride = torch.tensor([1, 2, 2])
+    module.post_upsample_output_stride = module.output_stride
+    scnn.stream_module = torch.nn.Sequential(module)
+    scnn._module_stats = {module: {"lost": Lost(top=0, left=0, bottom=0, right=0)}}
+
+    step_h, step_w = scnn._compute_valid_input_step([32], [32])
+
+    assert (step_h, step_w) == (40, 40)

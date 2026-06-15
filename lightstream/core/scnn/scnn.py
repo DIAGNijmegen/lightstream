@@ -471,7 +471,14 @@ class StreamingCNN(torch.nn.Module):
         raise TypeError(f"Unsupported output spec kind: {kind}")
 
     def _compute_internal_safe_input_step(self):
-        """Compute conservative input-step bounds from per-layer backward stats."""
+        """Compute conservative input-step bounds from per-layer lost-region stats.
+
+        Upsampling layers report two different losses in layer-local coordinates:
+        forward loss is measured on the high-resolution upsample output, while
+        backward input loss is measured on the low-resolution gradient input.
+        Convert both to input-image coordinates before comparing them to the
+        input tile size so tile overlap covers the largest lost border.
+        """
         candidates_h = []
         candidates_w = []
 
@@ -487,15 +494,63 @@ class StreamingCNN(torch.nn.Module):
                     candidates_h.append(step_h)
                     candidates_w.append(step_w)
             elif isinstance(mod, StreamingUpsample2d):
-                input_lost = getattr(mod, "upsample_backward_input_lost", None)
-                if input_lost is None:
-                    continue
-                output_stride = getattr(mod, "pre_upsample_output_stride", torch.tensor([1, 1, 1]))
-                step_h = self.tile_shape[H_DIM] - int(input_lost.top + input_lost.bottom) * int(output_stride[1])
-                step_w = self.tile_shape[W_DIM] - int(input_lost.left + input_lost.right) * int(output_stride[2])
-                if step_h > 0 and step_w > 0:
-                    candidates_h.append(step_h)
-                    candidates_w.append(step_w)
+                stats = self._module_stats.get(mod, {})
+                forward_lost = stats.get("lost")
+                backward_input_lost = stats.get(
+                    "upsample_backward_input_lost",
+                    getattr(mod, "upsample_backward_input_lost", None),
+                )
+                pre_upsample_output_stride = torch.as_tensor(
+                    getattr(mod, "pre_upsample_output_stride", torch.tensor([1, 1, 1])),
+                    dtype=torch.long,
+                )
+                post_upsample_output_stride = torch.as_tensor(
+                    getattr(
+                        mod,
+                        "post_upsample_output_stride",
+                        getattr(mod, "output_stride", torch.tensor([1, 1, 1])),
+                    ),
+                    dtype=torch.long,
+                )
+
+                upsample_candidates_h = []
+                upsample_candidates_w = []
+                if forward_lost is not None:
+                    step_h = self.tile_shape[H_DIM] - int(forward_lost.top + forward_lost.bottom) * int(
+                        post_upsample_output_stride[1]
+                    )
+                    step_w = self.tile_shape[W_DIM] - int(forward_lost.left + forward_lost.right) * int(
+                        post_upsample_output_stride[2]
+                    )
+                    if step_h > 0 and step_w > 0:
+                        candidates_h.append(step_h)
+                        candidates_w.append(step_w)
+                        upsample_candidates_h.append(step_h)
+                        upsample_candidates_w.append(step_w)
+                if backward_input_lost is not None:
+                    step_h = self.tile_shape[H_DIM] - int(
+                        backward_input_lost.top + backward_input_lost.bottom
+                    ) * int(pre_upsample_output_stride[1])
+                    step_w = self.tile_shape[W_DIM] - int(
+                        backward_input_lost.left + backward_input_lost.right
+                    ) * int(pre_upsample_output_stride[2])
+                    if step_h > 0 and step_w > 0:
+                        candidates_h.append(step_h)
+                        candidates_w.append(step_w)
+                        upsample_candidates_h.append(step_h)
+                        upsample_candidates_w.append(step_w)
+                if upsample_candidates_h and upsample_candidates_w:
+                    self._print_verbose(
+                        "Upsample safe tile step",
+                        {
+                            "module": mod,
+                            "forward_lost": forward_lost,
+                            "backward_input_lost": backward_input_lost,
+                            "pre_upsample_output_stride": pre_upsample_output_stride,
+                            "post_upsample_output_stride": post_upsample_output_stride,
+                            "safe_tile_step": (min(upsample_candidates_h), min(upsample_candidates_w)),
+                        },
+                    )
 
         # Fallback to global backward-safe span if per-layer stats are unavailable
         grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
@@ -853,6 +908,9 @@ class StreamingCNN(torch.nn.Module):
             1,
             valid_output_widths[0] * int(self._output_stride_per_output[0][2]),
         )
+        grad_safe_h, grad_safe_w = self._compute_internal_safe_input_step()
+        valid_input_height = min(valid_input_height, int(grad_safe_h))
+        valid_input_width = min(valid_input_width, int(grad_safe_w))
 
         internal_align_h, internal_align_w = self._compute_internal_alignment()
         align_h = math.lcm(int(self._output_stride_per_output[0][1]), internal_align_h)
