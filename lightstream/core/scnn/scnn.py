@@ -486,6 +486,16 @@ class StreamingCNN(torch.nn.Module):
                 if step_h > 0 and step_w > 0:
                     candidates_h.append(step_h)
                     candidates_w.append(step_w)
+            elif isinstance(mod, StreamingUpsample2d):
+                input_lost = getattr(mod, "upsample_backward_input_lost", None)
+                if input_lost is None:
+                    continue
+                output_stride = getattr(mod, "pre_upsample_output_stride", torch.tensor([1, 1, 1]))
+                step_h = self.tile_shape[H_DIM] - int(input_lost.top + input_lost.bottom) * int(output_stride[1])
+                step_w = self.tile_shape[W_DIM] - int(input_lost.left + input_lost.right) * int(output_stride[2])
+                if step_h > 0 and step_w > 0:
+                    candidates_h.append(step_h)
+                    candidates_w.append(step_w)
 
         # Fallback to global backward-safe span if per-layer stats are unavailable
         grad_safe_h = self.tile_shape[H_DIM] - self.tile_gradient_lost.top - self.tile_gradient_lost.bottom
@@ -607,6 +617,7 @@ class StreamingCNN(torch.nn.Module):
                     "grad_lost",
                     "side_aware_grad_lost",
                     "backward_valid_lost",
+                    "upsample_backward_input_lost",
                 ):
                     if key in stats and hasattr(mod, key):
                         setattr(mod, key, stats[key])
@@ -657,6 +668,7 @@ class StreamingCNN(torch.nn.Module):
                 stats["output_stride"] = module.output_stride
                 stats["post_upsample_output_stride"] = module.output_stride
                 stats["backward_valid_lost"] = module.backward_valid_lost
+                stats["upsample_backward_input_lost"] = module.upsample_backward_input_lost
                 if module.scale_factor is not None:
                     sf = module.scale_factor
                     stats["scale_factor_hw"] = (
@@ -1925,6 +1937,47 @@ class StreamingCNN(torch.nn.Module):
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
+
+    def _bilinear_upsample_backward_input_valid_mask(self, grad_output, grad_input, grad_lost, scale_h, scale_w):
+        """Return low-resolution grad-input cells with complete valid high-resolution support."""
+        out_h, out_w = int(grad_output.shape[H_DIM]), int(grad_output.shape[W_DIM])
+        in_h, in_w = int(grad_input.shape[H_DIM]), int(grad_input.shape[W_DIM])
+        device = grad_output.device
+
+        high_valid_y0 = int(grad_lost.top)
+        high_valid_y1 = out_h - int(grad_lost.bottom)
+        high_valid_x0 = int(grad_lost.left)
+        high_valid_x1 = out_w - int(grad_lost.right)
+
+        def contributing_outputs(input_idx, out_size, scale):
+            outputs = []
+            for out_idx in range(out_size):
+                src = (float(out_idx) + 0.5) / float(scale) - 0.5
+                lo = math.floor(src)
+                hi = math.ceil(src)
+                if input_idx == lo or input_idx == hi:
+                    outputs.append(out_idx)
+            return outputs
+
+        y_valid = []
+        for in_y in range(in_h):
+            outputs = contributing_outputs(in_y, out_h, scale_h)
+            y_valid.append(bool(outputs) and all(high_valid_y0 <= out_y < high_valid_y1 for out_y in outputs))
+
+        x_valid = []
+        for in_x in range(in_w):
+            outputs = contributing_outputs(in_x, out_w, scale_w)
+            x_valid.append(bool(outputs) and all(high_valid_x0 <= out_x < high_valid_x1 for out_x in outputs))
+
+        valid_mask = torch.zeros((in_h, in_w), dtype=torch.bool, device=device)
+        for in_y, valid_y in enumerate(y_valid):
+            if not valid_y:
+                continue
+            for in_x, valid_x in enumerate(x_valid):
+                if valid_x:
+                    valid_mask[in_y, in_x] = True
+        return valid_mask
+
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_norm = _is_pointwise_channel_norm(module)
@@ -1986,6 +2039,22 @@ class StreamingCNN(torch.nn.Module):
 
             self._print_verbose(module, "\n", grad_lost)
             self._module_stats[module]["grad_lost"] = grad_lost
+
+            if (
+                is_upsample
+                and module.mode == "bilinear"
+                and getattr(module, "align_corners", None) in (None, False)
+            ):
+                scale_h, scale_w = self._resolve_upsample_scale(module, grad_in, grad_out[0])
+                input_valid_mask = self._bilinear_upsample_backward_input_valid_mask(
+                    grad_out[0], grad_in[0], grad_lost, scale_h, scale_w
+                )
+                input_lost_probe = input_valid_mask[None, None].expand(
+                    grad_in[0].shape[B_DIM], grad_in[0].shape[C_DIM], *input_valid_mask.shape
+                )
+                self._module_stats[module]["upsample_backward_input_lost"] = self._non_max_border_amount(
+                    input_lost_probe.to(dtype=self.dtype) * 10 - 1
+                )
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 

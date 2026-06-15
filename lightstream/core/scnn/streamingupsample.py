@@ -28,6 +28,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         recompute_scale_factor,
         grad_lost,
         backward_valid_lost,
+        upsample_backward_input_lost,
         seen_indices,
         pre_upsample_output_stride,
         output_stride,
@@ -41,6 +42,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.recompute_scale_factor = recompute_scale_factor
         ctx.grad_lost = grad_lost
         ctx.backward_valid_lost = backward_valid_lost
+        ctx.upsample_backward_input_lost = upsample_backward_input_lost
         ctx.seen_indices = seen_indices
         ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.output_stride = output_stride
@@ -60,7 +62,11 @@ class StreamingUpsample2dF(torch.autograd.Function):
         (inpt,) = ctx.saved_tensors
         sides = ctx.input_loc.sides
         grad_lost = ctx.grad_lost
-        backward_valid_lost = ctx.backward_valid_lost or Lost(0, 0, 0, 0)
+        upsample_backward_input_lost = (
+            ctx.upsample_backward_input_lost
+            if ctx.upsample_backward_input_lost is not None
+            else ctx.backward_valid_lost or Lost(0, 0, 0, 0)
+        )
 
         lost_top = grad_lost.top if not sides.top else 0
         lost_bottom = grad_lost.bottom if not sides.bottom else 0
@@ -262,10 +268,10 @@ class StreamingUpsample2dF(torch.autograd.Function):
             grad_in = None
 
         if grad_in is not None:
-            input_lost_top = backward_valid_lost.top if not sides.top else 0
-            input_lost_bottom = backward_valid_lost.bottom if not sides.bottom else 0
-            input_lost_left = backward_valid_lost.left if not sides.left else 0
-            input_lost_right = backward_valid_lost.right if not sides.right else 0
+            input_lost_top = upsample_backward_input_lost.top if not sides.top else 0
+            input_lost_bottom = upsample_backward_input_lost.bottom if not sides.bottom else 0
+            input_lost_left = upsample_backward_input_lost.left if not sides.left else 0
+            input_lost_right = upsample_backward_input_lost.right if not sides.right else 0
             masked_grad_in = torch.zeros_like(grad_in)
             if grad_in.shape[H_DIM] > input_lost_top + input_lost_bottom and grad_in.shape[W_DIM] > input_lost_left + input_lost_right:
                 masked_grad_in[
@@ -281,7 +287,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
                 ]
             grad_in = masked_grad_in
 
-        return grad_in, None, None, None, None, None, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 upsample2d = StreamingUpsample2dF.apply
@@ -322,6 +328,7 @@ class StreamingUpsample2d(nn.Module):
         self.post_upsample_output_stride = self.output_stride
         self.side_aware_grad_lost = None
         self.backward_valid_lost = Lost(0, 0, 0, 0)
+        self.upsample_backward_input_lost = None
         self.reset()
 
     def reset(self):
@@ -338,6 +345,7 @@ class StreamingUpsample2d(nn.Module):
             self.recompute_scale_factor,
             self.grad_lost,
             self.backward_valid_lost,
+            self.upsample_backward_input_lost,
             self.seen_indices,
             self.pre_upsample_output_stride,
             self.output_stride,
