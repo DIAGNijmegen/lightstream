@@ -98,6 +98,22 @@ class StreamingUpsample2dF(torch.autograd.Function):
         valid_left = lost_left
         valid_right = W - lost_right
 
+        owned_support_top, owned_support_bottom = _bilinear_backward_support(
+            owned_lowres_box.y, owned_lowres_box.height, inpt.shape[H_DIM], H
+        )
+        owned_support_left, owned_support_right = _bilinear_backward_support(
+            owned_lowres_box.x, owned_lowres_box.width, inpt.shape[W_DIM], W
+        )
+        clipped_support_edges = []
+        if owned_support_top < valid_top:
+            clipped_support_edges.append("top")
+        if owned_support_bottom > valid_bottom:
+            clipped_support_edges.append("bottom")
+        if owned_support_left < valid_left:
+            clipped_support_edges.append("left")
+        if owned_support_right > valid_right:
+            clipped_support_edges.append("right")
+
         low_y0 = owned_lowres_box.y
         low_y1 = owned_lowres_box.y + owned_lowres_box.height
         low_x0 = owned_lowres_box.x
@@ -134,6 +150,28 @@ class StreamingUpsample2dF(torch.autograd.Function):
             max(0, low_x1 - low_x0),
             owned_lowres_box.sides,
         )
+
+        if clipped_support_edges:
+            logger.debug(
+                "StreamingUpsample2dF.backward found owned low-res cells whose required high-res support "
+                "extends beyond valid grad_output bounds: input_loc=%s sides=%s tile_sides=%s "
+                "owned_lowres_box=%s required_support=(top=%s, bottom=%s, left=%s, right=%s) "
+                "valid_highres=(top=%s, bottom=%s, left=%s, right=%s) complete_lowres_box=%s clipped_edges=%s",
+                ctx.input_loc,
+                sides,
+                owned_lowres_box.sides,
+                owned_lowres_box,
+                owned_support_top,
+                owned_support_bottom,
+                owned_support_left,
+                owned_support_right,
+                valid_top,
+                valid_bottom,
+                valid_left,
+                valid_right,
+                complete_lowres_box,
+                tuple(clipped_support_edges),
+            )
 
         owned_y1 = owned_lowres_box.y + owned_lowres_box.height
         owned_x1 = owned_lowres_box.x + owned_lowres_box.width
