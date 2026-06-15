@@ -24,7 +24,6 @@ class StreamingConv2dF(torch.autograd.Function):
         dilation,
         groups,
         grad_lost,
-        backward_valid_lost,
         seen_indices,
         output_stride,
         input_loc,
@@ -35,7 +34,6 @@ class StreamingConv2dF(torch.autograd.Function):
         ctx.dilation = dilation
         ctx.groups = groups
         ctx.grad_lost = grad_lost
-        ctx.backward_valid_lost = backward_valid_lost
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
@@ -54,7 +52,6 @@ class StreamingConv2dF(torch.autograd.Function):
         sides = ctx.input_loc.sides  # Type: Sides
         seen_indices = ctx.seen_indices
         grad_lost = ctx.grad_lost  # Type: Lost
-        backward_valid_lost = ctx.backward_valid_lost  # Type: Lost
         output_stride = ctx.output_stride
         grad_bias = None
         kernel_size = weight.shape[-1]
@@ -72,23 +69,6 @@ class StreamingConv2dF(torch.autograd.Function):
                 dilation,
                 groups,
             )
-            lost_top = backward_valid_lost.top if not sides.top else 0
-            lost_bottom = backward_valid_lost.bottom if not sides.bottom else 0
-            lost_left = backward_valid_lost.left if not sides.left else 0
-            lost_right = backward_valid_lost.right if not sides.right else 0
-            masked_grad_in = torch.zeros_like(grad_in)
-            masked_grad_in[
-                :,
-                :,
-                lost_top : grad_in.shape[H_DIM] - lost_bottom,
-                lost_left : grad_in.shape[W_DIM] - lost_right,
-            ] = grad_in[
-                :,
-                :,
-                lost_top : grad_in.shape[H_DIM] - lost_bottom,
-                lost_left : grad_in.shape[W_DIM] - lost_right,
-            ]
-            grad_in = masked_grad_in
         else:
             grad_in = None
 
@@ -207,9 +187,9 @@ class StreamingConv2dF(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
 
         if bias is not None:
-            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None)
         else:
-            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None)
 
 
 conv2d = StreamingConv2dF.apply  # type:ignore
@@ -246,7 +226,6 @@ class StreamingConv2d(_ConvNd):
             padding_mode,
         )
         self.grad_lost = Lost(0, 0, 0, 0)
-        self.backward_valid_lost = Lost(0, 0, 0, 0)
         self.reset()
 
     @classmethod
@@ -305,7 +284,6 @@ class StreamingConv2d(_ConvNd):
             self.dilation,
             self.groups,
             self.grad_lost,
-            self.backward_valid_lost,
             self.seen_indices,
             self.output_stride,
             self.input_loc,
