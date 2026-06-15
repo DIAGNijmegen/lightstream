@@ -976,6 +976,28 @@ class StreamingCNN(torch.nn.Module):
                 f"internal alignment {align_w}"
             )
 
+    def _tile_start_list(self, tile_iter):
+        """Return input-space tile starts for compact forward/backward diagnostics."""
+        return [(int(input_y), int(input_x)) for input_y, input_x, _ in tile_iter]
+
+    def _log_forward_tile_starts(self):
+        logger.debug("forward tile starts: %s", self._tile_start_list(self._last_forward_tiles))
+
+    def _log_backward_tile_starts(self, tile_iter):
+        logger.debug("backward tile starts: %s", self._tile_start_list(tile_iter))
+
+    def _validate_backward_tile_iter_matches_forward(self, tile_iter):
+        """Assert in debug mode that backward replays the exact forward tile starts."""
+        if not __debug__ or not self._last_forward_tiles:
+            return
+
+        forward_starts = self._tile_start_list(self._last_forward_tiles)
+        backward_starts = self._tile_start_list(tile_iter)
+        assert backward_starts == forward_starts, (
+            "Backward tile starts differ from forward tile starts: "
+            f"forward={forward_starts}, backward={backward_starts}"
+        )
+
     def _prepare_forward_outputs(self, image, output_heights, output_widths, result_device):
         outputs = [None] * len(self._tile_output_shapes)
 
@@ -1504,6 +1526,7 @@ class StreamingCNN(torch.nn.Module):
         assert last_sides is not None and last_sides.bottom and last_sides.right, (
             "It seems like we could not reconstruct all output"
         )
+        self._log_forward_tile_starts()
 
         self._validate_reducer_head_map_resolved()
 
@@ -1564,7 +1587,9 @@ class StreamingCNN(torch.nn.Module):
         for public_grad, internal_idx in zip(grad_tensors, public_indices):
             internal_grad_tensors[internal_idx] = public_grad
 
-        if len(self._tile_output_shapes) == 1:
+        if len(self._tile_output_shapes) == 1 and self._last_forward_tiles:
+            tile_iter = list(self._last_forward_tiles)
+        elif len(self._tile_output_shapes) == 1:
             tile_iter = self._prepare_backward_tile_iter_single_head(image, internal_grad_tensors, tile_height, tile_width)
         else:
             tile_iter = self._prepare_backward_tile_iter_multi_head(
@@ -1576,6 +1601,9 @@ class StreamingCNN(torch.nn.Module):
                 tile_height=tile_height,
                 tile_width=tile_width,
             )
+
+        self._log_backward_tile_starts(tile_iter)
+        self._validate_backward_tile_iter_matches_forward(tile_iter)
 
         self._validate_reducer_lifecycle_for_backward()
 
