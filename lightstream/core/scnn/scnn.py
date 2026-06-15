@@ -1742,67 +1742,6 @@ class StreamingCNN(torch.nn.Module):
         out_stride[0] = 1
         return out_stride
 
-
-    def _bilinear_upsample_forward_valid_mask(self, inpt, output, scale_h, scale_w, sides=None):
-        """Propagate spatial validity through align_corners=False bilinear upsample.
-
-        PyTorch bilinear upsample uses edge-value padding at true image boundaries,
-        but a streaming tile's interior seams cannot borrow pixels from neighbouring
-        tiles that are not present. A high-resolution output pixel is therefore
-        valid only when every floor/ceil source pixel required by the bilinear
-        stencil is valid, except at true image sides where out-of-range source
-        indices clamp to the tile edge just like PyTorch.
-        """
-        input_valid = torch.any(inpt != 0, dim=(0, 1))
-        in_h, in_w = int(inpt.shape[H_DIM]), int(inpt.shape[W_DIM])
-        out_h, out_w = int(output.shape[H_DIM]), int(output.shape[W_DIM])
-        device = inpt.device
-
-        def axis_valid_indices(out_size, in_size, scale, before_side, after_side):
-            axis_valid = []
-            for out_idx in range(out_size):
-                src = (float(out_idx) + 0.5) / float(scale) - 0.5
-                candidates = (math.floor(src), math.ceil(src))
-                resolved = []
-                valid = True
-                for idx in candidates:
-                    if 0 <= idx < in_size:
-                        resolved.append(idx)
-                    elif idx < 0 and before_side:
-                        resolved.append(0)
-                    elif idx >= in_size and after_side:
-                        resolved.append(in_size - 1)
-                    else:
-                        valid = False
-                        break
-                axis_valid.append((valid, tuple(resolved)))
-            return axis_valid
-
-        side_top = bool(getattr(sides, "top", False)) if sides is not None else False
-        side_bottom = bool(getattr(sides, "bottom", False)) if sides is not None else False
-        side_left = bool(getattr(sides, "left", False)) if sides is not None else False
-        side_right = bool(getattr(sides, "right", False)) if sides is not None else False
-
-        y_indices = axis_valid_indices(out_h, in_h, scale_h, side_top, side_bottom)
-        x_indices = axis_valid_indices(out_w, in_w, scale_w, side_left, side_right)
-        valid_mask = torch.zeros((out_h, out_w), dtype=torch.bool, device=device)
-        for out_y, (valid_y, src_ys) in enumerate(y_indices):
-            if not valid_y:
-                continue
-            for out_x, (valid_x, src_xs) in enumerate(x_indices):
-                if not valid_x:
-                    continue
-                required_valid = True
-                for src_y in src_ys:
-                    for src_x in src_xs:
-                        if not bool(input_valid[src_y, src_x]):
-                            required_valid = False
-                            break
-                    if not required_valid:
-                        break
-                valid_mask[out_y, out_x] = required_valid
-        return valid_mask
-
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_norm = _is_pointwise_channel_norm(module)
@@ -1846,26 +1785,14 @@ class StreamingCNN(torch.nn.Module):
             # Sum all dimensions (useful for DenseNet like networks). Channel-only
             # normalization preserves spatial support, but constant setup tensors can
             # make its actual output all zeros, so derive validity from its input.
-            if (
-                is_upsample
-                and module.mode == "bilinear"
-                and getattr(module, "align_corners", None) in (None, False)
-            ):
-                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
-                valid_mask = self._bilinear_upsample_forward_valid_mask(inpt[0], output, scale_h, scale_w)
-                lost_probe = valid_mask[None, None].expand(output.shape[B_DIM], output.shape[C_DIM], *valid_mask.shape)
-                lost = self._non_max_border_amount(lost_probe.to(dtype=self.dtype) * 10 - 1)
 
-                output.fill_(0)
-                output[:, :, valid_mask] = 1
-            else:
-                lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
+            lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
 
-                # Make output between 0-1 again, so the values do not explode
-                output.fill_(0)
-                output[
-                    :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
-                ] = 1
+            # Make output between 0-1 again, so the values do not explode
+            output.fill_(0)
+            output[
+                :, :, lost.top : output[0, 0].shape[0] - lost.bottom, lost.left : output[0, 0].shape[1] - lost.right
+            ] = 1
 
             module_stats = {
                 "lost": lost,
@@ -1876,32 +1803,7 @@ class StreamingCNN(torch.nn.Module):
             }
             if is_upsample:
                 module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
-                module_stats["forward_valid_lost"] = lost
-                if module.mode == "bilinear" and getattr(module, "align_corners", None) in (None, False):
-                    scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
-                    side_masks = {
-                        "interior": self._bilinear_upsample_forward_valid_mask(inpt[0], output, scale_h, scale_w),
-                        "top": self._bilinear_upsample_forward_valid_mask(
-                            inpt[0], output, scale_h, scale_w, Sides(left=0, top=1, right=0, bottom=0)
-                        ),
-                        "bottom": self._bilinear_upsample_forward_valid_mask(
-                            inpt[0], output, scale_h, scale_w, Sides(left=0, top=0, right=0, bottom=1)
-                        ),
-                        "left": self._bilinear_upsample_forward_valid_mask(
-                            inpt[0], output, scale_h, scale_w, Sides(left=1, top=0, right=0, bottom=0)
-                        ),
-                        "right": self._bilinear_upsample_forward_valid_mask(
-                            inpt[0], output, scale_h, scale_w, Sides(left=0, top=0, right=1, bottom=0)
-                        ),
-                    }
-                    module_stats["side_aware_forward_valid_lost"] = {
-                        side: self._non_max_border_amount(
-                            mask[None, None].expand(output.shape[B_DIM], output.shape[C_DIM], *mask.shape).to(dtype=self.dtype)
-                            * 10
-                            - 1
-                        )
-                        for side, mask in side_masks.items()
-                    }
+
             self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt

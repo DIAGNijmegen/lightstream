@@ -6,14 +6,26 @@ from torch.nn.modules.utils import _pair
 from torch.nn.grad import conv2d_input, conv2d_weight
 from torch.amp import custom_fwd, custom_bwd
 
-from lightstream.core.scnn.utils import _ntuple, Box, Lost, _new_value_indices, B_DIM, C_DIM, H_DIM, W_DIM
+from lightstream.core.scnn.utils import (
+    _ntuple,
+    Box,
+    Lost,
+    _new_value_indices,
+    B_DIM,
+    C_DIM,
+    H_DIM,
+    W_DIM,
+)
 
 _triple = _ntuple(3)
 
 
 class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
-    @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+    @custom_fwd(
+        device_type="cuda",
+        cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    )
     def forward(
         ctx,
         inpt,
@@ -37,7 +49,9 @@ class StreamingConv2dF(torch.autograd.Function):
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
-        return torch.nn.functional.conv2d(inpt, weight, bias, stride, padding, dilation, groups)
+        return torch.nn.functional.conv2d(
+            inpt, weight, bias, stride, padding, dilation, groups
+        )
 
     @staticmethod
     @custom_bwd(device_type="cuda")
@@ -79,9 +93,18 @@ class StreamingConv2dF(torch.autograd.Function):
         lost_left = grad_lost.left if not sides.left else 0
         lost_right = grad_lost.right if not sides.right else 0
 
-        valid_grad = grad[:, :, lost_top : grad.shape[H_DIM] - lost_bottom, lost_left : grad.shape[W_DIM] - lost_right]
+        valid_grad = grad[
+            :,
+            :,
+            lost_top : grad.shape[H_DIM] - lost_bottom,
+            lost_left : grad.shape[W_DIM] - lost_right,
+        ]
 
-        stride, kernel_size, padding = (_triple(stride), _triple(kernel_size), _triple(padding))
+        stride, kernel_size, padding = (
+            _triple(stride),
+            _triple(kernel_size),
+            _triple(padding),
+        )
 
         output_stride = output_stride * torch.tensor(stride)
         input_loc = ctx.input_loc
@@ -127,10 +150,17 @@ class StreamingConv2dF(torch.autograd.Function):
             input_x = max(0, input_x)
             input_y = max(0, input_y)
 
-            relevant_input_height = relevant_grad.shape[H_DIM] * stride[1] + (kernel_size[1] - 1)
-            relevant_input_width = relevant_grad.shape[W_DIM] * stride[2] + (kernel_size[2] - 1)
+            relevant_input_height = relevant_grad.shape[H_DIM] * stride[1] + (
+                kernel_size[1] - 1
+            )
+            relevant_input_width = relevant_grad.shape[W_DIM] * stride[2] + (
+                kernel_size[2] - 1
+            )
             relevant_input = inpt[
-                :, :, input_y : input_y + relevant_input_height, input_x : input_x + relevant_input_width
+                :,
+                :,
+                input_y : input_y + relevant_input_height,
+                input_x : input_x + relevant_input_width,
             ]
 
             # If layer has padding we need to pad based on if the current tile
@@ -187,9 +217,33 @@ class StreamingConv2dF(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
 
         if bias is not None:
-            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None)
+            return (
+                grad_in,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         else:
-            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None)
+            return (
+                grad_in,
+                grad_weight,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
 
 conv2d = StreamingConv2dF.apply  # type:ignore
