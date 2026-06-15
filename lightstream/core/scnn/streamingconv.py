@@ -15,7 +15,7 @@ class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
     def forward(
-        ctx, inpt, weight, bias, stride, padding, dilation, groups, grad_lost, seen_indices, output_stride, input_loc
+        ctx, inpt, weight, bias, stride, padding, dilation, groups, grad_lost, weight_grad_lost, seen_indices, output_stride, input_loc
     ):
         ctx.save_for_backward(inpt, weight, bias)
         ctx.stride = stride
@@ -23,6 +23,7 @@ class StreamingConv2dF(torch.autograd.Function):
         ctx.dilation = dilation
         ctx.groups = groups
         ctx.grad_lost = grad_lost
+        ctx.weight_grad_lost = weight_grad_lost
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
@@ -41,6 +42,7 @@ class StreamingConv2dF(torch.autograd.Function):
         sides = ctx.input_loc.sides  # Type: Sides
         seen_indices = ctx.seen_indices
         grad_lost = ctx.grad_lost  # Type: Lost
+        weight_grad_lost = ctx.weight_grad_lost  # Type: Lost
         output_stride = ctx.output_stride
         grad_bias = None
         kernel_size = weight.shape[-1]
@@ -104,66 +106,74 @@ class StreamingConv2dF(torch.autograd.Function):
                 new_output_box.x : new_output_box.x + new_output_box.width,
             ]
 
-            input_y = (new_output_box.y + lost_top) * stride[1]
-            input_x = (new_output_box.x + lost_left) * stride[2]
-
-            # Accounting for padding:
-            # the kernel locations are relative to the padded input, inpt[0] is not padded
-            # this means that the corresponding input of the grad_loc is modules.padding shifted to the left
-            # we account for this:
-            input_y -= padding[1]
-            input_x -= padding[2]
-            input_x = max(0, input_x)
-            input_y = max(0, input_y)
-
-            relevant_input_height = relevant_grad.shape[H_DIM] * stride[1] + (kernel_size[1] - 1)
-            relevant_input_width = relevant_grad.shape[W_DIM] * stride[2] + (kernel_size[2] - 1)
-            relevant_input = inpt[
-                :, :, input_y : input_y + relevant_input_height, input_x : input_x + relevant_input_width
-            ]
-
-            # If layer has padding we need to pad based on if the current tile
-            # is at the sides of the input.
-            if (padding[0] > 0 or padding[1] > 0 or padding[2] > 0) and (
-                sides.top or sides.left or sides.right or sides.bottom
-            ):
-                # The size of the tile should remain equal.
-                crop_bottom = padding[1] if sides.top else 0
-                crop_right = padding[2] if sides.left else 0
-                relevant_input = inpt[
-                    :,
-                    :,
-                    input_y : input_y + relevant_input_height - crop_bottom,
-                    input_x : input_x + relevant_input_width - crop_right,
-                ]
-
-                relevant_input = torch.nn.functional.pad(
-                    relevant_input,
-                    [
-                        padding[2] if sides.left else 0,
-                        padding[2] if sides.right else 0,
-                        padding[1] if sides.top else 0,
-                        padding[1] if sides.bottom else 0,
-                    ],
-                )
-
-            # Calculate the kernel gradients with the new unseen gradient values
-            relevant_grad = relevant_grad.contiguous()
-
-            grad_weight = torch.nn.grad.conv2d_weight(
-                relevant_input.to(weight.dtype),
-                weight.shape,
-                relevant_grad.to(weight.dtype),
-                stride[1:3],
-                (0, 0),  # padding
-                dilation,
-                groups,
-            )
-
+            # Keep bias-gradient accumulation based on the unique grad_output region.
             if bias is not None:
                 grad_bias = relevant_grad[0].sum((1, 2))
 
-            del relevant_input
+            weight_lost_top = 0 if sides.top else int(weight_grad_lost.top)
+            weight_lost_bottom = 0 if sides.bottom else int(weight_grad_lost.bottom)
+            weight_lost_left = 0 if sides.left else int(weight_grad_lost.left)
+            weight_lost_right = 0 if sides.right else int(weight_grad_lost.right)
+            safe_top = max(weight_lost_top - lost_top, 0)
+            safe_left = max(weight_lost_left - lost_left, 0)
+            safe_bottom = valid_grad.shape[H_DIM] - max(weight_lost_bottom - lost_bottom, 0)
+            safe_right = valid_grad.shape[W_DIM] - max(weight_lost_right - lost_right, 0)
+
+            box_top = max(new_output_box.y, safe_top)
+            box_left = max(new_output_box.x, safe_left)
+            box_bottom = min(new_output_box.y + new_output_box.height, safe_bottom)
+            box_right = min(new_output_box.x + new_output_box.width, safe_right)
+
+            if box_bottom > box_top and box_right > box_left:
+                relevant_grad = valid_grad[:, :, box_top:box_bottom, box_left:box_right]
+
+                input_y = (box_top + lost_top) * stride[1] - padding[1]
+                input_x = (box_left + lost_left) * stride[2] - padding[2]
+                input_x = max(0, input_x)
+                input_y = max(0, input_y)
+
+                relevant_input_height = relevant_grad.shape[H_DIM] * stride[1] + (kernel_size[1] - 1)
+                relevant_input_width = relevant_grad.shape[W_DIM] * stride[2] + (kernel_size[2] - 1)
+                relevant_input = inpt[
+                    :, :, input_y : input_y + relevant_input_height, input_x : input_x + relevant_input_width
+                ]
+
+                if (padding[0] > 0 or padding[1] > 0 or padding[2] > 0) and (
+                    sides.top or sides.left or sides.right or sides.bottom
+                ):
+                    crop_bottom = padding[1] if sides.top else 0
+                    crop_right = padding[2] if sides.left else 0
+                    relevant_input = inpt[
+                        :,
+                        :,
+                        input_y : input_y + relevant_input_height - crop_bottom,
+                        input_x : input_x + relevant_input_width - crop_right,
+                    ]
+
+                    relevant_input = torch.nn.functional.pad(
+                        relevant_input,
+                        [
+                            padding[2] if sides.left else 0,
+                            padding[2] if sides.right else 0,
+                            padding[1] if sides.top else 0,
+                            padding[1] if sides.bottom else 0,
+                        ],
+                    )
+
+                relevant_grad = relevant_grad.contiguous()
+                grad_weight = torch.nn.grad.conv2d_weight(
+                    relevant_input.to(weight.dtype),
+                    weight.shape,
+                    relevant_grad.to(weight.dtype),
+                    stride[1:3],
+                    (0, 0),
+                    dilation,
+                    groups,
+                )
+                del relevant_input
+            else:
+                grad_weight = torch.zeros_like(weight)
+
             del relevant_grad
         else:
             # if self.verbose and not hasattr(self, '_inefficient_tile_shape_warning'):
@@ -176,9 +186,9 @@ class StreamingConv2dF(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
 
         if bias is not None:
-            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None)
         else:
-            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None)
+            return (grad_in, grad_weight, None, None, None, None, None, None, None, None, None, None)
 
 
 conv2d = StreamingConv2dF.apply  # type:ignore
@@ -215,6 +225,7 @@ class StreamingConv2d(_ConvNd):
             padding_mode,
         )
         self.grad_lost = Lost(0, 0, 0, 0)
+        self.weight_grad_lost = Lost(0, 0, 0, 0)
         self.reset()
 
     @classmethod
@@ -273,6 +284,7 @@ class StreamingConv2d(_ConvNd):
             self.dilation,
             self.groups,
             self.grad_lost,
+            self.weight_grad_lost,
             self.seen_indices,
             self.output_stride,
             self.input_loc,
