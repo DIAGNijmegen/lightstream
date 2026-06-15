@@ -31,22 +31,6 @@ BACKWARD_STREAMING_MODULE_TYPES = (StreamingConv2d, StreamingUpsample2d, Streami
 
 
 
-def _max_lost(*lost_values):
-    """Return the per-side maximum of any non-None Lost values."""
-    values = [lost for lost in lost_values if lost is not None]
-    if not values:
-        return Lost(0, 0, 0, 0)
-    return Lost(
-        max(int(lost.top) for lost in values),
-        max(int(lost.left) for lost in values),
-        max(int(lost.bottom) for lost in values),
-        max(int(lost.right) for lost in values),
-    )
-
-
-def _ceil_div(a, b):
-    return -(-int(a) // int(b))
-
 def _is_pointwise_channel_norm(module):
     """Return True for channel-only normalization layers that preserve spatial support."""
     return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm))
@@ -591,7 +575,6 @@ class StreamingCNN(torch.nn.Module):
             if module in self._module_stats:
                 mod = StreamingConv2d.from_torch_conv2d(module)
                 mod.grad_lost = self._module_stats[module]["grad_lost"]
-                mod.weight_grad_lost = self._module_stats[module].get("weight_grad_lost", Lost(0, 0, 0, 0))
                 mod.backward_valid_lost = self._module_stats[module].get("backward_valid_lost", Lost(0, 0, 0, 0))
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
@@ -1747,42 +1730,6 @@ class StreamingCNN(torch.nn.Module):
         out_stride[0] = 1
         return out_stride
 
-    def _upsample_activation_lost(self, module, input_activation_lost, scale_h, scale_w):
-        """Return output activation loss for upsampling seam-sensitive borders."""
-        mode = getattr(module, "mode", None)
-        if mode not in ("bilinear", "bicubic", "linear", "trilinear"):
-            return input_activation_lost
-
-        seam_h = max(1, int(math.ceil(float(scale_h)))) if scale_h and scale_h > 1 else 1
-        seam_w = max(1, int(math.ceil(float(scale_w)))) if scale_w and scale_w > 1 else 1
-        seam_lost = Lost(seam_h, seam_w, seam_h, seam_w)
-        return _max_lost(input_activation_lost, seam_lost)
-
-    def _conv_weight_grad_lost(self, input_activation_lost, input_shape, output_shape, stride, kernel_size, padding, dilation):
-        """Return conv output border loss whose receptive fields touch invalid input activations."""
-        stride = _triple(stride)
-        kernel_size = _triple(kernel_size)
-        padding = _triple(padding)
-        dilation = _triple(dilation)
-        input_h, input_w = int(input_shape[H_DIM]), int(input_shape[W_DIM])
-        output_h, output_w = int(output_shape[H_DIM]), int(output_shape[W_DIM])
-
-        valid_top = int(input_activation_lost.top)
-        valid_left = int(input_activation_lost.left)
-        valid_bottom = input_h - int(input_activation_lost.bottom)
-        valid_right = input_w - int(input_activation_lost.right)
-        kernel_h = int(dilation[1]) * (int(kernel_size[1]) - 1) + 1
-        kernel_w = int(dilation[2]) * (int(kernel_size[2]) - 1) + 1
-
-        first_y = max(0, _ceil_div(valid_top + int(padding[1]), int(stride[1])))
-        first_x = max(0, _ceil_div(valid_left + int(padding[2]), int(stride[2])))
-        last_y = min(output_h - 1, (valid_bottom - kernel_h + int(padding[1])) // int(stride[1]))
-        last_x = min(output_w - 1, (valid_right - kernel_w + int(padding[2])) // int(stride[2]))
-
-        if last_y < first_y or last_x < first_x:
-            return Lost(output_h, output_w, output_h, output_w)
-        return Lost(first_y, first_x, output_h - last_y - 1, output_w - last_x - 1)
-
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_norm = _is_pointwise_channel_norm(module)
@@ -1828,16 +1775,6 @@ class StreamingCNN(torch.nn.Module):
             # make its actual output all zeros, so derive validity from its input.
             lost = self._non_max_border_amount(inpt[0] if is_pointwise_norm else output)
 
-            p_stats = self._prev_stats(output)
-            input_activation_lost = p_stats.get("activation_valid_lost", Lost(0, 0, 0, 0)) if p_stats else Lost(0, 0, 0, 0)
-            if is_pointwise_norm:
-                activation_valid_lost = input_activation_lost
-            elif is_upsample:
-                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
-                activation_valid_lost = self._upsample_activation_lost(module, input_activation_lost, scale_h, scale_w)
-            else:
-                activation_valid_lost = lost
-
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
             output[
@@ -1850,7 +1787,6 @@ class StreamingCNN(torch.nn.Module):
                 "kernel_size": kernel_size,
                 "padding": padding,
                 "module": module,
-                "activation_valid_lost": activation_valid_lost,
             }
             self._print_verbose(module, "\n", module_stats["lost"])
 
@@ -1882,25 +1818,8 @@ class StreamingCNN(torch.nn.Module):
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
-            input_activation_lost = p_stats.get("activation_valid_lost", Lost(0, 0, 0, 0)) if p_stats else Lost(0, 0, 0, 0)
-            if is_pointwise_norm:
-                activation_valid_lost = input_activation_lost
-            elif is_upsample:
-                activation_valid_lost = self._upsample_activation_lost(module, input_activation_lost, scale_h, scale_w)
+            if is_upsample:
                 module_stats["post_upsample_output_stride"] = output_stride
-            else:
-                activation_valid_lost = module_stats.get("lost", Lost(0, 0, 0, 0))
-                if isinstance(module, torch.nn.Conv2d):
-                    module_stats["weight_grad_lost"] = self._conv_weight_grad_lost(
-                        input_activation_lost,
-                        inpt[0].shape,
-                        output.shape,
-                        stride,
-                        kernel_size,
-                        padding,
-                        module.dilation,
-                    )
-            module_stats["activation_valid_lost"] = activation_valid_lost
             self._stats_per_grad_fn[output.grad_fn] = module_stats
             self._module_stats[module] = module_stats
 
