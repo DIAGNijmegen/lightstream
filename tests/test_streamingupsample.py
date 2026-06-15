@@ -146,20 +146,23 @@ def test_streaming_upsample_backward_valid_lost_does_not_depend_on_seen_indices_
     torch.testing.assert_close(x.grad[:, :, 1:3, 1:3], torch.full((1, 1, 2, 2), 4.0))
 
 
-def test_bilinear_upsample_backward_drops_incomplete_support_cells(caplog):
+def test_bilinear_upsample_backward_uses_stat_derived_lowres_lost_region():
     module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
-    module.grad_lost = Lost(top=0, left=0, bottom=1, right=1)
+    # This high-resolution grad-output loss is intentionally different from the
+    # low-resolution backward-input loss. The backward pass must not use it to
+    # crop grad_in directly.
+    module.grad_lost = Lost(top=0, left=0, bottom=99, right=99)
+    module.upsample_backward_input_lost = Lost(top=1, left=1, bottom=1, right=1)
     module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
 
-    x = torch.ones(1, 1, 3, 3, requires_grad=True)
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
 
-    with caplog.at_level("DEBUG", logger="lightstream.core.scnn.streamingupsample"):
-        module(x).sum().backward()
-
-    expected = torch.tensor([[[[4.0, 4.0, 2.0], [4.0, 4.0, 2.0], [2.0, 2.0, 1.0]]]])
+    expected = torch.tensor(
+        [[[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
+    )
     torch.testing.assert_close(x.grad, expected)
-    assert module.seen_indices == Box(0, 2, 2, 0, None)
-    assert "dropped candidate low-res cells with incomplete high-res support" in caplog.text
+    assert module.seen_indices == Box(0, 0, 0, 0, None)
 
 
 def test_upsample_statistics_store_pre_upsample_output_stride():
