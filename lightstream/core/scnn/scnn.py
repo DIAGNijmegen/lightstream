@@ -657,6 +657,7 @@ class StreamingCNN(torch.nn.Module):
                 stats["pre_upsample_output_stride"] = module.pre_upsample_output_stride
                 stats["output_stride"] = module.output_stride
                 stats["post_upsample_output_stride"] = module.output_stride
+                stats["backward_valid_lost"] = module.backward_valid_lost
                 if module.scale_factor is not None:
                     sf = module.scale_factor
                     stats["scale_factor_hw"] = (
@@ -1788,6 +1789,8 @@ class StreamingCNN(torch.nn.Module):
                 "padding": padding,
                 "module": module,
             }
+            if is_upsample:
+                module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
             self._print_verbose(module, "\n", module_stats["lost"])
 
             self._saved_tensors[module] = inpt

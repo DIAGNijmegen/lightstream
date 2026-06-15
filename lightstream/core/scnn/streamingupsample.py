@@ -27,6 +27,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         align_corners,
         recompute_scale_factor,
         grad_lost,
+        backward_valid_lost,
         seen_indices,
         pre_upsample_output_stride,
         output_stride,
@@ -39,6 +40,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.align_corners = align_corners
         ctx.recompute_scale_factor = recompute_scale_factor
         ctx.grad_lost = grad_lost
+        ctx.backward_valid_lost = backward_valid_lost
         ctx.seen_indices = seen_indices
         ctx.pre_upsample_output_stride = pre_upsample_output_stride
         ctx.output_stride = output_stride
@@ -58,6 +60,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         (inpt,) = ctx.saved_tensors
         sides = ctx.input_loc.sides
         grad_lost = ctx.grad_lost
+        backward_valid_lost = ctx.backward_valid_lost or Lost(0, 0, 0, 0)
 
         lost_top = grad_lost.top if not sides.top else 0
         lost_bottom = grad_lost.bottom if not sides.bottom else 0
@@ -238,9 +241,9 @@ class StreamingUpsample2dF(torch.autograd.Function):
         )
 
         grad_for_interp = torch.zeros_like(grad_output)
-        if support_bottom > support_top and support_right > support_left:
-            grad_for_interp[:, :, support_top:support_bottom, support_left:support_right] = grad_output[
-                :, :, support_top:support_bottom, support_left:support_right
+        if valid_bottom > valid_top and valid_right > valid_left:
+            grad_for_interp[:, :, valid_top:valid_bottom, valid_left:valid_right] = grad_output[
+                :, :, valid_top:valid_bottom, valid_left:valid_right
             ]
 
         if ctx.needs_input_grad[0]:
@@ -259,22 +262,26 @@ class StreamingUpsample2dF(torch.autograd.Function):
             grad_in = None
 
         if grad_in is not None:
+            input_lost_top = backward_valid_lost.top if not sides.top else 0
+            input_lost_bottom = backward_valid_lost.bottom if not sides.bottom else 0
+            input_lost_left = backward_valid_lost.left if not sides.left else 0
+            input_lost_right = backward_valid_lost.right if not sides.right else 0
             masked_grad_in = torch.zeros_like(grad_in)
-            if complete_lowres_box.height > 0 and complete_lowres_box.width > 0:
+            if grad_in.shape[H_DIM] > input_lost_top + input_lost_bottom and grad_in.shape[W_DIM] > input_lost_left + input_lost_right:
                 masked_grad_in[
                     :,
                     :,
-                    complete_lowres_box.y : complete_lowres_box.y + complete_lowres_box.height,
-                    complete_lowres_box.x : complete_lowres_box.x + complete_lowres_box.width,
+                    input_lost_top : grad_in.shape[H_DIM] - input_lost_bottom,
+                    input_lost_left : grad_in.shape[W_DIM] - input_lost_right,
                 ] = grad_in[
                     :,
                     :,
-                    complete_lowres_box.y : complete_lowres_box.y + complete_lowres_box.height,
-                    complete_lowres_box.x : complete_lowres_box.x + complete_lowres_box.width,
+                    input_lost_top : grad_in.shape[H_DIM] - input_lost_bottom,
+                    input_lost_left : grad_in.shape[W_DIM] - input_lost_right,
                 ]
             grad_in = masked_grad_in
 
-        return grad_in, None, None, None, None, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None, None, None, None, None, None
 
 
 upsample2d = StreamingUpsample2dF.apply
@@ -314,7 +321,7 @@ class StreamingUpsample2d(nn.Module):
         self.output_stride = torch.tensor([1, 1, 1])
         self.post_upsample_output_stride = self.output_stride
         self.side_aware_grad_lost = None
-        self.backward_valid_lost = None
+        self.backward_valid_lost = Lost(0, 0, 0, 0)
         self.reset()
 
     def reset(self):
@@ -330,6 +337,7 @@ class StreamingUpsample2d(nn.Module):
             self.align_corners,
             self.recompute_scale_factor,
             self.grad_lost,
+            self.backward_valid_lost,
             self.seen_indices,
             self.pre_upsample_output_stride,
             self.output_stride,
