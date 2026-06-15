@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn as nn
 import pytest
@@ -999,3 +1001,29 @@ def test_single_head_backward_tile_step_rounds_down_to_internal_alignment():
     assert y_starts[:2] == [0, 1760]
     assert 1764 not in y_starts
     assert all(input_y % 8 == 0 and input_x % 8 == 0 for input_y, input_x, _sides in tile_iter)
+
+
+def test_single_head_backward_alignment_debug_allows_edge_snapped_tiles(caplog):
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.tile_gradient_lost = Lost(left=78, top=78, right=78, bottom=78)
+    scnn.output_stride = torch.tensor([1, 1, 1])
+    scnn._tile_output_shape = (1, 1, 1920, 1920)
+    scnn._compute_internal_alignment = lambda: (8, 8)
+    scnn.debug_backward_tile_alignment = True
+
+    image = torch.empty(1, 3, 4022, 1920)
+    grad_tensors = [torch.empty(1, 1, 4022, 1920)]
+
+    with caplog.at_level(logging.DEBUG, logger="lightstream.core.scnn.scnn"):
+        tile_iter = scnn._prepare_backward_tile_iter_single_head(
+            image=image,
+            grad_tensors=grad_tensors,
+            tile_height=1920,
+            tile_width=1920,
+        )
+
+    bottom_tile_y, _bottom_tile_x, bottom_tile_sides = tile_iter[-1]
+    assert bottom_tile_sides.bottom
+    assert bottom_tile_y % 8 != 0
+    assert "valid_grad_height=1760" in caplog.text
+    assert f"y={bottom_tile_y}" in caplog.text

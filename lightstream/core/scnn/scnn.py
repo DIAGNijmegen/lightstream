@@ -159,6 +159,7 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
         self.debug_reducer_replay = False
         self.debug_forward_sentinel_check = False
+        self.debug_backward_tile_alignment = False
         self._hooks = []
         self._last_forward_tiles = []
         self._streaming_reducers = []
@@ -1331,23 +1332,27 @@ class StreamingCNN(torch.nn.Module):
 
                 input_y = int(output_y * int(self.output_stride[1]))
                 input_x = int(output_x * int(self.output_stride[2]))
+                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
                 logger.debug(
                     "Backward single-head tile start: y=%s, x=%s, sides=%s, internal_alignment=(%s, %s)",
                     input_y,
                     input_x,
-                    Sides(sides_left, sides_top, sides_right, sides_bottom),
+                    sides,
                     internal_align_h,
                     internal_align_w,
                 )
-                assert input_y % internal_align_h == 0, (
-                    f"Backward single-head tile y-start {input_y} is not a multiple of "
-                    f"internal alignment {internal_align_h}"
-                )
-                assert input_x % internal_align_w == 0, (
-                    f"Backward single-head tile x-start {input_x} is not a multiple of "
-                    f"internal alignment {internal_align_w}"
-                )
-                tile_iter.append((input_y, input_x, Sides(sides_left, sides_top, sides_right, sides_bottom)))
+                if getattr(self, "debug_backward_tile_alignment", False) or logger.isEnabledFor(logging.DEBUG):
+                    if not sides.bottom:
+                        assert input_y % internal_align_h == 0, (
+                            f"Backward single-head non-bottom-edge tile y-start {input_y} "
+                            f"is not a multiple of internal alignment {internal_align_h}"
+                        )
+                    if not sides.right:
+                        assert input_x % internal_align_w == 0, (
+                            f"Backward single-head non-right-edge tile x-start {input_x} "
+                            f"is not a multiple of internal alignment {internal_align_w}"
+                        )
+                tile_iter.append((input_y, input_x, sides))
 
         return tile_iter
 
