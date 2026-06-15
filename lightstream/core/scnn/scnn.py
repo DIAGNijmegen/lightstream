@@ -673,6 +673,7 @@ class StreamingCNN(torch.nn.Module):
                     "side_aware_grad_lost",
                     "backward_valid_lost",
                     "upsample_backward_input_lost",
+                    "upsample_forward_output_lost",
                 ):
                     if key in stats and hasattr(mod, key):
                         setattr(mod, key, stats[key])
@@ -724,6 +725,7 @@ class StreamingCNN(torch.nn.Module):
                 stats["post_upsample_output_stride"] = module.output_stride
                 stats["backward_valid_lost"] = module.backward_valid_lost
                 stats["upsample_backward_input_lost"] = module.upsample_backward_input_lost
+                stats["upsample_forward_output_lost"] = module.upsample_forward_output_lost
                 if module.scale_factor is not None:
                     sf = module.scale_factor
                     stats["scale_factor_hw"] = (
@@ -1861,6 +1863,7 @@ class StreamingCNN(torch.nn.Module):
             }
             if is_upsample:
                 module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
+                module_stats["upsample_forward_output_lost"] = module_stats["lost"]
 
             self._print_verbose(module, "\n", module_stats["lost"])
 
