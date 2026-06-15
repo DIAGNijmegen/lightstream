@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -61,18 +62,16 @@ class StreamingUpsample2dF(torch.autograd.Function):
 
         H = grad_output.shape[H_DIM]
         W = grad_output.shape[W_DIM]
-        valid_grad = grad_output[:, :, lost_top : H - lost_bottom, lost_left : W - lost_right]
 
-        output_stride = ctx.output_stride
-        stride_h = int(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[1])
-        stride_w = int(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[2])
-        # grad_output is in post-upsample coordinates, so locating valid_grad for
-        # _new_value_indices(valid_grad.shape, ...) must use the post-upsample stride.
-        data_loc_y = int(ctx.input_loc.y // stride_h) + lost_top
-        data_loc_x = int(ctx.input_loc.x // stride_w) + lost_left
+        pre_output_stride = ctx.pre_upsample_output_stride
+        stride_h = int(pre_output_stride[1].item()) if isinstance(pre_output_stride, torch.Tensor) else int(pre_output_stride[1])
+        stride_w = int(pre_output_stride[2].item()) if isinstance(pre_output_stride, torch.Tensor) else int(pre_output_stride[2])
+
+        data_loc_y = int(ctx.input_loc.y // stride_h)
+        data_loc_x = int(ctx.input_loc.x // stride_w)
         data_loc = Box(data_loc_y, 0, data_loc_x, 0, ctx.input_loc.sides)
 
-        new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
+        owned_lowres_box, updated_total_indices = _new_value_indices(inpt.shape, data_loc, ctx.seen_indices)
 
         ctx.seen_indices.y = updated_total_indices.y
         ctx.seen_indices.height = updated_total_indices.height
@@ -80,18 +79,38 @@ class StreamingUpsample2dF(torch.autograd.Function):
         ctx.seen_indices.width = updated_total_indices.width
         ctx.seen_indices.sides = updated_total_indices.sides
 
+        def _bilinear_backward_support(start: int, length: int, in_size: int, out_size: int) -> tuple[int, int]:
+            if length <= 0:
+                return 0, 0
+            end = start + length
+            if out_size <= 0:
+                return 0, 0
+            scale = float(out_size) / float(max(1, in_size))
+            # For align_corners=False, output coordinate o samples input coordinate
+            # (o + 0.5) / scale - 0.5. An input index i receives gradients from
+            # output locations whose sampling coordinate lies in (i - 1, i + 1).
+            # This conservative integer envelope includes all high-resolution
+            # locations that can contribute to any owned low-resolution index.
+            support_start = math.floor(scale * (float(start) - 0.5) - 0.5) + 1
+            support_end = math.ceil(scale * (float(end) + 0.5) - 0.5)
+            return max(0, support_start), min(out_size, support_end)
+
+        support_top, support_bottom = _bilinear_backward_support(
+            owned_lowres_box.y, owned_lowres_box.height, inpt.shape[H_DIM], H
+        )
+        support_left, support_right = _bilinear_backward_support(
+            owned_lowres_box.x, owned_lowres_box.width, inpt.shape[W_DIM], W
+        )
+
+        support_top = max(support_top, lost_top)
+        support_bottom = min(support_bottom, H - lost_bottom)
+        support_left = max(support_left, lost_left)
+        support_right = min(support_right, W - lost_right)
+
         grad_for_interp = torch.zeros_like(grad_output)
-        if new_output_box.height > 0 and new_output_box.width > 0:
-            grad_for_interp[
-                :,
-                :,
-                lost_top + new_output_box.y : lost_top + new_output_box.y + new_output_box.height,
-                lost_left + new_output_box.x : lost_left + new_output_box.x + new_output_box.width,
-            ] = valid_grad[
-                :,
-                :,
-                new_output_box.y : new_output_box.y + new_output_box.height,
-                new_output_box.x : new_output_box.x + new_output_box.width,
+        if support_bottom > support_top and support_right > support_left:
+            grad_for_interp[:, :, support_top:support_bottom, support_left:support_right] = grad_output[
+                :, :, support_top:support_bottom, support_left:support_right
             ]
 
         if ctx.needs_input_grad[0]:
@@ -108,6 +127,22 @@ class StreamingUpsample2dF(torch.autograd.Function):
                 grad_in = torch.autograd.grad(out, inpt_grad, grad_for_interp, retain_graph=False, allow_unused=False)[0]
         else:
             grad_in = None
+
+        if grad_in is not None:
+            masked_grad_in = torch.zeros_like(grad_in)
+            if owned_lowres_box.height > 0 and owned_lowres_box.width > 0:
+                masked_grad_in[
+                    :,
+                    :,
+                    owned_lowres_box.y : owned_lowres_box.y + owned_lowres_box.height,
+                    owned_lowres_box.x : owned_lowres_box.x + owned_lowres_box.width,
+                ] = grad_in[
+                    :,
+                    :,
+                    owned_lowres_box.y : owned_lowres_box.y + owned_lowres_box.height,
+                    owned_lowres_box.x : owned_lowres_box.x + owned_lowres_box.width,
+                ]
+            grad_in = masked_grad_in
 
         return grad_in, None, None, None, None, None, None, None, None, None, None
 
@@ -144,8 +179,12 @@ class StreamingUpsample2d(nn.Module):
         self.recompute_scale_factor = recompute_scale_factor
 
         self.grad_lost = Lost(0, 0, 0, 0)
+        self.scale_factor_hw = None
         self.pre_upsample_output_stride = torch.tensor([1, 1, 1])
         self.output_stride = torch.tensor([1, 1, 1])
+        self.post_upsample_output_stride = self.output_stride
+        self.side_aware_grad_lost = None
+        self.backward_valid_lost = None
         self.reset()
 
     def reset(self):

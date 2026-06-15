@@ -581,7 +581,9 @@ class StreamingCNN(torch.nn.Module):
             if module in self._module_stats:
                 stats = self._module_stats[module]
                 mod.grad_lost = stats.get("grad_lost", Lost(0, 0, 0, 0))
-                mod.output_stride = stats.get("output_stride", torch.tensor([1, 1, 1]))
+                mod.output_stride = stats.get(
+                    "post_upsample_output_stride", stats.get("output_stride", torch.tensor([1, 1, 1]))
+                )
                 mod.pre_upsample_output_stride = stats.get("pre_upsample_output_stride")
                 if mod.pre_upsample_output_stride is None:
                     scale_h, scale_w = stats.get("scale_factor_hw", (mod.scale_factor, mod.scale_factor))
@@ -595,6 +597,17 @@ class StreamingCNN(torch.nn.Module):
                     mod.pre_upsample_output_stride = torch.round(mod.pre_upsample_output_stride).to(torch.long)
                     mod.pre_upsample_output_stride[0] = 1
                     stats["pre_upsample_output_stride"] = mod.pre_upsample_output_stride
+                stats.setdefault("post_upsample_output_stride", mod.output_stride)
+                for key in (
+                    "scale_factor_hw",
+                    "pre_upsample_output_stride",
+                    "post_upsample_output_stride",
+                    "grad_lost",
+                    "side_aware_grad_lost",
+                    "backward_valid_lost",
+                ):
+                    if key in stats and hasattr(mod, key):
+                        setattr(mod, key, stats[key])
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, ChannelLayerNorm):
@@ -640,7 +653,12 @@ class StreamingCNN(torch.nn.Module):
                 stats["grad_lost"] = module.grad_lost
                 stats["pre_upsample_output_stride"] = module.pre_upsample_output_stride
                 stats["output_stride"] = module.output_stride
-                stats["pre_upsample_output_stride"] = module.pre_upsample_output_stride
+                stats["post_upsample_output_stride"] = module.output_stride
+                if module.scale_factor is not None:
+                    sf = module.scale_factor
+                    stats["scale_factor_hw"] = (
+                        (float(sf[-2]), float(sf[-1])) if isinstance(sf, tuple) else (float(sf), float(sf))
+                    )
                 self._module_stats[mod] = stats
             else:
                 self._module_stats[mod] = self._module_stats[module]
@@ -1886,6 +1904,14 @@ class StreamingCNN(torch.nn.Module):
             new_grad_in = valid_grad[None].expand(grad_in[0].shape[1], *valid_grad.shape)[None]
             new_grad_in = new_grad_in.type(self.dtype) * 10 - 1
             new_grad_in_lost = self._non_max_border_amount(new_grad_in)
+            self._module_stats[module]["backward_valid_lost"] = new_grad_in_lost
+            self._module_stats[module]["side_aware_grad_lost"] = {
+                "interior": grad_lost,
+                "top": Lost(0, grad_lost.left, grad_lost.bottom, grad_lost.right),
+                "bottom": Lost(grad_lost.top, grad_lost.left, 0, grad_lost.right),
+                "left": Lost(grad_lost.top, 0, grad_lost.bottom, grad_lost.right),
+                "right": Lost(grad_lost.top, grad_lost.left, grad_lost.bottom, 0),
+            }
 
             return (new_grad_in, *grad_in[1:])
 
