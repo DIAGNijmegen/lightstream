@@ -78,8 +78,6 @@ class StreamingTestNet(StreamingModule):
             torch.nn.MaxPool2d(2),
         )
 
-
-
         decoder = torch.nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             torch.nn.Conv2d(256, 256, kernel_size=3, padding=padding),
