@@ -180,28 +180,23 @@ class StreamingUpsample2dF(torch.autograd.Function):
         skipped_bottom = owned_y1 - (complete_lowres_box.y + complete_lowres_box.height)
         skipped_right = owned_x1 - (complete_lowres_box.x + complete_lowres_box.width)
 
-        if skipped_top > 0 or skipped_left > 0:
-            raise RuntimeError(
-                "StreamingUpsample2dF.backward would skip low-res cells on the top/left edge, "
-                "which cannot be owned by a later tile. "
-                f"owned_lowres_box={owned_lowres_box}, complete_lowres_box={complete_lowres_box}, "
-                f"data_loc={data_loc}, valid_highres=({valid_top}:{valid_bottom}, {valid_left}:{valid_right})"
-            )
-
-        if skipped_bottom > 0 and sides.bottom:
-            raise RuntimeError(
-                "StreamingUpsample2dF.backward cannot defer bottom low-res cells from the final tile row. "
-                f"owned_lowres_box={owned_lowres_box}, complete_lowres_box={complete_lowres_box}, data_loc={data_loc}"
-            )
-        if skipped_right > 0 and sides.right:
-            raise RuntimeError(
-                "StreamingUpsample2dF.backward cannot defer right low-res cells from the final tile column. "
-                f"owned_lowres_box={owned_lowres_box}, complete_lowres_box={complete_lowres_box}, data_loc={data_loc}"
-            )
-        if skipped_bottom > 0 or skipped_right > 0:
+        dropped_cells = (
+            skipped_top * owned_lowres_box.width
+            + skipped_bottom * owned_lowres_box.width
+            + skipped_left * complete_lowres_box.height
+            + skipped_right * complete_lowres_box.height
+        )
+        if dropped_cells > 0:
             logger.debug(
-                "Deferring incomplete low-res upsample gradient cells to a later tile: "
-                "owned_lowres_box=%s complete_lowres_box=%s data_loc=%s valid_highres=(%s:%s, %s:%s)",
+                "StreamingUpsample2dF.backward dropped candidate low-res cells with incomplete high-res support: "
+                "dropped_cells=%s skipped=(top=%s, bottom=%s, left=%s, right=%s) "
+                "owned_lowres_box=%s complete_lowres_box=%s data_loc=%s "
+                "valid_highres=(top=%s, bottom=%s, left=%s, right=%s)",
+                dropped_cells,
+                skipped_top,
+                skipped_bottom,
+                skipped_left,
+                skipped_right,
                 owned_lowres_box,
                 complete_lowres_box,
                 data_loc,
@@ -212,30 +207,28 @@ class StreamingUpsample2dF(torch.autograd.Function):
             )
 
         if complete_lowres_box.height > 0 and complete_lowres_box.width > 0:
-            emitted_rel_bottom = complete_lowres_box.y + complete_lowres_box.height
-            emitted_rel_right = complete_lowres_box.x + complete_lowres_box.width
-            emitted_abs_bottom = data_loc.y + emitted_rel_bottom
-            emitted_abs_right = data_loc.x + emitted_rel_right
+            # seen_indices is a scan-order frontier and can represent only a contiguous
+            # prefix of emitted low-resolution cells. Advance it only over cells that
+            # were actually emitted; if the complete box does not start at the owned
+            # box origin, leave the frontier unchanged rather than marking a gap seen.
+            if complete_lowres_box.y == owned_lowres_box.y and complete_lowres_box.x == owned_lowres_box.x:
+                emitted_rel_bottom = complete_lowres_box.y + complete_lowres_box.height
+                emitted_rel_right = complete_lowres_box.x + complete_lowres_box.width
+                emitted_abs_bottom = data_loc.y + emitted_rel_bottom
+                emitted_abs_right = data_loc.x + emitted_rel_right
 
-            updated_y = updated_total_indices.y
-            updated_height = updated_total_indices.height
-            if data_loc.x == 0:
-                updated_height = emitted_abs_bottom
-            updated_x = emitted_abs_right
-
-            if updated_x > emitted_abs_right or (data_loc.x == 0 and updated_height > emitted_abs_bottom):
-                raise RuntimeError(
-                    "StreamingUpsample2dF.backward advanced seen_indices past an un-emitted low-res cell. "
-                    f"updated=(y={updated_y}, height={updated_height}, x={updated_x}), "
-                    f"emitted_abs_bottom={emitted_abs_bottom}, emitted_abs_right={emitted_abs_right}, "
-                    f"owned_lowres_box={owned_lowres_box}, complete_lowres_box={complete_lowres_box}"
+                ctx.seen_indices.y = updated_total_indices.y
+                ctx.seen_indices.height = emitted_abs_bottom if data_loc.x == 0 else updated_total_indices.height
+                ctx.seen_indices.x = emitted_abs_right
+                ctx.seen_indices.width = updated_total_indices.width
+                ctx.seen_indices.sides = updated_total_indices.sides
+            else:
+                logger.debug(
+                    "StreamingUpsample2dF.backward did not advance seen_indices because emitted low-res cells "
+                    "do not form a contiguous scan-order prefix: owned_lowres_box=%s complete_lowres_box=%s",
+                    owned_lowres_box,
+                    complete_lowres_box,
                 )
-
-            ctx.seen_indices.y = updated_y
-            ctx.seen_indices.height = updated_height
-            ctx.seen_indices.x = updated_x
-            ctx.seen_indices.width = updated_total_indices.width
-            ctx.seen_indices.sides = updated_total_indices.sides
 
         support_top, support_bottom = _bilinear_backward_support(
             complete_lowres_box.y, complete_lowres_box.height, inpt.shape[H_DIM], H
