@@ -1264,6 +1264,24 @@ class StreamingCNN(torch.nn.Module):
         valid_grad_width = (tile_width - grad_lost.left - grad_lost.right) // int(self.output_stride[2])
         valid_grad_width *= int(self.output_stride[2])
 
+        internal_align_h, internal_align_w = self._compute_internal_alignment()
+        valid_grad_height = max(
+            internal_align_h,
+            (valid_grad_height // internal_align_h) * internal_align_h,
+        )
+        valid_grad_width = max(
+            internal_align_w,
+            (valid_grad_width // internal_align_w) * internal_align_w,
+        )
+
+        logger.debug(
+            "Backward single-head tiling step: valid_grad_height=%s, valid_grad_width=%s, internal_alignment=(%s, %s)",
+            valid_grad_height,
+            valid_grad_width,
+            internal_align_h,
+            internal_align_w,
+        )
+
         n_rows = math.ceil(float(image.shape[H_DIM] - grad_lost.top - grad_lost.bottom) / float(valid_grad_height))
         n_cols = math.ceil(float(image.shape[W_DIM] - grad_lost.left - grad_lost.right) / float(valid_grad_width))
 
@@ -1289,9 +1307,25 @@ class StreamingCNN(torch.nn.Module):
                 if sides_right:
                     output_x = max(base_grad.shape[W_DIM] - output_width, 0)
 
-                input_y = output_y * int(self.output_stride[1])
-                input_x = output_x * int(self.output_stride[2])
-                tile_iter.append((int(input_y), int(input_x), Sides(sides_left, sides_top, sides_right, sides_bottom)))
+                input_y = int(output_y * int(self.output_stride[1]))
+                input_x = int(output_x * int(self.output_stride[2]))
+                logger.debug(
+                    "Backward single-head tile start: y=%s, x=%s, sides=%s, internal_alignment=(%s, %s)",
+                    input_y,
+                    input_x,
+                    Sides(sides_left, sides_top, sides_right, sides_bottom),
+                    internal_align_h,
+                    internal_align_w,
+                )
+                assert input_y % internal_align_h == 0, (
+                    f"Backward single-head tile y-start {input_y} is not a multiple of "
+                    f"internal alignment {internal_align_h}"
+                )
+                assert input_x % internal_align_w == 0, (
+                    f"Backward single-head tile x-start {input_x} is not a multiple of "
+                    f"internal alignment {internal_align_w}"
+                )
+                tile_iter.append((input_y, input_x, Sides(sides_left, sides_top, sides_right, sides_bottom)))
 
         return tile_iter
 

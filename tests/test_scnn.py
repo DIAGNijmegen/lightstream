@@ -4,6 +4,7 @@ import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.core.scnn.utils import Lost
 from lightstream.models.testnet.segment import StreamingTestNet
 
 from lightstream.core.reducer import (
@@ -975,3 +976,26 @@ def test_internal_alignment_keeps_resnet_encoder_upsampling_decoder_tile_phase()
     image = torch.rand(1, 3, 224, 224)
     scnn.forward(image)
     _assert_non_edge_starts_match_alignment(scnn)
+
+
+def test_single_head_backward_tile_step_rounds_down_to_internal_alignment():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.tile_gradient_lost = Lost(left=78, top=78, right=78, bottom=78)
+    scnn.output_stride = torch.tensor([1, 1, 1])
+    scnn._tile_output_shape = (1, 1, 1920, 1920)
+    scnn._compute_internal_alignment = lambda: (8, 8)
+
+    image = torch.empty(1, 3, 4000, 1920)
+    grad_tensors = [torch.empty(1, 1, 4000, 1920)]
+
+    tile_iter = scnn._prepare_backward_tile_iter_single_head(
+        image=image,
+        grad_tensors=grad_tensors,
+        tile_height=1920,
+        tile_width=1920,
+    )
+
+    y_starts = [input_y for input_y, _input_x, _sides in tile_iter]
+    assert y_starts[:2] == [0, 1760]
+    assert 1764 not in y_starts
+    assert all(input_y % 8 == 0 and input_x % 8 == 0 for input_y, input_x, _sides in tile_iter)
