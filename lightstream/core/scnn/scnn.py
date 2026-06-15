@@ -162,6 +162,8 @@ class StreamingCNN(torch.nn.Module):
         self.debug_backward_tile_alignment = False
         self._hooks = []
         self._last_forward_tiles = []
+        self._last_forward_signature = None
+        self._last_forward_tiles_consumed = True
         self._streaming_reducers = []
         self._reducer_head_map = {}
         self._reducer_input_indices = {}
@@ -999,6 +1001,89 @@ class StreamingCNN(torch.nn.Module):
             f"forward={forward_starts}, backward={backward_starts}"
         )
 
+    def _build_tile_reuse_signature(self, image, output_heights, output_widths, public_indices):
+        """Capture the forward context that must match before reusing its tile grid."""
+        return {
+            "image_shape": tuple(image.shape),
+            "tile_shape": tuple(self.tile_shape),
+            "tile_output_shapes": tuple(tuple(shape) for shape in self._tile_output_shapes),
+            "output_heights": tuple(int(height) for height in output_heights),
+            "output_widths": tuple(int(width) for width in output_widths),
+            "public_indices": tuple(public_indices),
+            "reducer_heads": tuple(sorted(self._reducer_head_map)),
+            "reducer_inputs": tuple(
+                (int(head_idx), tuple(int(input_idx) for input_idx in input_indices))
+                for head_idx, input_indices in sorted(self._reducer_input_indices.items())
+            ),
+        }
+
+    def _can_reuse_forward_tiles_for_single_head_backward(
+        self,
+        image,
+        internal_grad_tensors,
+        output_heights,
+        output_widths,
+        public_indices,
+    ):
+        """Return whether the immediately preceding forward grid is safe for backward."""
+        if len(self._tile_output_shapes) != 1:
+            return False
+        if not self._last_forward_tiles or self._last_forward_signature is None:
+            return False
+        if self._last_forward_tiles_consumed:
+            return False
+
+        signature = self._build_tile_reuse_signature(
+            image=image,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            public_indices=tuple(public_indices),
+        )
+        if signature != self._last_forward_signature:
+            logger.debug(
+                "Not reusing forward tile grid for backward because the forward signature changed: "
+                "forward=%s, backward=%s",
+                self._last_forward_signature,
+                signature,
+            )
+            return False
+
+        head_grad = internal_grad_tensors[0]
+        if head_grad is None:
+            return False
+        expected_grad_shape = (
+            int(image.shape[B_DIM]),
+            int(self._tile_output_shapes[0][C_DIM]),
+            int(output_heights[0]),
+            int(output_widths[0]),
+        )
+        if tuple(head_grad.shape) != expected_grad_shape:
+            logger.debug(
+                "Not reusing forward tile grid for backward because grad shape %s != expected %s",
+                tuple(head_grad.shape),
+                expected_grad_shape,
+            )
+            return False
+
+        # Reducer heads consume the exact forward replay order; there is no alternate
+        # reducer-specific single-head grid in this implementation.
+        return True
+
+    def _compare_reused_forward_tiles_to_backward_tiles(self, reused_tile_iter, computed_tile_iter):
+        """Debug-log old backward starts beside reused forward starts."""
+        reused_starts = self._tile_start_list(reused_tile_iter)
+        computed_starts = self._tile_start_list(computed_tile_iter)
+        logger.debug(
+            "single-head backward tile starts: reused_forward=%s, computed_backward=%s",
+            reused_starts,
+            computed_starts,
+        )
+        if getattr(self, "debug_backward_tile_alignment", False):
+            assert reused_starts == computed_starts, (
+                "Reused forward tile starts differ from computed single-head backward starts: "
+                f"reused_forward={reused_starts}, computed_backward={computed_starts}"
+            )
+
     def _prepare_forward_outputs(self, image, output_heights, output_widths, result_device):
         outputs = [None] * len(self._tile_output_shapes)
 
@@ -1532,6 +1617,13 @@ class StreamingCNN(torch.nn.Module):
             "It seems like we could not reconstruct all output"
         )
         self._log_forward_tile_starts()
+        self._last_forward_signature = self._build_tile_reuse_signature(
+            image=image,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            public_indices=tuple(self._public_output_indices()),
+        )
+        self._last_forward_tiles_consumed = False
 
         self._validate_reducer_head_map_resolved()
 
@@ -1592,8 +1684,21 @@ class StreamingCNN(torch.nn.Module):
         for public_grad, internal_idx in zip(grad_tensors, public_indices):
             internal_grad_tensors[internal_idx] = public_grad
 
-        if len(self._tile_output_shapes) == 1 and self._last_forward_tiles:
+        if self._can_reuse_forward_tiles_for_single_head_backward(
+            image=image,
+            internal_grad_tensors=internal_grad_tensors,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            public_indices=public_indices,
+        ):
             tile_iter = list(self._last_forward_tiles)
+            computed_tile_iter = self._prepare_backward_tile_iter_single_head(
+                image,
+                internal_grad_tensors,
+                tile_height,
+                tile_width,
+            )
+            self._compare_reused_forward_tiles_to_backward_tiles(tile_iter, computed_tile_iter)
         elif len(self._tile_output_shapes) == 1:
             tile_iter = self._prepare_backward_tile_iter_single_head(image, internal_grad_tensors, tile_height, tile_width)
         else:
@@ -1609,6 +1714,7 @@ class StreamingCNN(torch.nn.Module):
 
         self._log_backward_tile_starts(tile_iter)
         self._validate_backward_tile_iter_matches_forward(tile_iter)
+        self._last_forward_tiles_consumed = True
 
         self._validate_reducer_lifecycle_for_backward()
 
