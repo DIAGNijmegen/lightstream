@@ -592,6 +592,7 @@ class StreamingCNN(torch.nn.Module):
                 mod = StreamingConv2d.from_torch_conv2d(module)
                 mod.grad_lost = self._module_stats[module]["grad_lost"]
                 mod.weight_grad_lost = self._module_stats[module].get("weight_grad_lost", Lost(0, 0, 0, 0))
+                mod.backward_valid_lost = self._module_stats[module].get("backward_valid_lost", Lost(0, 0, 0, 0))
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
