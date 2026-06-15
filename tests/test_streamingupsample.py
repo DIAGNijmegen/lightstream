@@ -104,6 +104,48 @@ def test_streaming_upsample_backward_keeps_pre_upsample_coordinate_gradients():
     assert torch.count_nonzero(second.grad).item() == second.numel()
 
 
+def test_streaming_upsample_backward_masks_input_gradient_with_backward_valid_lost():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    module.backward_valid_lost = Lost(top=1, left=1, bottom=1, right=1)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
+
+    expected = torch.tensor(
+        [[[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(x.grad, expected)
+
+
+def test_streaming_upsample_backward_valid_lost_is_side_aware():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    module.backward_valid_lost = Lost(top=1, left=1, bottom=1, right=1)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=1, top=1, right=0, bottom=0))
+
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
+
+    expected = torch.tensor(
+        [[[[4.0, 4.0, 4.0, 0.0], [4.0, 4.0, 4.0, 0.0], [4.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(x.grad, expected)
+
+
+def test_streaming_upsample_backward_valid_lost_does_not_depend_on_seen_indices_ownership():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    module.backward_valid_lost = Lost(top=1, left=1, bottom=1, right=1)
+    module.pre_upsample_output_stride = torch.tensor([1, 2, 2])
+    module.seen_indices = Box(0, 4, 4, 0, None)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
+
+    assert torch.count_nonzero(x.grad).item() == 4
+    torch.testing.assert_close(x.grad[:, :, 1:3, 1:3], torch.full((1, 1, 2, 2), 4.0))
+
+
 def test_bilinear_upsample_backward_drops_incomplete_support_cells(caplog):
     module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
     module.grad_lost = Lost(top=0, left=0, bottom=1, right=1)
@@ -114,9 +156,7 @@ def test_bilinear_upsample_backward_drops_incomplete_support_cells(caplog):
     with caplog.at_level("DEBUG", logger="lightstream.core.scnn.streamingupsample"):
         module(x).sum().backward()
 
-    expected = torch.tensor(
-        [[[[4.0, 4.0, 0.0], [4.0, 4.0, 0.0], [0.0, 0.0, 0.0]]]]
-    )
+    expected = torch.tensor([[[[4.0, 4.0, 2.0], [4.0, 4.0, 2.0], [2.0, 2.0, 1.0]]]])
     torch.testing.assert_close(x.grad, expected)
     assert module.seen_indices == Box(0, 2, 2, 0, None)
     assert "dropped candidate low-res cells with incomplete high-res support" in caplog.text
@@ -143,3 +183,24 @@ def test_upsample_statistics_store_pre_upsample_output_stride():
     stats = scnn._module_stats[module]
     assert stats["output_stride"].tolist() == [1, 1, 1]
     assert stats["pre_upsample_output_stride"].tolist() == [1, 2, 2]
+    assert stats["backward_valid_lost"] == Lost(0, 0, 0, 0)
+
+
+def test_upsample_backward_statistics_store_backward_valid_lost():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    inpt = torch.ones(1, 1, 4, 4, requires_grad=True)
+    output = module(inpt)
+    scnn._module_stats[module] = {}
+
+    output.sum().backward()
+    scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
+
+    assert scnn._module_stats[module]["backward_valid_lost"] == Lost(0, 0, 0, 0)
