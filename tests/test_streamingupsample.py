@@ -18,6 +18,45 @@ def test_streaming_upsample_from_torch_matches_interpolate():
     torch.testing.assert_close(out, expected)
 
 
+def test_streaming_upsample_nearest_matches_interpolate():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = module(x)
+
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_from_torch_nearest_matches_interpolate():
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    module = StreamingUpsample2d.from_torch_upsample(upsample)
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = module(x)
+
+    assert module.align_corners is None
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_to_torch_nearest_emits_valid_upsample():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    upsample = module.to_torch_upsample()
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = upsample(x)
+
+    assert upsample.align_corners is None
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_rejects_align_corners_for_nearest():
+    with pytest.raises(ValueError, match="align_corners=None"):
+        StreamingUpsample2d(scale_factor=2, mode="nearest", align_corners=True)
+
+
 def test_streaming_upsample_rejects_align_corners_true_for_bilinear():
     with pytest.raises(ValueError):
         StreamingUpsample2d(scale_factor=2.0, mode="bilinear", align_corners=True)
