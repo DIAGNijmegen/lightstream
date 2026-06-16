@@ -117,6 +117,28 @@ def test_bilinear_upsample_statistics_add_explicit_border_loss():
     assert torch.all(output[:, :, 1:-1, 1:-1] == 1)
 
 
+def test_nearest_upsample_statistics_do_not_add_explicit_border_loss():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    inpt = torch.ones(1, 3, 5, 7)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    lost = scnn._module_stats[module]["lost"]
+    assert lost == Lost(0, 0, 0, 0)
+    assert output.shape[-2:] == (10, 14)
+    assert torch.all(output == 1)
+
+
 @pytest.mark.parametrize(
     ("scale_factor", "expected_loss"),
     [
