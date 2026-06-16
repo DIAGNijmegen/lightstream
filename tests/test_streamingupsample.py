@@ -7,6 +7,42 @@ from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 from lightstream.core.scnn.utils import Box, Lost, Sides
 
 
+@pytest.mark.parametrize(
+    "upsample",
+    [
+        pytest.param(torch.nn.Upsample(scale_factor=2, mode="nearest"), id="nearest"),
+        pytest.param(
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            id="bilinear",
+        ),
+    ],
+)
+def test_streaming_upsample_roundtrip_preserves_fields_and_matches_interpolate(upsample):
+    module = StreamingUpsample2d.from_torch_upsample(upsample)
+    roundtrip = module.to_torch_upsample()
+
+    for converted in (module, roundtrip):
+        assert converted.size == upsample.size
+        assert converted.scale_factor == upsample.scale_factor
+        assert converted.mode == upsample.mode
+        assert converted.align_corners == upsample.align_corners
+        assert converted.recompute_scale_factor == upsample.recompute_scale_factor
+
+    x = torch.arange(1 * 2 * 4 * 5, dtype=torch.float32).reshape(1, 2, 4, 5)
+    interpolate_kwargs = {
+        "size": upsample.size,
+        "scale_factor": upsample.scale_factor,
+        "mode": upsample.mode,
+        "recompute_scale_factor": upsample.recompute_scale_factor,
+    }
+    if upsample.mode != "nearest":
+        interpolate_kwargs["align_corners"] = upsample.align_corners
+    expected = torch.nn.functional.interpolate(x, **interpolate_kwargs)
+
+    torch.testing.assert_close(module(x), expected)
+    torch.testing.assert_close(roundtrip(x), expected)
+
+
 def test_streaming_upsample_from_torch_matches_interpolate():
     upsample = torch.nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False)
     module = StreamingUpsample2d.from_torch_upsample(upsample)
