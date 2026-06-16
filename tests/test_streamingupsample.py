@@ -116,7 +116,6 @@ def test_bilinear_upsample_statistics_add_explicit_border_loss():
     assert torch.all(output[:, :, :, -1:] == 0)
     assert torch.all(output[:, :, 1:-1, 1:-1] == 1)
 
-
 def test_nearest_upsample_statistics_do_not_add_explicit_border_loss():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn.eps = 1e-5
@@ -292,6 +291,59 @@ def test_upsample_backward_statistics_store_backward_valid_lost():
     scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
 
     assert scnn._module_stats[module]["backward_valid_lost"] == Lost(0, 0, 0, 0)
+
+
+def test_nearest_upsample_backward_statistics_do_not_store_bilinear_input_lost():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    inpt = torch.ones(1, 1, 4, 4, requires_grad=True)
+    output = module(inpt)
+    scnn._module_stats[module] = {}
+
+    output.sum().backward()
+    scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
+
+    stats = scnn._module_stats[module]
+    assert stats["backward_valid_lost"] == Lost(0, 0, 0, 0)
+    assert stats.get("upsample_backward_input_lost") is None
+
+
+def test_converted_nearest_upsample_uses_backward_valid_lost_without_bilinear_input_lost():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._streaming_reducers = []
+    torch_upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    scnn._module_stats = {
+        torch_upsample: {
+            "grad_lost": Lost(top=0, left=0, bottom=99, right=99),
+            "backward_valid_lost": Lost(top=1, left=1, bottom=1, right=1),
+            "upsample_backward_input_lost": Lost(top=0, left=0, bottom=0, right=0),
+            "output_stride": torch.tensor([1, 1, 1]),
+            "pre_upsample_output_stride": torch.tensor([1, 2, 2]),
+        }
+    }
+
+    module = scnn._convert_modules_for_streaming(torch_upsample)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+
+    assert isinstance(module, StreamingUpsample2d)
+    assert module.mode == "nearest"
+    assert module.backward_valid_lost == Lost(top=1, left=1, bottom=1, right=1)
+    assert module.upsample_backward_input_lost is None
+
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
+
+    expected = torch.tensor(
+        [[[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(x.grad, expected)
 
 
 def test_safe_input_step_accounts_for_upsample_forward_and_backward_lost_regions():

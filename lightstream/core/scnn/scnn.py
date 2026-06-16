@@ -693,11 +693,14 @@ class StreamingCNN(torch.nn.Module):
                     "grad_lost",
                     "side_aware_grad_lost",
                     "backward_valid_lost",
-                    "upsample_backward_input_lost",
                     "upsample_forward_output_lost",
                 ):
                     if key in stats and hasattr(mod, key):
                         setattr(mod, key, stats[key])
+                if mod.mode == "bilinear" and "upsample_backward_input_lost" in stats:
+                    mod.upsample_backward_input_lost = stats["upsample_backward_input_lost"]
+                else:
+                    mod.upsample_backward_input_lost = None
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, ChannelLayerNorm):

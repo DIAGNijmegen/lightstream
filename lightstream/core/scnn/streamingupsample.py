@@ -59,7 +59,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         sides = ctx.input_loc.sides
         upsample_backward_input_lost = (
             ctx.upsample_backward_input_lost
-            if ctx.upsample_backward_input_lost is not None
+            if ctx.mode == "bilinear" and ctx.upsample_backward_input_lost is not None
             else ctx.backward_valid_lost or Lost(0, 0, 0, 0)
         )
 
