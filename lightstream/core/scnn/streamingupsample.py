@@ -124,6 +124,8 @@ class StreamingUpsample2d(nn.Module):
             raise ValueError(
                 f"Unsupported upsample mode `{mode}` for StreamingUpsample2d. Supported modes: {sorted(self._SUPPORTED_MODES)}"
             )
+        if mode == "nearest" and align_corners is not None:
+            raise ValueError("StreamingUpsample2d requires align_corners=None for nearest mode.")
         if mode == "bilinear" and align_corners not in (None, False):
             raise ValueError("StreamingUpsample2d currently supports bilinear mode only with align_corners=False.")
 
