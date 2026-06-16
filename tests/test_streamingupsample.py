@@ -29,6 +29,30 @@ def test_constructor_keeps_upsample_modules():
     assert torch.nn.Upsample in constructor.keep_modules
 
 
+def test_constructor_converts_nearest_upsample_to_streaming_upsample():
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    model = torch.nn.Sequential(torch.nn.Conv2d(3, 3, 1), upsample).eval()
+    constructor = StreamingConstructor(
+        model,
+        tile_size=8,
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+    scnn = constructor.prepare_streaming_model()
+    converted = scnn.stream_module[1]
+
+    assert isinstance(converted, StreamingUpsample2d)
+    assert converted.mode == "nearest"
+    assert converted.scale_factor == upsample.scale_factor
+    assert converted.size == upsample.size
+    assert converted.recompute_scale_factor == upsample.recompute_scale_factor
+    assert converted.align_corners is None
+
+
 def test_bilinear_upsample_statistics_add_explicit_border_loss():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn.eps = 1e-5
