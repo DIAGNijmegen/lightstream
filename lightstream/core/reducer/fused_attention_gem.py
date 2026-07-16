@@ -381,12 +381,12 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
-        if valid_mask is None:
-            raise ValueError("StreamingFusedAttentionGeMReducer backward replay requires a valid_mask.")
         payload = self._parse_multi_input_payload(trimmed_output)
         if len(payload) != 2:
             raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
         fused_y, logits_stacked = payload
+        if valid_mask is None:
+            valid_mask = torch.ones(fused_y.shape[-2:], device=fused_y.device, dtype=torch.bool)
         if fused_y.ndim != 4:
             raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
         _validate_stacked_logits(logits_stacked, fused_y)

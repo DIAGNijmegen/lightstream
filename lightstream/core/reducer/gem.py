@@ -177,7 +177,7 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
 
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
         if valid_mask is None:
-            raise ValueError("StreamingGeMReducer backward replay requires a valid_mask.")
+            valid_mask = torch.ones(trimmed_output.shape[-2:], device=trimmed_output.device, dtype=torch.bool)
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, trimmed_output.dtype)
         x = trimmed_output.to(dtype=acc_dtype)
