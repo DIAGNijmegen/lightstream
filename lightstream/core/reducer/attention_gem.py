@@ -284,9 +284,9 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
-        if valid_mask is None:
-            raise ValueError("StreamingAttentionGeMReducer backward replay requires a valid_mask.")
         x_tile, logits_tile = self._parse_multi_input_payload(trimmed_output)
+        if valid_mask is None:
+            valid_mask = torch.ones(x_tile.shape[-2:], device=x_tile.device, dtype=torch.bool)
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x_tile.dtype)
         x = x_tile.to(dtype=acc_dtype).clamp_min(self.eps)
         logits = _normalize_logits(logits_tile, x_tile).to(dtype=acc_dtype)
