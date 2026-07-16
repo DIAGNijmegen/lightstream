@@ -76,6 +76,8 @@ class GeMReducer(BaseReducer):
             return StreamingGeMReducer(
                 eps=self.eps,
                 accumulator_dtype=self.accumulator_dtype,
+                mask_resize=self.mask_resize,
+                mask_resize_mode=self.mask_resize_mode,
                 r_parameter=self.r,
             )
 
@@ -84,6 +86,8 @@ class GeMReducer(BaseReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             learnable_r=False,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         with torch.no_grad():
             reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
@@ -99,11 +103,15 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
         r: float | None = None,
         r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
         if r is not None:
             r_init = r
@@ -219,6 +227,8 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             return GeMReducer(
                 eps=self.eps,
                 accumulator_dtype=self.accumulator_dtype,
+                mask_resize=self.mask_resize,
+                mask_resize_mode=self.mask_resize_mode,
                 r_parameter=self.r,
             )
 
@@ -227,6 +237,8 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             learnable_r=False,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         with torch.no_grad():
             reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
