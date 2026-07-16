@@ -163,6 +163,8 @@ class FusedAttentionGeMReducer(BaseReducer):
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))
@@ -181,10 +183,14 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
         uniform_attention_eps: float = 0.0,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
@@ -446,6 +452,8 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))

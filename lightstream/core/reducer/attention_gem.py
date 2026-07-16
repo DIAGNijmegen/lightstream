@@ -121,6 +121,8 @@ class AttentionGeMReducer(BaseReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
@@ -129,10 +131,20 @@ class AttentionGeMReducer(BaseReducer):
 class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
     """Streaming attention-weighted global GeM reducer with stable softmax accumulation."""
 
-    def __init__(self, r_init: float = 4.0, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None, uniform_attention_eps: float = 0.0):
+    def __init__(
+        self,
+        r_init: float = 4.0,
+        eps: float = 1e-6,
+        accumulator_dtype: torch.dtype | None = None,
+        uniform_attention_eps: float = 0.0,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
+    ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("running_m", torch.zeros(0), persistent=False)
         self.register_buffer("running_zhat", torch.zeros(0), persistent=False)
@@ -339,6 +351,8 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
