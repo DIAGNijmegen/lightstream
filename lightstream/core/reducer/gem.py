@@ -4,7 +4,7 @@ import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class GeMReducer(BaseReducer):
@@ -16,12 +16,16 @@ class GeMReducer(BaseReducer):
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
         r: float | None = None,
         r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
         if r is not None:
             r_init = r
@@ -57,7 +61,7 @@ class GeMReducer(BaseReducer):
         x_pow = x_clamped.pow(r)
 
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x)
+            mask_nchw = prepare_spatial_mask(mask, x, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode)
             mask_acc = mask_nchw.to(dtype=acc_dtype)
             denom = mask_acc.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
             mean_pow = (x_pow * mask_acc).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
