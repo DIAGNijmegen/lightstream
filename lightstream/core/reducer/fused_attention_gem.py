@@ -7,7 +7,7 @@ import torch
 from .attention_gem import _normalize_logits, _validate_uniform_attention_eps
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 _WEIGHT_LEN = 3
@@ -73,11 +73,15 @@ class FusedAttentionGeMReducer(BaseReducer):
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
         uniform_attention_eps: float = 0.0,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
@@ -118,7 +122,7 @@ class FusedAttentionGeMReducer(BaseReducer):
 
         logits_acc = tuple(logit.to(device=y1.device, dtype=acc_dtype) for logit in logits)
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, y1).to(device=y1.device)
+            mask_nchw = prepare_spatial_mask(mask, y1, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode).to(device=y1.device)
             neg_inf = torch.finfo(acc_dtype).min
             logits_acc = tuple(torch.where(mask_nchw, logit, torch.full_like(logit, neg_inf)) for logit in logits_acc)
             any_valid = mask_nchw.flatten(2).any(dim=-1, keepdim=True).unsqueeze(-1)

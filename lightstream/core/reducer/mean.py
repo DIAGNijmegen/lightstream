@@ -5,15 +5,22 @@ import torch
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
 from .sum import StreamingSumReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class MeanReducer(BaseReducer):
     """Apply global spatial mean reduction on NCHW tensors."""
 
-    def __init__(self, accumulator_dtype: torch.dtype | None = None):
+    def __init__(
+        self,
+        accumulator_dtype: torch.dtype | None = None,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
+    ):
         super().__init__()
         self.accumulator_dtype = accumulator_dtype
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
     def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         if len(inputs) != 1:
@@ -25,7 +32,7 @@ class MeanReducer(BaseReducer):
             return x
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x)
+            mask_nchw = prepare_spatial_mask(mask, x, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode)
             masked = x * mask_nchw.to(dtype=x.dtype)
             denom = mask_nchw.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
             mean = masked.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
