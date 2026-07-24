@@ -278,7 +278,7 @@ def main() -> None:
     dtype = _parse_dtype(args.dtype)
 
     img = torch.rand((1, 3, args.input_size, args.input_size), device=device, dtype=dtype)
-    mask = _build_dummy_mask(args.input_size, device=device)
+    mask = _build_dummy_mask(args.input_size * 2, device=device)
 
     print(f"device={device}, dtype={dtype}, tile_size={args.tile_size}, input_size={args.input_size}")
     _run_compare(args, img, mask)

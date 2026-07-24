@@ -7,6 +7,42 @@ from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
 from lightstream.core.scnn.utils import Box, Lost, Sides
 
 
+@pytest.mark.parametrize(
+    "upsample",
+    [
+        pytest.param(torch.nn.Upsample(scale_factor=2, mode="nearest"), id="nearest"),
+        pytest.param(
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            id="bilinear",
+        ),
+    ],
+)
+def test_streaming_upsample_roundtrip_preserves_fields_and_matches_interpolate(upsample):
+    module = StreamingUpsample2d.from_torch_upsample(upsample)
+    roundtrip = module.to_torch_upsample()
+
+    for converted in (module, roundtrip):
+        assert converted.size == upsample.size
+        assert converted.scale_factor == upsample.scale_factor
+        assert converted.mode == upsample.mode
+        assert converted.align_corners == upsample.align_corners
+        assert converted.recompute_scale_factor == upsample.recompute_scale_factor
+
+    x = torch.arange(1 * 2 * 4 * 5, dtype=torch.float32).reshape(1, 2, 4, 5)
+    interpolate_kwargs = {
+        "size": upsample.size,
+        "scale_factor": upsample.scale_factor,
+        "mode": upsample.mode,
+        "recompute_scale_factor": upsample.recompute_scale_factor,
+    }
+    if upsample.mode != "nearest":
+        interpolate_kwargs["align_corners"] = upsample.align_corners
+    expected = torch.nn.functional.interpolate(x, **interpolate_kwargs)
+
+    torch.testing.assert_close(module(x), expected)
+    torch.testing.assert_close(roundtrip(x), expected)
+
+
 def test_streaming_upsample_from_torch_matches_interpolate():
     upsample = torch.nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False)
     module = StreamingUpsample2d.from_torch_upsample(upsample)
@@ -18,6 +54,45 @@ def test_streaming_upsample_from_torch_matches_interpolate():
     torch.testing.assert_close(out, expected)
 
 
+def test_streaming_upsample_nearest_matches_interpolate():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = module(x)
+
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_from_torch_nearest_matches_interpolate():
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    module = StreamingUpsample2d.from_torch_upsample(upsample)
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = module(x)
+
+    assert module.align_corners is None
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_to_torch_nearest_emits_valid_upsample():
+    module = StreamingUpsample2d(scale_factor=2, mode="nearest")
+    upsample = module.to_torch_upsample()
+
+    x = torch.rand(1, 3, 9, 11)
+    expected = torch.nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+    out = upsample(x)
+
+    assert upsample.align_corners is None
+    torch.testing.assert_close(out, expected)
+
+
+def test_streaming_upsample_rejects_align_corners_for_nearest():
+    with pytest.raises(ValueError, match="align_corners=None"):
+        StreamingUpsample2d(scale_factor=2, mode="nearest", align_corners=True)
+
+
 def test_streaming_upsample_rejects_align_corners_true_for_bilinear():
     with pytest.raises(ValueError):
         StreamingUpsample2d(scale_factor=2.0, mode="bilinear", align_corners=True)
@@ -27,6 +102,30 @@ def test_constructor_keeps_upsample_modules():
     model = torch.nn.Sequential(torch.nn.Conv2d(3, 3, 1), torch.nn.Upsample(scale_factor=2.0, mode="nearest"))
     constructor = StreamingConstructor(model, tile_size=32, verbose=False, statistics_on_cpu=True)
     assert torch.nn.Upsample in constructor.keep_modules
+
+
+def test_constructor_converts_nearest_upsample_to_streaming_upsample():
+    upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    model = torch.nn.Sequential(torch.nn.Conv2d(3, 3, 1), upsample).eval()
+    constructor = StreamingConstructor(
+        model,
+        tile_size=8,
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+    scnn = constructor.prepare_streaming_model()
+    converted = scnn.stream_module[1]
+
+    assert isinstance(converted, StreamingUpsample2d)
+    assert converted.mode == "nearest"
+    assert converted.scale_factor == upsample.scale_factor
+    assert converted.size == upsample.size
+    assert converted.recompute_scale_factor == upsample.recompute_scale_factor
+    assert converted.align_corners is None
 
 
 def test_bilinear_upsample_statistics_add_explicit_border_loss():
@@ -52,6 +151,27 @@ def test_bilinear_upsample_statistics_add_explicit_border_loss():
     assert torch.all(output[:, :, :, :1] == 0)
     assert torch.all(output[:, :, :, -1:] == 0)
     assert torch.all(output[:, :, 1:-1, 1:-1] == 1)
+
+def test_nearest_upsample_statistics_do_not_add_explicit_border_loss():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    inpt = torch.ones(1, 3, 5, 7)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    lost = scnn._module_stats[module]["lost"]
+    assert lost == Lost(0, 0, 0, 0)
+    assert output.shape[-2:] == (10, 14)
+    assert torch.all(output == 1)
 
 
 @pytest.mark.parametrize(
@@ -207,6 +327,59 @@ def test_upsample_backward_statistics_store_backward_valid_lost():
     scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
 
     assert scnn._module_stats[module]["backward_valid_lost"] == Lost(0, 0, 0, 0)
+
+
+def test_nearest_upsample_backward_statistics_do_not_store_bilinear_input_lost():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    inpt = torch.ones(1, 1, 4, 4, requires_grad=True)
+    output = module(inpt)
+    scnn._module_stats[module] = {}
+
+    output.sum().backward()
+    scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
+
+    stats = scnn._module_stats[module]
+    assert stats["backward_valid_lost"] == Lost(0, 0, 0, 0)
+    assert stats.get("upsample_backward_input_lost") is None
+
+
+def test_converted_nearest_upsample_uses_backward_valid_lost_without_bilinear_input_lost():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._streaming_reducers = []
+    torch_upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
+    scnn._module_stats = {
+        torch_upsample: {
+            "grad_lost": Lost(top=0, left=0, bottom=99, right=99),
+            "backward_valid_lost": Lost(top=1, left=1, bottom=1, right=1),
+            "upsample_backward_input_lost": Lost(top=0, left=0, bottom=0, right=0),
+            "output_stride": torch.tensor([1, 1, 1]),
+            "pre_upsample_output_stride": torch.tensor([1, 2, 2]),
+        }
+    }
+
+    module = scnn._convert_modules_for_streaming(torch_upsample)
+    module.input_loc = Box(0, 0, 0, 0, Sides(left=0, top=0, right=0, bottom=0))
+
+    assert isinstance(module, StreamingUpsample2d)
+    assert module.mode == "nearest"
+    assert module.backward_valid_lost == Lost(top=1, left=1, bottom=1, right=1)
+    assert module.upsample_backward_input_lost is None
+
+    x = torch.ones(1, 1, 4, 4, requires_grad=True)
+    module(x).sum().backward()
+
+    expected = torch.tensor(
+        [[[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(x.grad, expected)
 
 
 def test_safe_input_step_accounts_for_upsample_forward_and_backward_lost_regions():

@@ -4,7 +4,7 @@ import torch
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class GeMReducer(BaseReducer):
@@ -16,12 +16,16 @@ class GeMReducer(BaseReducer):
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
         r: float | None = None,
         r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
         if r is not None:
             r_init = r
@@ -57,7 +61,7 @@ class GeMReducer(BaseReducer):
         x_pow = x_clamped.pow(r)
 
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, x)
+            mask_nchw = prepare_spatial_mask(mask, x, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode)
             mask_acc = mask_nchw.to(dtype=acc_dtype)
             denom = mask_acc.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).clamp_min(1)
             mean_pow = (x_pow * mask_acc).sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype) / denom
@@ -72,6 +76,8 @@ class GeMReducer(BaseReducer):
             return StreamingGeMReducer(
                 eps=self.eps,
                 accumulator_dtype=self.accumulator_dtype,
+                mask_resize=self.mask_resize,
+                mask_resize_mode=self.mask_resize_mode,
                 r_parameter=self.r,
             )
 
@@ -80,6 +86,8 @@ class GeMReducer(BaseReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             learnable_r=False,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         with torch.no_grad():
             reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
@@ -95,11 +103,15 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
         eps: float = 1e-6,
         accumulator_dtype: torch.dtype | None = None,
         learnable_r: bool = False,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
         r: float | None = None,
         r_parameter: torch.nn.Parameter | None = None,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
         if r is not None:
             r_init = r
@@ -177,7 +189,7 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
 
     def reduce_tile_for_backward(self, trimmed_output: torch.Tensor, valid_mask: torch.Tensor | None, global_context: dict[str, torch.Tensor | int | float | None]) -> torch.Tensor:
         if valid_mask is None:
-            raise ValueError("StreamingGeMReducer backward replay requires a valid_mask.")
+            valid_mask = torch.ones(trimmed_output.shape[-2:], device=trimmed_output.device, dtype=torch.bool)
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, trimmed_output.dtype)
         x = trimmed_output.to(dtype=acc_dtype)
@@ -215,6 +227,8 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             return GeMReducer(
                 eps=self.eps,
                 accumulator_dtype=self.accumulator_dtype,
+                mask_resize=self.mask_resize,
+                mask_resize_mode=self.mask_resize_mode,
                 r_parameter=self.r,
             )
 
@@ -223,6 +237,8 @@ class StreamingGeMReducer(BaseStreamingGlobalReducer):
             eps=self.eps,
             accumulator_dtype=self.accumulator_dtype,
             learnable_r=False,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         with torch.no_grad():
             reducer.r.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))

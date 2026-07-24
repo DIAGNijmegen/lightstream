@@ -55,7 +55,14 @@ class StreamingTestNet(StreamingModule):
         padding = 1
 
         encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, kernel_size=3, padding=padding),
+            torch.nn.Conv2d(3, 4, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(4),
+            torch.nn.Conv2d(4, 8, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            ChannelLayerNorm(8),
+            torch.nn.MaxPool2d(2),
+            torch.nn.Conv2d(8, 16, kernel_size=3, padding=padding),
             torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 32, kernel_size=3, padding=padding),
@@ -65,38 +72,31 @@ class StreamingTestNet(StreamingModule):
             torch.nn.Conv2d(32, 64, kernel_size=3, padding=padding),
             torch.nn.ReLU(),
             ChannelLayerNorm(64),
-            torch.nn.Conv2d(64, 128, kernel_size=3, padding=padding),
+            torch.nn.Conv2d(64, 64, kernel_size=3, padding=padding),
             torch.nn.ReLU(),
-            ChannelLayerNorm(128),
-            torch.nn.MaxPool2d(2),
-            torch.nn.Conv2d(128, 256, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            ChannelLayerNorm(256),
-            torch.nn.Conv2d(256, 256, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            ChannelLayerNorm(256),
+            ChannelLayerNorm(64),
             torch.nn.MaxPool2d(2),
         )
 
         decoder = torch.nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            torch.nn.Conv2d(256, 256, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(256, 128, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            torch.nn.Conv2d(128, 128, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(128, 64, kernel_size=3, padding=padding),
-            torch.nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="nearest"),
             torch.nn.Conv2d(64, 64, kernel_size=3, padding=padding),
             torch.nn.ReLU(),
             torch.nn.Conv2d(64, 32, kernel_size=3, padding=padding),
             torch.nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            torch.nn.Conv2d(32, 32, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(32, 16, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(16, 8, kernel_size=3, padding=padding),
+            torch.nn.ReLU(),
         )
 
-        classifier = torch.nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        classifier = torch.nn.Conv2d(8, 1, kernel_size=3, padding=1)
 
         stream_net = torch.nn.Sequential(encoder, decoder, classifier)
 

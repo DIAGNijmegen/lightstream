@@ -7,7 +7,7 @@ import torch
 from .attention_gem import _normalize_logits, _validate_uniform_attention_eps
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
 from .reducer_base import BaseReducer
-from .utils import normalize_spatial_mask, resolve_accumulator_dtype
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 _WEIGHT_LEN = 3
@@ -73,11 +73,15 @@ class FusedAttentionGeMReducer(BaseReducer):
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
         uniform_attention_eps: float = 0.0,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
     ):
         super().__init__()
         self.eps = float(eps)
         self.accumulator_dtype = accumulator_dtype
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
@@ -118,7 +122,7 @@ class FusedAttentionGeMReducer(BaseReducer):
 
         logits_acc = tuple(logit.to(device=y1.device, dtype=acc_dtype) for logit in logits)
         if mask is not None:
-            mask_nchw = normalize_spatial_mask(mask, y1).to(device=y1.device)
+            mask_nchw = prepare_spatial_mask(mask, y1, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode).to(device=y1.device)
             neg_inf = torch.finfo(acc_dtype).min
             logits_acc = tuple(torch.where(mask_nchw, logit, torch.full_like(logit, neg_inf)) for logit in logits_acc)
             any_valid = mask_nchw.flatten(2).any(dim=-1, keepdim=True).unsqueeze(-1)
@@ -159,6 +163,8 @@ class FusedAttentionGeMReducer(BaseReducer):
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))
@@ -177,10 +183,14 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         attention_weights: tuple[float, float, float] = (0.3, 0.4, 0.3),
         accumulator_dtype: torch.dtype | None = None,
         uniform_attention_eps: float = 0.0,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("value_weights", _weights_tensor("value_weights", value_weights))
         self.register_buffer("attention_weights", _weights_tensor("attention_weights", attention_weights))
@@ -381,12 +391,12 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
         }
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask: torch.Tensor | None, global_context):
-        if valid_mask is None:
-            raise ValueError("StreamingFusedAttentionGeMReducer backward replay requires a valid_mask.")
         payload = self._parse_multi_input_payload(trimmed_output)
         if len(payload) != 2:
             raise ValueError(f"StreamingFusedAttentionGeMReducer expects payload arity=2, got {len(payload)}")
         fused_y, logits_stacked = payload
+        if valid_mask is None:
+            valid_mask = torch.ones(fused_y.shape[-2:], device=fused_y.device, dtype=torch.bool)
         if fused_y.ndim != 4:
             raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
         _validate_stacked_logits(logits_stacked, fused_y)
@@ -442,6 +452,8 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             attention_weights=tuple(float(x) for x in self.attention_weights.detach().cpu()),
             accumulator_dtype=self.accumulator_dtype,
             uniform_attention_eps=self.uniform_attention_eps,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         reducer.value_weights.data.copy_(self.value_weights.detach().to(device=reducer.value_weights.device, dtype=reducer.value_weights.dtype))

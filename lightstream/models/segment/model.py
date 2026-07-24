@@ -68,10 +68,10 @@ class WSS(nn.Module):
             encoder, weights=weights, include_layer4=not remove_last_block
         )
 
-        self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2)
-        self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2)
-        self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2)
-        self.red4 = FusedAttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2)
+        self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2, mask_resize=True)
+        self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2, mask_resize=True)
+        self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2, mask_resize=True)
+        self.red4 = FusedAttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, uniform_attention_eps=0.2, mask_resize=True)
 
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),

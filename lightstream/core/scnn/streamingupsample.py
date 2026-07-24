@@ -59,7 +59,7 @@ class StreamingUpsample2dF(torch.autograd.Function):
         sides = ctx.input_loc.sides
         upsample_backward_input_lost = (
             ctx.upsample_backward_input_lost
-            if ctx.upsample_backward_input_lost is not None
+            if ctx.mode == "bilinear" and ctx.upsample_backward_input_lost is not None
             else ctx.backward_valid_lost or Lost(0, 0, 0, 0)
         )
 
@@ -124,6 +124,8 @@ class StreamingUpsample2d(nn.Module):
             raise ValueError(
                 f"Unsupported upsample mode `{mode}` for StreamingUpsample2d. Supported modes: {sorted(self._SUPPORTED_MODES)}"
             )
+        if mode == "nearest" and align_corners is not None:
+            raise ValueError("StreamingUpsample2d requires align_corners=None for nearest mode.")
         if mode == "bilinear" and align_corners not in (None, False):
             raise ValueError("StreamingUpsample2d currently supports bilinear mode only with align_corners=False.")
 

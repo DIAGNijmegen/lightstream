@@ -181,6 +181,10 @@ class StreamingCNN(torch.nn.Module):
         self._reducer_head_map = {}
         self._reducer_input_indices = {}
         self._active_reducer_mask = None
+        self._active_reducer_mask_image = None
+        self._prepared_reducer_domain_masks = {}
+        self._current_output_heights = None
+        self._current_output_widths = None
 
         if state_dict is None:
             self._configure()
@@ -221,6 +225,62 @@ class StreamingCNN(torch.nn.Module):
                 )
             return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
         raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
+
+    def _prepare_reducer_domain_mask(
+        self,
+        mask: torch.Tensor | None,
+        head_idx: int,
+        reducer: BaseStreamingGlobalReducer,
+        output_height: int,
+        output_width: int,
+    ) -> torch.Tensor | None:
+        """Normalize and optionally resize a full user mask to one reducer output domain."""
+        if mask is None:
+            return None
+        if self._active_reducer_mask_image is None:
+            raise RuntimeError("Reducer mask preparation requires the active forward/backward image context.")
+
+        normalized = self._normalize_reducer_mask(mask, self._active_reducer_mask_image)
+        if normalized is None:
+            return None
+
+        expected_shape = (int(output_height), int(output_width))
+        actual_shape = (int(normalized.shape[-2]), int(normalized.shape[-1]))
+        if actual_shape == expected_shape:
+            return normalized
+
+        if not getattr(reducer, "mask_resize", False):
+            raise ValueError(
+                f"Reducer mask for head_idx={head_idx} has spatial size {actual_shape}, "
+                f"expected {expected_shape}. Enable mask_resize=True on the reducer to resize "
+                "the full user mask into the reducer output domain before tile slicing."
+            )
+        mask_resize_mode = getattr(reducer, "mask_resize_mode", "nearest")
+        if mask_resize_mode != "nearest":
+            raise ValueError(
+                f"Unsupported reducer mask_resize_mode '{mask_resize_mode}' for head_idx={head_idx}. "
+                "Only 'nearest' is supported for streaming reducer mask resizing."
+            )
+
+        resized = torch.nn.functional.interpolate(
+            normalized[None, None].to(dtype=torch.float32),
+            size=expected_shape,
+            mode=mask_resize_mode,
+        )[0, 0]
+        return resized.to(device=self.device, dtype=torch.bool)
+
+    def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
+        reducer = self._reducer_head_map[head_idx]
+        cache_key = (id(reducer), int(head_idx))
+        if cache_key not in self._prepared_reducer_domain_masks:
+            self._prepared_reducer_domain_masks[cache_key] = self._prepare_reducer_domain_mask(
+                self._active_reducer_mask,
+                head_idx,
+                reducer,
+                self._current_output_heights[head_idx],
+                self._current_output_widths[head_idx],
+            )
+        return self._prepared_reducer_domain_masks[cache_key]
 
     def _slice_reducer_mask(
         self,
@@ -693,11 +753,14 @@ class StreamingCNN(torch.nn.Module):
                     "grad_lost",
                     "side_aware_grad_lost",
                     "backward_valid_lost",
-                    "upsample_backward_input_lost",
                     "upsample_forward_output_lost",
                 ):
                     if key in stats and hasattr(mod, key):
                         setattr(mod, key, stats[key])
+                if mod.mode == "bilinear" and "upsample_backward_input_lost" in stats:
+                    mod.upsample_backward_input_lost = stats["upsample_backward_input_lost"]
+                else:
+                    mod.upsample_backward_input_lost = None
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, ChannelLayerNorm):
@@ -1282,8 +1345,9 @@ class StreamingCNN(torch.nn.Module):
                 )
         dst_y0, dst_y1, dst_x0, dst_x1 = (int(v) for v in dst_box)
         payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
+        reducer_domain_mask = self._get_prepared_reducer_domain_mask(head_idx)
         tile_mask = self._slice_reducer_mask(
-            user_mask,
+            reducer_domain_mask,
             dst_y0,
             dst_y1,
             dst_x0,
@@ -1506,13 +1570,17 @@ class StreamingCNN(torch.nn.Module):
         """Perform forward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
-        self._active_reducer_mask = self._normalize_reducer_mask(mask, image)
+        self._active_reducer_mask = mask
+        self._active_reducer_mask_image = image
+        self._prepared_reducer_domain_masks = {}
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
+        self._current_output_heights = output_heights
+        self._current_output_widths = output_widths
         valid_input_height, valid_input_width = self._compute_valid_input_step(
             valid_output_heights, valid_output_widths
         )
@@ -1646,13 +1714,19 @@ class StreamingCNN(torch.nn.Module):
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
         if mask is not None:
-            self._active_reducer_mask = self._normalize_reducer_mask(mask, image)
+            self._active_reducer_mask = mask
+            self._active_reducer_mask_image = image
+            self._prepared_reducer_domain_masks = {}
+        elif self._active_reducer_mask_image is None:
+            self._active_reducer_mask_image = image
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
+        self._current_output_heights = output_heights
+        self._current_output_widths = output_widths
         valid_input_height, valid_input_width = self._compute_valid_input_step(
             valid_output_heights, valid_output_widths
         )
@@ -1854,8 +1928,9 @@ class StreamingCNN(torch.nn.Module):
 
         dst_y0, dst_y1, dst_x0, dst_x1 = common_dst_box
         ref = payload[0] if isinstance(payload, (tuple, list)) else payload
+        reducer_domain_mask = self._get_prepared_reducer_domain_mask(head_idx)
         valid_mask = self._slice_reducer_mask(
-            self._active_reducer_mask,
+            reducer_domain_mask,
             dst_y0,
             dst_y1,
             dst_x0,
