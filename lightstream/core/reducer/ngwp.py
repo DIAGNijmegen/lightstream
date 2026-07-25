@@ -36,13 +36,19 @@ class NGWPReducer(BaseReducer):
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
 
-    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if len(inputs) != 2:
             raise ValueError(f"NGWPReducer expects (scores, activation_masks), got {len(inputs)} inputs.")
         scores, activation_masks = inputs
         _validate_inputs(scores, activation_masks)
         if self._streaming_passthrough:
-            return scores
+            passthrough = (
+                scores.view_as(scores),
+                activation_masks.view_as(activation_masks),
+            )
+            self._last_inputs = passthrough
+            self._last_output = passthrough[0]
+            return passthrough
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, scores.dtype)
         scores_acc, activations_acc = scores.to(acc_dtype), activation_masks.to(acc_dtype)
         if mask is not None:
@@ -70,9 +76,15 @@ class StreamingNGWPReducer(BaseStreamingGlobalReducer):
     def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None):
         if len(inputs) != 2:
             raise ValueError(f"StreamingNGWPReducer expects (scores_tile, activation_masks_tile), got {len(inputs)} inputs.")
-        _validate_inputs(*inputs)
-        self._last_output = inputs[0]
-        return tuple(inputs)
+        scores_tile, activation_masks_tile = inputs
+        _validate_inputs(scores_tile, activation_masks_tile)
+        passthrough = (
+            scores_tile.view_as(scores_tile),
+            activation_masks_tile.view_as(activation_masks_tile),
+        )
+        self._last_inputs = passthrough
+        self._last_output = passthrough[0]
+        return passthrough
 
     def _payload(self, payload):
         values = self._parse_multi_input_payload(payload)
