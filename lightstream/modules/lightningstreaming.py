@@ -15,9 +15,19 @@ class LightningStreamingModule(L.LightningModule):
         stream_network: StreamingModule,
     ):
         super().__init__()
+        self._streaming_wrapper = stream_network
+        self._tile_size = stream_network.tile_size
 
-        self.stream_network = stream_network.stream_network
-        self._tile_size = self.stream_network.tile_shape[2]
+    @property
+    def stream_network(self):
+        """The converted network, available after :meth:`setup`."""
+        if not self._streaming_wrapper._is_prepared:
+            raise RuntimeError("The streaming network has not been prepared; Lightning setup must run first")
+        return self._streaming_wrapper.stream_network
+
+    def setup(self, stage: str | None = None) -> None:
+        """Prepare after Lightning has initialized its distributed strategy."""
+        self._streaming_wrapper.prepare_streaming_model()
 
     @property
     def tile_size(self):

@@ -239,3 +239,45 @@ def test_distributed_nonzero_rank_errors_when_cache_missing_after_barrier(monkey
         StreamingModule(nn.Identity(), 8, tile_cache_path=cache_path)
 
     assert DummyConstructor.calls == []
+
+
+def test_deferred_preparation_waits_for_process_group_and_is_idempotent(monkeypatch, tmp_path):
+    initialized = False
+    saves = []
+    barriers = []
+
+    monkeypatch.setattr(StreamingModule, "load_tile_cache_if_needed", lambda self: None)
+    monkeypatch.setattr(
+        StreamingModule,
+        "save_tile_cache_if_needed",
+        lambda self, overwrite=False: saves.append(overwrite),
+    )
+    monkeypatch.setattr(
+        StreamingModule,
+        "_distributed_is_initialized",
+        staticmethod(lambda: initialized),
+    )
+    monkeypatch.setattr(StreamingModule, "_distributed_world_size", staticmethod(lambda: 2))
+    monkeypatch.setattr(StreamingModule, "_distributed_rank", staticmethod(lambda: 0))
+    monkeypatch.setattr(
+        StreamingModule,
+        "_distributed_barrier",
+        staticmethod(lambda: barriers.append("barrier")),
+    )
+
+    wrapper = StreamingModule(
+        nn.Identity(),
+        8,
+        tile_cache_path=tmp_path / "cache",
+        defer_prepare=True,
+    )
+    assert DummyConstructor.calls == []
+    assert wrapper.tile_cache_metadata is None
+
+    initialized = True
+    wrapper.prepare_streaming_model()
+    wrapper.prepare_streaming_model()
+
+    assert [call["tile_cache"] for call in DummyConstructor.calls] == [None]
+    assert saves == [False]
+    assert barriers == ["barrier"]
