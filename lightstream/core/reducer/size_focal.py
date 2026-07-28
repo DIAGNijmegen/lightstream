@@ -1,4 +1,7 @@
-"""Size-focal pooling reducers."""
+"""Size-focal pooling reducers.
+From the article Single-Stage Semantic Segmentation from Image Labels
+
+"""
 
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ def _validate_parameters(p: float, lambda_: float) -> tuple[float, float]:
 class SizeFocalReducer(BaseReducer):
     """Compute size-focal scores from one activation/probability map."""
 
-    def __init__(self, p: float = 1.0, lambda_: float = 1e-6, accumulator_dtype: torch.dtype | None = None,
+    def __init__(self, p: float = 3.0, lambda_: float = 0.01, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):
         super().__init__()
         self.p, self.lambda_ = _validate_parameters(p, lambda_)
@@ -57,7 +60,7 @@ class SizeFocalReducer(BaseReducer):
 class StreamingSizeFocalReducer(BaseStreamingGlobalReducer):
     """Streaming size-focal reducer; nonlinear finalization happens once globally."""
 
-    def __init__(self, p: float = 1.0, lambda_: float = 1e-6, accumulator_dtype: torch.dtype | None = None,
+    def __init__(self, p: float = 3.0, lambda_: float = 0.01, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.p, self.lambda_ = _validate_parameters(p, lambda_)

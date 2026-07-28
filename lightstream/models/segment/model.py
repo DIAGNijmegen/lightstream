@@ -36,6 +36,12 @@ class WSS(nn.Module):
         self.red3 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
         self.red4 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
 
+        self.red5 = SizeFocalReducer(mask_resize=True)
+        self.red6 = SizeFocalReducer(mask_resize=True)
+        self.red7 = SizeFocalReducer(mask_resize=True)
+        self.red8 = SizeFocalReducer(mask_resize=True)
+
+
         self.sigmoid = nn.Sigmoid()
         self.decoder1 = nn.Sequential(
             nn.Conv2d(64, 1, 1),
@@ -64,17 +70,18 @@ class WSS(nn.Module):
         s2 = self.sigmoid(m2)
         s3 = self.sigmoid(m3)
 
-
         m = 0.3 * m1 + 0.4 * m2 + 0.3 * m3
         s = self.sigmoid(m)
-
-
 
         return (
             self.red1(m1, s1, mask=mask),
             self.red2(m2, s2, mask=mask),
             self.red3(m3, s3, mask=mask),
             self.red4(m, s, mask=mask),
+            self.red5(s1, mask=mask),
+            self.red6(s2, mask=mask),
+            self.red7(s3, mask=mask),
+            self.red8(s, mask=mask),
         )
 
 

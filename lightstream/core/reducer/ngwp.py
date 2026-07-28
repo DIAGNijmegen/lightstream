@@ -26,7 +26,7 @@ def _validate_inputs(scores: torch.Tensor, activation_masks: torch.Tensor) -> No
 class NGWPReducer(BaseReducer):
     """Reduce ``(scores, activation_masks)`` by normalized global weighting."""
 
-    def __init__(self, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None,
+    def __init__(self, eps: float = 1, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):
         super().__init__()
         if not math.isfinite(eps) or eps < 0:
@@ -65,7 +65,7 @@ class NGWPReducer(BaseReducer):
 class StreamingNGWPReducer(BaseStreamingGlobalReducer):
     """Streaming nGWP, accumulating global numerator and denominator separately."""
 
-    def __init__(self, eps: float = 1e-6, accumulator_dtype: torch.dtype | None = None,
+    def __init__(self, eps: float = 1, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):
         super().__init__(mode="sum", accumulator_dtype=accumulator_dtype)
         if not math.isfinite(eps) or eps < 0:
