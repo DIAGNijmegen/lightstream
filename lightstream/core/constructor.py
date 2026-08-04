@@ -7,7 +7,8 @@ many networks having padding, which will create wrong results when tiles are str
 However, only convolutional and local pooling layers need to be used for calculating streaming statistics
 since they will have padding. Most other modules (normalization layers, fully connected layers) are not compatible
 with streaming or will be kept on module.eval() during both training and inference. Channel-only normalization
-through ChannelLayerNorm is the supported exception because it does not mix spatial positions.
+through ChannelLayerNorm and layer scaling through LayerScale are the supported exceptions because they do not
+mix spatial positions.
 
 """
 
