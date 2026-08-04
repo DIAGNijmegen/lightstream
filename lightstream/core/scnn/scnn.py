@@ -31,6 +31,7 @@ from lightstream.core.scnn.streaminglayernorm import (
     ChannelLayerNorm,
     StreamingChannelLayerNorm,
 )
+from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -43,12 +44,13 @@ BACKWARD_STREAMING_MODULE_TYPES = (
     StreamingConv2d,
     StreamingUpsample2d,
     StreamingChannelLayerNorm,
+    StreamingLayerScale,
 )
 
 
 def _is_pointwise_channel_norm(module):
     """Return True for channel-only normalization layers that preserve spatial support."""
-    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm))
+    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm, LayerScale, StreamingLayerScale))
 
 
 def _is_backward_streaming_module(module):
@@ -763,6 +765,18 @@ class StreamingCNN(torch.nn.Module):
                     mod.upsample_backward_input_lost = None
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, LayerScale):
+            mod = StreamingLayerScale.from_layer_scale(module)
+            if module in self._module_stats:
+                stats = self._module_stats[module]
+                if "grad_lost" in stats:
+                    mod.grad_lost = stats["grad_lost"]
+                if "output_stride" in stats:
+                    mod.output_stride = stats["output_stride"]
+                self._module_stats[mod] = stats
+                del self._module_stats[module]
+            del module
+            return mod
         elif isinstance(module, ChannelLayerNorm):
             mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
             if module in self._module_stats:
@@ -815,6 +829,16 @@ class StreamingCNN(torch.nn.Module):
                     stats["scale_factor_hw"] = (
                         (float(sf[-2]), float(sf[-1])) if isinstance(sf, tuple) else (float(sf), float(sf))
                     )
+                self._module_stats[mod] = stats
+            else:
+                self._module_stats[mod] = self._module_stats[module]
+                del self._module_stats[module]
+        elif isinstance(module, StreamingLayerScale):
+            mod = module.to_layer_scale()
+            if module not in self._module_stats:
+                stats = {}
+                stats["grad_lost"] = module.grad_lost
+                stats["output_stride"] = module.output_stride
                 self._module_stats[mod] = stats
             else:
                 self._module_stats[mod] = self._module_stats[module]

@@ -7,5 +7,6 @@ modules from here instead of from implementation modules such as
 """
 
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm, StreamingChannelLayerNorm
+from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
 
-__all__ = ["ChannelLayerNorm", "StreamingChannelLayerNorm"]
+__all__ = ["ChannelLayerNorm", "StreamingChannelLayerNorm", "LayerScale", "StreamingLayerScale"]
