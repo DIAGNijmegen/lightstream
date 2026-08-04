@@ -4,8 +4,26 @@ import types
 import pytest
 import torch
 
+from lightstream.core.reducer import MeanReducer, StreamingMeanReducer
 from lightstream.core.scnn import LayerScale, StreamingLayerScale
 from lightstream.core.scnn.streaminglayerscale import LayerScale as ImportedLayerScale
+
+
+def test_layer_scale_scalar_shape_forward_matches_raw_multiplication():
+    x = torch.randn(2, 3, 5, 7)
+    module = LayerScale(shape=1, init_value=1.75)
+
+    assert tuple(module.scale.shape) == (1,)
+    torch.testing.assert_close(module(x), x * module.scale)
+
+
+def test_layer_scale_channel_shape_broadcasts_across_spatial_dimensions():
+    x = torch.randn(2, 3, 5, 7)
+    module = LayerScale(shape=(1, 3, 1, 1), init_value=1.0)
+    module.scale.data.copy_(torch.tensor([[[[0.5]], [[1.5]], [[2.5]]]]))
+
+    expected = x * torch.tensor([0.5, 1.5, 2.5]).view(1, 3, 1, 1)
+    torch.testing.assert_close(module(x), expected)
 
 
 def test_layer_scale_broadcasts_supported_shapes():
@@ -113,3 +131,60 @@ def test_scnn_layer_scale_forward_backward_parity(monkeypatch):
         torch.testing.assert_close(
             streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4
         )
+
+
+class SmallLayerScaleReducerNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 4, kernel_size=3, padding=1),
+            LayerScale((1, 4, 1, 1), init_value=0.5),
+            torch.nn.ReLU(),
+        )
+        self.head = torch.nn.Sequential(
+            torch.nn.Conv2d(4, 2, kernel_size=1, bias=False),
+            MeanReducer(),
+        )
+
+    def forward(self, x):
+        return self.head(self.features(x))
+
+
+def test_scnn_layer_scale_reducer_head_forward_backward_scale_gradient_parity():
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    torch.manual_seed(405)
+    model = SmallLayerScaleReducerNet().eval()
+    reference = SmallLayerScaleReducerNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = torch.randn(1, 3, 13, 11)
+
+    ref_image = image.detach().clone().requires_grad_(True)
+    ref_output = reference(ref_image)
+    upstream_grad = torch.randn_like(ref_output)
+    torch.autograd.backward(ref_output, upstream_grad)
+
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, 8, 8),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    assert isinstance(scnn.stream_module.features[1], StreamingLayerScale)
+    assert isinstance(scnn.stream_module.head[1], StreamingMeanReducer)
+
+    stream_output = scnn.forward(image.detach().clone())
+    torch.testing.assert_close(stream_output, ref_output.detach(), atol=1e-5, rtol=1e-4)
+
+    scnn.backward(image.detach().clone(), upstream_grad.detach().clone())
+
+    torch.testing.assert_close(
+        scnn.stream_module.features[1].scale.grad,
+        reference.features[1].scale.grad,
+        atol=1e-5,
+        rtol=1e-4,
+    )
