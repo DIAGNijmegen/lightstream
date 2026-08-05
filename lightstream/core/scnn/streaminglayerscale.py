@@ -8,7 +8,7 @@ from torch.amp import custom_bwd, custom_fwd
 from lightstream.core.scnn.utils import Box, H_DIM, Lost, W_DIM, _new_value_indices
 
 
-def _normalize_scale_shape(shape: int | Iterable[int] | torch.Size) -> torch.Size:
+def _normalize_weight_shape(shape: int | Iterable[int] | torch.Size) -> torch.Size:
     if isinstance(shape, torch.Size):
         values = tuple(shape)
     elif isinstance(shape, int):
@@ -46,15 +46,15 @@ class LayerScale(nn.Module):
         self, shape: int | Iterable[int] | torch.Size, init_value: float = 0.0
     ):
         super().__init__()
-        self.shape = _normalize_scale_shape(shape)
+        self.shape = _normalize_weight_shape(shape)
         self.init_value = init_value
-        self.scale = nn.Parameter(torch.full(self.shape, init_value))
+        self.weight = nn.Parameter(torch.full(self.shape, init_value))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         try:
-            return x * self.scale
+            return x * self.weight
         except RuntimeError as error:
-            raise _broadcast_error(type(self).__name__, x, self.scale) from error
+            raise _broadcast_error(type(self).__name__, x, self.weight) from error
 
 
 class StreamingLayerScaleF(torch.autograd.Function):
@@ -63,32 +63,32 @@ class StreamingLayerScaleF(torch.autograd.Function):
         device_type="cuda",
         cast_inputs=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
     )
-    def forward(ctx, inpt, scale, grad_lost, seen_indices, output_stride, input_loc):
+    def forward(ctx, inpt, weight, grad_lost, seen_indices, output_stride, input_loc):
         ctx.grad_lost = grad_lost
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
         ctx.input_loc = input_loc
-        ctx.save_for_backward(inpt, scale)
-        return inpt * scale
+        ctx.save_for_backward(inpt, weight)
+        return inpt * weight
 
     @staticmethod
     @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
-        inpt, scale = ctx.saved_tensors
+        inpt, weight = ctx.saved_tensors
 
         grad_in = (
-            grad_output * scale.to(dtype=grad_output.dtype)
+            grad_output * weight.to(dtype=grad_output.dtype)
             if ctx.needs_input_grad[0]
             else None
         )
-        grad_scale = None
+        grad_weight = None
 
         if ctx.needs_input_grad[1]:
             if grad_output.ndim < 4:
-                grad_scale = (
-                    (grad_output * inpt).sum_to_size(scale.shape).to(dtype=scale.dtype)
+                grad_weight = (
+                    (grad_output * inpt).sum_to_size(weight.shape).to(dtype=weight.dtype)
                 )
-                return grad_in, grad_scale, None, None, None, None
+                return grad_in, grad_weight, None, None, None, None
 
             input_loc = ctx.input_loc
             sides = input_loc.sides if input_loc is not None else None
@@ -145,15 +145,15 @@ class StreamingLayerScaleF(torch.autograd.Function):
                 x1 = x0 + new_output_box.width
                 relevant_grad = grad_output[:, :, y0:y1, x0:x1]
                 relevant_input = inpt[:, :, y0:y1, x0:x1]
-                grad_scale = (
+                grad_weight = (
                     (relevant_grad * relevant_input)
-                    .sum_to_size(scale.shape)
-                    .to(dtype=scale.dtype)
+                    .sum_to_size(weight.shape)
+                    .to(dtype=weight.dtype)
                 )
             else:
-                grad_scale = torch.zeros_like(scale)
+                grad_weight = torch.zeros_like(weight)
 
-        return grad_in, grad_scale, None, None, None, None
+        return grad_in, grad_weight, None, None, None, None
 
 
 streaming_layer_scale = StreamingLayerScaleF.apply
@@ -166,9 +166,9 @@ class StreamingLayerScale(nn.Module):
         self, shape: int | Iterable[int] | torch.Size, init_value: float = 0.0
     ):
         super().__init__()
-        self.shape = _normalize_scale_shape(shape)
+        self.shape = _normalize_weight_shape(shape)
         self.init_value = init_value
-        self.scale = nn.Parameter(torch.full(self.shape, init_value))
+        self.weight = nn.Parameter(torch.full(self.shape, init_value))
         self.grad_lost = Lost(0, 0, 0, 0)
         self.output_stride = torch.tensor([1, 1, 1])
         self.reset()
@@ -181,7 +181,7 @@ class StreamingLayerScale(nn.Module):
         try:
             return streaming_layer_scale(
                 x,
-                self.scale,
+                self.weight,
                 self.grad_lost,
                 self.seen_indices,
                 self.output_stride,
@@ -196,19 +196,19 @@ class StreamingLayerScale(nn.Module):
             raise TypeError(
                 f"StreamingLayerScale.from_layer_scale expected LayerScale, got {type(module).__name__}."
             )
-        mod = cls(module.scale.shape, module.init_value)
+        mod = cls(module.weight.shape, module.init_value)
         mod = mod.to(
-            device=module.scale.device, dtype=module.scale.dtype, non_blocking=True
+            device=module.weight.device, dtype=module.weight.dtype, non_blocking=True
         )
-        mod.scale.requires_grad = module.scale.requires_grad
-        mod.scale.data.copy_(module.scale.data)
+        mod.weight.requires_grad = module.weight.requires_grad
+        mod.weight.data.copy_(module.weight.data)
         return mod
 
     def to_layer_scale(self) -> LayerScale:
-        mod = LayerScale(self.scale.shape, self.init_value)
+        mod = LayerScale(self.weight.shape, self.init_value)
         mod = mod.to(
-            device=self.scale.device, dtype=self.scale.dtype, non_blocking=True
+            device=self.weight.device, dtype=self.weight.dtype, non_blocking=True
         )
-        mod.scale.requires_grad = self.scale.requires_grad
-        mod.scale.data.copy_(self.scale.data)
+        mod.weight.requires_grad = self.weight.requires_grad
+        mod.weight.data.copy_(self.weight.data)
         return mod
