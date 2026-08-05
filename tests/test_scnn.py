@@ -27,6 +27,48 @@ from lightstream.core.reducer import (
 )
 
 
+def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = nn.Conv2d(3, 4, kernel_size=3, padding=(2, 3), dilation=(2, 3), bias=False)
+    scnn.stream_module = nn.Sequential(module)
+    inpt = torch.ones(1, 3, 16, 16)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    module_stats = scnn._module_stats[module]
+    assert module_stats["dilation"] == (1, 2, 3)
+
+    scnn.output_stride = torch.tensor([1, 1, 1])
+    scnn.tile_output_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_lost = [scnn.tile_output_lost]
+    scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_shape = torch.Size([1, 4, 16, 16])
+    scnn._tile_output_shapes = [scnn._tile_output_shape]
+    scnn._output_stride_per_output = [scnn.output_stride]
+    scnn._output_spec = ("tensor", None)
+
+    state = scnn.get_tile_cache()
+    restored = StreamingCNN.__new__(StreamingCNN)
+    restored.stream_module = scnn.stream_module
+    restored._module_stats = {}
+    restored.disable = lambda: None
+    restored.enable = lambda: None
+
+    restored.load_tile_cache(state)
+
+    assert restored._module_stats[module]["dilation"] == (1, 2, 3)
+
+
+
 @pytest.mark.parametrize(
     "reducer_cls",
     [
