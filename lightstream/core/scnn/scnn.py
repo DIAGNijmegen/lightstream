@@ -2077,16 +2077,19 @@ class StreamingCNN(torch.nn.Module):
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
         elif not is_upsample:
-            stride, kernel_size, padding = (
+            stride, kernel_size, padding, dilation = (
                 _triple(module.stride),
                 _triple(module.kernel_size),
                 _triple(module.padding),
+                _triple(getattr(module, "dilation", 1)),
             )
         else:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
@@ -2135,6 +2138,7 @@ class StreamingCNN(torch.nn.Module):
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,
+                "dilation": dilation,
                 "module": module,
             }
             if is_upsample:
