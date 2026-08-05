@@ -68,7 +68,7 @@ class StreamingConv2dF(torch.autograd.Function):
         grad_lost = ctx.grad_lost  # Type: Lost
         output_stride = ctx.output_stride
         grad_bias = None
-        kernel_size = weight.shape[-1]
+        kernel_size = weight.shape[-2:]
 
         if ctx.needs_input_grad[0]:
             # TODO: performance improvements possible by only backpropping valid input
@@ -100,11 +100,18 @@ class StreamingConv2dF(torch.autograd.Function):
             lost_left : grad.shape[W_DIM] - lost_right,
         ]
 
-        stride, kernel_size, padding = (
+        stride, kernel_size, padding, dilation = (
             _triple(stride),
             _triple(kernel_size),
             _triple(padding),
+            _triple(dilation),
         )
+        stride_h, stride_w = stride[1], stride[2]
+        kernel_h, kernel_w = kernel_size[1], kernel_size[2]
+        padding_h, padding_w = padding[1], padding[2]
+        dilation_h, dilation_w = dilation[1], dilation[2]
+        effective_kernel_h = dilation_h * (kernel_h - 1) + 1
+        effective_kernel_w = dilation_w * (kernel_w - 1) + 1
 
         output_stride = output_stride * torch.tensor(stride)
         input_loc = ctx.input_loc
@@ -138,23 +145,23 @@ class StreamingConv2dF(torch.autograd.Function):
                 new_output_box.x : new_output_box.x + new_output_box.width,
             ]
 
-            input_y = (new_output_box.y + lost_top) * stride[1]
-            input_x = (new_output_box.x + lost_left) * stride[2]
+            input_y = (new_output_box.y + lost_top) * stride_h
+            input_x = (new_output_box.x + lost_left) * stride_w
 
             # Accounting for padding:
             # the kernel locations are relative to the padded input, inpt[0] is not padded
             # this means that the corresponding input of the grad_loc is modules.padding shifted to the left
             # we account for this:
-            input_y -= padding[1]
-            input_x -= padding[2]
+            input_y -= padding_h
+            input_x -= padding_w
             input_x = max(0, input_x)
             input_y = max(0, input_y)
 
-            relevant_input_height = relevant_grad.shape[H_DIM] * stride[1] + (
-                kernel_size[1] - 1
+            relevant_input_height = (
+                (relevant_grad.shape[H_DIM] - 1) * stride_h + effective_kernel_h
             )
-            relevant_input_width = relevant_grad.shape[W_DIM] * stride[2] + (
-                kernel_size[2] - 1
+            relevant_input_width = (
+                (relevant_grad.shape[W_DIM] - 1) * stride_w + effective_kernel_w
             )
             relevant_input = inpt[
                 :,
@@ -165,12 +172,12 @@ class StreamingConv2dF(torch.autograd.Function):
 
             # If layer has padding we need to pad based on if the current tile
             # is at the sides of the input.
-            if (padding[0] > 0 or padding[1] > 0 or padding[2] > 0) and (
+            if (padding_h > 0 or padding_w > 0) and (
                 sides.top or sides.left or sides.right or sides.bottom
             ):
                 # The size of the tile should remain equal.
-                crop_bottom = padding[1] if sides.top else 0
-                crop_right = padding[2] if sides.left else 0
+                crop_bottom = padding_h if sides.top else 0
+                crop_right = padding_w if sides.left else 0
                 relevant_input = inpt[
                     :,
                     :,
@@ -181,28 +188,44 @@ class StreamingConv2dF(torch.autograd.Function):
                 relevant_input = torch.nn.functional.pad(
                     relevant_input,
                     [
-                        padding[2] if sides.left else 0,
-                        padding[2] if sides.right else 0,
-                        padding[1] if sides.top else 0,
-                        padding[1] if sides.bottom else 0,
+                        padding_w if sides.left else 0,
+                        padding_w if sides.right else 0,
+                        padding_h if sides.top else 0,
+                        padding_h if sides.bottom else 0,
                     ],
                 )
 
-            # Calculate the kernel gradients with the new unseen gradient values
-            relevant_grad = relevant_grad.contiguous()
-
-            grad_weight = torch.nn.grad.conv2d_weight(
-                relevant_input.to(weight.dtype),
-                weight.shape,
-                relevant_grad.to(weight.dtype),
-                stride[1:3],
-                (0, 0),  # padding
-                dilation,
-                groups,
+            # Calculate the kernel gradients with the new unseen gradient values.
+            # conv2d_weight requires input geometry large enough to produce the
+            # requested gradient output for the requested stride and dilation.
+            valid_geometry = (
+                relevant_grad.shape[H_DIM] > 0
+                and relevant_grad.shape[W_DIM] > 0
+                and relevant_input.shape[H_DIM] >= relevant_input_height
+                and relevant_input.shape[W_DIM] >= relevant_input_width
             )
 
-            if bias is not None:
-                grad_bias = relevant_grad[0].sum((1, 2))
+            if valid_geometry:
+                relevant_grad = relevant_grad.contiguous()
+
+                grad_weight = torch.nn.grad.conv2d_weight(
+                    relevant_input.to(weight.dtype),
+                    weight.shape,
+                    relevant_grad.to(weight.dtype),
+                    (stride_h, stride_w),
+                    (0, 0),  # padding
+                    (dilation_h, dilation_w),
+                    groups,
+                )
+
+                if bias is not None:
+                    grad_bias = relevant_grad[0].sum((1, 2))
+            else:
+                grad_weight = torch.zeros_like(weight)
+                if bias is None:
+                    grad_bias = None
+                else:
+                    grad_bias = torch.zeros_like(bias)
 
             del relevant_input
             del relevant_grad
