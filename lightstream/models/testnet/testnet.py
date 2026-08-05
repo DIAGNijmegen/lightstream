@@ -7,29 +7,15 @@ from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.scnn.streaminglayerscale import LayerScale
 
-class GatedAttention(nn.Module):
-    """Convolutional implementation of Gated Attention compatible with streaming."""
+class Head(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = LayerScale(1, init_value=3.0)
 
-    def __init__(self, in_channels: int, hidden_channels: int, n_classes: int, scale_factor: int=1):
-        super(GatedAttention, self).__init__()
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.out_channels = n_classes
-
-        self.sigmoid_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Sigmoid()])
-        self.tanh_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Tanh()])
-
-        self.att_logits = nn.Conv2d(hidden_channels, n_classes, kernel_size=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        sigmoid_att = self.sigmoid_branch(x)
-        tanh_att = self.tanh_branch(x)
-
-        dot_product = sigmoid_att * tanh_att
-
-        att_logits = self.att_logits(dot_product)
-        return att_logits
+    def forward(self, x):
+        return self.scale(x)
 
 
 class StreamingTestNet(StreamingModule):
@@ -81,18 +67,20 @@ class StreamingTestNet(StreamingModule):
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
+            Head(),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
+            Head(),
             torch.nn.MaxPool2d(2),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
+            Head(),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
-            GatedAttention(16,8,2))
-
+            Head())
         return stream_net
 
 if __name__ == "__main__":

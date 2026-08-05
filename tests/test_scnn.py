@@ -16,10 +16,12 @@ from lightstream.core.reducer import (
     FusedAttentionGeMReducer,
     GeMReducer,
     MeanReducer,
+    NGWPReducer,
     StreamingAttentionGeMReducer,
     StreamingFusedAttentionGeMReducer,
     StreamingGeMReducer,
     StreamingMeanReducer,
+    StreamingNGWPReducer,
     StreamingSumReducer,
     SumReducer,
 )
@@ -240,6 +242,27 @@ class AttentionGeMHeadNet(nn.Module):
         logits = self.att_logits(feat)
         reduced = self.reducer(value, logits, mask=mask)
         return reduced, value, logits
+
+
+class NGWPMultiHeadNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=3, padding=1, bias=False),
+            nn.Softplus(),
+        )
+        self.score_heads = nn.ModuleList([nn.Conv2d(5, 2, kernel_size=1) for _ in range(4)])
+        self.activation_heads = nn.ModuleList([nn.Conv2d(5, 2, kernel_size=1) for _ in range(4)])
+        self.reducers = nn.ModuleList([NGWPReducer(eps=1e-6) for _ in range(4)])
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        feat = self.backbone(x)
+        scores = [head(feat) for head in self.score_heads]
+        activation_masks = [torch.sigmoid(head(feat)) for head in self.activation_heads]
+        return tuple(
+            reducer(score, activation_mask, mask=mask)
+            for reducer, score, activation_mask in zip(self.reducers, scores, activation_masks)
+        )
 
 
 
@@ -745,6 +768,85 @@ def test_attention_gem_streaming_passthrough_logit_bias_gradient_uniform_shift_p
     assert torch.allclose(stream_bias_grad, ref_bias_grad, atol=1e-5, rtol=1e-4)
     assert torch.allclose(ref_bias_grad, torch.zeros_like(ref_bias_grad), atol=1e-6, rtol=0)
     assert torch.allclose(stream_bias_grad, torch.zeros_like(stream_bias_grad), atol=1e-6, rtol=0)
+
+
+def test_ngwp_passthrough_preserves_two_input_payload_order():
+    scores = torch.randn(1, 2, 4, 5)
+    activation_masks = torch.rand(1, 2, 4, 5)
+    reducer = NGWPReducer()
+    reducer._streaming_passthrough = True
+
+    offline_payload = reducer(scores, activation_masks)
+    streaming = reducer.to_streaming()
+    streaming_payload = streaming(scores, activation_masks)
+
+    for owner, payload in ((reducer, offline_payload), (streaming, streaming_payload)):
+        assert len(payload) == 2
+        assert torch.equal(payload[0], scores)
+        assert torch.equal(payload[1], activation_masks)
+        assert payload[0].data_ptr() == scores.data_ptr()
+        assert payload[1].data_ptr() == activation_masks.data_ptr()
+        assert owner._last_inputs is payload
+        assert owner._last_output is payload[0]
+
+
+def test_scnn_four_ngwp_heads_regenerate_eight_tensor_tile_payload_and_forward_parity():
+    torch.manual_seed(137)
+    model = NGWPMultiHeadNet().eval()
+    image = torch.randn(1, 3, 9, 11)
+    mask = torch.rand(9, 11) > 0.2
+
+    with torch.no_grad():
+        expected = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=4)
+
+    assert all(isinstance(reducer, StreamingNGWPReducer) for reducer in scnn.stream_module.reducers)
+    assert len(scnn._tile_output_shapes) == 8
+
+    with torch.no_grad():
+        streamed = scnn.forward(image, mask=mask)
+
+    assert len(streamed) == 4
+    for actual, wanted in zip(streamed, expected):
+        assert torch.allclose(actual, wanted, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_four_ngwp_heads_backward_replay_gradient_parity_for_both_inputs():
+    torch.manual_seed(139)
+    model = NGWPMultiHeadNet().eval()
+    reference = NGWPMultiHeadNet().eval()
+    reference.load_state_dict(model.state_dict())
+    image = torch.randn(1, 3, 11, 9)
+    mask = torch.rand(11, 9) > 0.25
+
+    reference_outputs = reference(image.clone().requires_grad_(True), mask=mask)
+    output_gradients = tuple(
+        torch.full_like(output, 0.11 + 0.07 * index)
+        for index, output in enumerate(reference_outputs)
+    )
+    torch.autograd.backward(reference_outputs, output_gradients)
+
+    scnn = _make_streaming(model, tile_size=5)
+    streamed_outputs = scnn.forward(image.clone(), mask=mask)
+    for actual, wanted in zip(streamed_outputs, reference_outputs):
+        assert torch.allclose(actual, wanted.detach(), atol=1e-5, rtol=1e-4)
+    scnn.backward(image.clone(), output_gradients, mask=mask)
+
+    reference_parameters = dict(reference.named_parameters())
+    streaming_parameters = dict(scnn.stream_module.named_parameters())
+    for family in ("score_heads", "activation_heads"):
+        family_names = [name for name in reference_parameters if name.startswith(family)]
+        assert family_names
+        for name in family_names:
+            assert reference_parameters[name].grad is not None
+            assert streaming_parameters[name].grad is not None
+            assert torch.allclose(
+                streaming_parameters[name].grad,
+                reference_parameters[name].grad,
+                atol=1e-5,
+                rtol=1e-4,
+            ), name
 
 
 def test_scnn_single_input_reducers_compatibility_unchanged():

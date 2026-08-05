@@ -37,6 +37,8 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
 - `AttentionGeMReducer`: `inputs == (x, att_logits)`, where `att_logits` is `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`.
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
+- `NGWPReducer`: `inputs == (scores, activation_masks)`, with both tensors aligned as `[N, C, H, W]`. It returns `sum(scores * activation_masks) / (eps + sum(activation_masks))` per batch/channel.
+- `SizeFocalReducer`: `inputs == (m,)`, where `m` is an activation/probability tensor `[N, C, H, W]`. It returns `(1 - mean_m)^p * log(lambda_ + mean_m)` per batch/channel.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
 
 ## Package structure
@@ -95,6 +97,28 @@ This passthrough keeps your model code stable while switching execution strategy
 4. **Backward behavior**
    - Tile-level backward expands `[N, C, 1, 1]` gradients back to tile shape and reapplies masks.
    - Mean mode uses normalization from stream counts.
+
+## nGWP and size-focal reducers
+
+Both families accept `mask=` as a tissue mask. Only tissue pixels are included in
+their sums and denominators/counts. Masks follow the package's 2D/3D/4D spatial
+mask contract. By default they must already align with the reducer output; set
+`mask_resize=True` to resize a reduced-resolution tissue mask using nearest-neighbor
+interpolation. Empty tissue masks return zero for every affected output channel.
+
+`StreamingNGWPReducer` retains separate weighted-score and activation-mask sums,
+then divides only during `finalize_from_state`. `StreamingSizeFocalReducer` retains
+only activation sums and valid-pixel counts, then applies its nonlinear expression
+only during finalization. Their backward replay uses those finalized global values,
+so tiled gradients equal the corresponding full-frame gradients.
+
+These reducers are independent terminal outputs in a streamed model; do not compose
+them in the streaming graph. Once `StreamingCNN.forward()` has completed, combine
+their finalized `[N, C, 1, 1]` outputs in the caller/training module:
+
+```python
+final_prediction = ngwp_prediction + size_focal_prediction
+```
 
 ## Example: global mean pooling
 

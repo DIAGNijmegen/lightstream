@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -41,6 +41,7 @@ class StreamingResNet(StreamingModule):
         tile_size: int,
         additional_modules: nn.Module | None = None,
         remove_last_block=False,
+        replace_stride_with_dilation: Optional[list[bool]] = None,
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
@@ -53,10 +54,14 @@ class StreamingResNet(StreamingModule):
     ):
         model_choices = self.get_model_choices()
 
+        if replace_stride_with_dilation is not None and encoder != "resnet50":
+            raise ValueError(f"replace_stride_with_dilation must be None for encoder {encoder}, got {replace_stride_with_dilation}")
+
+
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
-        resnet = model_choices[encoder](weights="DEFAULT")
+        resnet = model_choices[encoder](weights="DEFAULT", replace_stride_with_dilation=replace_stride_with_dilation)
 
         if additional_modules is not None:
             stream_network = Sequential(
@@ -104,18 +109,19 @@ class StreamingResNet(StreamingModule):
 
 if __name__ == "__main__":
     print(" is cuda available? ", torch.cuda.is_available())
-    dtype=torch.float32
+    dtype = torch.float64
     img = torch.rand((1, 3, 4800, 4800)).to("cuda", dtype=dtype)
     network = StreamingResNet(
-        "resnet18",
+        "resnet50",
         3200,
         additional_modules=torch.nn.MaxPool2d((2, 2)),
+        replace_stride_with_dilation=[False, True, True],
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
     )
     network.to("cuda", dtype=dtype)
-    netowrk.eval()
+    network.eval()
     network.stream_network.device = torch.device("cuda")
 
     network.stream_network.mean = network.stream_network.mean.to("cuda", dtype=dtype)

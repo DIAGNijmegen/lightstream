@@ -6,7 +6,7 @@ import argparse
 import torch
 import torch.nn as nn
 from time import time
-from lightstream.models.testnet.segment import StreamingTestNet
+from lightstream.models.testnet.testnet import StreamingTestNet
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -150,7 +150,6 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    print(network)
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
     print(
@@ -185,7 +184,6 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     streaming_param_grads = _gather_param_grads(network.stream_network.stream_module)
 
     network.stream_network.disable()
-    print(network)
     normal_net = network.stream_network.stream_module
     _freeze_batchnorm(normal_net)
     _zero_grads(normal_net.parameters())
@@ -252,7 +250,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=960)
-    parser.add_argument("--input-size", type=int, default=1920)
+    parser.add_argument("--input-size", type=int, default=3520)
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
