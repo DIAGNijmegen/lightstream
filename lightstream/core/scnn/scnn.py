@@ -431,10 +431,9 @@ class StreamingCNN(torch.nn.Module):
             gradients.append(gradient)
 
             p_stats = self._prev_stats(out)
-            if p_stats:
-                output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
-            else:
-                output_stride = torch.tensor([1, 1, 1])
+            output_stride, _ = self._compatible_predecessor_coordinates(
+                p_stats, context=f"output {idx}"
+            )
 
             self._output_stride_per_output.append(output_stride)
 
@@ -2202,14 +2201,9 @@ class StreamingCNN(torch.nn.Module):
             module_stats = self._module_stats[module]
 
             p_stats = self._prev_stats(output)
-            if p_stats:
-                prev_output_stride = (
-                    p_stats["output_stride"] * p_stats["stride"].clone().detach()
-                    if isinstance(p_stats["stride"], torch.Tensor)
-                    else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
-                )
-            else:
-                prev_output_stride = torch.tensor([1, 1, 1])
+            prev_output_stride, prev_output_phase = self._compatible_predecessor_coordinates(
+                p_stats, context=f"input to {module!r}"
+            )
 
             if is_upsample:
                 pre_upsample_output_stride = prev_output_stride.clone().detach()
@@ -2228,6 +2222,15 @@ class StreamingCNN(torch.nn.Module):
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
+            # The phase identifies the spatial lattice independently of the
+            # autograd operation used to join branches. Pointwise operations
+            # and upsampling preserve its origin; convolution/pooling shift it
+            # by their left/top padding in predecessor coordinates.
+            output_phase = prev_output_phase.clone()
+            if not is_upsample and not is_pointwise_module:
+                output_phase[1] -= int(padding[1]) * int(prev_output_stride[1])
+                output_phase[2] -= int(padding[2]) * int(prev_output_stride[2])
+            module_stats["output_phase"] = output_phase
             if is_upsample:
                 module_stats["post_upsample_output_stride"] = output_stride
             self._stats_per_grad_fn[output.grad_fn] = module_stats
@@ -2472,9 +2475,12 @@ class StreamingCNN(torch.nn.Module):
         return grad_in
 
     def _prev_stats(self, grad_fn):
-        """DAG traversal, finds the first grad_fn that is in self._stats_per_grad_fn
+        """Collect every nearest statistics-bearing spatial predecessor.
 
-        Finds the first grad_fn that is in self._stats_per_grad_fn, which is needed for output stride calculations
+        Traversal stops independently on each path when it reaches recorded
+        module statistics. Autograd graphs are DAGs, so both visited-node and
+        result deduplication are necessary. Parameter/scalar paths naturally
+        terminate without contributing spatial coordinates.
 
         Parameters
         ----------
@@ -2484,20 +2490,62 @@ class StreamingCNN(torch.nn.Module):
         if hasattr(grad_fn, "grad_fn"):
             grad_fn = grad_fn.grad_fn
 
-        prev_stats = None
+        pending = [grad_fn]
+        visited = set()
+        found = []
+        found_ids = set()
+        while pending:
+            node = pending.pop()
+            if node is None or id(node) in visited:
+                continue
+            visited.add(id(node))
+            stats = self._stats_per_grad_fn.get(node)
+            if stats is not None:
+                if id(stats) not in found_ids:
+                    found.append(stats)
+                    found_ids.add(id(stats))
+                continue
+            pending.extend(
+                child for child, _ in getattr(node, "next_functions", ()) if child is not None
+            )
+        return found
 
-        if grad_fn in self._stats_per_grad_fn:
-            prev_stats = self._stats_per_grad_fn[grad_fn]
-            return prev_stats
-        elif hasattr(grad_fn, "next_functions") and len(grad_fn.next_functions) > 0:
-            children = [x[0] for x in grad_fn.next_functions]
+    @staticmethod
+    def _compatible_predecessor_coordinates(predecessors, context):
+        """Return the common effective stride and phase for spatial branches."""
+        if not predecessors:
+            origin = torch.tensor([0, 0, 0], dtype=torch.long)
+            return torch.tensor([1, 1, 1], dtype=torch.long), origin
 
-            for x in children:
-                prev_stats = self._prev_stats(x)
-                if prev_stats is not None:
-                    break
-            return prev_stats
-        return prev_stats
+        coordinates = []
+        for stats in predecessors:
+            output_stride = torch.as_tensor(stats["output_stride"], dtype=torch.long)
+            stride = torch.as_tensor(stats.get("stride", (1, 1, 1)), dtype=torch.long)
+            effective_stride = output_stride * stride
+            phase = torch.as_tensor(
+                stats.get("output_phase", (0, 0, 0)), dtype=torch.long
+            )
+            # Phases differing by a whole stride describe the same lattice.
+            phase = torch.remainder(phase, effective_stride)
+            coordinates.append((effective_stride, phase))
+
+        expected_stride, expected_phase = coordinates[0]
+        incompatible = [
+            (stride.tolist(), phase.tolist())
+            for stride, phase in coordinates[1:]
+            if not torch.equal(stride[1:], expected_stride[1:])
+            or not torch.equal(phase[1:], expected_phase[1:])
+        ]
+        if incompatible:
+            all_coordinates = [
+                (stride.tolist(), phase.tolist()) for stride, phase in coordinates
+            ]
+            raise ValueError(
+                f"Incompatible spatial predecessor coordinates for {context}: "
+                f"effective stride and phase values are {all_coordinates}. "
+                "All spatial branches must use the same sampling lattice."
+            )
+        return expected_stride, expected_phase
 
     def get_tile_cache(self):
         named_stats = {"net_stats": {}}
