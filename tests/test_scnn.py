@@ -59,6 +59,25 @@ def test_prev_stats_collects_all_nearest_spatial_predecessors_once():
     assert phase.tolist() == [0, 0, 0]
 
 
+def test_prev_stats_does_not_mix_near_coordinates_with_deeper_skip_path():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    source = torch.ones(1, requires_grad=True)
+    deep = source * 2
+    near = deep * 3
+    near_stats = _predecessor_stats([1, 4, 4], phase=(0, 3, 3))
+    stale_stats = _predecessor_stats([0, 1, 1])
+    scnn._stats_per_grad_fn = {
+        near.grad_fn: near_stats,
+        deep.grad_fn: stale_stats,
+    }
+
+    # The direct branch reaches `near` one level before the skip branch can
+    # walk back to `deep`; only the globally nearest statistics are relevant.
+    output = near + deep.square()
+
+    assert scnn._prev_stats(output) == [near_stats]
+
+
 @pytest.mark.parametrize(
     ("right_stride", "right_phase"),
     [([1, 4, 2], [0, 0, 0]), ([1, 2, 2], [0, 1, 0])],
