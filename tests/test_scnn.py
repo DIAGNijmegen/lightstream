@@ -78,6 +78,44 @@ def test_predecessor_coordinates_reject_incompatible_spatial_branches(
         StreamingCNN._compatible_predecessor_coordinates(predecessors, "test merge")
 
 
+def test_predecessor_coordinates_ignore_legacy_non_spatial_stride():
+    predecessors = [
+        _predecessor_stats([0, 4, 4], phase=(7, -4, 12)),
+        _predecessor_stats([1, 4, 4], phase=(9, 0, 0)),
+    ]
+
+    stride, phase = StreamingCNN._compatible_predecessor_coordinates(
+        predecessors, "legacy coordinate records"
+    )
+
+    assert stride.tolist() == [0, 4, 4]
+    assert phase.tolist() == [7, 0, 0]
+
+
+def test_resnet_initial_conv_to_max_pool_coordinates_allow_zero_legacy_stride():
+    # Conv2d/MaxPool2d strides are expanded from (H, W) to (0, H, W).
+    # The initial ResNet convolution produces spatial stride two, and its
+    # max-pool predecessor record therefore has effective stride (0, 4, 4).
+    conv_stats = _predecessor_stats([1, 2, 2], phase=(0, -3, -3))
+    conv_stats["stride"] = torch.tensor([0, 2, 2])
+    pool_equivalent = _predecessor_stats([1, 4, 4], phase=(1, 1, 1))
+
+    stride, phase = StreamingCNN._compatible_predecessor_coordinates(
+        [conv_stats, pool_equivalent], "ResNet conv1 to maxpool"
+    )
+
+    assert stride.tolist() == [0, 4, 4]
+    assert phase.tolist() == [0, 1, 1]
+
+
+@pytest.mark.parametrize("stride", ([1, 0, 4], [1, 4, 0], [1, -1, 4]))
+def test_predecessor_coordinates_require_positive_spatial_stride(stride):
+    with pytest.raises(ValueError, match="height/width stride must be strictly positive"):
+        StreamingCNN._compatible_predecessor_coordinates(
+            [_predecessor_stats(stride)], "invalid spatial stride"
+        )
+
+
 def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn.eps = 1e-5
