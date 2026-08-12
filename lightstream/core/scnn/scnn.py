@@ -32,6 +32,7 @@ from lightstream.core.scnn.streaminglayernorm import (
     StreamingChannelLayerNorm,
 )
 from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.scnn.statisticsprobe import StatisticsProbe
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -50,7 +51,16 @@ BACKWARD_STREAMING_MODULE_TYPES = (
 
 def _is_spatial_preserving_pointwise_module(module):
     """Return True for pointwise channel modules that preserve spatial support."""
-    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm, LayerScale, StreamingLayerScale))
+    return isinstance(
+        module,
+        (
+            ChannelLayerNorm,
+            StreamingChannelLayerNorm,
+            LayerScale,
+            StreamingLayerScale,
+            StatisticsProbe,
+        ),
+    )
 
 
 def _is_backward_streaming_module(module):
