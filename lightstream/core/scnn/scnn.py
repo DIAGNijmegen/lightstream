@@ -8,7 +8,6 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
-import numpy as np
 import torch
 import torch.autograd
 import torch.backends
@@ -331,6 +330,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
+        original_device = self.device
         state_dict = self._save_parameters()
         (
             old_deterministic_flag,
@@ -362,8 +362,8 @@ class StreamingCNN(torch.nn.Module):
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
-            self.stream_module = self.stream_module.cuda()
-            self.device = torch.device("cuda")  # type:ignore
+            self.stream_module = self.stream_module.to(original_device)
+            self.device = original_device
 
         # Remove all hooks and add hooks for correcting gradients
         # during lightstream
@@ -2335,15 +2335,15 @@ class StreamingCNN(torch.nn.Module):
 
                 f_grad = torch.sum(grad_out[0], dim=1)[0]
                 f_grad = f_grad * new_outpt
-                f_grad = f_grad.cpu()
-                f_grad = np.repeat(f_grad, stride[1], axis=0)
-                f_grad = np.repeat(f_grad, stride[2], axis=1)
-                grad = np.zeros(grad_in[0].shape[2:])
+                f_grad = torch.repeat_interleave(f_grad, int(stride[1]), dim=0)
+                f_grad = torch.repeat_interleave(f_grad, int(stride[2]), dim=1)
+                grad = torch.zeros(
+                    grad_in[0].shape[2:], device=f_grad.device, dtype=f_grad.dtype
+                )
 
                 self._print_verbose("testing shape gradient fix")
                 grad[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[: grad.shape[0], : grad.shape[1]]
 
-                f_grad = torch.from_numpy(grad)
                 f_grad = f_grad.to(self.device)
 
             if grad_out[0].numel() == 0 or torch.count_nonzero(grad_out[0]) == 0:
