@@ -180,7 +180,7 @@ class SSHR(nn.Module):
             encoder_channels=channels,
             encoder_strides=self.feature_strides,
             n_classes=1,
-            kernel_size=16,
+            kernel_size=8,
         )
 
         self.segmentation_head = FuseHead(apply_sigmoid=False)
