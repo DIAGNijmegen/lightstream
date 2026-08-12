@@ -88,7 +88,7 @@ def _freeze_batchnorm(module: nn.Module) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for ResNet18.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=1920)
+    parser.add_argument("--tile-size", type=int, default=1280)
     parser.add_argument("--input-size", type=int, default=2560)
     args = parser.parse_args()
 
@@ -107,7 +107,7 @@ def main() -> None:
         "resnet50",
         tile_size,
         replace_stride_with_dilation= [False, True, True],
-        remove_last_block=False,
+        remove_last_block=True,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,

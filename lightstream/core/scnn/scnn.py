@@ -2077,16 +2077,19 @@ class StreamingCNN(torch.nn.Module):
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
         elif not is_upsample:
-            stride, kernel_size, padding = (
+            stride, kernel_size, padding, dilation = (
                 _triple(module.stride),
                 _triple(module.kernel_size),
                 _triple(module.padding),
+                _triple(getattr(module, "dilation", 1)),
             )
         else:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
 
         if not torch.is_grad_enabled():  # type:ignore
             # Convert strided convolutions/pooling to average pool
@@ -2135,6 +2138,7 @@ class StreamingCNN(torch.nn.Module):
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,
+                "dilation": dilation,
                 "module": module,
             }
             if is_upsample:
@@ -2227,16 +2231,23 @@ class StreamingCNN(torch.nn.Module):
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             _padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
         elif not is_upsample:
-            stride, kernel_size, _padding = (
+            stride, kernel_size, _padding, dilation = (
                 _triple(module.stride),
                 _triple(module.kernel_size),
                 _triple(module.padding),
+                _triple(getattr(module, "dilation", 1)),
             )
         else:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
             _padding = torch.tensor([0, 0, 0])
+            dilation = torch.tensor([1, 1, 1])
+        dilation_h, dilation_w = dilation[1], dilation[2]
+        kernel_h, kernel_w = kernel_size[1], kernel_size[2]
+        effective_kernel_h = dilation_h * (kernel_h - 1) + 1
+        effective_kernel_w = dilation_w * (kernel_w - 1) + 1
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
             # on groups of channels. Channel-only normalization and layer scaling are pointwise in space,
@@ -2309,18 +2320,19 @@ class StreamingCNN(torch.nn.Module):
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
-            # When kernel_size > stride we have some _overlap_ of gradients,
-            # this overlap makes extra positions in the input gradient invalid.
+            # When the effective kernel is larger than the stride we have some
+            # _overlap_ of gradients, this overlap makes extra positions in the
+            # input gradient invalid. Dilation increases the effective receptive
+            # field, so use the effective kernel rather than the raw kernel size.
             # Pointwise spatial-preserving channel modules have no additional spatial loss.
             if (not is_upsample and not is_pointwise_module) and (
-                (stride[0] > 1 and kernel_size[0] > stride[0])
-                or (stride[1] > 1 and kernel_size[1] > stride[1])
-                or (stride[2] > 1 and kernel_size[2] > stride[2])
+                (stride[1] > 1 and effective_kernel_h > stride[1])
+                or (stride[2] > 1 and effective_kernel_w > stride[2])
             ):
                 valid_lost = self._non_max_border_amount(f_grad)
                 valid_grad.fill_(0)
-                overlap_rows = kernel_size[1] - stride[1]
-                overlap_cols = kernel_size[2] - stride[2]
+                overlap_rows = effective_kernel_h - stride[1]
+                overlap_cols = effective_kernel_w - stride[2]
                 valid_grad[
                     valid_lost.top + overlap_rows : valid_grad.shape[0] - valid_lost.bottom - overlap_rows,
                     valid_lost.left + overlap_cols : valid_grad.shape[1] - valid_lost.right - overlap_cols,

@@ -27,6 +27,78 @@ from lightstream.core.reducer import (
 )
 
 
+def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = nn.Conv2d(3, 4, kernel_size=3, padding=(2, 3), dilation=(2, 3), bias=False)
+    scnn.stream_module = nn.Sequential(module)
+    inpt = torch.ones(1, 3, 16, 16)
+
+    with torch.no_grad():
+        output = module(inpt)
+        scnn._forward_gather_statistics_hook(module, (inpt,), output)
+
+    module_stats = scnn._module_stats[module]
+    assert module_stats["dilation"] == (1, 2, 3)
+
+    scnn.output_stride = torch.tensor([1, 1, 1])
+    scnn.tile_output_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_lost = [scnn.tile_output_lost]
+    scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
+    scnn._tile_output_shape = torch.Size([1, 4, 16, 16])
+    scnn._tile_output_shapes = [scnn._tile_output_shape]
+    scnn._output_stride_per_output = [scnn.output_stride]
+    scnn._output_spec = ("tensor", None)
+
+    state = scnn.get_tile_cache()
+    restored = StreamingCNN.__new__(StreamingCNN)
+    restored.stream_module = scnn.stream_module
+    restored._module_stats = {}
+    restored.disable = lambda: None
+    restored.enable = lambda: None
+
+    restored.load_tile_cache(state)
+
+    assert restored._module_stats[module]["dilation"] == (1, 2, 3)
+
+def _conv2d_backward_valid_lost_for_dilation(dilation):
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.eps = 1e-5
+    scnn.dtype = torch.float32
+    scnn.device = torch.device("cpu")
+    scnn._saved_tensors = {}
+    scnn._module_stats = {}
+    scnn._print_verbose = lambda *args, **kwargs: None
+
+    module = nn.Conv2d(1, 1, kernel_size=2, stride=2, dilation=dilation, bias=False)
+    module.weight.data.fill_(1)
+    inpt = torch.ones(1, 1, 8, 8, requires_grad=True)
+    output = module(inpt)
+    scnn._module_stats[module] = {}
+
+    output.sum().backward()
+    scnn._backward_gather_statistics_hook(module, (inpt.grad,), (torch.ones_like(output),))
+
+    return scnn._module_stats[module]["backward_valid_lost"]
+
+
+def test_backward_statistics_use_dilated_effective_kernel_for_overlap():
+    dilation_1_lost = _conv2d_backward_valid_lost_for_dilation(1)
+    dilation_2_lost = _conv2d_backward_valid_lost_for_dilation(2)
+
+    assert dilation_1_lost == Lost(0, 0, 0, 0)
+    assert dilation_2_lost.top > dilation_1_lost.top
+    assert dilation_2_lost.left > dilation_1_lost.left
+    assert dilation_2_lost.bottom > dilation_1_lost.bottom
+    assert dilation_2_lost.right > dilation_1_lost.right
+
+
 @pytest.mark.parametrize(
     "reducer_cls",
     [

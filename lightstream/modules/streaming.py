@@ -381,7 +381,7 @@ class StreamingModule(nn.Module):
 
         Notes
         -----
-        The probe tile is capped at 64x64 pixels to avoid allocating very large
+        The probe tile is capped at 1024x1024 pixels to avoid allocating very large
         tensors while still exercising output/reducer structure. The persisted
         ``tile_shape`` continues to record the configured tile size.
         """
@@ -408,7 +408,7 @@ class StreamingModule(nn.Module):
         training_modes = {module: module.training for module in stream_network.modules()}
         try:
             stream_network.eval()
-            probe_tile_size = min(int(self.tile_size), 64)
+            probe_tile_size = min(int(self.tile_size), 1024)
             tile = torch.ones((1, 3, probe_tile_size, probe_tile_size), dtype=dtype, device=device)
             with torch.no_grad():
                 self._set_reducer_passthrough(stream_network, False)
