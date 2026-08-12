@@ -42,6 +42,7 @@ class StreamingConstructor:
         add_keep_modules: Optional[list[nn.Module]] = None,
         before_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
         after_streaming_init_callbacks: Optional[list[Callable[..., Any]]] = None,
+        debug_gradient_statistics: bool = False,
     ):
         """Initialize a streaming model constructor.
 
@@ -74,6 +75,7 @@ class StreamingConstructor:
         self.mean = mean
         self.std = std
         self.tile_cache = tile_cache
+        self.debug_gradient_statistics = debug_gradient_statistics
 
         self.before_streaming_init_callbacks = before_streaming_init_callbacks or []
         self.after_streaming_init_callbacks = after_streaming_init_callbacks or []
@@ -178,6 +180,7 @@ class StreamingConstructor:
             mean=self.mean,
             std=self.std,
             state_dict=self.tile_cache,
+            debug_gradient_statistics=self.debug_gradient_statistics,
         )
 
     def save_parameters(self) -> dict:

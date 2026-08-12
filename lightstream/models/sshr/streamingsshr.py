@@ -27,6 +27,7 @@ class StreamingSSHR(StreamingModule):
         std: list | None = None,
         tile_cache_path=None,
         reducer_accumulator_dtype: torch.dtype | None = None,
+        debug_gradient_statistics: bool = False,
     ):
         model_choices = self.get_model_choices()
 
@@ -70,6 +71,7 @@ class StreamingSSHR(StreamingModule):
             mean=mean,
             std=std,
             add_keep_modules=[nn.BatchNorm2d],
+            debug_gradient_statistics=debug_gradient_statistics,
         )
 
     @staticmethod
