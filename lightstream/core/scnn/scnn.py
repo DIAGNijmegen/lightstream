@@ -141,6 +141,7 @@ class StreamingCNN(torch.nn.Module):
         mean=None,
         std=None,
         state_dict=None,
+        debug_gradient_statistics=False,
     ):
         """
         Parameters:
@@ -152,6 +153,8 @@ class StreamingCNN(torch.nn.Module):
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
             eps (float): epsilon error to compare floating values
+            debug_gradient_statistics (bool): temporarily log synthetic and intermediate
+                gradient statistics without changing gradients (default is False)
         """
         super().__init__()
         global H_DIM, W_DIM
@@ -167,6 +170,10 @@ class StreamingCNN(torch.nn.Module):
         self.gather_input_gradient = saliency
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
+        self.debug_gradient_statistics = debug_gradient_statistics
+        # Models with targeted diagnostic hooks (for example SSHR) opt in by
+        # inspecting this attribute during their forward pass.
+        setattr(self.stream_module, "debug_gradient_statistics", debug_gradient_statistics)
 
         if mean is not None and not isinstance(mean, torch.Tensor):
             mean = torch.Tensor(mean)[:, None, None]
@@ -427,6 +434,27 @@ class StreamingCNN(torch.nn.Module):
                 lost.left : out.shape[W_DIM] - lost.right,
             ] = 1
             gradients.append(gradient)
+
+            if self.debug_gradient_statistics:
+                finite = torch.isfinite(gradient)
+                finite_values = gradient[finite]
+                finite_min = finite_values.min().item() if finite_values.numel() else None
+                finite_max = finite_values.max().item() if finite_values.numel() else None
+                logger.warning(
+                    "synthetic upstream gradient[%d]: shape=%s nan=%d inf=%d "
+                    "finite_min=%s finite_max=%s",
+                    idx,
+                    tuple(gradient.shape),
+                    torch.isnan(gradient).sum().item(),
+                    torch.isinf(gradient).sum().item(),
+                    finite_min,
+                    finite_max,
+                )
+                debug_recorder = getattr(
+                    self.stream_module, "_record_supplied_gradient_statistics", None
+                )
+                if debug_recorder is not None:
+                    debug_recorder(idx, gradient)
 
             p_stats = self._prev_stats(out)
             if p_stats:

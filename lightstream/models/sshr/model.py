@@ -2,16 +2,21 @@
 https://github.com/Nexuslkl/Swin_MIL/blob/main/models/swin_mil.py
 
 """
+import logging
+from typing import List
+
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import List
 from torchinfo import summary
 
 from lightstream.core.reducer import NGWPReducer
 from lightstream.models.segment.resnet import make_resnet_backbone
 from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.scnn.streaminglayerscale import LayerScale
+
+
+logger = logging.getLogger(__name__)
 
 
 class LocalRectification(nn.Module):
@@ -178,6 +183,59 @@ class SSHR(nn.Module):
         self.segmentation_head = FuseHead(apply_sigmoid=False)
         self.upsample_blocks = self._init_upsample_blocks(self.feature_strides)
         self._init_reducers(reducer_accumulator_dtype)
+        # Set by StreamingCNN. This diagnostic is deliberately disabled by
+        # default so ordinary training does not retain or inspect gradients.
+        self.debug_gradient_statistics = False
+        self._gradient_debug_previous_finite = True
+        self._gradient_debug_source_reported = False
+
+    def _record_supplied_gradient_statistics(self, index: int, gradient: Tensor) -> None:
+        """Seed transition tracking with the gradient supplied to backward."""
+        if not self.debug_gradient_statistics:
+            return
+        finite = bool(torch.isfinite(gradient).all().item())
+        if not finite and not self._gradient_debug_source_reported:
+            logger.warning(
+                "first finite-to-non-finite gradient transition: supplied upstream gradient[%d]",
+                index,
+            )
+            self._gradient_debug_source_reported = True
+        self._gradient_debug_previous_finite = (
+            self._gradient_debug_previous_finite and finite
+        )
+
+    def _attach_gradient_debug_hook(self, tensor: Tensor, name: str, source: str) -> None:
+        if not self.debug_gradient_statistics or not tensor.requires_grad:
+            return
+
+        def report(gradient: Tensor) -> Tensor:
+            finite = torch.isfinite(gradient)
+            finite_values = gradient[finite]
+            finite_min = finite_values.min().item() if finite_values.numel() else None
+            finite_max = finite_values.max().item() if finite_values.numel() else None
+            is_finite = bool(finite.all().item())
+            logger.warning(
+                "%s gradient: shape=%s nan=%d inf=%d finite_min=%s finite_max=%s",
+                name,
+                tuple(gradient.shape),
+                torch.isnan(gradient).sum().item(),
+                torch.isinf(gradient).sum().item(),
+                finite_min,
+                finite_max,
+            )
+            if (
+                self._gradient_debug_previous_finite
+                and not is_finite
+                and not self._gradient_debug_source_reported
+            ):
+                logger.warning(
+                    "first finite-to-non-finite gradient transition: %s", source
+                )
+                self._gradient_debug_source_reported = True
+            self._gradient_debug_previous_finite = is_finite
+            return gradient
+
+        tensor.register_hook(report)
 
     def _init_upsample_blocks(self, scale_factors: list[float]):
         blocks = nn.ModuleList()
@@ -196,6 +254,9 @@ class SSHR(nn.Module):
 
 
     def forward(self, x, mask=None):
+        if self.debug_gradient_statistics:
+            self._gradient_debug_previous_finite = True
+            self._gradient_debug_source_reported = False
         features = self.encoder(x)
         logits = self.decoder(features)
 
@@ -207,11 +268,21 @@ class SSHR(nn.Module):
 
         # Only enlarge what is needed for spatial fusion
         probs_up = [self.upsample_blocks[i](p) for i, p in enumerate(probs)]
+        for index, probability in enumerate(probs_up):
+            self._attach_gradient_debug_hook(
+                probability, f"probs_up[{index}]", "fusion"
+            )
 
         p_fused = self.segmentation_head(*probs_up, fuse_weights=self.fuse_weights)
+        self._attach_gradient_debug_hook(p_fused, "p_fused", "Tensor.logit")
         logit_fused = p_fused.logit(eps=1e-6)
+        self._attach_gradient_debug_hook(logit_fused, "logit_fused", "NGWPReducer")
 
-        reduced_outputs += (self.reducers[-1](logit_fused, p_fused, mask=mask),)
+        reduced_fused = self.reducers[-1](logit_fused, p_fused, mask=mask)
+        self._attach_gradient_debug_hook(
+            reduced_fused, "reduced_fused", "supplied upstream gradient"
+        )
+        reduced_outputs += (reduced_fused,)
 
         return reduced_outputs
 
