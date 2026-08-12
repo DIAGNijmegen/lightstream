@@ -183,6 +183,10 @@ class StreamingCNN(torch.nn.Module):
         self._output_stride_per_output = None
         self._output_spec = None
         self._module_stats = {}
+        # Forward pre-hooks populate this while statistics are gathered.  A
+        # pre-hook is required because some modules normalize or otherwise
+        # mutate their input before the corresponding forward hook runs.
+        self._incoming_module_lost = {}
         self._saved_tensors = {}
         self.debug_reducer_replay = False
         self.debug_forward_sentinel_check = False
@@ -2015,13 +2019,20 @@ class StreamingCNN(torch.nn.Module):
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
+        def pre_forw_lambda(module, inpt):
+            self._forward_gather_statistics_pre_hook(module, inpt)
+
         def forw_lambda(module, inpt, outpt):
             self._forward_gather_statistics_hook(module, inpt, outpt)
 
         def back_lambda(module, grad_in, grad_out):
             return self._backward_gather_statistics_hook(module, grad_in, grad_out)
 
-        self._add_hooks(forward_hook=forw_lambda, backward_hook=back_lambda)
+        self._add_hooks(
+            forward_hook=forw_lambda,
+            backward_hook=back_lambda,
+            forward_pre_hook=pre_forw_lambda,
+        )
 
     def _add_hooks_for_streaming(self):
         if self.gather_input_gradient:
@@ -2040,6 +2051,7 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
+        forward_pre_hook=None,
         forward_modules=(
             torch.nn.Conv2d,
             torch.nn.MaxPool2d,
@@ -2052,6 +2064,9 @@ class StreamingCNN(torch.nn.Module):
             register_forward = isinstance(mod, forward_modules) or _is_spatial_preserving_pointwise_module(mod)
             register_backward = back_modules and (isinstance(mod, back_modules) or _is_spatial_preserving_pointwise_module(mod))
             if register_forward:
+                if forward_pre_hook is not None:
+                    pre_forw_handle = mod.register_forward_pre_hook(forward_pre_hook)
+                    self._hooks.append(pre_forw_handle)
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
                 if register_backward:
@@ -2080,6 +2095,22 @@ class StreamingCNN(torch.nn.Module):
         out_stride[0] = 1
         return out_stride
 
+    def _forward_gather_statistics_pre_hook(self, module, inpt):
+        """Capture support from the tensor presented to ``module``.
+
+        Forward hooks run after ``forward`` and therefore cannot reliably
+        inspect an input that a module transformed in place.  Keep a queue for
+        each module so reused module instances also pair each forward hook with
+        the correct incoming region.
+        """
+        if torch.is_grad_enabled():
+            return
+        if not inpt or not isinstance(inpt[0], torch.Tensor):
+            raise TypeError(f"Statistics module {module} must receive a tensor as its first input")
+        self._incoming_module_lost.setdefault(module, []).append(
+            self._non_max_border_amount(inpt[0])
+        )
+
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
@@ -2102,6 +2133,13 @@ class StreamingCNN(torch.nn.Module):
             dilation = torch.tensor([1, 1, 1])
 
         if not torch.is_grad_enabled():  # type:ignore
+            incoming = self._incoming_module_lost.get(module, [])
+            # Retain a fallback for direct callers of this private hook; normal
+            # statistics collection always captures this in the pre-hook.
+            input_lost = incoming.pop(0) if incoming else self._non_max_border_amount(inpt[0])
+            if not incoming:
+                self._incoming_module_lost.pop(module, None)
+
             # Convert strided convolutions/pooling to average pool
             if (not is_upsample and not is_pointwise_module) and (
                 isinstance(module, (torch.nn.MaxPool2d))
@@ -2145,6 +2183,7 @@ class StreamingCNN(torch.nn.Module):
 
             module_stats = {
                 "lost": lost,
+                "input_lost": input_lost,
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,
