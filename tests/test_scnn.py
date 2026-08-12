@@ -27,6 +27,57 @@ from lightstream.core.reducer import (
 )
 
 
+def _predecessor_stats(stride, phase=(0, 0, 0)):
+    return {
+        "output_stride": torch.tensor(stride),
+        "stride": torch.tensor([1, 1, 1]),
+        "output_phase": torch.tensor(phase),
+    }
+
+
+def test_prev_stats_collects_all_nearest_spatial_predecessors_once():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    source = torch.ones(1, requires_grad=True)
+    left = source * 2
+    right = source * 3
+    left_stats = _predecessor_stats([1, 2, 2])
+    right_stats = _predecessor_stats([1, 2, 2])
+    scnn._stats_per_grad_fn = {
+        left.grad_fn: left_stats,
+        right.grad_fn: right_stats,
+    }
+
+    # Reusing left exercises result deduplication, while the trainable scalar
+    # exercises a non-spatial parameter branch.
+    scalar = torch.nn.Parameter(torch.tensor(2.0))
+    output = (left + right + left) * scalar
+    predecessors = scnn._prev_stats(output)
+
+    assert {id(stats) for stats in predecessors} == {id(left_stats), id(right_stats)}
+    stride, phase = scnn._compatible_predecessor_coordinates(predecessors, "test output")
+    assert stride.tolist() == [1, 2, 2]
+    assert phase.tolist() == [0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("right_stride", "right_phase"),
+    [([1, 4, 2], [0, 0, 0]), ([1, 2, 2], [0, 1, 0])],
+)
+def test_predecessor_coordinates_reject_incompatible_spatial_branches(
+    right_stride, right_phase
+):
+    predecessors = [
+        _predecessor_stats([1, 2, 2]),
+        _predecessor_stats(right_stride, right_phase),
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="Incompatible spatial predecessor coordinates.*effective stride and phase",
+    ):
+        StreamingCNN._compatible_predecessor_coordinates(predecessors, "test merge")
+
+
 def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn.eps = 1e-5
