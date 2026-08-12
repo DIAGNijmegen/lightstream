@@ -9,5 +9,6 @@ as ``lightstream.core.scnn.streaminglayernorm`` or
 
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm, StreamingChannelLayerNorm
 from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.scnn.streamingmerge import StreamingMerge
 
-__all__ = ["ChannelLayerNorm", "StreamingChannelLayerNorm", "LayerScale", "StreamingLayerScale"]
+__all__ = ["ChannelLayerNorm", "StreamingChannelLayerNorm", "LayerScale", "StreamingLayerScale", "StreamingMerge"]
