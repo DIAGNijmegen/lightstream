@@ -31,7 +31,7 @@ class LocalRectification(nn.Module):
     ):
         super(LocalRectification, self).__init__()
 
-        hidden_channels = max(1, shallow_channels // 8)
+        hidden_channels = 256
         self.rec_block = nn.Sequential(
             nn.AvgPool2d(kernel_size=kernel_size, stride=kernel_size),
             nn.Conv2d(deep_channels, hidden_channels, kernel_size=1, bias=False),
