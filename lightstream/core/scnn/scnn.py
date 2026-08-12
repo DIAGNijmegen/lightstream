@@ -2518,23 +2518,39 @@ class StreamingCNN(torch.nn.Module):
             return torch.tensor([1, 1, 1], dtype=torch.long), origin
 
         coordinates = []
+        spatial_indices = (H_DIM - 1, W_DIM - 1)
         for stats in predecessors:
             output_stride = torch.as_tensor(stats["output_stride"], dtype=torch.long)
             stride = torch.as_tensor(stats.get("stride", (1, 1, 1)), dtype=torch.long)
             effective_stride = output_stride * stride
             phase = torch.as_tensor(
                 stats.get("output_phase", (0, 0, 0)), dtype=torch.long
-            )
+            ).clone()
+            spatial_stride = effective_stride[list(spatial_indices)]
+            if torch.any(spatial_stride <= 0):
+                raise ValueError(
+                    f"Invalid spatial predecessor coordinates for {context}: "
+                    f"effective height/width stride must be strictly positive, got "
+                    f"{effective_stride.tolist()}."
+                )
             # Phases differing by a whole stride describe the same lattice.
-            phase = torch.remainder(phase, effective_stride)
+            # The leading entry is a legacy, non-spatial coordinate and may be
+            # zero (for example, strides expanded from a Conv2d tuple).
+            phase[list(spatial_indices)] = torch.remainder(
+                phase[list(spatial_indices)], spatial_stride
+            )
             coordinates.append((effective_stride, phase))
 
         expected_stride, expected_phase = coordinates[0]
         incompatible = [
             (stride.tolist(), phase.tolist())
             for stride, phase in coordinates[1:]
-            if not torch.equal(stride[1:], expected_stride[1:])
-            or not torch.equal(phase[1:], expected_phase[1:])
+            if not torch.equal(
+                stride[list(spatial_indices)], expected_stride[list(spatial_indices)]
+            )
+            or not torch.equal(
+                phase[list(spatial_indices)], expected_phase[list(spatial_indices)]
+            )
         ]
         if incompatible:
             all_coordinates = [
