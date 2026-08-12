@@ -2477,10 +2477,12 @@ class StreamingCNN(torch.nn.Module):
     def _prev_stats(self, grad_fn):
         """Collect every nearest statistics-bearing spatial predecessor.
 
-        Traversal stops independently on each path when it reaches recorded
-        module statistics. Autograd graphs are DAGs, so both visited-node and
-        result deduplication are necessary. Parameter/scalar paths naturally
-        terminate without contributing spatial coordinates.
+        Traversal is breadth-first and stops after the first graph depth that
+        contains recorded module statistics. This prevents an uninstrumented
+        skip/parameter path from contributing stale coordinates from much
+        earlier in the graph after a nearer spatial producer has been found.
+        All records at that nearest depth are retained so merges between
+        equally near spatial branches can still be validated.
 
         Parameters
         ----------
@@ -2492,23 +2494,29 @@ class StreamingCNN(torch.nn.Module):
 
         pending = [grad_fn]
         visited = set()
-        found = []
-        found_ids = set()
         while pending:
-            node = pending.pop()
-            if node is None or id(node) in visited:
-                continue
-            visited.add(id(node))
-            stats = self._stats_per_grad_fn.get(node)
-            if stats is not None:
-                if id(stats) not in found_ids:
-                    found.append(stats)
-                    found_ids.add(id(stats))
-                continue
-            pending.extend(
-                child for child, _ in getattr(node, "next_functions", ()) if child is not None
-            )
-        return found
+            next_pending = []
+            found = []
+            found_ids = set()
+            for node in pending:
+                if node is None or id(node) in visited:
+                    continue
+                visited.add(id(node))
+                stats = self._stats_per_grad_fn.get(node)
+                if stats is not None:
+                    if id(stats) not in found_ids:
+                        found.append(stats)
+                        found_ids.add(id(stats))
+                    continue
+                next_pending.extend(
+                    child
+                    for child, _ in getattr(node, "next_functions", ())
+                    if child is not None
+                )
+            if found:
+                return found
+            pending = next_pending
+        return []
 
     @staticmethod
     def _compatible_predecessor_coordinates(predecessors, context):
@@ -2518,23 +2526,39 @@ class StreamingCNN(torch.nn.Module):
             return torch.tensor([1, 1, 1], dtype=torch.long), origin
 
         coordinates = []
+        spatial_indices = (H_DIM - 1, W_DIM - 1)
         for stats in predecessors:
             output_stride = torch.as_tensor(stats["output_stride"], dtype=torch.long)
             stride = torch.as_tensor(stats.get("stride", (1, 1, 1)), dtype=torch.long)
             effective_stride = output_stride * stride
             phase = torch.as_tensor(
                 stats.get("output_phase", (0, 0, 0)), dtype=torch.long
-            )
+            ).clone()
+            spatial_stride = effective_stride[list(spatial_indices)]
+            if torch.any(spatial_stride <= 0):
+                raise ValueError(
+                    f"Invalid spatial predecessor coordinates for {context}: "
+                    f"effective height/width stride must be strictly positive, got "
+                    f"{effective_stride.tolist()}."
+                )
             # Phases differing by a whole stride describe the same lattice.
-            phase = torch.remainder(phase, effective_stride)
+            # The leading entry is a legacy, non-spatial coordinate and may be
+            # zero (for example, strides expanded from a Conv2d tuple).
+            phase[list(spatial_indices)] = torch.remainder(
+                phase[list(spatial_indices)], spatial_stride
+            )
             coordinates.append((effective_stride, phase))
 
         expected_stride, expected_phase = coordinates[0]
         incompatible = [
             (stride.tolist(), phase.tolist())
             for stride, phase in coordinates[1:]
-            if not torch.equal(stride[1:], expected_stride[1:])
-            or not torch.equal(phase[1:], expected_phase[1:])
+            if not torch.equal(
+                stride[list(spatial_indices)], expected_stride[list(spatial_indices)]
+            )
+            or not torch.equal(
+                phase[list(spatial_indices)], expected_phase[list(spatial_indices)]
+            )
         ]
         if incompatible:
             all_coordinates = [
