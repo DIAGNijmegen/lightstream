@@ -20,6 +20,7 @@ from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.reducer import BaseReducer
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 from lightstream.core.scnn.streaminglayerscale import LayerScale
+from lightstream.core.scnn.statisticsprobe import StatisticsProbe
 from typing import Any, Callable, Optional
 
 
@@ -89,6 +90,7 @@ class StreamingConstructor:
             torch.nn.Upsample,
             ChannelLayerNorm,
             LayerScale,
+            StatisticsProbe,
             BaseReducer,
         ]
 

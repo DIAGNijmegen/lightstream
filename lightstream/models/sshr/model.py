@@ -12,7 +12,7 @@ from lightstream.models.segment.resnet import make_resnet_backbone
 from lightstream.core.reducer import NGWPReducer
 from torchinfo import summary
 
-from lightstream.core.scnn.streaminglayerscale import LayerScale
+from lightstream.core.scnn.statisticsprobe import StatisticsProbe
 
 
 class LocalRectification(nn.Module):
@@ -46,6 +46,14 @@ class LocalRectification(nn.Module):
 
         self.gamma = 0.0 # LayerScale(shape=1, init_value=0.0)
 
+        # Local arithmetic has no module boundary of its own.  These identities
+        # make every operand and result visible while streaming tile statistics
+        # are gathered, without changing ordinary model execution.
+        self.feature_shallow_probe = StatisticsProbe()
+        self.weights_probe = StatisticsProbe()
+        self.weighted_features_probe = StatisticsProbe()
+        self.output_probe = StatisticsProbe()
+
     def forward(self, feature_shallow: Tensor, feature_deep: Tensor) -> Tensor:
         """
 
@@ -59,9 +67,11 @@ class LocalRectification(nn.Module):
 
         """
 
-        weights = self.rec_block(feature_deep)
-        weighted_features = feature_shallow * weights
-        return feature_shallow + 1.0 * weighted_features
+        feature_shallow = self.feature_shallow_probe(feature_shallow)
+        weights = self.weights_probe(self.rec_block(feature_deep))
+        weighted_features = self.weighted_features_probe(feature_shallow * weights)
+        output = feature_shallow + weighted_features
+        return self.output_probe(output)
 
 
 class SSHRDecoder(nn.Module):
