@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import List
 
+import numpy as np
 import torch
 import torch.autograd
 import torch.backends
@@ -182,10 +183,6 @@ class StreamingCNN(torch.nn.Module):
         self._output_stride_per_output = None
         self._output_spec = None
         self._module_stats = {}
-        # Forward pre-hooks populate this while statistics are gathered.  A
-        # pre-hook is required because some modules normalize or otherwise
-        # mutate their input before the corresponding forward hook runs.
-        self._incoming_module_lost = {}
         self._saved_tensors = {}
         self.debug_reducer_replay = False
         self.debug_forward_sentinel_check = False
@@ -330,7 +327,6 @@ class StreamingCNN(torch.nn.Module):
 
     def _configure(self):
         # Save current model and cudnn flags, since we need to change them and restore later
-        original_device = self.device
         state_dict = self._save_parameters()
         (
             old_deterministic_flag,
@@ -362,8 +358,8 @@ class StreamingCNN(torch.nn.Module):
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
-            self.stream_module = self.stream_module.to(original_device)
-            self.device = original_device
+            self.stream_module = self.stream_module.cuda()
+            self.device = torch.device("cuda")  # type:ignore
 
         # Remove all hooks and add hooks for correcting gradients
         # during lightstream
@@ -431,9 +427,10 @@ class StreamingCNN(torch.nn.Module):
             gradients.append(gradient)
 
             p_stats = self._prev_stats(out)
-            output_stride, _ = self._compatible_predecessor_coordinates(
-                p_stats, context=f"output {idx}"
-            )
+            if p_stats:
+                output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+            else:
+                output_stride = torch.tensor([1, 1, 1])
 
             self._output_stride_per_output.append(output_stride)
 
@@ -2018,20 +2015,13 @@ class StreamingCNN(torch.nn.Module):
         self._add_hooks_for_streaming()
 
     def _add_hooks_for_statistics(self):
-        def pre_forw_lambda(module, inpt):
-            self._forward_gather_statistics_pre_hook(module, inpt)
-
         def forw_lambda(module, inpt, outpt):
             self._forward_gather_statistics_hook(module, inpt, outpt)
 
         def back_lambda(module, grad_in, grad_out):
             return self._backward_gather_statistics_hook(module, grad_in, grad_out)
 
-        self._add_hooks(
-            forward_hook=forw_lambda,
-            backward_hook=back_lambda,
-            forward_pre_hook=pre_forw_lambda,
-        )
+        self._add_hooks(forward_hook=forw_lambda, backward_hook=back_lambda)
 
     def _add_hooks_for_streaming(self):
         if self.gather_input_gradient:
@@ -2050,7 +2040,6 @@ class StreamingCNN(torch.nn.Module):
         self,
         forward_hook,
         backward_hook,
-        forward_pre_hook=None,
         forward_modules=(
             torch.nn.Conv2d,
             torch.nn.MaxPool2d,
@@ -2063,9 +2052,6 @@ class StreamingCNN(torch.nn.Module):
             register_forward = isinstance(mod, forward_modules) or _is_spatial_preserving_pointwise_module(mod)
             register_backward = back_modules and (isinstance(mod, back_modules) or _is_spatial_preserving_pointwise_module(mod))
             if register_forward:
-                if forward_pre_hook is not None:
-                    pre_forw_handle = mod.register_forward_pre_hook(forward_pre_hook)
-                    self._hooks.append(pre_forw_handle)
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
                 if register_backward:
@@ -2094,22 +2080,6 @@ class StreamingCNN(torch.nn.Module):
         out_stride[0] = 1
         return out_stride
 
-    def _forward_gather_statistics_pre_hook(self, module, inpt):
-        """Capture support from the tensor presented to ``module``.
-
-        Forward hooks run after ``forward`` and therefore cannot reliably
-        inspect an input that a module transformed in place.  Keep a queue for
-        each module so reused module instances also pair each forward hook with
-        the correct incoming region.
-        """
-        if torch.is_grad_enabled():
-            return
-        if not inpt or not isinstance(inpt[0], torch.Tensor):
-            raise TypeError(f"Statistics module {module} must receive a tensor as its first input")
-        self._incoming_module_lost.setdefault(module, []).append(
-            self._non_max_border_amount(inpt[0])
-        )
-
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
@@ -2132,13 +2102,6 @@ class StreamingCNN(torch.nn.Module):
             dilation = torch.tensor([1, 1, 1])
 
         if not torch.is_grad_enabled():  # type:ignore
-            incoming = self._incoming_module_lost.get(module, [])
-            # Retain a fallback for direct callers of this private hook; normal
-            # statistics collection always captures this in the pre-hook.
-            input_lost = incoming.pop(0) if incoming else self._non_max_border_amount(inpt[0])
-            if not incoming:
-                self._incoming_module_lost.pop(module, None)
-
             # Convert strided convolutions/pooling to average pool
             if (not is_upsample and not is_pointwise_module) and (
                 isinstance(module, (torch.nn.MaxPool2d))
@@ -2182,7 +2145,6 @@ class StreamingCNN(torch.nn.Module):
 
             module_stats = {
                 "lost": lost,
-                "input_lost": input_lost,
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,
@@ -2201,9 +2163,14 @@ class StreamingCNN(torch.nn.Module):
             module_stats = self._module_stats[module]
 
             p_stats = self._prev_stats(output)
-            prev_output_stride, prev_output_phase = self._compatible_predecessor_coordinates(
-                p_stats, context=f"input to {module!r}"
-            )
+            if p_stats:
+                prev_output_stride = (
+                    p_stats["output_stride"] * p_stats["stride"].clone().detach()
+                    if isinstance(p_stats["stride"], torch.Tensor)
+                    else p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                )
+            else:
+                prev_output_stride = torch.tensor([1, 1, 1])
 
             if is_upsample:
                 pre_upsample_output_stride = prev_output_stride.clone().detach()
@@ -2222,15 +2189,6 @@ class StreamingCNN(torch.nn.Module):
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
-            # The phase identifies the spatial lattice independently of the
-            # autograd operation used to join branches. Pointwise operations
-            # and upsampling preserve its origin; convolution/pooling shift it
-            # by their left/top padding in predecessor coordinates.
-            output_phase = prev_output_phase.clone()
-            if not is_upsample and not is_pointwise_module:
-                output_phase[1] -= int(padding[1]) * int(prev_output_stride[1])
-                output_phase[2] -= int(padding[2]) * int(prev_output_stride[2])
-            module_stats["output_phase"] = output_phase
             if is_upsample:
                 module_stats["post_upsample_output_stride"] = output_stride
             self._stats_per_grad_fn[output.grad_fn] = module_stats
@@ -2335,15 +2293,15 @@ class StreamingCNN(torch.nn.Module):
 
                 f_grad = torch.sum(grad_out[0], dim=1)[0]
                 f_grad = f_grad * new_outpt
-                f_grad = torch.repeat_interleave(f_grad, int(stride[1]), dim=0)
-                f_grad = torch.repeat_interleave(f_grad, int(stride[2]), dim=1)
-                grad = torch.zeros(
-                    grad_in[0].shape[2:], device=f_grad.device, dtype=f_grad.dtype
-                )
+                f_grad = f_grad.cpu()
+                f_grad = np.repeat(f_grad, stride[1], axis=0)
+                f_grad = np.repeat(f_grad, stride[2], axis=1)
+                grad = np.zeros(grad_in[0].shape[2:])
 
                 self._print_verbose("testing shape gradient fix")
                 grad[: f_grad.shape[0], : f_grad.shape[1]] = f_grad[: grad.shape[0], : grad.shape[1]]
 
+                f_grad = torch.from_numpy(grad)
                 f_grad = f_grad.to(self.device)
 
             if grad_out[0].numel() == 0 or torch.count_nonzero(grad_out[0]) == 0:
@@ -2475,14 +2433,9 @@ class StreamingCNN(torch.nn.Module):
         return grad_in
 
     def _prev_stats(self, grad_fn):
-        """Collect every nearest statistics-bearing spatial predecessor.
+        """DAG traversal, finds the first grad_fn that is in self._stats_per_grad_fn
 
-        Traversal is breadth-first and stops after the first graph depth that
-        contains recorded module statistics. This prevents an uninstrumented
-        skip/parameter path from contributing stale coordinates from much
-        earlier in the graph after a nearer spatial producer has been found.
-        All records at that nearest depth are retained so merges between
-        equally near spatial branches can still be validated.
+        Finds the first grad_fn that is in self._stats_per_grad_fn, which is needed for output stride calculations
 
         Parameters
         ----------
@@ -2492,84 +2445,20 @@ class StreamingCNN(torch.nn.Module):
         if hasattr(grad_fn, "grad_fn"):
             grad_fn = grad_fn.grad_fn
 
-        pending = [grad_fn]
-        visited = set()
-        while pending:
-            next_pending = []
-            found = []
-            found_ids = set()
-            for node in pending:
-                if node is None or id(node) in visited:
-                    continue
-                visited.add(id(node))
-                stats = self._stats_per_grad_fn.get(node)
-                if stats is not None:
-                    if id(stats) not in found_ids:
-                        found.append(stats)
-                        found_ids.add(id(stats))
-                    continue
-                next_pending.extend(
-                    child
-                    for child, _ in getattr(node, "next_functions", ())
-                    if child is not None
-                )
-            if found:
-                return found
-            pending = next_pending
-        return []
+        prev_stats = None
 
-    @staticmethod
-    def _compatible_predecessor_coordinates(predecessors, context):
-        """Return the common effective stride and phase for spatial branches."""
-        if not predecessors:
-            origin = torch.tensor([0, 0, 0], dtype=torch.long)
-            return torch.tensor([1, 1, 1], dtype=torch.long), origin
+        if grad_fn in self._stats_per_grad_fn:
+            prev_stats = self._stats_per_grad_fn[grad_fn]
+            return prev_stats
+        elif hasattr(grad_fn, "next_functions") and len(grad_fn.next_functions) > 0:
+            children = [x[0] for x in grad_fn.next_functions]
 
-        coordinates = []
-        spatial_indices = (H_DIM - 1, W_DIM - 1)
-        for stats in predecessors:
-            output_stride = torch.as_tensor(stats["output_stride"], dtype=torch.long)
-            stride = torch.as_tensor(stats.get("stride", (1, 1, 1)), dtype=torch.long)
-            effective_stride = output_stride * stride
-            phase = torch.as_tensor(
-                stats.get("output_phase", (0, 0, 0)), dtype=torch.long
-            ).clone()
-            spatial_stride = effective_stride[list(spatial_indices)]
-            if torch.any(spatial_stride <= 0):
-                raise ValueError(
-                    f"Invalid spatial predecessor coordinates for {context}: "
-                    f"effective height/width stride must be strictly positive, got "
-                    f"{effective_stride.tolist()}."
-                )
-            # Phases differing by a whole stride describe the same lattice.
-            # The leading entry is a legacy, non-spatial coordinate and may be
-            # zero (for example, strides expanded from a Conv2d tuple).
-            phase[list(spatial_indices)] = torch.remainder(
-                phase[list(spatial_indices)], spatial_stride
-            )
-            coordinates.append((effective_stride, phase))
-
-        expected_stride, expected_phase = coordinates[0]
-        incompatible = [
-            (stride.tolist(), phase.tolist())
-            for stride, phase in coordinates[1:]
-            if not torch.equal(
-                stride[list(spatial_indices)], expected_stride[list(spatial_indices)]
-            )
-            or not torch.equal(
-                phase[list(spatial_indices)], expected_phase[list(spatial_indices)]
-            )
-        ]
-        if incompatible:
-            all_coordinates = [
-                (stride.tolist(), phase.tolist()) for stride, phase in coordinates
-            ]
-            raise ValueError(
-                f"Incompatible spatial predecessor coordinates for {context}: "
-                f"effective stride and phase values are {all_coordinates}. "
-                "All spatial branches must use the same sampling lattice."
-            )
-        return expected_stride, expected_phase
+            for x in children:
+                prev_stats = self._prev_stats(x)
+                if prev_stats is not None:
+                    break
+            return prev_stats
+        return prev_stats
 
     def get_tile_cache(self):
         named_stats = {"net_stats": {}}
