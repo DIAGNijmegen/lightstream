@@ -1,13 +1,8 @@
 import collections.abc as container_abcs
 from itertools import repeat
-from typing import NamedTuple, Union
+from typing import NamedTuple
 
-from dataclasses import dataclass
-
-B_DIM = 0
-C_DIM = 1
-H_DIM = 2
-W_DIM = 3
+from lightstream.core.engine.geometry import B_DIM, C_DIM, H_DIM, W_DIM, Box, Lost, Sides
 
 
 # inspired by torch/nn/modules/utils.py
@@ -29,38 +24,11 @@ _triple = _ntuple(3)
 
 
 # Utility named tuples, makes code more readable
-class Sides(NamedTuple):
-    left: int
-    top: int
-    right: int
-    bottom: int
-
-
-@dataclass
-class Box:
-    y: int
-    height: int
-    x: int
-    width: int
-    sides: Union[Sides, None]
-
-
 class IOShape(NamedTuple):
     batch: int
     channels: int
     height: int
     width: int
-
-
-@dataclass
-class Lost:
-    top: int
-    left: int
-    bottom: int
-    right: int
-
-    def __str__(self):
-        return "Lost(top:%2.1f, left:%2.1f, bottom:%2.1f, right:%2.1f)" % (self.top, self.left, self.bottom, self.right)
 
 
 def _new_value_indices(data_shape, data_indices, old_value_indices):

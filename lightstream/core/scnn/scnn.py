@@ -35,6 +35,10 @@ from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayer
 from lightstream.core.scnn.statisticsprobe import StatisticsProbe
 from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
+from lightstream.core.engine.executors import BackwardCall, BackwardExecutor, ForwardCall, ForwardExecutor
+from lightstream.core.engine.geometry import iter_tiles, tile_grid
+from lightstream.core.engine.planner import StreamingPlanBuilder
+from lightstream.core.engine.stitching import stitch_window
 
 
 logger = logging.getLogger(__name__)
@@ -200,10 +204,14 @@ class StreamingCNN(torch.nn.Module):
         self._current_output_heights = None
         self._current_output_widths = None
 
+        builder = StreamingPlanBuilder(self)
         if state_dict is None:
-            self._configure()
+            self.plan = builder.build()
         else:
             self.load_tile_cache(state_dict)
+            self.plan = builder.build(probe=False)
+        self._forward_executor = ForwardExecutor(self)
+        self._backward_executor = BackwardExecutor(self)
 
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
@@ -327,7 +335,7 @@ class StreamingCNN(torch.nn.Module):
             )
         return sliced
 
-    def _configure(self):
+    def _configure_legacy(self):
         # Save current model and cudnn flags, since we need to change them and restore later
         state_dict = self._save_parameters()
         (
@@ -1054,14 +1062,7 @@ class StreamingCNN(torch.nn.Module):
         valid_input_width,
     ):
         """Compute tiling grid shape for a given image and tile step."""
-        n_rows = math.ceil(float(max(1, image_height - tile_height)) / float(valid_input_height)) + 1
-        n_cols = math.ceil(float(max(1, image_width - tile_width)) / float(valid_input_width)) + 1
-
-        if image_width <= tile_width:
-            n_cols = 1
-        if image_height <= tile_height:
-            n_rows = 1
-        return n_rows, n_cols
+        return tile_grid(image_height, image_width, tile_height, tile_width, valid_input_height, valid_input_width)
 
     def _iter_input_tiles(
         self,
@@ -1074,25 +1075,10 @@ class StreamingCNN(torch.nn.Module):
         tile_width,
     ):
         """Yield input-space tile coordinates with border-aware side markers."""
-        for row in range(n_rows):
-            for col in range(n_cols):
-                input_y = row * valid_input_height
-                input_x = col * valid_input_width
-
-                sides_top = row == 0
-                sides_left = col == 0
-                sides_bottom = input_y + tile_height >= image.shape[H_DIM]
-                sides_right = input_x + tile_width >= image.shape[W_DIM]
-                sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
-
-                if sides_bottom:
-                    input_y = max(image.shape[H_DIM] - tile_height, 0)
-                if sides_right:
-                    input_x = max(image.shape[W_DIM] - tile_width, 0)
-
-                input_y = input_y if not sides.top else 0
-                input_x = input_x if not sides.left else 0
-                yield int(input_y), int(input_x), sides
+        yield from iter_tiles(
+            image.shape[H_DIM], image.shape[W_DIM], tile_height, tile_width,
+            valid_input_height, valid_input_width, n_rows, n_cols,
+        )
 
     def _log_and_validate_tile_start(self, input_y, input_x, sides, internal_alignment):
         """Log tile starts and verify non-edge starts keep internal sampling phase."""
@@ -1212,7 +1198,11 @@ class StreamingCNN(torch.nn.Module):
             f"dst=({dst_x0}:{dst_x1}) src_w={trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1].shape[W_DIM]}"
         )
 
-        outputs[idx][:, :, dst_y0:dst_y1, dst_x0:dst_x1] = trimmed_output[:, :, src_y0:src_y1, src_x0:src_x1]
+        stitch_window(
+            outputs[idx], trimmed_output,
+            (dst_y0, dst_y1, dst_x0, dst_x1),
+            (src_y0, src_y1, src_x0, src_x1),
+        )
 
     def _build_head_output_window(
         self,
@@ -1603,6 +1593,10 @@ class StreamingCNN(torch.nn.Module):
         del trimmed_outputs
 
     def forward(self, image, result_on_cpu=False, mask=None):
+        """Delegate a forward call to the plan-driven executor."""
+        return self._forward_executor.execute(self.plan, ForwardCall(image, result_on_cpu, mask))
+
+    def _forward_impl(self, image, result_on_cpu=False, mask=None):
         """Perform forward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
@@ -1746,6 +1740,10 @@ class StreamingCNN(torch.nn.Module):
         return output
 
     def backward(self, image, grad, mask=None):
+        """Delegate a backward call to the plan-driven executor."""
+        return self._backward_executor.execute(self.plan, BackwardCall(image, grad, mask))
+
+    def _backward_impl(self, image, grad, mask=None):
         """Perform backward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
