@@ -1,11 +1,11 @@
 # Streaming CNN layers
 
-`lightstream.core.scnn` is the documented public module for streaming CNN layer
+`lightstream.core.layers` is the documented public module for streaming CNN layer
 building blocks. Import channel layer normalization and layer scale helpers from
 this package instead of private implementation modules:
 
 ```python
-from lightstream.core.scnn import ChannelLayerNorm, LayerScale, StreamingChannelLayerNorm
+from lightstream.core.layers import ChannelLayerNorm, LayerScale, StreamingChannelLayerNorm
 ```
 
 ## LayerScale for discoverable learned scaling
@@ -27,7 +27,7 @@ class Block(torch.nn.Module):
 with a module-based scale:
 
 ```python
-from lightstream.core.scnn import LayerScale
+from lightstream.core.layers import LayerScale
 
 class Block(torch.nn.Module):
     def __init__(self):
@@ -42,7 +42,7 @@ class Block(torch.nn.Module):
 starts at zero:
 
 ```python
-from lightstream.core.scnn import LayerScale
+from lightstream.core.layers import LayerScale
 
 class ResidualBlock(torch.nn.Module):
     def __init__(self, branch):
@@ -66,4 +66,4 @@ replace them automatically. `LayerScale` makes the operation explicit in the
 module tree, allowing `StreamingCNN` conversion to replace it with
 `StreamingLayerScale` while preserving the `scale` state-dict key.
 
-::: lightstream.core.scnn
+::: lightstream.core.layers

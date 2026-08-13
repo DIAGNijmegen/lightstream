@@ -14,7 +14,7 @@ import torch.autograd
 import torch.backends
 import torch.nn.functional
 
-from lightstream.core.scnn.utils import (
+from lightstream.core.engine.geometry import (
     Sides,
     Box,
     Lost,
@@ -25,18 +25,17 @@ from lightstream.core.scnn.utils import (
     H_DIM,
     W_DIM,
 )
-from lightstream.core.scnn.streamingconv import StreamingConv2d
-from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.scnn.streaminglayernorm import (
+from lightstream.core.layers.streamingconv import StreamingConv2d
+from lightstream.core.layers.streamingupsample import StreamingUpsample2d
+from lightstream.core.layers.streaminglayernorm import (
     ChannelLayerNorm,
     StreamingChannelLayerNorm,
 )
-from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
-from lightstream.core.scnn.statisticsprobe import StatisticsProbe
-from lightstream.core.scnn.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.layers.statisticsprobe import StatisticsProbe
+from lightstream.core.layers.streamingmerge import StreamingMerge
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 from lightstream.core.engine.executors import BackwardCall, BackwardExecutor, ForwardCall, ForwardExecutor
-from lightstream.core.engine.geometry import iter_tiles, tile_grid
 from lightstream.core.engine.planner import StreamingPlanBuilder
 from lightstream.core.engine.stitching import stitch_window
 

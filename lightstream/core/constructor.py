@@ -18,10 +18,10 @@ import torch.nn as nn
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.reducer import BaseReducer
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
-from lightstream.core.scnn.streaminglayerscale import LayerScale
-from lightstream.core.scnn.statisticsprobe import StatisticsProbe
-from lightstream.core.scnn.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.layers.streaminglayerscale import LayerScale
+from lightstream.core.layers.statisticsprobe import StatisticsProbe
+from lightstream.core.layers.streamingmerge import StreamingMerge
 from typing import Any, Callable, Optional
 
 
