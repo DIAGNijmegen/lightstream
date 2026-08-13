@@ -93,3 +93,55 @@ def output_window(tile_origin: int, stride: int, output_size: int, tile_output_s
     destination_start = tile_origin // int(stride) + source_start
     destination_end = min(output_size, destination_start + source_end - source_start)
     return destination_start, destination_end, source_start, source_start + destination_end - destination_start
+
+
+def _ntuple(n: int):
+    """Build a parser that normalizes a scalar or iterable to an n-tuple."""
+    from collections.abc import Iterable
+    from itertools import repeat
+
+    def parse(value, default=0):
+        if isinstance(value, Iterable):
+            if len(value) == n:
+                return value
+            if len(value) == n - 1:
+                return (default, *value)
+            return tuple(repeat(value[0], n))
+        return tuple(repeat(value, n))
+
+    return parse
+
+
+def _new_value_indices(data_shape, data_indices, old_value_indices):
+    """Return the unseen portion of a row-major tile and updated coverage."""
+    rel_top, rel_bottom, rel_left, rel_right = 0, 0, 0, 0
+    old_values_y = old_value_indices.y
+    old_values_x = old_value_indices.x
+    old_values_height = old_value_indices.height
+
+    if data_indices.x == 0:
+        old_values_y = old_values_height
+        old_values_height = data_indices.y + data_shape[H_DIM]
+        old_values_x = 0
+
+    if data_indices.x == old_values_x:
+        rel_right = data_shape[W_DIM]
+    else:
+        assert old_values_x - data_indices.x >= 0, "Misses data in x-axis!"
+        rel_left = old_values_x - data_indices.x
+        rel_right = data_shape[W_DIM]
+
+    if data_indices.y == old_values_y:
+        rel_bottom = data_shape[H_DIM]
+    else:
+        assert old_values_y - data_indices.y >= 0, "We miss data in y-axis"
+        rel_top = old_values_y - data_indices.y
+        rel_bottom = data_shape[H_DIM]
+
+    old_values_x += rel_right - rel_left
+    assert rel_top >= 0, f"We miss data in y-axis before: {data_indices}"
+    assert rel_left >= 0, f"We miss data in x-axis before: {data_indices}"
+
+    unseen = Box(rel_top, rel_bottom - rel_top, rel_left, rel_right - rel_left)
+    coverage = Box(int(old_values_y), int(old_values_height), int(old_values_x), 0)
+    return unseen, coverage

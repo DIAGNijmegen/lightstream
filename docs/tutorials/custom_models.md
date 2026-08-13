@@ -27,7 +27,7 @@ Before implementing a streaming version of your model, make sure that the follow
 ```python
 import torch.nn as nn
 
-from lightstream.core.scnn import ChannelLayerNorm
+from lightstream.core.layers import ChannelLayerNorm
 
 num_channels = 64
 streamable_block = nn.Sequential(
