@@ -6,12 +6,11 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from typing import List
-
-
-from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.reducer import NGWPReducer
 from torchinfo import summary
 
+from lightstream.core.reducer import NGWPReducer
+from lightstream.models.segment.resnet import make_resnet_backbone
+from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.scnn.streaminglayerscale import LayerScale
 
 
@@ -32,7 +31,7 @@ class LocalRectification(nn.Module):
     ):
         super(LocalRectification, self).__init__()
 
-        hidden_channels = max(1, shallow_channels // 8)
+        hidden_channels = 256
         self.rec_block = nn.Sequential(
             nn.AvgPool2d(kernel_size=kernel_size, stride=kernel_size),
             nn.Conv2d(deep_channels, hidden_channels, kernel_size=1, bias=False),
@@ -44,7 +43,9 @@ class LocalRectification(nn.Module):
             ),
         )
 
-        self.gamma = 0.0 # LayerScale(shape=1, init_value=0.0)
+        self.multiply = StreamingMerge("multiply")
+        self.add = StreamingMerge("add")
+        self.gamma = LayerScale(shape=1, init_value=1.0)
 
     def forward(self, feature_shallow: Tensor, feature_deep: Tensor) -> Tensor:
         """
@@ -60,8 +61,9 @@ class LocalRectification(nn.Module):
         """
 
         weights = self.rec_block(feature_deep)
-        weighted_features = feature_shallow * weights
-        return feature_shallow + 1.0 * weighted_features
+        weighted_features = self.multiply(feature_shallow, weights)
+        scaled_features = self.gamma(weighted_features)
+        return self.add(feature_shallow, scaled_features)
 
 
 class SSHRDecoder(nn.Module):
@@ -170,7 +172,7 @@ class SSHR(nn.Module):
             encoder_channels=channels,
             encoder_strides=self.feature_strides,
             n_classes=1,
-            kernel_size=16,
+            kernel_size=8,
         )
 
         self.segmentation_head = FuseHead(apply_sigmoid=False)

@@ -32,6 +32,8 @@ from lightstream.core.scnn.streaminglayernorm import (
     StreamingChannelLayerNorm,
 )
 from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.scnn.statisticsprobe import StatisticsProbe
+from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -50,7 +52,17 @@ BACKWARD_STREAMING_MODULE_TYPES = (
 
 def _is_spatial_preserving_pointwise_module(module):
     """Return True for pointwise channel modules that preserve spatial support."""
-    return isinstance(module, (ChannelLayerNorm, StreamingChannelLayerNorm, LayerScale, StreamingLayerScale))
+    return isinstance(
+        module,
+        (
+            ChannelLayerNorm,
+            StreamingChannelLayerNorm,
+            LayerScale,
+            StreamingLayerScale,
+            StatisticsProbe,
+            StreamingMerge,
+        ),
+    )
 
 
 def _is_backward_streaming_module(module):
@@ -2073,6 +2085,7 @@ class StreamingCNN(torch.nn.Module):
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
+        is_merge = isinstance(module, StreamingMerge)
         if is_pointwise_module:
             stride = torch.tensor([1, 1, 1])
             kernel_size = torch.tensor([1, 1, 1])
@@ -2122,7 +2135,11 @@ class StreamingCNN(torch.nn.Module):
             # constant setup tensors can make the actual output all zeros, so
             # derive validity from the input.
 
-            lost = self._non_max_border_amount(inpt[0] if is_pointwise_module else output)
+            # A merge's valid support is the intersection encoded by its actual
+            # numerical result.  Other pointwise boundaries remain value
+            # independent and inherit support from their sole input.
+            validity_source = output if is_merge or not is_pointwise_module else inpt[0]
+            lost = self._non_max_border_amount(validity_source)
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
@@ -2151,6 +2168,31 @@ class StreamingCNN(torch.nn.Module):
             self._module_stats[module] = module_stats
         else:
             module_stats = self._module_stats[module]
+
+            if is_merge:
+                if inpt[0].shape[-2:] != inpt[1].shape[-2:]:
+                    raise ValueError(
+                        "StreamingMerge inputs must have compatible spatial shapes; "
+                        f"got {tuple(inpt[0].shape[-2:])} and {tuple(inpt[1].shape[-2:])}"
+                    )
+                input_stats = [self._prev_stats(value) for value in inpt]
+                coordinates = []
+                for stats in input_stats:
+                    if stats is None:
+                        coordinates.append(((1, 1, 1), Lost(0, 0, 0, 0)))
+                    else:
+                        effective_stride = stats["output_stride"] * torch.as_tensor(stats["stride"])
+                        coordinates.append(
+                            (
+                                tuple(int(value) for value in effective_stride),
+                                stats["lost"],
+                            )
+                        )
+                if coordinates[0] != coordinates[1]:
+                    raise ValueError(
+                        "StreamingMerge inputs must have compatible spatial coordinates; "
+                        f"got {coordinates[0]} and {coordinates[1]}"
+                    )
 
             p_stats = self._prev_stats(output)
             if p_stats:
