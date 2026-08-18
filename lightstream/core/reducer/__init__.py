@@ -6,6 +6,7 @@ from .mean import MeanReducer, StreamingMeanReducer
 from .ngwp import NGWPReducer, StreamingNGWPReducer
 from .reducer_base import BaseReducer
 from .size_focal import SizeFocalReducer, StreamingSizeFocalReducer
+from .sigmoid_attention import SigmoidAttentionPoolingReducer, StreamingSigmoidAttentionPoolingReducer
 from .sum import StreamingSumReducer, SumReducer
 
 __all__ = [
@@ -26,4 +27,6 @@ __all__ = [
     "StreamingNGWPReducer",
     "SizeFocalReducer",
     "StreamingSizeFocalReducer",
+    "SigmoidAttentionPoolingReducer",
+    "StreamingSigmoidAttentionPoolingReducer",
 ]
