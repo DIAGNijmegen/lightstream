@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
 
 
 class StreamingTestNet(StreamingModule):

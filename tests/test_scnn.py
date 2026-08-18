@@ -6,7 +6,7 @@ import pytest
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.core.scnn.utils import Lost
+from lightstream.core.engine.geometry import Lost
 from lightstream.models.testnet.segment import StreamingTestNet
 
 from lightstream.core.reducer import (
