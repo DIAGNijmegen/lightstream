@@ -39,6 +39,7 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
 - `NGWPReducer`: `inputs == (scores, activation_masks)`, with both tensors aligned as `[N, C, H, W]`. It returns `sum(scores * activation_masks) / (eps + sum(activation_masks))` per batch/channel.
 - `SizeFocalReducer`: `inputs == (m,)`, where `m` is an activation/probability tensor `[N, C, H, W]`. It returns `(1 - mean_m)^p * log(lambda_ + mean_m)` per batch/channel.
+- `SigmoidAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor. It preserves every channel and returns `[N, C, 1, 1]`; attention is the spatial `softmax(sigmoid(logits) / tau)` per class.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
 
 ## Package structure
@@ -313,3 +314,16 @@ Re-export `MyReducer` and `StreamingMyReducer` via `lightstream.core.reducer.__i
 - `normalize_spatial_mask` supports 2D/3D/4D masks only.
 - Streaming count tracking is shared across channels (`[N, 1, 1, 1]`), so per-channel normalization behavior is not modeled.
 - The deprecated compatibility path `lightstream.modules.reducer` remains available but should not be used for new code.
+
+## Sigmoid attention pooling
+
+`SigmoidAttentionPoolingReducer` accepts exactly one class-logit tensor in NCHW
+layout. For every batch item and class independently it computes
+`softmax(sigmoid(logits) / tau)` across valid spatial positions and uses those
+weights to sum the original, raw logits. No class channels are combined. The
+result is always `[N, C, 1, 1]`. `tau` may be fixed or learned through a positive
+softplus parameterization. With `stopgrad_attention=True`, gradients through the
+sigmoid scores are stopped while the value path and a learned temperature remain
+differentiable. Its `StreamingSigmoidAttentionPoolingReducer` counterpart is an
+execution implementation; model definitions should instantiate the offline class
+and let `to_streaming()` perform conversion.
