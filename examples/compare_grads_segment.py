@@ -260,7 +260,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=2560)
+    parser.add_argument("--tile-size", type=int, default=1920)
     parser.add_argument("--input-size", type=int, default=4800)
     parser.add_argument(
         "--no-input-grad",

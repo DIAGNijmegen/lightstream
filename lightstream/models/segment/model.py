@@ -9,7 +9,8 @@ import torch.nn as nn
 from lightstream.models.segment.resnet import make_resnet_backbone
 from lightstream.core.reducer import (
     NGWPReducer,
-    SizeFocalReducer
+    SizeFocalReducer,
+    SigmoidAttentionPoolingReducer
 )
 from torchinfo import summary
 
@@ -31,16 +32,10 @@ class WSS(nn.Module):
             encoder, weights=weights, include_layer4=not remove_last_block
         )
 
-        self.red1 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red2 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red3 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red4 = NGWPReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-
-        self.red5 = SizeFocalReducer(mask_resize=True)
-        self.red6 = SizeFocalReducer(mask_resize=True)
-        self.red7 = SizeFocalReducer(mask_resize=True)
-        self.red8 = SizeFocalReducer(mask_resize=True)
-
+        self.red1 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
+        self.red2 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
+        self.red3 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
+        self.red4 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
 
         self.sigmoid = nn.Sigmoid()
         self.decoder1 = nn.Sequential(
@@ -66,22 +61,13 @@ class WSS(nn.Module):
         m2 = self.decoder2(x2)
         m3 = self.decoder3(x3)
 
-        s1 = self.sigmoid(m1)
-        s2 = self.sigmoid(m2)
-        s3 = self.sigmoid(m3)
-
         m = 0.3 * m1 + 0.4 * m2 + 0.3 * m3
-        s = self.sigmoid(m)
 
         return (
-            self.red1(m1, s1, mask=mask),
-            self.red2(m2, s2, mask=mask),
-            self.red3(m3, s3, mask=mask),
-            self.red4(m, s, mask=mask),
-            self.red5(s1, mask=mask),
-            self.red6(s2, mask=mask),
-            self.red7(s3, mask=mask),
-            self.red8(s, mask=mask),
+            self.red1(m1, mask=mask),
+            self.red2(m2, mask=mask),
+            self.red3(m3, mask=mask),
+            self.red4(m, mask=mask),
         )
 
 
