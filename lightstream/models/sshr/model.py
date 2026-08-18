@@ -13,6 +13,10 @@ from lightstream.models.segment.resnet import make_resnet_backbone
 from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.scnn.streaminglayerscale import LayerScale
 
+class Logit(nn.Module):
+    def forward(self, x):
+        return x.logit(eps=1e-6)
+
 
 class LocalRectification(nn.Module):
     """
@@ -160,6 +164,7 @@ class SSHR(nn.Module):
         self.register_buffer("fuse_weights", torch.tensor(fuse_weights_list, dtype=torch.float32))
         self.loss_weights = tuple(loss_weights_list)
         self.sigmoid = torch.nn.Sigmoid()
+        self.logit = Logit()
 
         self.encoder, self.channels = make_resnet_backbone( encoder, weights=weights, include_layer4=True)
 
@@ -209,7 +214,7 @@ class SSHR(nn.Module):
         probs_up = [self.upsample_blocks[i](p) for i, p in enumerate(probs)]
 
         p_fused = self.segmentation_head(*probs_up, fuse_weights=self.fuse_weights)
-        logit_fused = p_fused.logit(eps=1e-6)
+        logit_fused = self.logit(p_fused)
 
         reduced_outputs += (self.reducers[-1](logit_fused, p_fused, mask=mask),)
 
