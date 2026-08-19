@@ -115,6 +115,98 @@ def test_streaming_forward_and_backward_replay_parity(stopgrad, learnable):
         assert torch.allclose(streaming.raw_tau.grad, expected_tau_grad, atol=1e-9)
 
 
+@pytest.mark.parametrize("stopgrad", [False, True])
+@pytest.mark.parametrize("learnable", [False, True])
+@pytest.mark.parametrize("use_mask", [False, True])
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_backward_replay_input_gradient_matches_direct_offline_autograd(
+    stopgrad, learnable, use_mask, reverse_order
+):
+    """Exercise overlap ownership and replay order at float64 precision."""
+    torch.manual_seed(319)
+    shape = (2, 3, 5, 7)
+    source = torch.randn(*shape, dtype=torch.float64)
+    upstream = torch.randn(2, 3, 1, 1, dtype=torch.float64)
+    spatial_mask = torch.tensor(
+        [
+            [1, 0, 1, 1, 1, 0, 1],
+            [1, 1, 1, 0, 1, 1, 1],
+            [0, 1, 1, 1, 0, 1, 1],
+            [1, 1, 0, 1, 1, 1, 0],
+            [1, 0, 1, 1, 0, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    mask = spatial_mask if use_mask else torch.ones(5, 7, dtype=torch.bool)
+
+    # Deliberately overlapping tiles; reversing them changes which tile owns
+    # every overlap while preserving the global set of valid pixels.
+    boxes = [
+        (0, 3, 0, 4),
+        (0, 3, 3, 7),
+        (2, 5, 0, 4),
+        (2, 5, 3, 7),
+    ]
+    if reverse_order:
+        boxes.reverse()
+
+    streaming = StreamingSigmoidAttentionPoolingReducer(
+        0.73,
+        learnable_temperature=learnable,
+        stopgrad_attention=stopgrad,
+        accumulator_dtype=torch.float64,
+    )
+    streaming.start_stream(5, 7, 2, 3, source.device, source.dtype)
+    sides = SimpleNamespace(top=False, left=False, right=False, bottom=False)
+    for y0, y1, x0, x1 in boxes:
+        tile = source[..., y0:y1, x0:x1]
+        streaming.accumulate_stream_tile(
+            tile,
+            y0,
+            x0,
+            sides,
+            (y0, y1, x0, x1),
+            user_mask=mask[y0:y1, x0:x1],
+        )
+    streaming.finish_stream()
+
+    direct_x = source.clone().requires_grad_()
+    direct_scores = torch.sigmoid(direct_x)
+    if stopgrad:
+        direct_scores = direct_scores.detach()
+    direct_q = direct_scores / streaming.current_tau
+    direct_q = direct_q.masked_fill(~mask, -torch.inf)
+    direct_weights = torch.softmax(direct_q.flatten(2), dim=-1).view_as(direct_x)
+    direct_output = (direct_weights * direct_x).sum((-2, -1), keepdim=True)
+    direct_output.backward(upstream)
+    expected_input_grad = direct_x.grad.detach().clone()
+    expected_tau_grad = (
+        streaming.raw_tau.grad.detach().clone() if learnable else None
+    )
+    if learnable:
+        streaming.raw_tau.grad = None
+
+    replay_input_grad = torch.zeros_like(source)
+    seen = torch.zeros(5, 7, dtype=torch.bool)
+    context = streaming.extra_state_for_backward()
+    for y0, y1, x0, x1 in boxes:
+        new = ~seen[y0:y1, x0:x1]
+        valid = new & mask[y0:y1, x0:x1]
+        seen[y0:y1, x0:x1] = True
+        replay_tile = source[..., y0:y1, x0:x1].clone().requires_grad_()
+        replay = streaming.reduce_tile_for_backward(replay_tile, valid, context)
+        replay.backward(upstream)
+        replay_input_grad[..., y0:y1, x0:x1] += replay_tile.grad
+
+    assert torch.allclose(
+        replay_input_grad, expected_input_grad, rtol=2e-13, atol=2e-13
+    )
+    if learnable:
+        assert torch.allclose(
+            streaming.raw_tau.grad, expected_tau_grad, rtol=2e-13, atol=2e-13
+        )
+
+
 def test_conversion_and_invalid_configuration():
     reducer = SigmoidAttentionPoolingReducer(
         0.4, True, True, torch.float64, True, "bilinear"
