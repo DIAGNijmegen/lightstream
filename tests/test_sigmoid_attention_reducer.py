@@ -45,6 +45,16 @@ def _state_matches(actual, expected, *, atol, rtol):
     return bool(torch.all(error <= atol + rtol * expected.abs()))
 
 
+def _max_absolute_error(actual, expected):
+    return (actual - expected).abs().max().item()
+
+
+def _precision_limit(reference):
+    """A small, scale-aware envelope around float64 machine precision."""
+    scale = max(1.0, reference.detach().abs().max().item())
+    return 8 * torch.finfo(reference.dtype).eps * scale
+
+
 @pytest.mark.parametrize("stopgrad", [False, True])
 @pytest.mark.parametrize("learnable", [False, True])
 def test_formula_shape_mask_and_gradients(stopgrad, learnable):
@@ -190,6 +200,168 @@ def test_streaming_state_matches_full_frame_reference_after_every_tile(reverse_o
     assert all(value is None for value in first_divergence.values()), "; ".join(
         diagnostics
     )
+
+
+def test_fixed_input_parity_across_single_nonoverlapping_and_overlapping_tiles():
+    """Locate the first tiling regime that leaves float64 round-off parity."""
+    accumulator_dtype = torch.float64
+    logits = -torch.tensor(
+        [
+            [
+                [
+                    [8, 1, 4, 9, 2, 7],
+                    [3, 6, 2, 5, 8, 1],
+                    [9, 4, 7, 3, 6, 2],
+                    [2, 8, 1, 6, 4, 9],
+                ],
+                [
+                    [2, 7, 5, 1, 8, 4],
+                    [6, 3, 9, 2, 5, 7],
+                    [1, 8, 4, 6, 2, 9],
+                    [7, 2, 6, 4, 9, 3],
+                ],
+                [
+                    [5, 9, 2, 7, 3, 6],
+                    [8, 1, 4, 9, 6, 2],
+                    [3, 7, 5, 1, 8, 4],
+                    [9, 6, 3, 8, 2, 5],
+                ],
+            ]
+        ],
+        dtype=torch.float64,
+    )
+    mask = torch.tensor(
+        [
+            [1, 1, 0, 1, 1, 0],
+            [1, 0, 1, 1, 0, 1],
+            [0, 1, 1, 0, 1, 1],
+            [1, 1, 0, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    upstream = torch.tensor([[[[0.75]], [[-1.25]], [[2.0]]]], dtype=torch.float64)
+    configurations = {
+        "single_complete_tile": [(0, 4, 0, 6)],
+        "multiple_nonoverlapping_tiles": [
+            (0, 2, 0, 3),
+            (0, 2, 3, 6),
+            (2, 4, 0, 3),
+            (2, 4, 3, 6),
+        ],
+        "multiple_overlapping_tiles": [
+            (0, 3, 0, 4),
+            (0, 3, 2, 6),
+            (1, 4, 0, 4),
+            (1, 4, 2, 6),
+        ],
+    }
+
+    # Construct the dense baseline once.  Every tiled run below copies this
+    # reducer, so weights (raw_tau), effective temperature, mask, logits,
+    # accumulator dtype, and upstream gradient cannot drift between cases.
+    dense_reducer = SigmoidAttentionPoolingReducer(
+        tau_init=0.43, accumulator_dtype=accumulator_dtype
+    )
+    dense_logits = logits.clone().requires_grad_()
+    dense_output = dense_reducer(dense_logits, mask=mask)
+    dense_output.backward(upstream)
+    dense_gradient = dense_logits.grad.detach().clone()
+    state_reference = _sigmoid_attention_state_reference(
+        logits, dense_reducer.current_tau, mask, accumulator_dtype
+    )
+
+    results = []
+    sides = SimpleNamespace(top=False, left=False, right=False, bottom=False)
+    for name, boxes in configurations.items():
+        streaming = dense_reducer.to_streaming()
+        streaming.start_stream(4, 6, 1, 3, logits.device, logits.dtype)
+        assembled_logits = torch.empty_like(logits)
+        assigned = torch.zeros_like(mask)
+        replay_tiles = []
+
+        for box in boxes:
+            y0, y1, x0, x1 = box
+            tile = logits[..., y0:y1, x0:x1]
+            valid_mask = ~assigned[y0:y1, x0:x1]
+            valid_mask &= mask[y0:y1, x0:x1]
+            # Record the exact overlap-safe ownership and destination used by
+            # backward replay, independently of reducer internals.
+            replay_tiles.append((box, valid_mask.clone()))
+            assembled_logits[..., y0:y1, x0:x1] = tile
+            assigned[y0:y1, x0:x1] = True
+            streaming.accumulate_stream_tile(
+                tile, y0, x0, sides, box, user_mask=mask[y0:y1, x0:x1]
+            )
+
+        output = streaming.finish_stream()
+        replay_gradient = torch.zeros_like(logits)
+        context = streaming.extra_state_for_backward()
+        for (y0, y1, x0, x1), valid_mask in replay_tiles:
+            replay_logits = logits[..., y0:y1, x0:x1].clone().requires_grad_()
+            replay_output = streaming.reduce_tile_for_backward(
+                replay_logits, valid_mask, context
+            )
+            replay_output.backward(upstream)
+            replay_gradient[..., y0:y1, x0:x1] += replay_logits.grad
+
+        actuals = {
+            "reducer_input_logits": assembled_logits,
+            "running_m": streaming.running_m,
+            "running_zhat": streaming.running_zhat,
+            "running_shat": streaming.running_shat,
+            "final_output": output,
+            "reducer_input_gradient": replay_gradient,
+        }
+        expected = {
+            "reducer_input_logits": logits,
+            "running_m": state_reference[0],
+            "running_zhat": state_reference[1],
+            "running_shat": state_reference[2],
+            "final_output": dense_output.detach(),
+            "reducer_input_gradient": dense_gradient,
+        }
+        errors = {
+            key: _max_absolute_error(value, expected[key])
+            for key, value in actuals.items()
+        }
+        outside_precision = [
+            key
+            for key, error in errors.items()
+            if error > _precision_limit(expected[key])
+        ]
+        results.append((name, errors, outside_precision))
+
+        assert (
+            assigned.all()
+        ), f"{name}: destination assignments leave output pixels uncovered"
+        assert torch.equal(
+            streaming._stream_seen_mask, assigned
+        ), f"{name}: overlap-safe valid_mask ownership disagrees with destination assignments"
+
+    first = next((result for result in results if result[2]), None)
+    report = (
+        "no configuration exceeded machine precision"
+        if first is None
+        else (
+            f"first configuration beyond machine precision: {first[0]}; "
+            f"metrics={first[2]}; errors={first[1]}"
+        )
+    )
+    tolerances = {
+        "reducer_input_logits": 0.0,
+        "running_m": 0.0,
+        "running_zhat": 2e-15,
+        "running_shat": 2e-14,
+        "final_output": 2e-15,
+        "reducer_input_gradient": 2e-14,
+    }
+    failures = [
+        f"{name}.{metric}={error:.17g} (limit={tolerances[metric]:.17g})"
+        for name, errors, _ in results
+        for metric, error in errors.items()
+        if error > tolerances[metric]
+    ]
+    assert not failures, f"{report}; " + "; ".join(failures)
 
 
 @pytest.mark.parametrize("stopgrad", [False, True])

@@ -110,6 +110,7 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
             mask_resize_mode=self.mask_resize_mode,
             tau_min=self.tau_min,
         )
+        r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
         r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
         return r
 
@@ -230,5 +231,6 @@ class StreamingSigmoidAttentionPoolingReducer(
             mask_resize_mode=self.mask_resize_mode,
             tau_min=self.tau_min,
         )
+        r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
         r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
         return r
