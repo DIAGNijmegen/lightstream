@@ -111,7 +111,8 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
             tau_min=self.tau_min,
         )
         r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
-        r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
+        with torch.no_grad():
+            r.raw_tau.copy_(self.raw_tau)
         return r
 
 
@@ -232,5 +233,6 @@ class StreamingSigmoidAttentionPoolingReducer(
             tau_min=self.tau_min,
         )
         r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
-        r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
+        with torch.no_grad():
+            r.raw_tau.copy_(self.raw_tau)
         return r
