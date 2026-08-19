@@ -21,6 +21,30 @@ def _shifted_softmax_reference(x, tau, mask=None):
     return (weights * x).sum(dim=(-2, -1), keepdim=True, dtype=x.dtype)
 
 
+def _sigmoid_attention_state_reference(x, tau, accepted, accumulator_dtype):
+    """Recompute the streaming state from the full frame, not from tiles."""
+    values = x.to(accumulator_dtype)
+    q = torch.sigmoid(values) / tau.to(device=x.device, dtype=accumulator_dtype)
+    valid = accepted.to(device=x.device)[None, None]
+    q = torch.where(valid, q, torch.full_like(q, torch.finfo(q.dtype).min))
+    m = q.amax(dim=(-2, -1), keepdim=True)
+    shifted = torch.where(valid, torch.exp(q - m), torch.zeros_like(q))
+    zhat = shifted.sum(dim=(-2, -1), keepdim=True, dtype=accumulator_dtype)
+    shat = (shifted * values).sum(dim=(-2, -1), keepdim=True, dtype=accumulator_dtype)
+    return m, zhat, shat
+
+
+def _state_error(actual, expected):
+    absolute = (actual - expected).abs()
+    relative = absolute / expected.abs().clamp_min(torch.finfo(expected.dtype).tiny)
+    return absolute.max().item(), relative.max().item()
+
+
+def _state_matches(actual, expected, *, atol, rtol):
+    error = (actual - expected).abs()
+    return bool(torch.all(error <= atol + rtol * expected.abs()))
+
+
 @pytest.mark.parametrize("stopgrad", [False, True])
 @pytest.mark.parametrize("learnable", [False, True])
 def test_formula_shape_mask_and_gradients(stopgrad, learnable):
@@ -66,6 +90,106 @@ def test_offline_matches_explicit_shifted_softmax_reference():
     # The fused softmax and its explicit shifted decomposition are numerically
     # equivalent, but are not required to choose bitwise-identical reductions.
     assert torch.allclose(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+@pytest.mark.parametrize("reverse_order", [False, True], ids=["forward", "reversed"])
+def test_streaming_state_matches_full_frame_reference_after_every_tile(reverse_order):
+    """Diagnose the first merge that departs from the defining full-frame formula."""
+    accumulator_dtype = torch.float64
+    source = -torch.tensor(
+        [
+            [
+                [
+                    [8.0, 1.0, 4.0, 9.0, 2.0, 7.0],
+                    [3.0, 6.0, 2.0, 5.0, 8.0, 1.0],
+                    [9.0, 4.0, 7.0, 3.0, 6.0, 2.0],
+                    [2.0, 8.0, 1.0, 6.0, 4.0, 9.0],
+                ],
+                [
+                    [2.0, 7.0, 5.0, 1.0, 8.0, 4.0],
+                    [6.0, 3.0, 9.0, 2.0, 5.0, 7.0],
+                    [1.0, 8.0, 4.0, 6.0, 2.0, 9.0],
+                    [7.0, 2.0, 6.0, 4.0, 9.0, 3.0],
+                ],
+                [
+                    [5.0, 9.0, 2.0, 7.0, 3.0, 6.0],
+                    [8.0, 1.0, 4.0, 9.0, 6.0, 2.0],
+                    [3.0, 7.0, 5.0, 1.0, 8.0, 4.0],
+                    [9.0, 6.0, 3.0, 8.0, 2.0, 5.0],
+                ],
+            ]
+        ],
+        dtype=torch.float64,
+    )
+    spatial_mask = torch.tensor(
+        [
+            [1, 1, 0, 1, 1, 0],
+            [1, 0, 1, 1, 0, 1],
+            [0, 1, 1, 0, 1, 1],
+            [1, 1, 0, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    boxes = [(0, 3, 0, 4), (0, 3, 2, 6), (1, 4, 0, 4), (1, 4, 2, 6)]
+    if reverse_order:
+        boxes.reverse()
+
+    reducer = StreamingSigmoidAttentionPoolingReducer(
+        tau_init=0.43,
+        learnable_temperature=False,
+        accumulator_dtype=accumulator_dtype,
+    )
+    reducer.start_stream(4, 6, 1, 3, source.device, source.dtype)
+    sides = SimpleNamespace(top=False, left=False, right=False, bottom=False)
+    accepted = torch.zeros_like(spatial_mask)
+    owned = torch.zeros_like(spatial_mask)
+    first_divergence = {
+        name: None for name in ("running_m", "running_zhat", "running_shat")
+    }
+    tolerances = {
+        "running_m": (0.0, 0.0),
+        "running_zhat": (2e-15, 2e-15),
+        "running_shat": (2e-14, 2e-15),
+    }
+
+    for tile_index, (y0, y1, x0, x1) in enumerate(boxes):
+        newly_owned = ~owned[y0:y1, x0:x1]
+        accepted[y0:y1, x0:x1] |= newly_owned & spatial_mask[y0:y1, x0:x1]
+        owned[y0:y1, x0:x1] = True
+        reducer.accumulate_stream_tile(
+            source[..., y0:y1, x0:x1],
+            y0,
+            x0,
+            sides,
+            (y0, y1, x0, x1),
+            user_mask=spatial_mask[y0:y1, x0:x1],
+        )
+        reference = _sigmoid_attention_state_reference(
+            source, reducer.current_tau, accepted, accumulator_dtype
+        )
+        for name, expected in zip(first_divergence, reference):
+            actual = getattr(reducer, name)
+            atol, rtol = tolerances[name]
+            if first_divergence[name] is None and not _state_matches(
+                actual, expected, atol=atol, rtol=rtol
+            ):
+                first_divergence[name] = (tile_index, *_state_error(actual, expected))
+
+    final_reference = _sigmoid_attention_state_reference(
+        source, reducer.current_tau, spatial_mask, accumulator_dtype
+    )
+    diagnostics = []
+    for name, expected in zip(first_divergence, final_reference):
+        actual = getattr(reducer, name)
+        absolute_error, relative_error = _state_error(actual, expected)
+        diagnostics.append(
+            f"{name}: first_divergence={first_divergence[name]}, "
+            f"final_absolute_error={absolute_error:.17g}, "
+            f"final_relative_error={relative_error:.17g}"
+        )
+    assert all(value is None for value in first_divergence.values()), "; ".join(
+        diagnostics
+    )
 
 
 @pytest.mark.parametrize("stopgrad", [False, True])
@@ -182,9 +306,7 @@ def test_backward_replay_input_gradient_matches_direct_offline_autograd(
     direct_output = (direct_weights * direct_x).sum((-2, -1), keepdim=True)
     direct_output.backward(upstream)
     expected_input_grad = direct_x.grad.detach().clone()
-    expected_tau_grad = (
-        streaming.raw_tau.grad.detach().clone() if learnable else None
-    )
+    expected_tau_grad = streaming.raw_tau.grad.detach().clone() if learnable else None
     if learnable:
         streaming.raw_tau.grad = None
 
