@@ -33,10 +33,10 @@ class WSS(nn.Module):
             encoder, weights=weights, include_layer4=not remove_last_block
         )
 
-        self.red1 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red2 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red3 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
-        self.red4 = AttentionGeMReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True)
+        self.red1 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red2 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red3 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red4 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
 
         self.sigmoid = nn.Sigmoid()
         self.decoder1 = nn.Sequential(
@@ -65,10 +65,10 @@ class WSS(nn.Module):
         m = 0.3 * m1 + 0.4 * m2 + 0.3 * m3
 
         return (
-            self.red1(self.sigmoid(m1), m1, mask=mask),
-            self.red2(self.sigmoid(m2), m2, mask=mask),
-            self.red3(self.sigmoid(m3), m3, mask=mask),
-            self.red4(self.sigmoid(m), m, mask=mask),
+            self.red1(m1, mask=mask),
+            self.red2(m2, mask=mask),
+            self.red3(m3, mask=mask),
+            self.red4(m, mask=mask),
         )
 
 

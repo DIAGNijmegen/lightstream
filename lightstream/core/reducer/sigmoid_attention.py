@@ -102,10 +102,7 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
 
     def to_streaming(self):
         r = StreamingSigmoidAttentionPoolingReducer(
-            # ``raw_tau`` below is the source of truth.  Do not round-trip the
-            # effective temperature through a Python float (and the
-            # constructor's default float32 tensor) before copying it.
-            tau_init=self.tau_min + 1.0,
+            tau_init=float(self.current_tau.detach()),
             learnable_temperature=self.learnable_temperature,
             stopgrad_attention=self.stopgrad_attention,
             accumulator_dtype=self.accumulator_dtype,
@@ -113,9 +110,7 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
             mask_resize_mode=self.mask_resize_mode,
             tau_min=self.tau_min,
         )
-        r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
-        with torch.no_grad():
-            r.raw_tau.copy_(self.raw_tau)
+        r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
         return r
 
 
@@ -227,9 +222,7 @@ class StreamingSigmoidAttentionPoolingReducer(
 
     def to_reducer(self):
         r = SigmoidAttentionPoolingReducer(
-            # The initialized value is immediately replaced by the exact raw
-            # parameter/buffer, so avoid deriving it from ``current_tau``.
-            tau_init=self.tau_min + 1.0,
+            tau_init=float(self.current_tau.detach()),
             learnable_temperature=self.learnable_temperature,
             stopgrad_attention=self.stopgrad_attention,
             accumulator_dtype=self.accumulator_dtype,
@@ -237,7 +230,5 @@ class StreamingSigmoidAttentionPoolingReducer(
             mask_resize_mode=self.mask_resize_mode,
             tau_min=self.tau_min,
         )
-        r.to(device=self.raw_tau.device, dtype=self.raw_tau.dtype)
-        with torch.no_grad():
-            r.raw_tau.copy_(self.raw_tau)
+        r.raw_tau.data.copy_(self.raw_tau.data.to(r.raw_tau))
         return r
