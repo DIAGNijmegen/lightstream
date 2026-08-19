@@ -206,17 +206,25 @@ class StreamingSigmoidAttentionPoolingReducer(
             scores = scores.detach()
         q = scores / self.current_tau.to(device=x.device, dtype=dtype)
         valid = valid_mask[None, None].to(x.device)
-        un = torch.where(
+        weights_unnorm = torch.where(
             valid, torch.exp(q - global_context["m"].to(q)), torch.zeros_like(q)
         )
-        w = un / global_context["zhat"].to(q)
+        zhat = global_context["zhat"].to(q)
         mean = global_context["mean"].to(q).detach()
-        replay = (
-            w.detach() * values + w * (values.detach() - mean)
-            if self.stopgrad_attention
-            else w * (values - mean)
+
+        # Represents the direct value derivative: d(sum_i w_i * value_i)/d(value_i)
+        # with the attention weights held constant.
+        direct_value_surrogate = streaming_reduce_tile(
+            weights_unnorm.detach() * values, valid_mask, zhat
         )
-        return streaming_reduce_tile(replay, valid_mask, None).to(x.dtype)
+
+        # Represents the normalized-attention derivative:
+        # d(mean)/d(q_i) = w_i * (value_i - mean).  Detaching the centered
+        # values keeps this path limited to sigmoid-score/temperature gradients.
+        centered_attention_surrogate = streaming_reduce_tile(
+            weights_unnorm * (values.detach() - mean), valid_mask, zhat
+        )
+        return (direct_value_surrogate + centered_attention_surrogate).to(x.dtype)
 
     def to_reducer(self):
         r = SigmoidAttentionPoolingReducer(
