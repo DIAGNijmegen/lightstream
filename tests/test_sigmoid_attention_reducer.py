@@ -226,3 +226,53 @@ def test_conversion_and_invalid_configuration():
         reducer(torch.randn(2, 3, 4))
     with pytest.raises(ValueError):
         reducer(torch.randn(1, 1, 2, 2), torch.randn(1, 1, 2, 2))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("learnable", [False, True])
+def test_temperature_conversion_preserves_exact_raw_and_effective_values(
+    dtype, learnable
+):
+    """Reproduce conversion followed by the final model dtype/device move."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    offline = SigmoidAttentionPoolingReducer(
+        tau_init=0.37,
+        learnable_temperature=learnable,
+        tau_min=1e-6,
+    ).to(device=device, dtype=dtype)
+
+    before = {
+        "raw_tau": offline.raw_tau.detach().clone(),
+        "current_tau": offline.current_tau.detach().clone(),
+    }
+    streaming = offline.to_streaming()
+    # StreamingWSS performs conversion while it is constructed and applies
+    # this final model-wide move afterwards.
+    streaming.to(device=device, dtype=dtype)
+    during = {
+        "raw_tau": streaming.raw_tau.detach().clone(),
+        "current_tau": streaming.current_tau.detach().clone(),
+    }
+    restored = streaming.to_reducer()
+    after = {
+        "raw_tau": restored.raw_tau.detach().clone(),
+        "current_tau": restored.current_tau.detach().clone(),
+    }
+
+    for name in ("raw_tau", "current_tau"):
+        reference = before[name]
+        for stage, actual in (("streaming", during[name]), ("restored", after[name])):
+            difference = torch.abs(actual - reference)
+            diagnostic = (
+                f"{name} at {stage}: dtype={actual.dtype}, device={actual.device}, "
+                f"scalar={actual.item()!r}, reference={reference.item()!r}, "
+                f"absolute_difference={difference.item()!r}, "
+                f"torch.equal={torch.equal(actual, reference)}"
+            )
+            assert actual.dtype == reference.dtype, diagnostic
+            assert actual.device == reference.device, diagnostic
+            assert difference.item() == 0.0, diagnostic
+            assert torch.equal(actual, reference), diagnostic
+
+    assert isinstance(streaming.raw_tau, torch.nn.Parameter) == learnable
+    assert isinstance(restored.raw_tau, torch.nn.Parameter) == learnable
