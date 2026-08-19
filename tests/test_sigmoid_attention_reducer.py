@@ -63,7 +63,9 @@ def test_offline_matches_explicit_shifted_softmax_reference():
         torch.zeros_like(expected),
     )
 
-    assert torch.allclose(actual, expected, rtol=0, atol=1e-16)
+    # The fused softmax and its explicit shifted decomposition are numerically
+    # equivalent, but are not required to choose bitwise-identical reductions.
+    assert torch.allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
 @pytest.mark.parametrize("stopgrad", [False, True])
