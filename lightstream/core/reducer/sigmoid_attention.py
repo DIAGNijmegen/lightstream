@@ -136,8 +136,15 @@ class StreamingSigmoidAttentionPoolingReducer(
         self.stopgrad_attention = bool(stopgrad_attention)
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
-        for n in ("running_m", "running_zhat", "running_shat"):
+        for n in (
+            "running_m",
+            "running_zhat",
+            "running_shat",
+            "running_scorehat",
+            "running_value_scorehat",
+        ):
             self.register_buffer(n, torch.zeros(0), persistent=False)
+        self._temperature_surrogate_emitted = False
 
     def init_reduction_state(
         self, *, batch_size, channels, device, dtype, accumulator_dtype
@@ -151,6 +158,8 @@ class StreamingSigmoidAttentionPoolingReducer(
         )
         self.running_zhat = torch.zeros(shape, device=device, dtype=accumulator_dtype)
         self.running_shat = torch.zeros_like(self.running_zhat)
+        self.running_scorehat = torch.zeros_like(self.running_zhat)
+        self.running_value_scorehat = torch.zeros_like(self.running_zhat)
 
     def accumulate_valid_tile(self, tile, valid_mask):
         x = self._parse_single_input_payload(tile)
@@ -172,11 +181,19 @@ class StreamingSigmoidAttentionPoolingReducer(
         e = torch.where(valid, torch.exp(q - mt), torch.zeros_like(q))
         z = e.sum((-2, -1), keepdim=True)
         s = (e * values).sum((-2, -1), keepdim=True)
+        score_sum = (e * scores).sum((-2, -1), keepdim=True)
+        value_score_sum = (e * values * scores).sum(
+            (-2, -1), keepdim=True
+        )
         mn = torch.maximum(self.running_m.to(dtype), mt)
         a = torch.exp(self.running_m.to(dtype) - mn)
         b = torch.exp(mt - mn)
         self.running_zhat = self.running_zhat.to(dtype) * a + z * b
         self.running_shat = self.running_shat.to(dtype) * a + s * b
+        self.running_scorehat = self.running_scorehat.to(dtype) * a + score_sum * b
+        self.running_value_scorehat = (
+            self.running_value_scorehat.to(dtype) * a + value_score_sum * b
+        )
         self.running_m = mn
 
     def finalize_from_state(self):
@@ -191,11 +208,22 @@ class StreamingSigmoidAttentionPoolingReducer(
 
     def extra_state_for_backward(self):
         z = self.running_zhat.clamp_min(torch.finfo(self.running_zhat.dtype).tiny)
+        mean_value = self.running_shat / z
+        mean_score = self.running_scorehat / z
+        mean_value_score = self.running_value_scorehat / z
+        tau = self.current_tau.to(device=z.device, dtype=z.dtype)
         return {
             "m": self.running_m.detach(),
             "zhat": z.detach(),
-            "mean": (self.running_shat / z).detach(),
+            "mean": mean_value.detach(),
+            "dy_dtau": (
+                -(mean_value_score - mean_value * mean_score) / tau.square()
+            ).detach(),
         }
+
+    def start_backward_replay(self):
+        super().start_backward_replay()
+        self._temperature_surrogate_emitted = False
 
     def reduce_tile_for_backward(self, trimmed_output, valid_mask, global_context):
         x = self._parse_single_input_payload(trimmed_output)
@@ -206,7 +234,10 @@ class StreamingSigmoidAttentionPoolingReducer(
         scores = torch.sigmoid(values)
         if self.stopgrad_attention:
             scores = scores.detach()
-        q = scores / self.current_tau.to(device=x.device, dtype=dtype)
+        # Temperature is represented once by the global-statistics surrogate
+        # below, rather than once for every replay tile.
+        tau = self.current_tau.to(device=x.device, dtype=dtype)
+        q = scores / tau.detach()
         valid = valid_mask[None, None].to(x.device)
         un = torch.where(
             valid, torch.exp(q - global_context["m"].to(q)), torch.zeros_like(q)
@@ -220,7 +251,17 @@ class StreamingSigmoidAttentionPoolingReducer(
             if self.stopgrad_attention
             else w * (values - mean)
         )
-        return streaming_reduce_tile(replay, valid_mask, None).to(x.dtype)
+        reduced = streaming_reduce_tile(replay, valid_mask, None)
+        if not self._temperature_surrogate_emitted:
+            # d(tau)/d(raw_tau) = sigmoid(raw_tau).  Keeping this expression in
+            # terms of tau lets autograd apply that chain rule while dy/dtau is
+            # supplied by the globally accumulated softmax moments.
+            surrogate = global_context["dy_dtau"].to(reduced) * (
+                tau - tau.detach()
+            )
+            reduced = reduced + surrogate
+            self._temperature_surrogate_emitted = True
+        return reduced.to(x.dtype)
 
     def to_reducer(self):
         r = SigmoidAttentionPoolingReducer(
