@@ -86,17 +86,17 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
             q = torch.where(valid, q, torch.full_like(q, torch.finfo(dtype).min))
         else:
             valid = None
-        m = q.amax(dim=(-2, -1), keepdim=True)
-        exp_shifted = torch.exp(q - m)
+        # Keep the offline expression aligned with the defining operation.  An
+        # explicit shifted softmax was tested, but did not improve end-to-end
+        # offline/streaming parity.
+        w = torch.softmax(q.flatten(2), dim=-1).view_as(q)
         if valid is not None:
-            exp_shifted = torch.where(valid, exp_shifted, torch.zeros_like(exp_shifted))
+            w = torch.where(valid, w, torch.zeros_like(w))
             any_valid = valid.flatten(2).any(-1, keepdim=True).unsqueeze(-1)
         else:
             any_valid = torch.ones(
                 (x.shape[0], 1, 1, 1), device=x.device, dtype=torch.bool
             )
-        z = exp_shifted.sum(dim=(-2, -1), keepdim=True, dtype=dtype)
-        w = exp_shifted / z.clamp_min(torch.finfo(dtype).tiny)
         y = (w * values).sum(dim=(-2, -1), keepdim=True, dtype=dtype)
         return torch.where(any_valid, y, torch.zeros_like(y)).to(x.dtype)
 
@@ -206,25 +206,19 @@ class StreamingSigmoidAttentionPoolingReducer(
             scores = scores.detach()
         q = scores / self.current_tau.to(device=x.device, dtype=dtype)
         valid = valid_mask[None, None].to(x.device)
-        weights_unnorm = torch.where(
+        un = torch.where(
             valid, torch.exp(q - global_context["m"].to(q)), torch.zeros_like(q)
         )
-        zhat = global_context["zhat"].to(q)
+        w = un / global_context["zhat"].to(q)
         mean = global_context["mean"].to(q).detach()
-
-        # Represents the direct value derivative: d(sum_i w_i * value_i)/d(value_i)
-        # with the attention weights held constant.
-        direct_value_surrogate = streaming_reduce_tile(
-            weights_unnorm.detach() * values, valid_mask, zhat
+        # Unnormalized replay was also tested and was gradient-equivalent, but
+        # did not improve end-to-end parity over this normalized formulation.
+        replay = (
+            w.detach() * values + w * (values.detach() - mean)
+            if self.stopgrad_attention
+            else w * (values - mean)
         )
-
-        # Represents the normalized-attention derivative:
-        # d(mean)/d(q_i) = w_i * (value_i - mean).  Detaching the centered
-        # values keeps this path limited to sigmoid-score/temperature gradients.
-        centered_attention_surrogate = streaming_reduce_tile(
-            weights_unnorm * (values.detach() - mean), valid_mask, zhat
-        )
-        return (direct_value_surrogate + centered_attention_surrogate).to(x.dtype)
+        return streaming_reduce_tile(replay, valid_mask, None).to(x.dtype)
 
     def to_reducer(self):
         r = SigmoidAttentionPoolingReducer(
