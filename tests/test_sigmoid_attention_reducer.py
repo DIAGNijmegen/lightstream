@@ -570,3 +570,62 @@ def test_temperature_conversion_preserves_exact_raw_and_effective_values(
 
     assert isinstance(streaming.raw_tau, torch.nn.Parameter) == learnable
     assert isinstance(restored.raw_tau, torch.nn.Parameter) == learnable
+
+
+@pytest.mark.parametrize(
+    ("input_dtype", "accumulator_dtype", "module_dtype"),
+    [
+        pytest.param(torch.float16, torch.float32, torch.float32, id="fp16-fp32"),
+        pytest.param(
+            torch.bfloat16, torch.float32, torch.float32, id="bf16-fp32"
+        ),
+        pytest.param(torch.float32, torch.float64, torch.float32, id="fp32-fp64"),
+        pytest.param(
+            torch.float32, torch.float64, torch.float64, id="fp64-module-state"
+        ),
+    ],
+)
+@pytest.mark.parametrize("learnable", [False, True], ids=["buffer", "parameter"])
+def test_conversion_keeps_module_input_and_accumulator_dtypes_independent(
+    input_dtype, accumulator_dtype, module_dtype, learnable
+):
+    if input_dtype == torch.bfloat16:
+        try:
+            torch.softmax(torch.zeros(2, dtype=input_dtype), dim=0)
+        except RuntimeError:
+            pytest.skip("bfloat16 softmax is not supported on this device")
+
+    offline = SigmoidAttentionPoolingReducer(
+        tau_init=0.37,
+        learnable_temperature=learnable,
+        accumulator_dtype=accumulator_dtype,
+    ).to(dtype=module_dtype)
+    source_raw_tau = offline.raw_tau.detach().clone()
+    source_tau = offline.current_tau.detach().clone()
+    x = torch.linspace(-2, 2, 24, dtype=input_dtype).reshape(1, 2, 3, 4)
+    assert offline(x).dtype == input_dtype
+
+    streaming = offline.to_streaming()
+    assert streaming.accumulator_dtype == accumulator_dtype
+    assert streaming.raw_tau.dtype == module_dtype
+    assert torch.equal(streaming.raw_tau, source_raw_tau)
+    assert torch.equal(streaming.current_tau, source_tau)
+    assert isinstance(streaming.raw_tau, torch.nn.Parameter) == learnable
+
+    streaming.start_stream(3, 4, 1, 2, x.device, x.dtype)
+    sides = SimpleNamespace(top=False, left=False, right=False, bottom=False)
+    streaming.accumulate_stream_tile(x, 0, 0, sides, (0, 3, 0, 4))
+    output = streaming.finish_stream()
+
+    assert streaming.running_m.dtype == accumulator_dtype
+    assert streaming.running_zhat.dtype == accumulator_dtype
+    assert streaming.running_shat.dtype == accumulator_dtype
+    assert output.dtype == input_dtype
+    assert streaming.raw_tau.dtype == module_dtype
+
+    restored = streaming.to_reducer()
+    assert restored.accumulator_dtype == accumulator_dtype
+    assert restored.raw_tau.dtype == module_dtype
+    assert torch.equal(restored.raw_tau, source_raw_tau)
+    assert torch.equal(restored.current_tau, source_tau)
+    assert isinstance(restored.raw_tau, torch.nn.Parameter) == learnable
