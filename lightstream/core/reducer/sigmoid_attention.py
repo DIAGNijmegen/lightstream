@@ -86,15 +86,18 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
             q = torch.where(valid, q, torch.full_like(q, torch.finfo(dtype).min))
         else:
             valid = None
-        w = torch.softmax(q.flatten(2), -1).view_as(q)
+        m = q.amax(dim=(-2, -1), keepdim=True)
+        exp_shifted = torch.exp(q - m)
         if valid is not None:
-            w = torch.where(valid, w, torch.zeros_like(w))
+            exp_shifted = torch.where(valid, exp_shifted, torch.zeros_like(exp_shifted))
             any_valid = valid.flatten(2).any(-1, keepdim=True).unsqueeze(-1)
         else:
             any_valid = torch.ones(
                 (x.shape[0], 1, 1, 1), device=x.device, dtype=torch.bool
             )
-        y = (w * values).sum((-2, -1), keepdim=True, dtype=dtype)
+        z = exp_shifted.sum(dim=(-2, -1), keepdim=True, dtype=dtype)
+        w = exp_shifted / z.clamp_min(torch.finfo(dtype).tiny)
+        y = (w * values).sum(dim=(-2, -1), keepdim=True, dtype=dtype)
         return torch.where(any_valid, y, torch.zeros_like(y)).to(x.dtype)
 
     def to_streaming(self):

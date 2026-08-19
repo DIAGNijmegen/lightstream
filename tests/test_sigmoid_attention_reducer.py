@@ -7,6 +7,20 @@ from lightstream.core.reducer import (
 )
 
 
+def _shifted_softmax_reference(x, tau, mask=None):
+    q = torch.sigmoid(x) / tau
+    valid = None if mask is None else mask.to(device=x.device, dtype=torch.bool)
+    if valid is not None:
+        q = q.masked_fill(~valid, torch.finfo(x.dtype).min)
+    m = q.amax(dim=(-2, -1), keepdim=True)
+    exp_shifted = torch.exp(q - m)
+    if valid is not None:
+        exp_shifted = torch.where(valid, exp_shifted, torch.zeros_like(exp_shifted))
+    z = exp_shifted.sum(dim=(-2, -1), keepdim=True, dtype=x.dtype)
+    weights = exp_shifted / z.clamp_min(torch.finfo(x.dtype).tiny)
+    return (weights * x).sum(dim=(-2, -1), keepdim=True, dtype=x.dtype)
+
+
 @pytest.mark.parametrize("stopgrad", [False, True])
 @pytest.mark.parametrize("learnable", [False, True])
 def test_formula_shape_mask_and_gradients(stopgrad, learnable):
@@ -34,6 +48,24 @@ def test_formula_shape_mask_and_gradients(stopgrad, learnable):
     assert (reducer.raw_tau.grad is not None) == learnable
 
 
+def test_offline_matches_explicit_shifted_softmax_reference():
+    torch.manual_seed(29)
+    x = torch.randn(2, 3, 7, 11, dtype=torch.float64)
+    mask = torch.rand(2, 1, 7, 11) > 0.25
+    mask[1] = False
+    reducer = SigmoidAttentionPoolingReducer(0.37, accumulator_dtype=torch.float64)
+
+    actual = reducer(x, mask=mask)
+    expected = _shifted_softmax_reference(x, reducer.current_tau, mask)
+    expected = torch.where(
+        mask.flatten(2).any(-1, keepdim=True).unsqueeze(-1),
+        expected,
+        torch.zeros_like(expected),
+    )
+
+    assert torch.allclose(actual, expected, rtol=0, atol=1e-16)
+
+
 @pytest.mark.parametrize("stopgrad", [False, True])
 @pytest.mark.parametrize("learnable", [False, True])
 def test_streaming_forward_and_backward_replay_parity(stopgrad, learnable):
@@ -55,7 +87,18 @@ def test_streaming_forward_and_backward_replay_parity(stopgrad, learnable):
             tile = x.detach()[..., y0:y1, x0:x1]
             streaming.accumulate_stream_tile(tile, y0, x0, sides, (y0, y1, x0, x1))
             tiles.append((y0, y1, x0, x1, tile))
-    assert torch.allclose(streaming.finish_stream(), offline(x.detach()), atol=1e-12)
+    streamed = streaming.finish_stream()
+    shifted_reference = offline(x.detach())
+    q = torch.sigmoid(x.detach()) / offline.current_tau
+    fused_reference = (torch.softmax(q.flatten(2), -1).view_as(q) * x.detach()).sum(
+        dim=(-2, -1), keepdim=True, dtype=torch.float64
+    )
+    shifted_error = (streamed - shifted_reference).abs().max().item()
+    fused_error = (streamed - fused_reference).abs().max().item()
+    assert (
+        shifted_error <= 2e-16
+    ), f"explicit shifted-softmax reference error: {shifted_error}"
+    assert fused_error <= 3e-16, f"fused torch.softmax reference error: {fused_error}"
     seen = torch.zeros(5, 7, dtype=torch.bool)
     replay_grad = torch.zeros_like(x)
     for y0, y1, x0, x1, tile in tiles:
