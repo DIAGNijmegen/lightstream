@@ -11,6 +11,7 @@ from lightstream.core.reducer import (
     NGWPReducer,
     SizeFocalReducer,
     SigmoidAttentionPoolingReducer,
+    LogitAttentionPoolingReducer,
     AttentionGeMReducer
 )
 from torchinfo import summary
@@ -33,10 +34,10 @@ class WSS(nn.Module):
             encoder, weights=weights, include_layer4=not remove_last_block
         )
 
-        self.red1 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
-        self.red2 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
-        self.red3 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
-        self.red4 = SigmoidAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red1 = LogitAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red2 = LogitAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red3 = LogitAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
+        self.red4 = LogitAttentionPoolingReducer(accumulator_dtype=reducer_accumulator_dtype, mask_resize=True, stopgrad_attention=True)
 
         self.sigmoid = nn.Sigmoid()
         self.decoder1 = nn.Sequential(
