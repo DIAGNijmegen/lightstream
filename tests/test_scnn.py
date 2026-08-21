@@ -233,10 +233,10 @@ class AllReducerHeadsNet(nn.Module):
 
 
 class DownsampledReducerNet(nn.Module):
-    def __init__(self):
+    def __init__(self, mask_resize: bool = False):
         super().__init__()
         self.down = nn.Conv2d(3, 4, kernel_size=3, stride=2, padding=1, bias=False)
-        self.reducer = MeanReducer()
+        self.reducer = MeanReducer(mask_resize=mask_resize)
 
     def forward(self, x, mask: torch.Tensor | None = None):
         feat = self.down(x)
@@ -967,6 +967,28 @@ def test_scnn_downsampled_reducer_mask_matches_reduced_feature_map():
 
     with torch.no_grad():
         expected = model(image, mask=mask)
+
+    scnn = _make_streaming(model, tile_size=5)
+    with torch.no_grad():
+        streamed = scnn.forward(image, mask=mask)
+
+    assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_scnn_downsampled_reducer_resizes_input_domain_mask():
+    torch.manual_seed(118)
+    model = DownsampledReducerNet(mask_resize=True).eval()
+    image = torch.randn(1, 3, 9, 11)
+    mask = (torch.arange(9)[:, None] + torch.arange(11)[None, :]) % 3 != 0
+
+    with torch.no_grad():
+        features = model.down(image)
+        resized_mask = torch.nn.functional.interpolate(
+            mask[None, None].to(torch.float32),
+            size=features.shape[-2:],
+            mode="nearest",
+        ).to(torch.bool)[0, 0]
+        expected = model.reducer(features, mask=resized_mask)
 
     scnn = _make_streaming(model, tile_size=5)
     with torch.no_grad():
