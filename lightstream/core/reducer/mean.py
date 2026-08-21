@@ -40,14 +40,27 @@ class MeanReducer(BaseReducer):
         return x.mean(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
-        return StreamingMeanReducer(accumulator_dtype=self.accumulator_dtype)
+        return StreamingMeanReducer(
+            accumulator_dtype=self.accumulator_dtype,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
+        )
 
 
 class StreamingMeanReducer(StreamingSumReducer):
     """Streaming reducer configured for mean semantics."""
 
-    def __init__(self, accumulator_dtype: torch.dtype | None = None):
-        super().__init__(accumulator_dtype=accumulator_dtype)
+    def __init__(
+        self,
+        accumulator_dtype: torch.dtype | None = None,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
+    ):
+        super().__init__(
+            accumulator_dtype=accumulator_dtype,
+            mask_resize=mask_resize,
+            mask_resize_mode=mask_resize_mode,
+        )
         self.mode = "mean"
 
     def accumulate_valid_tile(self, tile: torch.Tensor, valid_mask: torch.Tensor) -> None:
@@ -72,4 +85,8 @@ class StreamingMeanReducer(StreamingSumReducer):
         return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
 
     def to_reducer(self) -> MeanReducer:
-        return MeanReducer(accumulator_dtype=self.accumulator_dtype)
+        return MeanReducer(
+            accumulator_dtype=self.accumulator_dtype,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
+        )
