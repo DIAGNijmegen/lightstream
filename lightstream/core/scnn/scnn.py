@@ -38,6 +38,7 @@ from lightstream.core.layers.streamingmerge import StreamingMerge
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 from lightstream.core.engine.executors import BackwardCall, BackwardExecutor, ForwardCall, ForwardExecutor
 from lightstream.core.engine.planner import StreamingPlanBuilder
+from lightstream.core.engine.operators import STREAMING_OPERATORS, register_operator
 from lightstream.core.engine.session import StreamSession
 from lightstream.core.engine.reducers import ReducerCoordinator
 
@@ -47,32 +48,40 @@ logger = logging.getLogger(__name__)
 _triple = _ntuple(3)
 
 
-BACKWARD_STREAMING_MODULE_TYPES = (
-    StreamingConv2d,
-    StreamingUpsample2d,
-    StreamingChannelLayerNorm,
-    StreamingLayerScale,
+# Conversion factories are registered separately from the resulting streaming
+# types so conversion and restoration are both discoverable capabilities.
+register_operator(
+    torch.nn.Conv2d, conversion=True, statistics_forward=True,
+    statistics_backward=True, alignment=True,
+    convert=lambda module, facade: StreamingConv2d.from_torch_conv2d(module),
+)
+register_operator(
+    torch.nn.Upsample, conversion=True, statistics_forward=True,
+    statistics_backward=True,
+    convert=lambda module, facade: StreamingUpsample2d.from_torch_upsample(module),
+)
+register_operator(
+    LayerScale, conversion=True, statistics_forward=True,
+    statistics_backward=True, spatial_preserving=True,
+    convert=lambda module, facade: StreamingLayerScale.from_layer_scale(module),
+)
+register_operator(
+    ChannelLayerNorm, conversion=True, statistics_forward=True,
+    statistics_backward=True, spatial_preserving=True,
+    convert=lambda module, facade: StreamingChannelLayerNorm.from_channel_layer_norm(module),
 )
 
 
 def _is_spatial_preserving_pointwise_module(module):
     """Return True for pointwise channel modules that preserve spatial support."""
-    return isinstance(
-        module,
-        (
-            ChannelLayerNorm,
-            StreamingChannelLayerNorm,
-            LayerScale,
-            StreamingLayerScale,
-            StatisticsProbe,
-            StreamingMerge,
-        ),
-    )
+    capabilities = STREAMING_OPERATORS.capabilities_for(module)
+    return bool(capabilities and capabilities.spatial_preserving and capabilities.statistics_forward)
 
 
 def _is_backward_streaming_module(module):
     """Return True for streaming modules that need backward tile location state."""
-    return isinstance(module, BACKWARD_STREAMING_MODULE_TYPES)
+    capabilities = STREAMING_OPERATORS.capabilities_for(module)
+    return bool(capabilities and capabilities.backward_tile_state)
 
 
 class StreamingCNN(torch.nn.Module):
@@ -587,14 +596,9 @@ class StreamingCNN(torch.nn.Module):
 
         align_h = 1
         align_w = 1
-        alignment_modules = (
-            StreamingConv2d,
-            torch.nn.Conv2d,
-            torch.nn.MaxPool2d,
-            torch.nn.AvgPool2d,
-        )
         for module in self.stream_module.modules():
-            if not isinstance(module, alignment_modules):
+            capabilities = STREAMING_OPERATORS.capabilities_for(module)
+            if capabilities is None or not capabilities.alignment:
                 continue
 
             output_stride, stride = self._module_alignment_stats(module)
@@ -640,15 +644,19 @@ class StreamingCNN(torch.nn.Module):
 
     def _convert_modules_for_streaming(self, module):
         mod = module
+        adapter = STREAMING_OPERATORS.adapter_for(module)
+        capabilities = adapter.capabilities if adapter is not None else None
+        if capabilities is not None and not capabilities.conversion:
+            raise TypeError(f"{type(module).__qualname__} is missing capability 'conversion'")
         if isinstance(module, torch.nn.Conv2d):
             if module in self._module_stats:
-                mod = StreamingConv2d.from_torch_conv2d(module)
+                mod = adapter.to_streaming(module, self)
                 mod.grad_lost = self._module_stats[module]["grad_lost"]
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, torch.nn.Upsample):
-            mod = StreamingUpsample2d.from_torch_upsample(module)
+            mod = adapter.to_streaming(module, self)
             if module in self._module_stats:
                 stats = self._module_stats[module]
                 mod.grad_lost = stats.get("grad_lost", Lost(0, 0, 0, 0))
@@ -688,7 +696,7 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, LayerScale):
-            mod = StreamingLayerScale.from_layer_scale(module)
+            mod = adapter.to_streaming(module, self)
             if module in self._module_stats:
                 stats = self._module_stats[module]
                 if "grad_lost" in stats:
@@ -700,7 +708,7 @@ class StreamingCNN(torch.nn.Module):
             del module
             return mod
         elif isinstance(module, ChannelLayerNorm):
-            mod = StreamingChannelLayerNorm.from_channel_layer_norm(module)
+            mod = adapter.to_streaming(module, self)
             if module in self._module_stats:
                 stats = self._module_stats[module]
                 if "grad_lost" in stats:
@@ -718,6 +726,15 @@ class StreamingCNN(torch.nn.Module):
         elif isinstance(module, BaseReducer):
             mod = module.to_streaming()
             self._streaming_reducers.append(mod)
+        elif adapter is not None:
+            # Third-party adapters participate without requiring another
+            # facade type switch.  A replacement is treated as an operator
+            # boundary; unchanged container adapters continue normal recursion.
+            converted = adapter.to_streaming(module, self)
+            if converted is not module:
+                if module in self._module_stats:
+                    self._module_stats[converted] = self._module_stats.pop(module)
+                return converted
         for name, child in module.named_children():
             mod.add_module(name, self._convert_modules_for_streaming(child))
         del module
@@ -725,8 +742,9 @@ class StreamingCNN(torch.nn.Module):
 
     def _reset_converted_modules(self, module):
         mod = module
+        adapter = STREAMING_OPERATORS.adapter_for(module)
         if isinstance(module, StreamingConv2d):
-            mod = module.to_torch_conv2d()
+            mod = adapter.from_streaming(module, self)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -736,7 +754,7 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, StreamingUpsample2d):
-            mod = module.to_torch_upsample()
+            mod = adapter.from_streaming(module, self)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -756,7 +774,7 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, StreamingLayerScale):
-            mod = module.to_layer_scale()
+            mod = adapter.from_streaming(module, self)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -766,7 +784,7 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
         elif isinstance(module, StreamingChannelLayerNorm):
-            mod = module.to_channel_layer_norm()
+            mod = adapter.from_streaming(module, self)
             if module not in self._module_stats:
                 stats = {}
                 stats["grad_lost"] = module.grad_lost
@@ -777,6 +795,12 @@ class StreamingCNN(torch.nn.Module):
                 del self._module_stats[module]
         elif isinstance(module, BaseStreamingGlobalReducer):
             mod = module.to_reducer()
+        elif adapter is not None:
+            restored = adapter.from_streaming(module, self)
+            if restored is not module:
+                if module in self._module_stats:
+                    self._module_stats[restored] = self._module_stats.pop(module)
+                return restored
         for name, child in module.named_children():
             mod.add_module(name, self._reset_converted_modules(child))
         del module
@@ -1052,8 +1076,9 @@ class StreamingCNN(torch.nn.Module):
         back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
     ):
         for mod in self.stream_module.modules():
-            register_forward = isinstance(mod, forward_modules) or _is_spatial_preserving_pointwise_module(mod)
-            register_backward = back_modules and (isinstance(mod, back_modules) or _is_spatial_preserving_pointwise_module(mod))
+            capabilities = STREAMING_OPERATORS.capabilities_for(mod)
+            register_forward = bool(capabilities and capabilities.statistics_forward)
+            register_backward = bool(back_modules and capabilities and capabilities.statistics_backward)
             if register_forward:
                 forw_handle = mod.register_forward_hook(forward_hook)
                 self._hooks.append(forw_handle)
