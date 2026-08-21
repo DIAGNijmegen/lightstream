@@ -6,7 +6,7 @@ these calculations here makes the tiling contract independently testable.
 
 import math
 from dataclasses import dataclass
-from typing import Iterator, NamedTuple
+from typing import Iterator, NamedTuple, Sequence
 
 B_DIM = 0
 C_DIM = 1
@@ -82,6 +82,28 @@ def aligned_step(candidates: list[int] | tuple[int, ...], alignments: list[int] 
 def full_output_size(image_size: int, tile_size: int, tile_output_size: int, stride: int) -> int:
     """Calculate one dimension of the fully stitched output."""
     return (image_size - tile_size) // int(stride) + tile_output_size
+
+
+def full_output_sizes(
+    image_height: int,
+    image_width: int,
+    tile_height: int,
+    tile_width: int,
+    tile_output_shapes: Sequence[Sequence[int]],
+    output_strides: Sequence[Sequence[int]],
+) -> tuple[list[int], list[int]]:
+    """Calculate the complete spatial extent of every output head."""
+    if len(tile_output_shapes) != len(output_strides):
+        raise ValueError("tile output shapes and output strides must have equal length")
+    heights = [
+        full_output_size(image_height, tile_height, shape[H_DIM], stride[1])
+        for shape, stride in zip(tile_output_shapes, output_strides)
+    ]
+    widths = [
+        full_output_size(image_width, tile_width, shape[W_DIM], stride[2])
+        for shape, stride in zip(tile_output_shapes, output_strides)
+    ]
+    return heights, widths
 
 
 def output_window(tile_origin: int, stride: int, output_size: int, tile_output_size: int,
