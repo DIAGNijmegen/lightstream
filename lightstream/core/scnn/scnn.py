@@ -24,6 +24,8 @@ from lightstream.core.engine.geometry import (
     C_DIM,
     H_DIM,
     W_DIM,
+    tile_grid,
+    iter_tiles,
 )
 from lightstream.core.layers.streamingconv import StreamingConv2d
 from lightstream.core.layers.streamingupsample import StreamingUpsample2d
