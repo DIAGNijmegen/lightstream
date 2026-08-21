@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .geometry import Lost
+from .reducers import StaticReducerBinding
 
 OutputSpec = tuple[str, Any]
 
@@ -36,5 +37,5 @@ class StreamingPlan:
     tile: TilePlan
     heads: tuple[HeadPlan, ...]
     modules: tuple[ModulePlan, ...]
-    reducer_heads: tuple[tuple[int, tuple[int, ...]], ...]
+    reducer_heads: tuple[StaticReducerBinding, ...]
     output_structure: OutputSpec

@@ -1,6 +1,7 @@
 """Setup/probing boundary for the compatibility facade."""
 
 from .configuration import HeadPlan, ModulePlan, StreamingPlan, TilePlan
+from .reducers import StaticReducerBinding
 
 
 class StreamingPlanBuilder:
@@ -22,9 +23,11 @@ class StreamingPlanBuilder:
             HeadPlan(tuple(shape), tuple(int(x) for x in stride), loss)
             for shape, stride, loss in zip(f._tile_output_shapes, f._output_stride_per_output, f._tile_output_lost)
         )
-        # Reducer-to-output identity is resolved from tensors produced by each
-        # invocation and therefore belongs to StreamSession, not the plan.
-        reducers = ()
+        reducers = tuple(
+            StaticReducerBinding(name=name, reducer_type=type(module).__qualname__)
+            for name, module in f.stream_module.named_modules()
+            if module in f._streaming_reducers
+        )
         return StreamingPlan(
             tile=TilePlan(tuple(f.tile_shape), f.tile_gradient_lost, tuple(f._compute_internal_alignment())),
             heads=heads,

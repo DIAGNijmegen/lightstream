@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from .reducers import ReducerBinding
+
 
 @dataclass
 class StreamSession:
@@ -26,6 +28,7 @@ class StreamSession:
     forward_tiles: list[tuple[Any, ...]] = field(default_factory=list)
     reducer_head_map: dict[int, Any] = field(default_factory=dict)
     reducer_input_indices: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    reducer_bindings: dict[int, ReducerBinding] = field(default_factory=dict)
     saved_tensors: dict[Any, Any] = field(default_factory=dict)
     saliency_map: torch.Tensor | None = None
     saliency_old_indices: Any = None
