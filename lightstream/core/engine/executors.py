@@ -100,9 +100,9 @@ class ForwardExecutor:
                     tile = r._normalize_on_gpu(tile)
                 tile_value = r.stream_module(tile)
                 tile_outputs, _ = r._flatten_output_structure(tile_value)
-                r._resolve_reducer_head_map(tile_outputs)
+                r.reducer_coordinator.resolve(tile_outputs, session)
                 self._allocate_outputs(outputs, ctx)
-                if r._reducer_head_map and not reducers_initialized:
+                if session.reducer_bindings and not reducers_initialized:
                     self._start_reducers(ctx)
                     reducers_initialized = True
                 if torch.backends.cudnn.benchmark:
@@ -110,10 +110,9 @@ class ForwardExecutor:
                 self._stitch(outputs, tile_outputs, y, x, sides, call.mask)
         assert last_sides and last_sides.bottom and last_sides.right, "It seems like we could not reconstruct all output"
         r._log_forward_tile_starts()
-        r._validate_reducer_head_map_resolved()
+        r.reducer_coordinator.validate_forward(session)
         r._saved_tensors = {}
-        for idx, reducer in r._reducer_head_map.items():
-            outputs[idx] = reducer.finish_stream().to(ctx.result_device)
+        r.reducer_coordinator.finish(session, outputs, ctx.result_device)
         public = r._public_output_indices()
         r._validate_public_output_indices(public)
         expected = r._count_tensors_in_spec(r._output_spec)
@@ -129,35 +128,29 @@ class ForwardExecutor:
 
     def _allocate_outputs(self, outputs, ctx):
         r = self.runtime
-        auxiliary = r._reducer_aux_indices()
+        auxiliary = r.reducer_coordinator.auxiliary_indices(r._session)
         for idx, shape in enumerate(r._tile_output_shapes):
-            if idx in r._reducer_head_map or idx in auxiliary or outputs[idx] is not None:
+            if idx in r._session.reducer_bindings or idx in auxiliary or outputs[idx] is not None:
                 continue
             outputs[idx] = torch.full((ctx.image.shape[B_DIM], shape[C_DIM], ctx.output_heights[idx],
                                        ctx.output_widths[idx]), 999, dtype=r.dtype, device=ctx.result_device)
 
     def _start_reducers(self, ctx):
         r = self.runtime
-        for idx, reducer in r._reducer_head_map.items():
-            reducer.start_stream(output_height=ctx.output_heights[idx], output_width=ctx.output_widths[idx],
-                                 batch_size=ctx.image.shape[B_DIM], channels=r._tile_output_shapes[idx][C_DIM],
-                                 device=r.device, dtype=r.dtype, debug_replay=r.debug_reducer_replay)
+        r.reducer_coordinator.start(r._session, ctx.output_heights, ctx.output_widths, ctx.image.shape[B_DIM])
 
     def _stitch(self, outputs, tile_outputs, y, x, sides, mask):
         r = self.runtime
-        auxiliary = r._reducer_aux_indices()
+        auxiliary = r.reducer_coordinator.auxiliary_indices(r._session)
         for idx, head in enumerate(tile_outputs):
             if idx in auxiliary:
                 continue
             _, loc, trimmed = r._build_stitched_tile_output(idx, head, y, x, sides)
-            if idx in r._reducer_head_map:
-                indices = r._reducer_input_indices.get(idx, (idx,))
-                if indices[0] != idx:
+            if idx in r._session.reducer_bindings:
+                binding = r._session.reducer_bindings[idx]
+                if binding.input_indices[0] != idx:
                     continue
-                payload, _, box = r._build_common_aligned_reducer_payload(
-                    head_idx=idx, tile_outputs=tile_outputs, ordered_indices=indices,
-                    tile_input_y=y, tile_input_x=x, sides=sides)
-                r._accumulate_reducer_forward_tile(idx, payload, box, y, x, sides, mask)
+                r.reducer_coordinator.accumulate(r._session, idx, tile_outputs, y, x, sides)
             else:
                 stitch_clipped(outputs[idx], trimmed, int(loc.y), int(loc.x))
 
@@ -207,7 +200,7 @@ class BackwardExecutor:
         tiles = self._tile_iterator(ctx, rows, cols, step_h, step_w)
         r._log_backward_tile_starts(tiles)
         r._validate_backward_tile_iter_matches_forward(tiles)
-        r._validate_reducer_lifecycle_for_backward()
+        r.reducer_coordinator.validate_backward(session)
         if r.debug_reducer_replay:
             session.reducer_replay_started = True
             for reducer in r._reducer_head_map.values(): reducer.start_backward_replay()
@@ -264,14 +257,16 @@ class BackwardExecutor:
         tile_h, tile_w = r._tile_output_shapes[idx][H_DIM], r._tile_output_shapes[idx][W_DIM]
         stride = r._output_stride_per_output[idx]
         oy, ox = y // int(stride[1]), x // int(stride[2])
-        reducer = idx in r._reducer_head_map
+        reducer = idx in r._session.reducer_bindings
         if sides.bottom: oy = max((ctx.output_heights[idx] if reducer else head_grad.shape[H_DIM]) - tile_h, 0)
         if sides.right: ox = max((ctx.output_widths[idx] if reducer else head_grad.shape[W_DIM]) - tile_w, 0)
         trimmed = r._trim_head_output(head, lost).to(r.device, non_blocking=True)
         if reducer:
-            gradient = r._build_reducer_gradient(head_grad)
-            return r._build_reducer_backward_pair(idx, trimmed, tile_outputs, gradient, y, x, sides,
-                                                  oy + lost.top, ox + lost.left)
+            gradient = head_grad.to(r.device, non_blocking=True)
+            if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
+                raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
+            return r.reducer_coordinator.backward_pair(r._session, idx, trimmed, tile_outputs, gradient, y, x,
+                                                       sides, oy + lost.top, ox + lost.left)
         gradient = head_grad[:, :, oy:oy + tile_h, ox:ox + tile_w]
         trimmed_grad = gradient[:, :, lost.top:gradient.shape[H_DIM] - lost.bottom,
                                 lost.left:gradient.shape[W_DIM] - lost.right]

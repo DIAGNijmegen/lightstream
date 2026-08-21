@@ -39,6 +39,7 @@ from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 from lightstream.core.engine.executors import BackwardCall, BackwardExecutor, ForwardCall, ForwardExecutor
 from lightstream.core.engine.planner import StreamingPlanBuilder
 from lightstream.core.engine.session import StreamSession
+from lightstream.core.engine.reducers import ReducerCoordinator
 
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,7 @@ class StreamingCNN(torch.nn.Module):
             self.plan = builder.build(probe=False)
         self._forward_executor = ForwardExecutor(self)
         self._backward_executor = BackwardExecutor(self, _is_backward_streaming_module)
+        self.reducer_coordinator = ReducerCoordinator(self)
 
     @property
     def _session(self):
@@ -234,124 +236,6 @@ class StreamingCNN(torch.nn.Module):
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
             print(*args, **kwargs)
-
-    def _normalize_reducer_mask(self, mask: torch.Tensor | None, image: torch.Tensor) -> torch.Tensor | None:
-        """Normalize reducer masks for rank, device, and dtype.
-
-        Spatial compatibility is intentionally deferred until a concrete
-        reducer tile is sliced because reducer heads may operate in a reduced
-        feature-space instead of the original input-image space. 3D [N,H,W]
-        and 4D [N,C,H,W] masks keep the existing streaming behavior: all batch
-        and channel planes are collapsed to one 2D reducer-domain mask with
-        ``torch.any(...)``. Per-sample masks would require keeping these axes
-        and extending the reducer APIs.
-        """
-        if mask is None:
-            return None
-        if mask.ndim == 2:
-            return mask.to(device=self.device, dtype=torch.bool)
-        if mask.ndim == 3:
-            if mask.shape[0] != image.shape[0]:
-                raise ValueError(
-                    f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]}; "
-                    "H/W must align with the reducer/reduced feature spatial domain."
-                )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=0)
-        if mask.ndim == 4:
-            if mask.shape[0] != image.shape[0]:
-                raise ValueError(
-                    f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
-                    "H/W must align with the reducer/reduced feature spatial domain."
-                )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
-        raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
-
-    def _prepare_reducer_domain_mask(
-        self,
-        mask: torch.Tensor | None,
-        head_idx: int,
-        reducer: BaseStreamingGlobalReducer,
-        output_height: int,
-        output_width: int,
-    ) -> torch.Tensor | None:
-        """Normalize and optionally resize a full user mask to one reducer output domain."""
-        if mask is None:
-            return None
-        if self._active_reducer_mask_image is None:
-            raise RuntimeError("Reducer mask preparation requires the active forward/backward image context.")
-
-        normalized = self._normalize_reducer_mask(mask, self._active_reducer_mask_image)
-        if normalized is None:
-            return None
-
-        expected_shape = (int(output_height), int(output_width))
-        actual_shape = (int(normalized.shape[-2]), int(normalized.shape[-1]))
-        if actual_shape == expected_shape:
-            return normalized
-
-        if not getattr(reducer, "mask_resize", False):
-            raise ValueError(
-                f"Reducer mask for head_idx={head_idx} has spatial size {actual_shape}, "
-                f"expected {expected_shape}. Enable mask_resize=True on the reducer to resize "
-                "the full user mask into the reducer output domain before tile slicing."
-            )
-        mask_resize_mode = getattr(reducer, "mask_resize_mode", "nearest")
-        if mask_resize_mode != "nearest":
-            raise ValueError(
-                f"Unsupported reducer mask_resize_mode '{mask_resize_mode}' for head_idx={head_idx}. "
-                "Only 'nearest' is supported for streaming reducer mask resizing."
-            )
-
-        resized = torch.nn.functional.interpolate(
-            normalized[None, None].to(dtype=torch.float32),
-            size=expected_shape,
-            mode=mask_resize_mode,
-        )[0, 0]
-        return resized.to(device=self.device, dtype=torch.bool)
-
-    def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
-        reducer = self._reducer_head_map[head_idx]
-        cache_key = (id(reducer), int(head_idx))
-        if cache_key not in self._prepared_reducer_domain_masks:
-            self._prepared_reducer_domain_masks[cache_key] = self._prepare_reducer_domain_mask(
-                self._active_reducer_mask,
-                head_idx,
-                reducer,
-                self._current_output_heights[head_idx],
-                self._current_output_widths[head_idx],
-            )
-        return self._prepared_reducer_domain_masks[cache_key]
-
-    def _slice_reducer_mask(
-        self,
-        mask: torch.Tensor | None,
-        y0: int,
-        y1: int,
-        x0: int,
-        x1: int,
-        *,
-        context: str,
-        expected_shape: tuple[int, int],
-    ) -> torch.Tensor | None:
-        if mask is None:
-            return None
-
-        y0, y1, x0, x1 = int(y0), int(y1), int(x0), int(x1)
-        mask_h, mask_w = int(mask.shape[-2]), int(mask.shape[-1])
-        if y0 < 0 or x0 < 0 or y1 > mask_h or x1 > mask_w or y1 < y0 or x1 < x0:
-            raise ValueError(
-                f"Reducer mask slice {context} ({y0}:{y1}, {x0}:{x1}) is outside mask bounds "
-                f"{tuple(mask.shape[-2:])}. The mask must align with the reducer/reduced feature spatial domain, "
-                "not necessarily the original input image."
-            )
-
-        sliced = mask[y0:y1, x0:x1]
-        if tuple(sliced.shape) != tuple(expected_shape):
-            raise ValueError(
-                f"Reducer mask slice {context} produced shape {tuple(sliced.shape)}, expected {tuple(expected_shape)}. "
-                "The mask must align with the reducer/reduced feature spatial domain, not necessarily the original input image."
-            )
-        return sliced
 
     def _configure_legacy(self):
         # Save current model and cudnn flags, since we need to change them and restore later
@@ -898,64 +782,6 @@ class StreamingCNN(torch.nn.Module):
         del module
         return mod
 
-    def _validate_reducer_head_map_resolved(self):
-        if not self._streaming_reducers:
-            return
-
-        resolved_reducers = set(self._reducer_head_map.values())
-        unresolved = [reducer for reducer in self._streaming_reducers if reducer not in resolved_reducers]
-        if unresolved:
-            raise RuntimeError(
-                "Reducer head mapping incomplete after forward tile sampling: "
-                f"resolved={len(resolved_reducers)}, expected={len(self._streaming_reducers)}"
-            )
-
-    def _validate_reducer_lifecycle_for_backward(self):
-        if not self._streaming_reducers:
-            return
-        if not self._reducer_head_map:
-            raise RuntimeError(
-                "Reducer backward replay requires prior streaming forward pass to resolve reducer heads."
-            )
-
-    def _resolve_reducer_head_map(self, flat_outputs):
-        # Invariant: reducer-head resolution happens once per forward stream and remains stable
-        # for the paired backward replay traversal.
-        if self._reducer_head_map or not self._streaming_reducers:
-            return
-
-        output_id_to_index = {}
-        for idx, tensor in enumerate(flat_outputs):
-            output_id_to_index.setdefault(id(tensor), idx)
-        for reducer in self._streaming_reducers:
-            reducer_inputs = getattr(reducer, "_last_inputs", None)
-            if reducer_inputs is not None:
-                if not isinstance(reducer_inputs, (tuple, list)):
-                    raise RuntimeError(
-                        f"Reducer {type(reducer).__name__} _last_inputs must be tuple/list, got {type(reducer_inputs)}"
-                    )
-                input_indices = []
-                for input_pos, inp in enumerate(reducer_inputs):
-                    idx = output_id_to_index.get(id(inp))
-                    if idx is None:
-                        raise RuntimeError(
-                            f"Reducer {type(reducer).__name__} input {input_pos} is not present in flattened outputs; cannot resolve reducer head inputs."
-                        )
-                    input_indices.append(idx)
-                output_index = output_id_to_index.get(id(reducer._last_output))
-                if output_index is None:
-                    raise RuntimeError(f"Reducer {type(reducer).__name__} output is not present in flattened outputs.")
-                self._reducer_head_map[output_index] = reducer
-                self._reducer_input_indices[output_index] = tuple(input_indices)
-                continue
-
-            if reducer._last_output is None:
-                continue
-            output_index = output_id_to_index.get(id(reducer._last_output))
-            if output_index is not None:
-                self._reducer_head_map[output_index] = reducer
-                self._reducer_input_indices[output_index] = (output_index,)
-
     def _reset_parameters_to_constant(self):
         for mod in self.stream_module.modules():
             if isinstance(mod, (torch.nn.Conv2d)):
@@ -1132,12 +958,6 @@ class StreamingCNN(torch.nn.Module):
 
 
 
-    def _build_reducer_gradient(self, head_grad):
-        gradient = head_grad.to(self.device, non_blocking=True)
-        if gradient.shape[H_DIM] != 1 or gradient.shape[W_DIM] != 1:
-            raise ValueError(f"Reducer-backed head expects gradient of shape N,C,1,1, got {tuple(gradient.shape)}")
-        return gradient
-
     def _trim_head_output(self, head_output, head_lost):
         return head_output[
             :,
@@ -1155,134 +975,6 @@ class StreamingCNN(torch.nn.Module):
         trimmed_output = self._trim_head_output(head_output, head_lost)
         return head_lost, output_loc, trimmed_output
 
-    def _build_common_aligned_reducer_payload(
-        self,
-        *,
-        head_idx,
-        tile_outputs,
-        ordered_indices,
-        tile_input_y,
-        tile_input_x,
-        sides,
-    ):
-        if not ordered_indices or ordered_indices[0] != head_idx:
-            raise RuntimeError(f"Reducer head {head_idx} input index order mismatch: indices={ordered_indices}")
-
-        payload_entries = []
-        previous_idx = -1
-        for reducer_input_idx in ordered_indices:
-            if reducer_input_idx <= previous_idx or reducer_input_idx >= len(tile_outputs):
-                raise RuntimeError(
-                    f"Reducer head {head_idx} input index order mismatch: "
-                    f"indices={ordered_indices} over outputs={len(tile_outputs)}"
-                )
-            previous_idx = reducer_input_idx
-            _, input_loc, input_trimmed = self._build_stitched_tile_output(
-                head_idx=reducer_input_idx,
-                head_output=tile_outputs[reducer_input_idx],
-                tile_input_y=tile_input_y,
-                tile_input_x=tile_input_x,
-                sides=sides,
-            )
-            if input_trimmed.ndim != 4:
-                raise RuntimeError(
-                    f"Reducer head {head_idx} tile input {reducer_input_idx} must be NCHW, "
-                    f"got {tuple(input_trimmed.shape)}"
-                )
-            payload_entries.append((reducer_input_idx, input_loc, input_trimmed))
-
-        common_y0 = max(int(loc.y) for _, loc, _ in payload_entries)
-        common_x0 = max(int(loc.x) for _, loc, _ in payload_entries)
-        common_y1 = min(int(loc.y) + int(tensor.shape[H_DIM]) for _, loc, tensor in payload_entries)
-        common_x1 = min(int(loc.x) + int(tensor.shape[W_DIM]) for _, loc, tensor in payload_entries)
-        if common_y1 <= common_y0 or common_x1 <= common_x0:
-            boxes = [
-                (
-                    idx,
-                    int(loc.y),
-                    int(loc.y) + int(tensor.shape[H_DIM]),
-                    int(loc.x),
-                    int(loc.x) + int(tensor.shape[W_DIM]),
-                )
-                for idx, loc, tensor in payload_entries
-            ]
-            raise RuntimeError(f"Reducer head {head_idx} inputs have no common valid intersection: boxes={boxes}")
-
-        cropped_payload = []
-        ref_batch = None
-        common_h = common_y1 - common_y0
-        common_w = common_x1 - common_x0
-        for input_pos, (reducer_input_idx, input_loc, input_trimmed) in enumerate(payload_entries):
-            if ref_batch is None:
-                ref_batch = input_trimmed.shape[B_DIM]
-            elif input_trimmed.shape[B_DIM] != ref_batch:
-                raise RuntimeError(
-                    f"Reducer head {head_idx} tile input batch mismatch at position {input_pos}: "
-                    f"expected N={ref_batch}, got shape={tuple(input_trimmed.shape)}"
-                )
-            src_y0 = common_y0 - int(input_loc.y)
-            src_y1 = src_y0 + common_h
-            src_x0 = common_x0 - int(input_loc.x)
-            src_x1 = src_x0 + common_w
-            cropped = input_trimmed[:, :, src_y0:src_y1, src_x0:src_x1]
-            if cropped.shape[H_DIM] != common_h or cropped.shape[W_DIM] != common_w:
-                raise RuntimeError(
-                    f"Reducer head {head_idx} common crop failed for input {reducer_input_idx}: "
-                    f"crop={tuple(cropped.shape)} expected spatial=({common_h}, {common_w})"
-                )
-            cropped_payload.append(cropped)
-
-        common_loc = Box(common_y0, -1, common_x0, -1, sides)
-        return cropped_payload, common_loc, (common_y0, common_y1, common_x0, common_x1)
-
-    def _accumulate_reducer_forward_tile(
-        self,
-        head_idx,
-        trimmed_payload,
-        dst_box,
-        tile_input_y,
-        tile_input_x,
-        sides,
-        user_mask,
-    ):
-        if not isinstance(trimmed_payload, (tuple, list)) or len(trimmed_payload) == 0:
-            raise RuntimeError(
-                f"Reducer head {head_idx} expects non-empty tuple/list payload, got {type(trimmed_payload)}"
-            )
-        ref = trimmed_payload[0]
-        for i, t in enumerate(trimmed_payload):
-            if t.ndim != 4:
-                raise RuntimeError(f"Reducer head {head_idx} tile input {i} must be NCHW, got {tuple(t.shape)}")
-            if t.shape[0] != ref.shape[0] or t.shape[H_DIM] != ref.shape[H_DIM] or t.shape[W_DIM] != ref.shape[W_DIM]:
-                raise RuntimeError(
-                    f"Reducer head {head_idx} tile input spatial mismatch after common crop: "
-                    f"input0={tuple(ref.shape)} input{i}={tuple(t.shape)}; expected same [N,*,H,W]."
-                )
-        dst_y0, dst_y1, dst_x0, dst_x1 = (int(v) for v in dst_box)
-        payload = trimmed_payload[0] if len(trimmed_payload) == 1 else tuple(trimmed_payload)
-        reducer_domain_mask = self._get_prepared_reducer_domain_mask(head_idx)
-        tile_mask = self._slice_reducer_mask(
-            reducer_domain_mask,
-            dst_y0,
-            dst_y1,
-            dst_x0,
-            dst_x1,
-            context=f"forward reducer head {head_idx}",
-            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
-        )
-        self._reducer_head_map[head_idx].accumulate_stream_tile(
-            trimmed_output=payload,
-            tile_y=int(tile_input_y),
-            tile_x=int(tile_input_x),
-            sides=sides,
-            dst_box=(dst_y0, dst_y1, dst_x0, dst_x1),
-            user_mask=tile_mask,
-        )
-
-
-
-
-
     def forward(self, image, result_on_cpu=False, mask=None):
         """Delegate a forward call to the plan-driven executor."""
         return self._forward_executor.execute(self.plan, ForwardCall(image, result_on_cpu, mask))
@@ -1294,67 +986,6 @@ class StreamingCNN(torch.nn.Module):
 
 
 
-
-    def _build_reducer_backward_pair(
-        self,
-        head_idx,
-        trimmed_output,
-        tile_outputs,
-        gradient,
-        tile_input_y,
-        tile_input_x,
-        sides,
-        output_y,
-        output_x,
-    ):
-        reducer = self._reducer_head_map[head_idx]
-        ordered_indices = self._reducer_input_indices.get(head_idx, (head_idx,))
-        if len(ordered_indices) == 1:
-            payload = trimmed_output
-            common_dst_box = (
-                int(output_y),
-                int(output_y + trimmed_output.shape[H_DIM]),
-                int(output_x),
-                int(output_x + trimmed_output.shape[W_DIM]),
-            )
-        else:
-            (
-                trimmed_payload,
-                _common_loc,
-                common_dst_box,
-            ) = self._build_common_aligned_reducer_payload(
-                head_idx=head_idx,
-                tile_outputs=tile_outputs,
-                ordered_indices=ordered_indices,
-                tile_input_y=tile_input_y,
-                tile_input_x=tile_input_x,
-                sides=sides,
-            )
-            payload = tuple(t.to(self.device, non_blocking=True) for t in trimmed_payload)
-
-        dst_y0, dst_y1, dst_x0, dst_x1 = common_dst_box
-        ref = payload[0] if isinstance(payload, (tuple, list)) else payload
-        reducer_domain_mask = self._get_prepared_reducer_domain_mask(head_idx)
-        valid_mask = self._slice_reducer_mask(
-            reducer_domain_mask,
-            dst_y0,
-            dst_y1,
-            dst_x0,
-            dst_x1,
-            context=f"backward reducer head {head_idx}",
-            expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
-        )
-
-        reduced_output, reduced_grad = reducer.build_backward_pair(
-            payload,
-            gradient,
-            input_y=int(tile_input_y),
-            input_x=int(tile_input_x),
-            sides=sides,
-            valid_mask=valid_mask,
-        )
-
-        return reduced_output, reduced_grad
 
     def _get_tile_lost_for_sides(self, sides, output_lost=None):
         output_lost = self.tile_output_lost if output_lost is None else output_lost
