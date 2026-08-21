@@ -22,7 +22,9 @@ class StreamingPlanBuilder:
             HeadPlan(tuple(shape), tuple(int(x) for x in stride), loss)
             for shape, stride, loss in zip(f._tile_output_shapes, f._output_stride_per_output, f._tile_output_lost)
         )
-        reducers = tuple(sorted((int(head), tuple(map(int, inputs))) for head, inputs in f._reducer_input_indices.items()))
+        # Reducer-to-output identity is resolved from tensors produced by each
+        # invocation and therefore belongs to StreamSession, not the plan.
+        reducers = ()
         return StreamingPlan(
             tile=TilePlan(tuple(f.tile_shape), f.tile_gradient_lost, tuple(f._compute_internal_alignment())),
             heads=heads,

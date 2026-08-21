@@ -14,6 +14,7 @@ import torch
 from .configuration import StreamingPlan
 from .geometry import B_DIM, C_DIM, H_DIM, W_DIM, Box, full_output_sizes, iter_tiles
 from .stitching import stitch_clipped
+from .session import StreamSession
 
 
 @dataclass(frozen=True)
@@ -57,27 +58,32 @@ class BackwardExecutionContext:
 class ForwardExecutor:
     def __init__(self, runtime):
         self.runtime = runtime
+        self.pending_session: StreamSession | None = None
+        self.executing_session: StreamSession | None = None
+        self.last_session: StreamSession | None = None
 
     def execute(self, plan: StreamingPlan, call: ForwardCall):
         r = self.runtime
         if plan is not r.plan:
             raise ValueError("ForwardExecutor received a plan for a different runtime")
+        if self.pending_session is not None:
+            raise RuntimeError("A streaming forward session is already pending backward; call backward before forwarding again.")
         image = call.image.to(r.device, non_blocking=True) if r.copy_to_gpu else call.image
-        r._active_reducer_mask, r._active_reducer_mask_image = call.mask, image
-        r._prepared_reducer_domain_masks = {}
+        session = StreamSession.for_forward(image, call.mask)
+        self.executing_session = session
+        self.pending_session = session
+        self.last_session = session
         th, tw = r.tile_shape[H_DIM], r.tile_shape[W_DIM]
         valid_h, valid_w = r._compute_valid_output_sizes()
         output_h, output_w = full_output_sizes(image.shape[H_DIM], image.shape[W_DIM], th, tw,
                                                r._tile_output_shapes, r._output_stride_per_output)
-        r._current_output_heights, r._current_output_widths = output_h, output_w
+        session.output_heights, session.output_widths = output_h, output_w
         step_h, step_w = r._compute_valid_input_step(valid_h, valid_w)
         rows, cols = r._compute_tile_grid(image.shape[H_DIM], image.shape[W_DIM], th, tw, step_h, step_w)
         ctx = ForwardExecutionContext(image, th, tw, output_h, output_w, step_h, step_w, rows, cols,
                                       torch.device("cpu") if call.result_on_cpu else r.device)
         if r.gather_input_gradient:
-            r.saliency_map = torch.zeros(image.shape, dtype=r.dtype, device="cpu")
-        r._last_forward_tiles = []
-        r._reducer_head_map, r._reducer_input_indices = {}, {}
+            session.saliency_map = torch.zeros(image.shape, dtype=r.dtype, device="cpu")
         outputs = [None] * len(r._tile_output_shapes)
         reducers_initialized = False
         last_sides = None
@@ -85,7 +91,7 @@ class ForwardExecutor:
             for y, x, sides in iter_tiles(image.shape[H_DIM], image.shape[W_DIM], th, tw,
                                           step_h, step_w, rows, cols):
                 last_sides = sides
-                r._last_forward_tiles.append((y, x, sides))
+                session.forward_tiles.append((y, x, sides))
                 r._log_and_validate_tile_start(y, x, sides, r._compute_internal_alignment())
                 tile = image[:, :, y:y + th, x:x + tw]
                 if not r.copy_to_gpu:
@@ -118,6 +124,7 @@ class ForwardExecutor:
         materialized = [outputs[i] for i in public]
         result, final = r._unflatten_output_structure(materialized, r._output_spec)
         assert final == len(materialized)
+        self.executing_session = None
         return result
 
     def _allocate_outputs(self, outputs, ctx):
@@ -159,22 +166,32 @@ class BackwardExecutor:
     def __init__(self, runtime, is_backward_streaming_module):
         self.runtime = runtime
         self.is_backward_streaming_module = is_backward_streaming_module
+        self.executing_session: StreamSession | None = None
 
     def execute(self, plan: StreamingPlan, call: BackwardCall):
         r = self.runtime
         if plan is not r.plan:
             raise ValueError("BackwardExecutor received a plan for a different runtime")
+        session = r._forward_executor.pending_session
+        if session is None:
+            if r._forward_executor.last_session is not None and r._forward_executor.last_session.consumed:
+                raise RuntimeError("The most recent streaming session has already been consumed by backward.")
+            raise RuntimeError("No pending streaming forward session is available for backward.")
+        if session.consumed:
+            raise RuntimeError("The pending streaming session has already been consumed by backward.")
+        session.validate_backward_image(call.image)
+        self.executing_session = session
         image = call.image.to(r.device, non_blocking=True) if r.copy_to_gpu else call.image
         if call.mask is not None:
-            r._active_reducer_mask, r._active_reducer_mask_image = call.mask, image
-            r._prepared_reducer_domain_masks = {}
-        elif r._active_reducer_mask_image is None:
-            r._active_reducer_mask_image = image
+            session.active_reducer_mask, session.active_reducer_mask_image = call.mask, image
+            session.prepared_reducer_domain_masks = {}
+        elif session.active_reducer_mask_image is None:
+            session.active_reducer_mask_image = image
         th, tw = r.tile_shape[H_DIM], r.tile_shape[W_DIM]
         valid_h, valid_w = r._compute_valid_output_sizes()
         output_h, output_w = full_output_sizes(image.shape[H_DIM], image.shape[W_DIM], th, tw,
                                                r._tile_output_shapes, r._output_stride_per_output)
-        r._current_output_heights, r._current_output_widths = output_h, output_w
+        session.output_heights, session.output_widths = output_h, output_w
         step_h, step_w = r._compute_valid_input_step(valid_h, valid_w)
         rows, cols = r._compute_tile_grid(image.shape[H_DIM], image.shape[W_DIM], th, tw, step_h, step_w)
         grads, spec = r._flatten_output_structure(call.gradient)
@@ -192,6 +209,7 @@ class BackwardExecutor:
         r._validate_backward_tile_iter_matches_forward(tiles)
         r._validate_reducer_lifecycle_for_backward()
         if r.debug_reducer_replay:
+            session.reducer_replay_started = True
             for reducer in r._reducer_head_map.values(): reducer.start_backward_replay()
         last = None
         for y, x, sides in tiles:
@@ -205,6 +223,9 @@ class BackwardExecutor:
                 module.input_loc = None
                 module.reset()
         assert last and last.right and last.bottom, "It seems like we could not reconstruct all output"
+        session.consumed = True
+        r._forward_executor.pending_session = None
+        self.executing_session = None
 
     def _tile_iterator(self, ctx, rows, cols, step_h, step_w):
         r = self.runtime

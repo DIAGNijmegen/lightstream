@@ -38,6 +38,7 @@ from lightstream.core.layers.streamingmerge import StreamingMerge
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 from lightstream.core.engine.executors import BackwardCall, BackwardExecutor, ForwardCall, ForwardExecutor
 from lightstream.core.engine.planner import StreamingPlanBuilder
+from lightstream.core.engine.session import StreamSession
 
 
 logger = logging.getLogger(__name__)
@@ -164,20 +165,12 @@ class StreamingCNN(torch.nn.Module):
         self._output_stride_per_output = None
         self._output_spec = None
         self._module_stats = {}
-        self._saved_tensors = {}
+        self._configuration_saved_tensors = {}
         self.debug_reducer_replay = False
         self.debug_forward_sentinel_check = False
         self.debug_backward_tile_alignment = False
         self._hooks = []
-        self._last_forward_tiles = []
         self._streaming_reducers = []
-        self._reducer_head_map = {}
-        self._reducer_input_indices = {}
-        self._active_reducer_mask = None
-        self._active_reducer_mask_image = None
-        self._prepared_reducer_domain_masks = {}
-        self._current_output_heights = None
-        self._current_output_widths = None
 
         builder = StreamingPlanBuilder(self)
         if state_dict is None:
@@ -187,6 +180,56 @@ class StreamingCNN(torch.nn.Module):
             self.plan = builder.build(probe=False)
         self._forward_executor = ForwardExecutor(self)
         self._backward_executor = BackwardExecutor(self, _is_backward_streaming_module)
+
+    @property
+    def _session(self):
+        """Return executor-owned invocation state (or ``None`` during setup)."""
+        backward = getattr(self, "_backward_executor", None)
+        if backward is not None and backward.executing_session is not None:
+            return backward.executing_session
+        forward = getattr(self, "_forward_executor", None)
+        if forward is None:
+            return None
+        return forward.executing_session or forward.pending_session or forward.last_session
+
+    def _session_field(self, name):
+        session = self._session
+        if session is None:
+            raise RuntimeError(f"Invocation state '{name}' is unavailable outside a streaming session.")
+        return getattr(session, name)
+
+    def _set_session_field(self, name, value):
+        session = self._session
+        if session is None:
+            # Compatibility for diagnostic helpers that are exercised without
+            # a full forward; normal invocation state is always executor-created.
+            session = StreamSession((), self.dtype)
+            self._forward_executor.last_session = session
+        setattr(session, name, value)
+
+    _active_reducer_mask = property(lambda self: self._session_field("active_reducer_mask"), lambda self, v: self._set_session_field("active_reducer_mask", v))
+    _active_reducer_mask_image = property(lambda self: self._session_field("active_reducer_mask_image"), lambda self, v: self._set_session_field("active_reducer_mask_image", v))
+    _prepared_reducer_domain_masks = property(lambda self: self._session_field("prepared_reducer_domain_masks"), lambda self, v: self._set_session_field("prepared_reducer_domain_masks", v))
+    _current_output_heights = property(lambda self: self._session_field("output_heights"), lambda self, v: self._set_session_field("output_heights", v))
+    _current_output_widths = property(lambda self: self._session_field("output_widths"), lambda self, v: self._set_session_field("output_widths", v))
+    _last_forward_tiles = property(lambda self: self._session_field("forward_tiles"), lambda self, v: self._set_session_field("forward_tiles", v))
+    _reducer_head_map = property(lambda self: self._session_field("reducer_head_map"), lambda self, v: self._set_session_field("reducer_head_map", v))
+    _reducer_input_indices = property(lambda self: self._session_field("reducer_input_indices"), lambda self, v: self._set_session_field("reducer_input_indices", v))
+    saliency_map = property(lambda self: self._session_field("saliency_map"), lambda self, v: self._set_session_field("saliency_map", v))
+    saliency_old_indices = property(lambda self: self._session_field("saliency_old_indices"), lambda self, v: self._set_session_field("saliency_old_indices", v))
+
+    @property
+    def _saved_tensors(self):
+        session = self._session
+        return self._configuration_saved_tensors if session is None else session.saved_tensors
+
+    @_saved_tensors.setter
+    def _saved_tensors(self, value):
+        session = self._session
+        if session is None:
+            self._configuration_saved_tensors = value
+        else:
+            session.saved_tensors = value
 
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
