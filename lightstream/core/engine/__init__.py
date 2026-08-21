@@ -3,7 +3,14 @@
 from .configuration import HeadPlan, ModulePlan, StreamingPlan, TilePlan
 from .executors import BackwardExecutor, ForwardExecutor
 from .geometry import Box, Lost, Sides
-from .planner import StreamingPlanBuilder
+from .planner import StreamingPlanBuilder, UnsupportedStreamingOperatorError
+from .operators import (
+    OperatorCapabilities,
+    STREAMING_OPERATORS,
+    StreamingOperatorAdapter,
+    StreamingOperatorRegistry,
+    register_operator,
+)
 from .session import StreamSession
 
 __all__ = [
