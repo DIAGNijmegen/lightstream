@@ -5,8 +5,8 @@ MIT License
 import math
 import copy
 import logging
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Any, List
 
 import numpy as np
 import torch
@@ -96,6 +96,47 @@ class BackwardContext:
     tile_width: int
     output_heights: list
     output_widths: list
+
+
+@dataclass
+class StreamSession:
+    """Mutable state for exactly one forward/backward lifecycle.
+
+    ``StreamingCNN`` deliberately supports only one live session. A successful
+    backward consumes it; failed forward/backward calls also close it so reducer
+    and tile state can never leak into a later lifecycle.
+    """
+
+    token: int
+    image: torch.Tensor
+    output_heights: list[int]
+    output_widths: list[int]
+    reducer_mask: torch.Tensor | None
+    prepared_reducer_masks: dict[tuple[int, int], torch.Tensor | None] = field(default_factory=dict)
+    tiles: list[tuple[int, int, Sides]] = field(default_factory=list)
+    reducer_metadata: dict[int, dict[str, Any]] = field(default_factory=dict)
+    saliency_output: torch.Tensor | None = None
+    state: str = "forward"
+
+
+class StreamSessionError(RuntimeError):
+    """Base class for explicit streaming lifecycle failures."""
+
+
+class MissingStreamSessionError(StreamSessionError):
+    """Raised when backward has no preceding successful forward."""
+
+
+class StreamSessionAlreadyConsumedError(StreamSessionError):
+    """Raised when backward is attempted more than once."""
+
+
+class StaleStreamSessionError(StreamSessionError):
+    """Raised when backward inputs cannot belong to the registered forward."""
+
+
+class ConcurrentStreamSessionError(StreamSessionError):
+    """Raised when forward is called while another session awaits backward."""
 
 
 class StreamingCNN(torch.nn.Module):
@@ -194,15 +235,12 @@ class StreamingCNN(torch.nn.Module):
         self.debug_forward_sentinel_check = False
         self.debug_backward_tile_alignment = False
         self._hooks = []
-        self._last_forward_tiles = []
         self._streaming_reducers = []
         self._reducer_head_map = {}
         self._reducer_input_indices = {}
-        self._active_reducer_mask = None
-        self._active_reducer_mask_image = None
-        self._prepared_reducer_domain_masks = {}
-        self._current_output_heights = None
-        self._current_output_widths = None
+        self._active_session: StreamSession | None = None
+        self._last_session: StreamSession | None = None
+        self._next_session_token = 1
 
         builder = StreamingPlanBuilder(self)
         if state_dict is None:
@@ -212,6 +250,18 @@ class StreamingCNN(torch.nn.Module):
             self.plan = builder.build(probe=False)
         self._forward_executor = ForwardExecutor(self)
         self._backward_executor = BackwardExecutor(self)
+
+    @property
+    def saliency_map(self):
+        """Compatibility view of the saliency output owned by the latest session."""
+        if self._last_session is None or self._last_session.saliency_output is None:
+            raise MissingStreamSessionError("No stream session has produced a saliency map.")
+        return self._last_session.saliency_output
+
+    def _session(self) -> StreamSession:
+        if self._active_session is None:
+            raise MissingStreamSessionError("No active stream session; call forward() before backward().")
+        return self._active_session
 
     def _print_verbose(self, *args: object, **kwargs: object) -> None:
         if self.verbose:
@@ -259,10 +309,7 @@ class StreamingCNN(torch.nn.Module):
         """Normalize and optionally resize a full user mask to one reducer output domain."""
         if mask is None:
             return None
-        if self._active_reducer_mask_image is None:
-            raise RuntimeError("Reducer mask preparation requires the active forward/backward image context.")
-
-        normalized = self._normalize_reducer_mask(mask, self._active_reducer_mask_image)
+        normalized = self._normalize_reducer_mask(mask, self._session().image)
         if normalized is None:
             return None
 
@@ -292,17 +339,18 @@ class StreamingCNN(torch.nn.Module):
         return resized.to(device=self.device, dtype=torch.bool)
 
     def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
+        session = self._session()
         reducer = self._reducer_head_map[head_idx]
         cache_key = (id(reducer), int(head_idx))
-        if cache_key not in self._prepared_reducer_domain_masks:
-            self._prepared_reducer_domain_masks[cache_key] = self._prepare_reducer_domain_mask(
-                self._active_reducer_mask,
+        if cache_key not in session.prepared_reducer_masks:
+            session.prepared_reducer_masks[cache_key] = self._prepare_reducer_domain_mask(
+                session.reducer_mask,
                 head_idx,
                 reducer,
-                self._current_output_heights[head_idx],
-                self._current_output_widths[head_idx],
+                session.output_heights[head_idx],
+                session.output_widths[head_idx],
             )
-        return self._prepared_reducer_domain_masks[cache_key]
+        return session.prepared_reducer_masks[cache_key]
 
     def _slice_reducer_mask(
         self,
@@ -1105,17 +1153,18 @@ class StreamingCNN(torch.nn.Module):
         return [(int(input_y), int(input_x)) for input_y, input_x, _ in tile_iter]
 
     def _log_forward_tile_starts(self):
-        logger.debug("forward tile starts: %s", self._tile_start_list(self._last_forward_tiles))
+        logger.debug("forward tile starts: %s", self._tile_start_list(self._session().tiles))
 
     def _log_backward_tile_starts(self, tile_iter):
         logger.debug("backward tile starts: %s", self._tile_start_list(tile_iter))
 
     def _validate_backward_tile_iter_matches_forward(self, tile_iter):
         """Assert in debug mode that backward replays the exact forward tile starts."""
-        if not __debug__ or not self._last_forward_tiles:
+        forward_tiles = self._session().tiles
+        if not __debug__ or not forward_tiles:
             return
 
-        forward_starts = self._tile_start_list(self._last_forward_tiles)
+        forward_starts = self._tile_start_list(forward_tiles)
         backward_starts = self._tile_start_list(tile_iter)
         assert backward_starts == forward_starts, (
             "Backward tile starts differ from forward tile starts: "
@@ -1593,24 +1642,46 @@ class StreamingCNN(torch.nn.Module):
         del trimmed_outputs
 
     def forward(self, image, result_on_cpu=False, mask=None):
-        """Delegate a forward call to the plan-driven executor."""
-        return self._forward_executor.execute(self.plan, ForwardCall(image, result_on_cpu, mask))
+        """Run forward and register its single-use backward session.
+
+        Concurrent sessions are not supported: the previous result must be
+        consumed by :meth:`backward` before another forward can start.
+        """
+        if self._active_session is not None:
+            raise ConcurrentStreamSessionError(
+                f"Session {self._active_session.token} is still awaiting backward; "
+                "concurrent stream sessions are not supported."
+            )
+        try:
+            output = self._forward_executor.execute(self.plan, ForwardCall(image, result_on_cpu, mask))
+        except Exception:
+            if self._active_session is not None:
+                self._active_session.state = "failed"
+                self._last_session = self._active_session
+                self._active_session = None
+            raise
+        self._session().state = "ready"
+        return output
 
     def _forward_impl(self, image, result_on_cpu=False, mask=None):
         """Perform forward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
-        self._active_reducer_mask = mask
-        self._active_reducer_mask_image = image
-        self._prepared_reducer_domain_masks = {}
-
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
-        self._current_output_heights = output_heights
-        self._current_output_widths = output_widths
+        session = StreamSession(
+            token=self._next_session_token,
+            image=image,
+            output_heights=output_heights,
+            output_widths=output_widths,
+            reducer_mask=mask,
+        )
+        self._next_session_token += 1
+        self._active_session = session
+        self._last_session = session
         valid_input_height, valid_input_width = self._compute_valid_input_step(
             valid_output_heights, valid_output_widths
         )
@@ -1624,9 +1695,8 @@ class StreamingCNN(torch.nn.Module):
         )
 
         if self.gather_input_gradient:
-            self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+            session.saliency_output = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
 
-        self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
         logger.debug(
             "Forward tiling step: valid_input_height=%s, valid_input_width=%s, tiles=%sx%s=%s, internal_alignment=%s",
@@ -1651,8 +1721,6 @@ class StreamingCNN(torch.nn.Module):
             n_cols=n_cols,
             result_device=result_device,
         )
-        self._reducer_head_map = {}
-        self._reducer_input_indices = {}
         reducers_initialized = False
         outputs, allocate_non_reducer_outputs = self._prepare_forward_outputs(
             image=forward_ctx.image,
@@ -1673,7 +1741,7 @@ class StreamingCNN(torch.nn.Module):
                 tile_width=forward_ctx.tile_width,
             ):
                 last_sides = sides
-                self._last_forward_tiles.append((input_y, input_x, sides))
+                session.tiles.append((input_y, input_x, sides))
                 self._log_and_validate_tile_start(input_y, input_x, sides, internal_alignment)
                 tile, tile_outputs = self._run_forward_tile(
                     forward_ctx.image,
@@ -1708,7 +1776,7 @@ class StreamingCNN(torch.nn.Module):
                     input_y,
                     input_x,
                     sides,
-                    user_mask=self._active_reducer_mask,
+                    user_mask=session.reducer_mask,
                 )
                 del tile
 
@@ -1723,6 +1791,12 @@ class StreamingCNN(torch.nn.Module):
         self._saved_tensors = {}
         for idx, reducer in self._reducer_head_map.items():
             outputs[idx] = reducer.finish_stream().to(result_device)
+            session.reducer_metadata[idx] = {
+                "module": reducer,
+                "input_indices": self._reducer_input_indices.get(idx, (idx,)),
+                "forward_tiles": len(session.tiles),
+                "debug_replay": self.debug_reducer_replay,
+            }
 
         public_indices = self._public_output_indices()
         self._validate_public_output_indices(public_indices)
@@ -1740,27 +1814,54 @@ class StreamingCNN(torch.nn.Module):
         return output
 
     def backward(self, image, grad, mask=None):
-        """Delegate a backward call to the plan-driven executor."""
-        return self._backward_executor.execute(self.plan, BackwardCall(image, grad, mask))
+        """Consume the session registered by the preceding successful forward."""
+        if self._active_session is None:
+            if self._last_session is not None and self._last_session.state == "consumed":
+                raise StreamSessionAlreadyConsumedError(
+                    f"Session {self._last_session.token} has already been consumed by backward()."
+                )
+            raise MissingStreamSessionError(
+                "backward() requires prior streaming forward pass with a successful, unconsumed session."
+            )
+        if self._active_session.state != "ready":
+            raise StreamSessionError(
+                f"Session {self._active_session.token} is not ready for backward "
+                f"(state={self._active_session.state!r})."
+            )
+        if tuple(image.shape) != tuple(self._active_session.image.shape):
+            stale_session = self._active_session
+            stale_session.state = "consumed"
+            stale_session.prepared_reducer_masks.clear()
+            self._last_session = stale_session
+            self._active_session = None
+            raise StaleStreamSessionError(
+                f"Backward image shape {tuple(image.shape)} does not match session "
+                f"{stale_session.token} forward image shape {tuple(stale_session.image.shape)}."
+            )
+        try:
+            return self._backward_executor.execute(self.plan, BackwardCall(image, grad, mask))
+        finally:
+            session = self._active_session
+            if session is not None:
+                session.state = "consumed"
+                session.prepared_reducer_masks.clear()
+                self._last_session = session
+                self._active_session = None
 
     def _backward_impl(self, image, grad, mask=None):
         """Perform backward pass with lightstream."""
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
+        session = self._session()
         if mask is not None:
-            self._active_reducer_mask = mask
-            self._active_reducer_mask_image = image
-            self._prepared_reducer_domain_masks = {}
-        elif self._active_reducer_mask_image is None:
-            self._active_reducer_mask_image = image
+            session.reducer_mask = mask
+            session.prepared_reducer_masks.clear()
 
         tile_height = self.tile_shape[H_DIM]
         tile_width = self.tile_shape[W_DIM]
 
         valid_output_heights, valid_output_widths = self._compute_valid_output_sizes()
         output_heights, output_widths = self._compute_full_output_sizes(image)
-        self._current_output_heights = output_heights
-        self._current_output_widths = output_widths
         valid_input_height, valid_input_width = self._compute_valid_input_step(
             valid_output_heights, valid_output_widths
         )
@@ -1788,8 +1889,8 @@ class StreamingCNN(torch.nn.Module):
         for public_grad, internal_idx in zip(grad_tensors, public_indices):
             internal_grad_tensors[internal_idx] = public_grad
 
-        if len(self._tile_output_shapes) == 1 and self._last_forward_tiles:
-            tile_iter = list(self._last_forward_tiles)
+        if session.tiles:
+            tile_iter = list(session.tiles)
         elif len(self._tile_output_shapes) == 1:
             tile_iter = self._prepare_backward_tile_iter_single_head(
                 image, internal_grad_tensors, tile_height, tile_width

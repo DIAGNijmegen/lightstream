@@ -475,9 +475,9 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     assert scnn.stream_module.norm.elementwise_affine is elementwise_affine
 
     stream_output = scnn.forward(image.detach().clone())
-    assert len(scnn._last_forward_tiles) > 1
-    assert any(y > 0 for y, _, _ in scnn._last_forward_tiles)
-    assert any(x > 0 for _, x, _ in scnn._last_forward_tiles)
+    assert len(scnn._last_session.tiles) > 1
+    assert any(y > 0 for y, _, _ in scnn._last_session.tiles)
+    assert any(x > 0 for _, x, _ in scnn._last_session.tiles)
     torch.testing.assert_close(stream_output, ref_output.detach(), atol=1e-5, rtol=1e-4)
 
     scnn.backward(image.detach().clone(), upstream_grad.detach().clone())

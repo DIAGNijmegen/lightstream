@@ -1,6 +1,6 @@
 """Setup/probing boundary for the compatibility facade."""
 
-from .configuration import HeadPlan, ModulePlan, StreamingPlan, TilePlan
+from .configuration import HeadPlan, ModulePlan, ReducerHeadPlan, StreamingPlan, TilePlan
 
 
 class StreamingPlanBuilder:
@@ -22,7 +22,12 @@ class StreamingPlanBuilder:
             HeadPlan(tuple(shape), tuple(int(x) for x in stride), loss)
             for shape, stride, loss in zip(f._tile_output_shapes, f._output_stride_per_output, f._tile_output_lost)
         )
-        reducers = tuple(sorted((int(head), tuple(map(int, inputs))) for head, inputs in f._reducer_input_indices.items()))
+        module_names = {module: name for name, module in f.stream_module.named_modules()}
+        reducers = tuple(
+            ReducerHeadPlan(int(head), tuple(map(int, inputs)), module_names[reducer])
+            for head, reducer in sorted(f._reducer_head_map.items())
+            for inputs in (f._reducer_input_indices.get(head, (head,)),)
+        )
         return StreamingPlan(
             tile=TilePlan(tuple(f.tile_shape), f.tile_gradient_lost, tuple(f._compute_internal_alignment())),
             heads=heads,

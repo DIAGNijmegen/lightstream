@@ -5,7 +5,12 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.core.scnn.scnn import (
+    ConcurrentStreamSessionError,
+    MissingStreamSessionError,
+    StreamSessionAlreadyConsumedError,
+    StreamingCNN,
+)
 from lightstream.core.scnn.utils import Lost
 from lightstream.models.testnet.segment import StreamingTestNet
 
@@ -439,6 +444,57 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
     return constructor.prepare_streaming_model()
 
 
+def test_stream_session_requires_forward_and_consumes_backward_once():
+    scnn = _make_streaming(MixedHeadsNet().eval())
+    image = torch.randn(1, 3, 8, 9)
+    grad = {"raw": torch.ones(1, 4, 8, 9), "reduced": torch.ones(1, 4, 1, 1)}
+
+    with pytest.raises(MissingStreamSessionError, match="requires prior streaming forward"):
+        scnn.backward(image, grad)
+
+    output = scnn.forward(image)
+    scnn.backward(image, {name: torch.ones_like(value) for name, value in output.items()})
+    assert scnn._active_session is None
+    assert scnn._last_session.state == "consumed"
+
+    with pytest.raises(StreamSessionAlreadyConsumedError, match="already been consumed"):
+        scnn.backward(image, {name: torch.ones_like(value) for name, value in output.items()})
+
+
+def test_stream_session_rejects_second_forward_until_backward():
+    scnn = _make_streaming(MixedHeadsNet().eval())
+    image = torch.randn(1, 3, 8, 9)
+    output = scnn.forward(image)
+
+    with pytest.raises(ConcurrentStreamSessionError, match="concurrent stream sessions are not supported"):
+        scnn.forward(image)
+
+    scnn.backward(image, {name: torch.ones_like(value) for name, value in output.items()})
+
+
+def test_stream_session_owns_reducer_masks_tiles_and_exception_cleanup():
+    scnn = _make_streaming(DownsampledReducerNet().eval())
+    image = torch.randn(1, 3, 9, 11)
+
+    with pytest.raises(ValueError, match="expected"):
+        scnn.forward(image, mask=torch.ones(2, 2, dtype=torch.bool))
+    assert scnn._active_session is None
+    assert scnn._last_session.state == "failed"
+
+    mask = torch.ones(5, 6, dtype=torch.bool)
+    output = scnn.forward(image, mask=mask)
+    session = scnn._active_session
+    assert session.tiles
+    assert session.prepared_reducer_masks
+    assert session.reducer_mask is mask
+    assert session.output_heights == [5]
+    assert session.output_widths == [6]
+
+    scnn.backward(image, torch.ones_like(output))
+    assert scnn._active_session is None
+    assert session.prepared_reducer_masks == {}
+
+
 def test_scnn_forward_all_reducer_heads_parity():
     torch.manual_seed(7)
     model = AllReducerHeadsNet().eval()
@@ -752,15 +808,12 @@ def test_scnn_mixed_head_reducer_mapping_stable():
     with torch.no_grad():
         expected = model(image)
         stream_first = scnn.forward(image)
-        stream_second = scnn.forward(image)
 
     assert scnn._reducer_head_map
     reducer_head_index = next(iter(scnn._reducer_head_map.keys()))
     assert reducer_head_index == 1
     assert torch.allclose(stream_first["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(stream_first["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
-    assert torch.allclose(stream_second["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
-    assert torch.allclose(stream_second["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
 
 
 def test_scnn_multi_input_reducer_forward_odd_borders_with_mask_parity():
@@ -1061,7 +1114,7 @@ def _assert_non_edge_starts_match_alignment(scnn: StreamingCNN) -> None:
     align_h, align_w = scnn._compute_internal_alignment()
     assert align_h > 1
     assert align_w > 1
-    for input_y, input_x, sides in scnn._last_forward_tiles:
+    for input_y, input_x, sides in scnn._last_session.tiles:
         if not sides.bottom:
             assert input_y % align_h == 0
         if not sides.right:

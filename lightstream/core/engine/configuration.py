@@ -30,11 +30,20 @@ class TilePlan:
 
 
 @dataclass(frozen=True)
+class ReducerHeadPlan:
+    """Immutable association between an internal output head and its reducer."""
+
+    head_index: int
+    input_indices: tuple[int, ...]
+    module_name: str
+
+
+@dataclass(frozen=True)
 class StreamingPlan:
     """Stable setup results shared by forward and backward executors."""
 
     tile: TilePlan
     heads: tuple[HeadPlan, ...]
     modules: tuple[ModulePlan, ...]
-    reducer_heads: tuple[tuple[int, tuple[int, ...]], ...]
+    reducer_heads: tuple[ReducerHeadPlan, ...]
     output_structure: OutputSpec
