@@ -247,64 +247,8 @@ class StreamingCNN(torch.nn.Module):
             print(*args, **kwargs)
 
     def _configure_legacy(self):
-        # Save current model and cudnn flags, since we need to change them and restore later
-        state_dict = self._save_parameters()
-        (
-            old_deterministic_flag,
-            old_benchmark_flag,
-        ) = self._set_cudnn_flags_to_determistic()
-        self._reset_parameters_to_constant()
-
-        # Add hooks to each layer to gather statistics
-        self._add_hooks_for_statistics()
-        self._set_reducer_passthrough(True)
-        self._set_channel_layer_norm_statistics_passthrough(True)
-
-        # We need to temporary store statistics per layer to keep track of the
-        # total output stride at each layer
-        self._stats_per_grad_fn = {}
-
-        # TODO; temp hack for tile sizes too big on gpu,
-        # we need float32 precision
-        if self.statistics_on_cpu:
-            self.stream_module = self.stream_module.cpu()
-            self.device = torch.device("cpu")  # type:ignore
-
-        # Create all-ones tile
-        tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
-
-        self._gather_forward_statistics(tile)
-        self._print_verbose("")
-        self._gather_backward_statistics(tile)
-
-        # TODO; temp hack for tile sizes too big on gpu,
-        if self.statistics_on_cpu:
-            self.stream_module = self.stream_module.cuda()
-            self.device = torch.device("cuda")  # type:ignore
-
-        # Remove all hooks and add hooks for correcting gradients
-        # during lightstream
-        self._remove_hooks()
-        self._set_reducer_passthrough(False)
-        self._set_channel_layer_norm_statistics_passthrough(False)
-        #
-        self._restore_parameters(state_dict)
-        self._capture_public_output_spec()
-        self._streaming_reducers = []
-        self.stream_module = self._convert_modules_for_streaming(self.stream_module)
-        self._add_hooks_for_streaming()
-
-        # Remove temporary data
-        self._saved_tensors = {}
-        del self._stats_per_grad_fn
-
-        # Zero the gradients
-        for param in self.stream_module.parameters():
-            if param.grad is not None:
-                param.grad.data.zero_()
-
-        self._set_cudnn_flags(old_deterministic_flag, old_benchmark_flag)
-        del state_dict
+        """Compatibility entry point; probing is owned by ``StreamingPlanBuilder``."""
+        StreamingPlanBuilder(self)._probe()
 
     def _capture_public_output_spec(self) -> None:
         """Capture user-facing output structure with reducers in normal (non-passthrough) mode."""
@@ -1087,7 +1031,8 @@ class StreamingCNN(torch.nn.Module):
                     self._hooks.append(back_handle)
 
     def _remove_hooks(self):
-        for hook in self._hooks:
+        hooks, self._hooks = self._hooks, []
+        for hook in hooks:
             hook.remove()
 
     def _resolve_upsample_scale(self, module, inpt, output):

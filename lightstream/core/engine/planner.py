@@ -1,6 +1,14 @@
 """Setup/probing boundary for the compatibility facade."""
 
-from .configuration import HeadPlan, ModulePlan, StreamingPlan, TilePlan
+from contextlib import ExitStack
+
+import torch
+
+from .configuration import (
+    HeadPlan, ModulePlan, StreamingPlan, TilePlan, cudnn_flags,
+    device_movement, gradient_mode, normalization_passthrough,
+    reducer_passthrough, statistics_hooks, temporary_parameters,
+)
 from .reducers import StaticReducerBinding
 from .operators import STREAMING_OPERATORS
 
@@ -18,7 +26,7 @@ class StreamingPlanBuilder:
     def build(self, *, probe: bool = True) -> StreamingPlan:
         self._validate_operators()
         if probe:
-            self.facade._configure_legacy()
+            self._probe()
         f = self.facade
         modules = []
         for name, module in f.stream_module.named_modules():
@@ -41,6 +49,43 @@ class StreamingPlanBuilder:
             reducer_heads=reducers,
             output_structure=f._output_spec,
         )
+
+    def _probe(self) -> None:
+        """Probe geometry while confining every temporary configuration change."""
+        f = self.facade
+        probe_device = torch.device("cpu") if f.statistics_on_cpu else None
+        f._stats_per_grad_fn = {}
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(cudnn_flags(deterministic=True, benchmark=False))
+                stack.enter_context(temporary_parameters(f))
+                stack.enter_context(device_movement(f, probe_device))
+                stack.enter_context(statistics_hooks(f))
+                stack.enter_context(reducer_passthrough(f))
+                stack.enter_context(normalization_passthrough(f))
+
+                tile = torch.ones(f.tile_shape, dtype=f.dtype, requires_grad=True, device=f.device)
+                with gradient_mode(False):
+                    f._gather_forward_statistics(tile)
+                f._print_verbose("")
+                with gradient_mode(True):
+                    f._gather_backward_statistics(tile)
+
+            # Public structure must be sampled with the restored public behavior.
+            with gradient_mode(False), device_movement(f, probe_device):
+                f._capture_public_output_spec()
+        finally:
+            f._remove_hooks()
+            f._saved_tensors = {}
+            f.__dict__.pop("_stats_per_grad_fn", None)
+            for parameter in f.stream_module.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.detach_()
+                    parameter.grad.zero_()
+
+        f._streaming_reducers = []
+        f.stream_module = f._convert_modules_for_streaming(f.stream_module)
+        f._add_hooks_for_streaming()
 
     def _validate_operators(self) -> None:
         # Reducers have their own lifecycle protocol and containers merely group
