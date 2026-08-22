@@ -943,7 +943,7 @@ class StreamingCNN(torch.nn.Module):
         trimmed_output = self._trim_head_output(head_output, head_lost)
         return head_lost, output_loc, trimmed_output
 
-    def forward(self, image, result_on_cpu=False, mask=None):
+    def forward(self, image, *, result_on_cpu=False, mask=None):
         """Delegate a forward call to the plan-driven executor."""
         return self._forward_executor.execute(self.plan, ForwardCall(image, result_on_cpu, mask))
 
@@ -1499,7 +1499,3 @@ class StreamingCNN(torch.nn.Module):
                 self._module_stats[module] = state["net_stats"][name]
 
         self.enable()
-
-    def __call__(self, image, **kwargs):
-        result_on_cpu = kwargs.pop("result_on_cpu", False)
-        return self.forward(image, result_on_cpu=result_on_cpu, **kwargs)

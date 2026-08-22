@@ -439,6 +439,41 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
     return constructor.prepare_streaming_model()
 
 
+def test_scnn_module_invocation_runs_forward_hooks_and_matches_direct_forward():
+    class RecordingForwardExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, plan, call):
+            self.calls.append((plan, call))
+            return call.image + 1
+
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    nn.Module.__init__(scnn)
+    scnn.plan = object()
+    scnn._forward_executor = RecordingForwardExecutor()
+    image = torch.randn(1, 3, 4, 4)
+    hook_events = []
+
+    scnn.register_forward_pre_hook(
+        lambda module, inputs: hook_events.append(("pre", module, inputs))
+    )
+    scnn.register_forward_hook(
+        lambda module, inputs, output: hook_events.append(("forward", module, inputs, output))
+    )
+
+    direct_result = scnn.forward(image, result_on_cpu=True)
+    invoked_result = scnn(image, result_on_cpu=True)
+
+    assert torch.equal(invoked_result, direct_result)
+    assert [event[0] for event in hook_events] == ["pre", "forward"]
+    assert hook_events[0][1:] == (scnn, (image,))
+    assert hook_events[1][1:3] == (scnn, (image,))
+    assert torch.equal(hook_events[1][3], invoked_result)
+    assert len(scnn._forward_executor.calls) == 2
+    assert all(call.result_on_cpu for _, call in scnn._forward_executor.calls)
+
+
 def test_scnn_forward_all_reducer_heads_parity():
     torch.manual_seed(7)
     model = AllReducerHeadsNet().eval()
