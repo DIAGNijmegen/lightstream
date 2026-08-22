@@ -37,14 +37,25 @@ class SumReducer(BaseReducer):
         return x.sum(dim=(-2, -1), keepdim=True, dtype=acc_dtype).to(dtype=x.dtype)
 
     def to_streaming(self) -> BaseStreamingGlobalReducer:
-        return StreamingSumReducer(accumulator_dtype=self.accumulator_dtype)
+        return StreamingSumReducer(
+            accumulator_dtype=self.accumulator_dtype,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
+        )
 
 
 class StreamingSumReducer(BaseStreamingGlobalReducer):
     """Streaming reducer configured for sum semantics."""
 
-    def __init__(self, accumulator_dtype: torch.dtype | None = None):
+    def __init__(
+        self,
+        accumulator_dtype: torch.dtype | None = None,
+        mask_resize: bool = False,
+        mask_resize_mode: str = "nearest",
+    ):
         super().__init__(mode="sum", accumulator_dtype=accumulator_dtype)
+        self.mask_resize = bool(mask_resize)
+        self.mask_resize_mode = mask_resize_mode
 
     def init_reduction_state(self, *, batch_size: int, channels: int, device: torch.device, dtype: torch.dtype, accumulator_dtype: torch.dtype) -> None:
         _ = (batch_size, channels, device, dtype, accumulator_dtype)
@@ -67,4 +78,8 @@ class StreamingSumReducer(BaseStreamingGlobalReducer):
         return streaming_reduce_tile(trimmed_output, valid_mask, global_context.get("normalization"))
 
     def to_reducer(self) -> SumReducer:
-        return SumReducer(accumulator_dtype=self.accumulator_dtype)
+        return SumReducer(
+            accumulator_dtype=self.accumulator_dtype,
+            mask_resize=self.mask_resize,
+            mask_resize_mode=self.mask_resize_mode,
+        )

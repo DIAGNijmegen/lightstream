@@ -39,6 +39,8 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
 - `NGWPReducer`: `inputs == (scores, activation_masks)`, with both tensors aligned as `[N, C, H, W]`. It returns `sum(scores * activation_masks) / (eps + sum(activation_masks))` per batch/channel.
 - `SizeFocalReducer`: `inputs == (m,)`, where `m` is an activation/probability tensor `[N, C, H, W]`. It returns `(1 - mean_m)^p * log(lambda_ + mean_m)` per batch/channel.
+- `SigmoidAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor. It preserves every channel and returns `[N, C, 1, 1]`; attention is the spatial `softmax(sigmoid(logits) / tau)` per class.
+- `LogitAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor used as both values and attention logits. It returns `[N, C, 1, 1]`.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
 
 ## Package structure
@@ -161,6 +163,46 @@ print(y.shape)  # torch.Size([2, 256, 1, 1])
 ```
 
 Under `use_streaming=True`, SCNN will call `reducer.to_streaming()` so tiled execution uses the corresponding `StreamingGeMReducer` implementation.
+
+## Logit-attention pooling
+
+`LogitAttentionPoolingReducer` accepts exactly one class-logit tensor
+`z` of shape `[N, C, H, W]`. The same tensor supplies the pooled values and
+the attention scores. For every batch and class independently it computes
+
+```text
+q_i = z_i / tau
+a_i = exp(q_i) / sum_j exp(q_j)
+y = sum_i a_i z_i                         # [N, C, 1, 1]
+```
+
+The positive temperature is parameterized as
+`tau = tau_min + softplus(raw_tau)`. It may be fixed or learned. Its parameter
+storage retains its own dtype and device across `to_streaming()` and
+`to_reducer()` conversions; `accumulator_dtype` controls only reduction math.
+Both `tau_init` and `tau_min` are validated, and `tau_init` must be finite and
+strictly greater than a finite, non-negative `tau_min`.
+
+An optional spatial `mask` excludes positions before softmax normalization.
+Masks use the package-wide mask shapes and resizing rules (`mask_resize` and
+`mask_resize_mode`). A batch item with no valid position returns zero for every
+class. The output always has the input dtype, even when accumulation uses
+float32 or float64.
+
+With `stopgrad_attention=True`, the attention branch uses
+`q = z.detach() / tau`: logits consequently receive only the direct value
+gradient `a_i`, while a learned temperature remains trainable. With the option
+disabled, logits receive the complete value-plus-softmax derivative. Streaming
+backward replay uses the finalized global softmax maximum, denominator, and
+mean, rather than normalizing within each tile. A global weighted-square moment
+provides the learned-temperature derivative once per backward replay, so it is
+independent of tile count and overlap.
+
+This differs from `SigmoidAttentionPoolingReducer` only in the attention source:
+sigmoid attention uses `softmax(sigmoid(z) / tau)`, bounding attention scores,
+whereas logit attention uses `softmax(z / tau)` directly. Both pool the original
+logits, normalize spatially per batch/class, share masking and temperature
+configuration, and expose streaming classes only as execution implementations.
 
 ## AttentionGeM
 
@@ -313,3 +355,16 @@ Re-export `MyReducer` and `StreamingMyReducer` via `lightstream.core.reducer.__i
 - `normalize_spatial_mask` supports 2D/3D/4D masks only.
 - Streaming count tracking is shared across channels (`[N, 1, 1, 1]`), so per-channel normalization behavior is not modeled.
 - The deprecated compatibility path `lightstream.modules.reducer` remains available but should not be used for new code.
+
+## Sigmoid attention pooling
+
+`SigmoidAttentionPoolingReducer` accepts exactly one class-logit tensor in NCHW
+layout. For every batch item and class independently it computes
+`softmax(sigmoid(logits) / tau)` across valid spatial positions and uses those
+weights to sum the original, raw logits. No class channels are combined. The
+result is always `[N, C, 1, 1]`. `tau` may be fixed or learned through a positive
+softplus parameterization. With `stopgrad_attention=True`, gradients through the
+sigmoid scores are stopped while the value path and a learned temperature remain
+differentiable. Its `StreamingSigmoidAttentionPoolingReducer` counterpart is an
+execution implementation; model definitions should instantiate the offline class
+and let `to_streaming()` perform conversion.

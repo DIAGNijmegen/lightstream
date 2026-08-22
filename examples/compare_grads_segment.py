@@ -33,7 +33,7 @@ def _selected_param_names(model: nn.Module) -> list[str]:
 
     for name, param in named_parameters:
         is_decoder_or_attention = name.startswith(
-            ("decoder1.", "decoder2.", "decoder3.", "att_1.", "att_2.", "att_3.")
+            ("decoder1.", "decoder2.", "decoder3.", "att_1.", "att_2.", "att_3.", "tau", "temperature", "reducer", "red")
         )
         is_backbone_conv_weight = (
             name.startswith("backbone.") and name.endswith("weight") and param.ndim == 4
@@ -260,8 +260,8 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare streaming vs non-streaming backward gradients for WSS.")
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
-    parser.add_argument("--tile-size", type=int, default=2560)
-    parser.add_argument("--input-size", type=int, default=4800)
+    parser.add_argument("--tile-size", type=int, default=1920)
+    parser.add_argument("--input-size", type=int, default=5120)
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",

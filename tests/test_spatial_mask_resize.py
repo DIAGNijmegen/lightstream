@@ -5,6 +5,19 @@ from lightstream.core.reducer import AttentionGeMReducer, FusedAttentionGeMReduc
 from lightstream.core.reducer.utils import prepare_spatial_mask
 
 
+@pytest.mark.parametrize("reducer_cls", [MeanReducer, SumReducer])
+def test_mask_resize_settings_survive_streaming_conversion_round_trip(reducer_cls):
+    reducer = reducer_cls(mask_resize=True, mask_resize_mode="nearest")
+
+    streaming = reducer.to_streaming()
+    round_tripped = streaming.to_reducer()
+
+    assert streaming.mask_resize is True
+    assert streaming.mask_resize_mode == "nearest"
+    assert round_tripped.mask_resize is True
+    assert round_tripped.mask_resize_mode == "nearest"
+
+
 def test_prepare_spatial_mask_rejects_mismatch_without_resize():
     x = torch.zeros(2, 3, 4, 6)
     mask = torch.ones(2, 2, 3, dtype=torch.bool)

@@ -1821,9 +1821,11 @@ class StreamingCNN(torch.nn.Module):
             output_widths=output_widths,
         )
 
-        if self.debug_reducer_replay:
-            for reducer in self._reducer_head_map.values():
-                reducer.start_backward_replay()
+        # Reducers can own one-shot backward state even when debug assignment
+        # validation is disabled (for example, a single global parameter
+        # surrogate emitted across all replay tiles).
+        for reducer in self._reducer_head_map.values():
+            reducer.start_backward_replay()
 
         last_sides = None
         for input_y, input_x, sides in tile_iter:
