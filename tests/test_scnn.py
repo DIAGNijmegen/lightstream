@@ -5,7 +5,7 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.scnn.scnn import StreamingCNN
+from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
 from lightstream.core.scnn.utils import Lost
 from lightstream.models.testnet.segment import StreamingTestNet
 
@@ -241,6 +241,18 @@ class DownsampledReducerNet(nn.Module):
     def forward(self, x, mask: torch.Tensor | None = None):
         feat = self.down(x)
         return self.reducer(feat, mask=mask)
+
+
+class MultiResolutionReducerNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.half = nn.Conv2d(3, 4, kernel_size=3, stride=2, padding=1, bias=False)
+        self.quarter = nn.Conv2d(3, 5, kernel_size=3, stride=4, padding=1, bias=False)
+        self.half_reducer = MeanReducer(mask_resize=True)
+        self.quarter_reducer = MeanReducer(mask_resize=True)
+
+    def forward(self, x):
+        return self.half_reducer(self.half(x)), self.quarter_reducer(self.quarter(x))
 
 
 class MixedHeadsNet(nn.Module):
@@ -995,6 +1007,67 @@ def test_scnn_downsampled_reducer_resizes_input_domain_mask():
         streamed = scnn.forward(image, mask=mask)
 
     assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "target_shape"),
+    [
+        ((9, 13), (4, 6)),       # downsample, non-integer ratio
+        ((3, 5), (8, 12)),       # upsample, non-integer ratio
+        ((8, 12), (4, 3)),       # exact integer ratios
+        ((7, 11), (13, 17)),     # odd dimensions
+        ((1, 9), (7, 1)),        # one-pixel source/target dimensions
+        ((9, 1), (1, 8)),
+    ],
+)
+def test_resize_nearest_bool_mask_matches_interpolate_for_all_chunk_sizes(source_shape, target_shape):
+    source = (torch.arange(source_shape[0] * source_shape[1]).reshape(source_shape) % 3 == 0)
+    expected = torch.nn.functional.interpolate(
+        source[None, None].float(), size=target_shape, mode="nearest"
+    )[0, 0].bool()
+
+    results = [
+        _resize_nearest_bool_mask(source, *target_shape, rows_per_chunk=chunk_size)
+        for chunk_size in (1, 4, target_shape[0] + 3)
+    ]
+    assert all(torch.equal(result, expected) for result in results)
+    assert all(torch.equal(result, results[0]) for result in results[1:])
+
+
+def test_resize_nearest_bool_mask_chunked_path_never_uses_float_interpolation(monkeypatch):
+    source = torch.rand(17, 19) > 0.5
+
+    def forbidden_interpolate(*args, **kwargs):
+        raise AssertionError("boolean mask resize must not call float interpolation")
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", forbidden_interpolate)
+    resized = _resize_nearest_bool_mask(source, 31, 37, rows_per_chunk=3)
+    assert resized.shape == (31, 37)
+    assert resized.dtype == torch.bool
+
+
+def test_scnn_multi_head_masks_are_resized_in_each_reducer_output_domain():
+    torch.manual_seed(120)
+    model = MultiResolutionReducerNet().eval()
+    image = torch.randn(1, 3, 17, 19)
+    mask = (torch.arange(17)[:, None] + 2 * torch.arange(19)[None, :]) % 5 != 0
+    scnn = _make_streaming(model, tile_size=9)
+
+    with torch.no_grad():
+        scnn.forward(image, mask=mask)
+
+    assert len(scnn._prepared_reducer_domain_masks) == 2
+    for head_idx, reducer in scnn._reducer_head_map.items():
+        prepared = scnn._prepared_reducer_domain_masks[(id(reducer), head_idx)]
+        target_shape = (
+            scnn._current_output_heights[head_idx],
+            scnn._current_output_widths[head_idx],
+        )
+        expected = torch.nn.functional.interpolate(
+            mask[None, None].float(), size=target_shape, mode="nearest"
+        )[0, 0].bool()
+        assert prepared.shape == target_shape
+        assert torch.equal(prepared.cpu(), expected)
 
 
 def test_scnn_too_small_reducer_mask_fails_at_reducer_slice_site():

@@ -39,6 +39,10 @@ from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 logger = logging.getLogger(__name__)
 
+# Keep each temporary indexing result reasonably small while still amortizing
+# the cost of launching an indexing operation (especially on accelerators).
+_MASK_RESIZE_ROWS_PER_CHUNK = 4096
+
 _triple = _ntuple(3)
 
 
@@ -48,6 +52,47 @@ BACKWARD_STREAMING_MODULE_TYPES = (
     StreamingChannelLayerNorm,
     StreamingLayerScale,
 )
+
+
+def _resize_nearest_bool_mask(
+    mask: torch.Tensor,
+    output_height: int,
+    output_width: int,
+    rows_per_chunk: int = _MASK_RESIZE_ROWS_PER_CHUNK,
+) -> torch.Tensor:
+    """Resize a normalized 2D bool mask using PyTorch's legacy nearest mapping.
+
+    ``interpolate(mode="nearest")`` selects source coordinate
+    ``floor(target_coordinate * source_size / target_size)``.  Coordinates are
+    always calculated in the complete output domain; chunking only limits the
+    number of output rows materialized by each advanced-indexing operation.
+    """
+    if mask.ndim != 2 or mask.dtype != torch.bool:
+        raise ValueError("mask must be a normalized 2D boolean tensor")
+    output_height, output_width = int(output_height), int(output_width)
+    rows_per_chunk = int(rows_per_chunk)
+    if output_height <= 0 or output_width <= 0:
+        raise ValueError("output_height and output_width must be positive")
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+
+    source_height, source_width = mask.shape
+    if source_height == 0 or source_width == 0:
+        raise ValueError("source mask dimensions must be positive")
+    if (source_height, source_width) == (output_height, output_width):
+        return mask
+
+    # Integer arithmetic is both exact and identical to interpolate's legacy
+    # nearest-neighbour coordinate transformation (not ``nearest-exact``).
+    target_columns = torch.arange(output_width, device=mask.device)
+    source_columns = torch.div(target_columns * source_width, output_width, rounding_mode="floor")
+    resized = torch.empty((output_height, output_width), dtype=torch.bool, device=mask.device)
+    for start in range(0, output_height, rows_per_chunk):
+        end = min(start + rows_per_chunk, output_height)
+        target_rows = torch.arange(start, end, device=mask.device)
+        source_rows = torch.div(target_rows * source_height, output_height, rounding_mode="floor")
+        resized[start:end] = mask[source_rows[:, None], source_columns[None, :]]
+    return resized
 
 
 def _is_spatial_preserving_pointwise_module(module):
@@ -223,21 +268,21 @@ class StreamingCNN(torch.nn.Module):
         if mask is None:
             return None
         if mask.ndim == 2:
-            return mask.to(device=self.device, dtype=torch.bool)
+            return mask.to(dtype=torch.bool)
         if mask.ndim == 3:
             if mask.shape[0] != image.shape[0]:
                 raise ValueError(
                     f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]}; "
                     "H/W must align with the reducer/reduced feature spatial domain."
                 )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=0)
+            return torch.any(mask.to(dtype=torch.bool), dim=0)
         if mask.ndim == 4:
             if mask.shape[0] != image.shape[0]:
                 raise ValueError(
                     f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
                     "H/W must align with the reducer/reduced feature spatial domain."
                 )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
+            return torch.any(mask.to(dtype=torch.bool), dim=(0, 1))
         raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
 
     def _prepare_reducer_domain_mask(
@@ -261,7 +306,7 @@ class StreamingCNN(torch.nn.Module):
         expected_shape = (int(output_height), int(output_width))
         actual_shape = (int(normalized.shape[-2]), int(normalized.shape[-1]))
         if actual_shape == expected_shape:
-            return normalized
+            return normalized.to(device=self.device)
 
         if not getattr(reducer, "mask_resize", False):
             raise ValueError(
@@ -276,12 +321,8 @@ class StreamingCNN(torch.nn.Module):
                 "Only 'nearest' is supported for streaming reducer mask resizing."
             )
 
-        resized = torch.nn.functional.interpolate(
-            normalized[None, None].to(dtype=torch.float32),
-            size=expected_shape,
-            mode=mask_resize_mode,
-        )[0, 0]
-        return resized.to(device=self.device, dtype=torch.bool)
+        resized = _resize_nearest_bool_mask(normalized, output_height, output_width)
+        return resized.to(device=self.device)
 
     def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
         reducer = self._reducer_head_map[head_idx]
