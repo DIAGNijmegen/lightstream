@@ -107,6 +107,11 @@ their sums and denominators/counts. Masks follow the package's 2D/3D/4D spatial
 mask contract. By default they must already align with the reducer output; set
 `mask_resize=True` to resize a reduced-resolution tissue mask using nearest-neighbor
 interpolation. Empty tissue masks return zero for every affected output channel.
+Mask resizing uses one global nearest-neighbor coordinate system for each reducer
+output domain. Output-row chunking bounds temporary indexing memory only and does
+not restart coordinates at chunk boundaries. When a streamed model has multiple
+reducer heads, each head receives a separately resized mask matching its own spatial
+resolution.
 
 `StreamingNGWPReducer` retains separate weighted-score and activation-mask sums,
 then divides only during `finalize_from_state`. `StreamingSizeFocalReducer` retains
