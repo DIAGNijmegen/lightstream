@@ -22,6 +22,7 @@ from .sigmoid_attention import (
     StreamingSigmoidAttentionPoolingReducer,
 )
 from .sum import StreamingSumReducer, SumReducer
+from .softmax_attention import SoftmaxAttentionReducer, StreamingSoftmaxAttentionReducer
 
 __all__ = [
     "MeanReducer",
@@ -47,4 +48,6 @@ __all__ = [
     "StreamingSigmoidAttentionPoolingReducer",
     "LogitAttentionPoolingReducer",
     "StreamingLogitAttentionPoolingReducer",
+    "SoftmaxAttentionReducer",
+    "StreamingSoftmaxAttentionReducer",
 ]
