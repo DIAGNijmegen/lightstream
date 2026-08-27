@@ -8,7 +8,7 @@ from torch.nn import Sequential
 from lightstream.modules.streaming import StreamingModule
 from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
 from lightstream.core.scnn.streaminglayerscale import LayerScale
-from lightstream.core.reducer import NormalizedSigmoidAttentionReducer
+from lightstream.core.reducer import SoftmaxAttentionReducer
 
 
 class GatedAttention(nn.Module):
@@ -41,7 +41,7 @@ class Head(nn.Module):
         super().__init__()
         self.att_net = GatedAttention(16,16,1)
         self.classifier = nn.Conv2d(16, 1, kernel_size=1)
-        self.reducer = NormalizedSigmoidAttentionReducer(accumulator_dtype=None, mask_resize=True)
+        self.reducer = SoftmaxAttentionReducer(accumulator_dtype=None, mask_resize=True)
     def forward(self, x):
         att = self.att_net(x)
         logits = self.classifier(x)
