@@ -302,6 +302,29 @@ Both `value_weights` and `attention_weights` are registered as non-trainable buf
 
 SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which keeps the public six-input reducer API but exposes a compact two-tensor internal payload `(fused_y, att_logits_stacked)`, where the stacked logits use shape `[N, 3, H, W]` for tiled accumulation and backward replay. The streaming implementation tracks per-branch softmax state plus one fused valid uniform sum/count, preserving the post-branch-fusion uniform-mix semantics in forward and backward replay.
 
+## Spatial softmax attention
+
+`SoftmaxAttentionReducer` takes positional inputs `(values, attention_logits)`,
+where `values` is `[N,C,H,W]` and attention logits may be `[N,H,W]`,
+`[N,1,H,W]`, or `[N,C,H,W]`. In the last form, channels are averaged before
+softmax to produce one shared attention field. Values are opaque scores: they are
+never sigmoid-transformed, clamped, or otherwise altered. The output is
+`[N,C,1,1]` and is defined, independently for each sample, by
+
+```text
+m = max(valid attention_logits)
+w_i = exp(attention_logits_i - m) / sum_j exp(attention_logits_j - m)
+output_c = sum_i w_i * values_c,i
+```
+
+Softmax normalization covers only valid spatial positions. Optional masks follow
+the common reducer conventions (including nearest-neighbor resizing with
+`mask_resize=True`); invalid positions receive zero weight, and fully masked
+samples return zero. `StreamingSoftmaxAttentionReducer` preserves the same
+global softmax across all tiles by retaining and rescaling a running maximum,
+denominator, and weighted numerator. Use `to_streaming()` and `to_reducer()` to
+convert between implementations.
+
 ## Extension guide: custom reducers
 
 If you add a new reducer family, provide both non-streaming and streaming pieces.
