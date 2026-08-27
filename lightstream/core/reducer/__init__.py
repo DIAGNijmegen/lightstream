@@ -11,6 +11,10 @@ from .logit_attention import (
     StreamingLogitAttentionPoolingReducer,
 )
 from .ngwp import NGWPReducer, StreamingNGWPReducer
+from .normalized_sigmoid_attention import (
+    NormalizedSigmoidAttentionReducer,
+    StreamingNormalizedSigmoidAttentionReducer,
+)
 from .reducer_base import BaseReducer
 from .size_focal import SizeFocalReducer, StreamingSizeFocalReducer
 from .sigmoid_attention import (
@@ -35,6 +39,8 @@ __all__ = [
     "StreamingFusedAttentionGeMReducer",
     "NGWPReducer",
     "StreamingNGWPReducer",
+    "NormalizedSigmoidAttentionReducer",
+    "StreamingNormalizedSigmoidAttentionReducer",
     "SizeFocalReducer",
     "StreamingSizeFocalReducer",
     "SigmoidAttentionPoolingReducer",

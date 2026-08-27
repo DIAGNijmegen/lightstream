@@ -36,6 +36,7 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 
 - `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
 - `AttentionGeMReducer`: `inputs == (x, att_logits)`, where `att_logits` is `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`.
+- `NormalizedSigmoidAttentionReducer`: `inputs == (values, attention_logits)`, with values `[N,C,H,W]` and attention logits `[N,H,W]`, `[N,1,H,W]`, or `[N,C,H,W]`.
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
 - `NGWPReducer`: `inputs == (scores, activation_masks)`, with both tensors aligned as `[N, C, H, W]`. It returns `sum(scores * activation_masks) / (eps + sum(activation_masks))` per batch/channel.
 - `SizeFocalReducer`: `inputs == (m,)`, where `m` is an activation/probability tensor `[N, C, H, W]`. It returns `(1 - mean_m)^p * log(lambda_ + mean_m)` per batch/channel.
@@ -210,6 +211,23 @@ logits, normalize spatially per batch/class, share masking and temperature
 configuration, and expose streaming classes only as execution implementations.
 
 ## AttentionGeM
+
+## Normalized sigmoid attention
+
+`NormalizedSigmoidAttentionReducer` preserves `values` exactly and uses the ratio
+
+```text
+output_c = sum_i(sigmoid(attention_logits_i) * values_i,c)
+           / sum_i(sigmoid(attention_logits_i))
+```
+
+over valid spatial positions. It does not apply a sigmoid, clamp, power, or any
+other transformation to instance values. One-channel attention broadcasts across
+value channels. As in `AttentionGeMReducer`, `[N,C,H,W]` attention logits are
+averaged across channels to a single attention field before sigmoid and spatial
+normalization. Masks exclude pixels from both sums, and fully masked samples yield
+zero. `StreamingNormalizedSigmoidAttentionReducer` accumulates the same numerator
+and denominator across tiles and uses global statistics during backward replay.
 
 `AttentionGeMReducer` reduces a value tensor `x` with attention logits over the same spatial domain. Its exact input ordering is:
 
