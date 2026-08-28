@@ -16,6 +16,30 @@ def test_streaming_merge_has_exact_eager_semantics(mode, expected):
     assert torch.equal(StreamingMerge(mode)(a, b), expected(a, b))
 
 
+def test_streaming_merge_multiply_retains_pytorch_overflow_semantics():
+    a = torch.full((1, 1, 2, 2), 1e30)
+    b = torch.full((1, 1, 2, 2), 1e30)
+
+    result = StreamingMerge("multiply")(a, b)
+
+    assert torch.equal(result, a * b)
+    assert torch.isinf(result).all()
+
+
+def test_streaming_merge_multiply_statistics_mode_preserves_finite_gradients():
+    merge = StreamingMerge("multiply")
+    merge._streaming_statistics_mode = True
+    a = torch.full((1, 1, 2, 2), 1e30, requires_grad=True)
+    b = torch.full((1, 1, 2, 2), 2e30, requires_grad=True)
+
+    result = merge(a, b)
+    result.sum().backward()
+
+    assert torch.isfinite(result).all()
+    assert a.grad is not None and torch.isfinite(a.grad).all() and torch.count_nonzero(a.grad)
+    assert b.grad is not None and torch.isfinite(b.grad).all() and torch.count_nonzero(b.grad)
+
+
 def test_streaming_merge_rejects_unknown_mode():
     with pytest.raises(ValueError, match="mode must be one of"):
         StreamingMerge("subtract")

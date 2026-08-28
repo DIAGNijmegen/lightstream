@@ -395,9 +395,13 @@ class StreamingCNN(torch.nn.Module):
         # Create all-ones tile
         tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
 
-        self._gather_forward_statistics(tile)
-        self._print_verbose("")
-        self._gather_backward_statistics(tile)
+        self._set_streaming_merge_statistics_mode(True)
+        try:
+            self._gather_forward_statistics(tile)
+            self._print_verbose("")
+            self._gather_backward_statistics(tile)
+        finally:
+            self._set_streaming_merge_statistics_mode(False)
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
@@ -440,6 +444,11 @@ class StreamingCNN(torch.nn.Module):
         for mod in self.stream_module.modules():
             if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
+
+    def _set_streaming_merge_statistics_mode(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingMerge):
+                mod._streaming_statistics_mode = enabled
 
     def _set_channel_layer_norm_statistics_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
