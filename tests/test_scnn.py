@@ -12,18 +12,21 @@ from lightstream.models.testnet.segment import StreamingTestNet
 from lightstream.core.reducer import (
     BaseReducer,
     BaseStreamingGlobalReducer,
+    AttentionKLDivergenceReducer,
     AttentionGeMReducer,
     FusedAttentionGeMReducer,
     GeMReducer,
     MeanReducer,
     NGWPReducer,
     StreamingAttentionGeMReducer,
+    StreamingAttentionKLDivergenceReducer,
     StreamingFusedAttentionGeMReducer,
     StreamingGeMReducer,
     StreamingMeanReducer,
     StreamingNGWPReducer,
     StreamingSumReducer,
     SumReducer,
+    SoftmaxAttentionReducer,
 )
 
 
@@ -438,6 +441,35 @@ class ValueLogitsHeadNet(nn.Module):
         return reduced, value, logits
 
 
+class SSHRReducerLayoutNet(nn.Module):
+    """Small integration fixture with SSHR's reducer and output ordering."""
+
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Conv2d(3, 1, kernel_size=1)
+        self.reducers = nn.ModuleList([SoftmaxAttentionReducer() for _ in range(4)])
+        self.fused_reducer = MeanReducer()
+        self.ema_reducers = nn.ModuleList([AttentionKLDivergenceReducer() for _ in range(4)])
+
+    def forward(self, x):
+        feature = self.features(x)
+        values = tuple(feature + i for i in range(4))
+        attention = tuple(feature + i + 1 for i in range(4))
+        teacher = tuple(feature + i + 1.5 for i in range(4))
+        outputs = tuple(
+            reducer(value, logits)
+            for reducer, value, logits in zip(self.reducers, values, attention)
+        )
+        outputs += (self.fused_reducer(feature),)
+        # Each attention tensor is first an auxiliary reducer input and then the
+        # primary input of its corresponding KL reducer, as in SSHR.
+        outputs += tuple(
+            reducer(student, target)
+            for reducer, student, target in zip(self.ema_reducers, attention, teacher)
+        )
+        return outputs
+
+
 def _make_streaming(model: nn.Module, tile_size: int = 4):
     constructor = StreamingConstructor(
         model,
@@ -773,6 +805,24 @@ def test_scnn_mixed_head_reducer_mapping_stable():
     assert torch.allclose(stream_first["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(stream_second["raw"], expected["raw"], atol=1e-5, rtol=1e-4)
     assert torch.allclose(stream_second["reduced"], expected["reduced"], atol=1e-5, rtol=1e-4)
+
+
+def test_sshr_layout_maps_kl_reducers_to_primary_occurrences():
+    model = SSHRReducerLayoutNet().eval()
+    image = torch.randn(2, 3, 9, 11)
+    scnn = _make_streaming(model, tile_size=5)
+
+    with torch.no_grad():
+        outputs = scnn.forward(image)
+
+    kl_heads = [
+        index
+        for index, reducer in scnn._reducer_head_map.items()
+        if isinstance(reducer, StreamingAttentionKLDivergenceReducer)
+    ]
+    assert kl_heads == [9, 11, 13, 15]
+    assert len(outputs) == 9
+    assert all(output.shape == (2, 1, 1, 1) for output in outputs)
 
 
 def test_scnn_multi_input_reducer_forward_odd_borders_with_mask_parity():

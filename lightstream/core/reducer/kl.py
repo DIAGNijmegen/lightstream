@@ -143,8 +143,9 @@ class StreamingAttentionKLDivergenceReducer(BaseStreamingGlobalReducer):
             )
         student_logits, teacher_logits = inputs
         _validate_logits(student_logits, teacher_logits)
-        self._last_inputs, self._last_output = (student_logits, teacher_logits), student_logits
-        return student_logits, teacher_logits
+        payload = (student_logits.view_as(student_logits), teacher_logits.view_as(teacher_logits))
+        self._last_inputs, self._last_output = payload, payload[0]
+        return payload
 
     def accumulate_stream_tile(self, trimmed_output, tile_y, tile_x, sides, dst_box, user_mask=None):
         payload = self._parse_multi_input_payload(trimmed_output)
