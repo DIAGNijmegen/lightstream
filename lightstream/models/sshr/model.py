@@ -10,7 +10,8 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from typing import List
 from torchinfo import summary
 
-from lightstream.core.reducer import MeanReducer, NormalizedSigmoidAttentionReducer, AttentionKLDivergenceReducer
+from lightstream.core.reducer import MeanReducer, NormalizedSigmoidAttentionReducer, AttentionKLDivergenceReducer, \
+    SoftmaxAttentionReducer
 from lightstream.models.segment.resnet import make_resnet_backbone
 from lightstream.core.scnn.streamingmerge import StreamingMerge
 from lightstream.core.scnn.streaminglayerscale import LayerScale
@@ -267,7 +268,7 @@ class SSHR(nn.Module):
 
         for i in range(len(self.loss_weights)):
 
-            block = NormalizedSigmoidAttentionReducer(mask_resize=True, accumulator_dtype=torch.float64)
+            block = SoftmaxAttentionReducer(mask_resize=True, accumulator_dtype=torch.float64)
 
             if i == len(self.loss_weights) - 1:
                 block = MeanReducer(mask_resize=True)
