@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from .base import BaseStreamingGlobalReducer, streaming_reduce_tile
-from .reducer.reducer_base import BaseReducer
-from .reducer.utils import prepare_spatial_mask, resolve_accumulator_dtype
+from .reducer_base import BaseReducer
+from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 def _validate_logits(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> None:
