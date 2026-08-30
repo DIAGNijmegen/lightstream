@@ -140,7 +140,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     print("=" * 80)
 
     network = StreamingSSHR(
-        "resnet34",
+        "resnet18",
         args.tile_size,
         additional_modules=None,
         mean=[0, 0, 0],
