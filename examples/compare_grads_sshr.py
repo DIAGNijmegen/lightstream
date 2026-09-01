@@ -173,6 +173,9 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         output if output.requires_grad else output.detach().requires_grad_()
         for output in stream_outputs
     )
+    print("")
+    print("Stream output for grads", stream_outputs_for_grads)
+    print("")
 
     output_grads = _base_output_grads(stream_outputs_for_grads, target, criterion)
     print(
