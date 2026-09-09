@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -97,6 +98,70 @@ def test_backward_statistics_use_dilated_effective_kernel_for_overlap():
     assert dilation_2_lost.left > dilation_1_lost.left
     assert dilation_2_lost.bottom > dilation_1_lost.bottom
     assert dilation_2_lost.right > dilation_1_lost.right
+
+
+def test_batch_norm_checkpoint_state_is_restored_and_does_not_affect_tile_cache():
+    def configure(running_mean, running_var):
+        model = nn.Sequential(
+            nn.Conv2d(3, 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.Conv2d(4, 2, kernel_size=3, padding=1),
+        ).eval()
+        with torch.no_grad():
+            model[1].weight.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5]))
+            model[1].bias.copy_(torch.tensor([-1.0, -0.5, 0.5, 1.0]))
+            model[1].running_mean.copy_(torch.tensor(running_mean))
+            model[1].running_var.copy_(torch.tensor(running_var))
+            model[1].num_batches_tracked.fill_(17)
+        checkpoint_state = {name: value.clone() for name, value in model.state_dict().items()}
+
+        scnn = StreamingCNN(
+            model,
+            tile_shape=(1, 3, 8, 8),
+            deterministic=True,
+            copy_to_gpu=False,
+            statistics_on_cpu=False,
+            normalize_on_gpu=False,
+        )
+
+        restored_state = scnn.stream_module.state_dict()
+        assert restored_state.keys() == checkpoint_state.keys()
+        for name, expected in checkpoint_state.items():
+            torch.testing.assert_close(restored_state[name], expected, rtol=0, atol=0)
+        return scnn.get_tile_cache()
+
+    first_cache = configure(
+        running_mean=[-100.0, -2.0, 5.0, 80.0],
+        running_var=[0.01, 0.5, 10.0, 250.0],
+    )
+    second_cache = configure(
+        running_mean=[90.0, 7.0, -4.0, -120.0],
+        running_var=[300.0, 20.0, 0.25, 0.02],
+    )
+
+    def assert_identical_finite(first, second):
+        assert type(first) is type(second)
+        if isinstance(first, torch.Tensor):
+            assert torch.isfinite(first).all()
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        elif isinstance(first, dict):
+            assert first.keys() == second.keys()
+            for key in first:
+                assert_identical_finite(first[key], second[key])
+        elif isinstance(first, (tuple, list)):
+            assert len(first) == len(second)
+            for first_value, second_value in zip(first, second):
+                assert_identical_finite(first_value, second_value)
+        elif isinstance(first, nn.Module):
+            assert repr(first) == repr(second)
+        elif isinstance(first, float):
+            assert math.isfinite(first)
+            assert first == second
+        else:
+            assert first == second
+
+    assert_identical_finite(first_cache, second_cache)
 
 
 @pytest.mark.parametrize(

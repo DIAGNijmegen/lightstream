@@ -1003,8 +1003,14 @@ class StreamingCNN(torch.nn.Module):
         # constant setup tensors from producing zero LayerNorm input gradients.
         for m in self.stream_module.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+                if m.weight is not None:
+                    m.weight.data.fill_(1)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+                if m.running_mean is not None:
+                    m.running_mean.data.zero_()
+                if m.running_var is not None:
+                    m.running_var.data.fill_(1)
                 m.eval()
 
     def _set_cudnn_flags(self, deterministic_flag, benchmark_flag):
