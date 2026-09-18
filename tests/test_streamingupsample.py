@@ -3,7 +3,7 @@ import torch
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+from lightstream.core.layers.streamingupsample import StreamingUpsample2d
 from lightstream.core.scnn.utils import Box, Lost, Sides
 
 

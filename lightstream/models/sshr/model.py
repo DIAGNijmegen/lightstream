@@ -13,8 +13,8 @@ from torchinfo import summary
 from lightstream.core.reducer import MeanReducer, NormalizedSigmoidAttentionReducer, AttentionKLDivergenceReducer, \
     SoftmaxAttentionReducer
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.scnn.streamingmerge import StreamingMerge
-from lightstream.core.scnn.streaminglayerscale import LayerScale
+from lightstream.core.layers.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayerscale import LayerScale
 
 
 class GatedAttention(nn.Module):

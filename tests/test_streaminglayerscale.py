@@ -5,8 +5,8 @@ import pytest
 import torch
 
 from lightstream.core.reducer import MeanReducer, StreamingMeanReducer
-from lightstream.core.scnn import LayerScale, StreamingLayerScale
-from lightstream.core.scnn.streaminglayerscale import LayerScale as ImportedLayerScale
+from lightstream.core.layers import LayerScale, StreamingLayerScale
+from lightstream.core.layers.streaminglayerscale import LayerScale as ImportedLayerScale
 
 
 def test_layer_scale_scalar_shape_forward_matches_raw_multiplication():
