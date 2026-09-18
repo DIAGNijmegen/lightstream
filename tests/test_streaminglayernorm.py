@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from lightstream.core.layers import ChannelLayerNorm, StreamingChannelLayerNorm
-from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm as ImportedChannelLayerNorm
+from lightstream.core.layers import ChannelLayerNorm as ImportedChannelLayerNorm
 
 
 def _channel_layer_norm_affine_keys(module: torch.nn.Module) -> set[str]:
@@ -189,7 +189,7 @@ def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
 
 
 def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metadata():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True).to(dtype=torch.float64)
     module.norm.weight.data.copy_(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
@@ -257,7 +257,7 @@ def test_channel_layer_norm_stores_constructor_metadata():
 
 
 def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadata():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True)
     module.norm = torch.nn.LayerNorm(3, eps=1e-2, elementwise_affine=True)
@@ -274,7 +274,7 @@ def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadat
 
 
 def test_streaming_channel_layer_norm_conversion_rejects_replaced_norm():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3)
     module.norm = torch.nn.Identity()
@@ -284,7 +284,7 @@ def test_streaming_channel_layer_norm_conversion_rejects_replaced_norm():
 
 def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
     from lightstream.core.scnn.scnn import StreamingCNN
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Lost
 
     norm = ChannelLayerNorm(3)
@@ -308,7 +308,7 @@ def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
 
 def test_scnn_resets_streaming_channel_layer_norm_and_preserves_stats():
     from lightstream.core.scnn.scnn import StreamingCNN
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Lost
 
     streaming_norm = StreamingChannelLayerNorm(3)
@@ -328,7 +328,7 @@ def test_scnn_resets_streaming_channel_layer_norm_and_preserves_stats():
 
 
 def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_backward():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     torch.manual_seed(11)
     module = ChannelLayerNorm(4, eps=1e-5, elementwise_affine=True)
@@ -351,7 +351,7 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
 
 
 def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Box, Lost, Sides
 
     torch.manual_seed(13)
@@ -376,7 +376,7 @@ def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region(
 
 
 def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     torch.manual_seed(17)
     module = ChannelLayerNorm(3, elementwise_affine=False)
@@ -404,9 +404,7 @@ def test_backward_streaming_module_predicate_includes_existing_and_layer_norm_ty
     monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
 
     from lightstream.core.scnn.scnn import _is_backward_streaming_module
-    from lightstream.core.layers.streamingconv import StreamingConv2d
-    from lightstream.core.layers.streaminglayernorm import StreamingChannelLayerNorm
-    from lightstream.core.layers.streamingupsample import StreamingUpsample2d
+    from lightstream.core.layers import StreamingChannelLayerNorm, StreamingConv2d, StreamingUpsample2d
 
     assert _is_backward_streaming_module(StreamingConv2d(3, 3, kernel_size=1))
     assert _is_backward_streaming_module(StreamingUpsample2d(scale_factor=2.0, mode="bilinear"))

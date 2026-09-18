@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.layers.streamingmerge import StreamingMerge
+from lightstream.core.layers import StreamingMerge
 
 
 @pytest.mark.parametrize(
