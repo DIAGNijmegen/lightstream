@@ -13,6 +13,7 @@ nav:
   - Models:
       ResNet: models/resnet.md
       ConvNext: models/convnext.md
+      NAT: models/nat.md
   - Modules:
       streaming: modules/streamingmodule.md
       imagenet: modules/imagenettemplate.md

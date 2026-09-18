@@ -21,6 +21,10 @@ dependencies = [
 
 
 [project.optional-dependencies]
+nat = [
+    "torch==2.13.0",
+    "natten==0.21.7",
+]
 docs = [
     "mkdocs",
     "mkdocstrings",
