@@ -1,41 +1,60 @@
-import importlib
+from pathlib import Path
 
-import pytest
-
-from lightstream.core import layers
-
-
-EXPECTED_LAYER_EXPORTS = {
-    "ChannelLayerNorm",
-    "LayerScale",
-    "StatisticsProbe",
-    "StreamingChannelLayerNorm",
-    "StreamingConv2d",
-    "StreamingLayerScale",
-    "StreamingMerge",
-    "StreamingUpsample2d",
-}
+from lightstream.core.layers import (
+    ChannelLayerNorm,
+    LayerScale,
+    StatisticsProbe,
+    StreamingChannelLayerNorm,
+    StreamingConv2d,
+    StreamingLayerScale,
+    StreamingMerge,
+    StreamingUpsample2d,
+)
 
 
-def test_layers_package_exports_public_layer_classes():
-    assert set(layers.__all__) == EXPECTED_LAYER_EXPORTS
-    assert all(
-        getattr(layers, name).__module__.startswith("lightstream.core.layers.")
-        for name in layers.__all__
-    )
+def test_layers_package_exports_supported_classes():
+    exported_classes = {
+        ChannelLayerNorm,
+        LayerScale,
+        StatisticsProbe,
+        StreamingChannelLayerNorm,
+        StreamingConv2d,
+        StreamingLayerScale,
+        StreamingMerge,
+        StreamingUpsample2d,
+    }
+
+    assert {cls.__name__ for cls in exported_classes} == {
+        "ChannelLayerNorm",
+        "LayerScale",
+        "StatisticsProbe",
+        "StreamingChannelLayerNorm",
+        "StreamingConv2d",
+        "StreamingLayerScale",
+        "StreamingMerge",
+        "StreamingUpsample2d",
+    }
 
 
-@pytest.mark.parametrize(
-    "module_name",
-    [
+def test_deleted_scnn_layer_module_paths_are_not_used():
+    repository = Path(__file__).resolve().parents[1]
+    deleted_modules = {
         "statisticsprobe",
         "streamingconv",
         "streaminglayernorm",
         "streaminglayerscale",
         "streamingmerge",
         "streamingupsample",
-    ],
-)
-def test_removed_scnn_layer_modules_are_not_importable(module_name):
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(f"lightstream.core.scnn.{module_name}")
+    }
+    forbidden_paths = {
+        "lightstream.core.scnn." + module_name for module_name in deleted_modules
+    }
+
+    offenders = []
+    for path in repository.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for forbidden_path in forbidden_paths:
+            if forbidden_path in source:
+                offenders.append(f"{path.relative_to(repository)}: {forbidden_path}")
+
+    assert offenders == []

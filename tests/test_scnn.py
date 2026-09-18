@@ -6,6 +6,16 @@ import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
+from lightstream.core.layers import (
+    ChannelLayerNorm,
+    LayerScale,
+    StatisticsProbe,
+    StreamingChannelLayerNorm,
+    StreamingConv2d,
+    StreamingLayerScale,
+    StreamingMerge,
+    StreamingUpsample2d,
+)
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
 from lightstream.core.scnn.utils import Lost
 from lightstream.models.testnet.segment import StreamingTestNet
@@ -26,6 +36,48 @@ from lightstream.core.reducer import (
     StreamingSumReducer,
     SumReducer,
 )
+
+
+def test_convert_and_reset_every_supported_layer_type():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._streaming_reducers = []
+
+    conv = nn.Conv2d(3, 3, kernel_size=1)
+    norm = ChannelLayerNorm(3)
+    scale = LayerScale((1, 3, 1, 1))
+    upsample = nn.Upsample(scale_factor=2, mode="nearest")
+    probe = StatisticsProbe()
+    merge = StreamingMerge("add")
+    model = nn.ModuleList([conv, norm, scale, upsample, probe, merge])
+
+    stats = {
+        "grad_lost": Lost(0, 0, 0, 0),
+        "output_stride": torch.tensor([1, 1, 1]),
+    }
+    scnn._module_stats = {
+        conv: dict(stats),
+        norm: dict(stats),
+        scale: dict(stats),
+        upsample: dict(stats),
+    }
+
+    converted = scnn._convert_modules_for_streaming(model)
+
+    assert isinstance(converted[0], StreamingConv2d)
+    assert isinstance(converted[1], StreamingChannelLayerNorm)
+    assert isinstance(converted[2], StreamingLayerScale)
+    assert isinstance(converted[3], StreamingUpsample2d)
+    assert converted[4] is probe
+    assert converted[5] is merge
+
+    restored = scnn._reset_converted_modules(converted)
+
+    assert type(restored[0]) is nn.Conv2d
+    assert type(restored[1]) is ChannelLayerNorm
+    assert type(restored[2]) is LayerScale
+    assert type(restored[3]) is nn.Upsample
+    assert restored[4] is probe
+    assert restored[5] is merge
 
 
 def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
