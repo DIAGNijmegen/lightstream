@@ -3,7 +3,7 @@ import operator
 import pytest
 import torch
 
-from lightstream.core.scnn.statisticsprobe import StatisticsProbe
+from lightstream.core.layers.statisticsprobe import StatisticsProbe
 
 
 def _valid(tensor: torch.Tensor) -> torch.Tensor:

@@ -6,8 +6,8 @@ import torch.nn as nn
 from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
-from lightstream.core.scnn.streaminglayerscale import LayerScale
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.layers.streaminglayerscale import LayerScale
 from lightstream.core.reducer import SoftmaxAttentionReducer
 
 
