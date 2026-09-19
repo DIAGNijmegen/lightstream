@@ -345,6 +345,133 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
 
 
 @pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param((3, 1), (3, 1), id="k3-d1-then-k3-d1"),
+        pytest.param((7, 1), (7, 1), id="k7-d1-then-k7-d1"),
+        pytest.param((3, 1), (3, 2), id="k3-d1-then-k3-d2"),
+        pytest.param((7, 1), (7, 2), id="k7-d1-then-k7-d2"),
+    ],
+)
+def test_two_real_natten_layers_match_and_reset_unique_queries(
+    natten_backend, first, second
+):
+    """Two independent attention layers accumulate halos and reset replay state."""
+    torch.manual_seed(7000 + first[0] * 100 + second[0] * 10 + second[1])
+    batch, channels, heads = 1, 8, 2
+
+    def make_layer(kernel_and_dilation):
+        kernel_size, dilation = kernel_and_dilation
+        return NeighborhoodAttention2D(
+            attention=_make_natten(
+                natten_backend,
+                channels=channels,
+                heads=heads,
+                kernel_size=kernel_size,
+                dilation=dilation,
+            )
+        )
+
+    # Construct both wrappers separately: sharing a NATTEN module here would
+    # conceal parameter-gradient and unique-query bookkeeping bugs.
+    base = nn.Sequential(make_layer(first), make_layer(second))
+    full_module = copy.deepcopy(base)
+    streaming_source = copy.deepcopy(base)
+    assert base[0].attention is not base[1].attention
+
+    radii = tuple(
+        dilation * (kernel_size - 1) // 2 for kernel_size, dilation in (first, second)
+    )
+    accumulated_radius = sum(radii)
+    expected_lost = Lost(
+        accumulated_radius,
+        accumulated_radius,
+        accumulated_radius,
+        accumulated_radius,
+    )
+
+    # The physical tile leaves a 5x7 valid interior after both receptive
+    # supports have accumulated.  Pick non-divisible full-image dimensions so
+    # the last tile is shifted on both axes rather than landing on the grid.
+    query_shape = (5, 7)
+    tile_hw = tuple(size + 2 * accumulated_radius for size in query_shape)
+    image_shape = [tile_hw[0] + query_shape[0] + 1, tile_hw[1] + query_shape[1] + 1]
+    for axis, query_extent in enumerate(query_shape):
+        while image_shape[axis] % query_extent == 0:
+            image_shape[axis] += 1
+    image_shape = tuple(image_shape)
+    assert all(tile_hw[axis] - 2 * accumulated_radius > 0 for axis in range(2))
+    assert all(image_shape[axis] % query_shape[axis] for axis in range(2))
+
+    streaming = StreamingCNN(
+        streaming_source,
+        tile_shape=(batch, channels, *tile_hw),
+        copy_to_gpu=True,
+    )
+    streamed_layers = list(streaming.stream_module)
+    assert all(
+        isinstance(layer, StreamingNeighborhoodAttention2D) for layer in streamed_layers
+    )
+    assert streamed_layers[0].attention is not streamed_layers[1].attention
+    assert streamed_layers[0].seen_indices is not streamed_layers[1].seen_indices
+
+    cache = streaming.get_tile_cache()
+    assert cache["net_stats"]["1"]["lost"] == expected_lost
+
+    full_optimizer = torch.optim.SGD(full_module.parameters(), lr=0.025)
+    streaming_optimizer = torch.optim.SGD(
+        streaming.stream_module.parameters(), lr=0.025
+    )
+
+    def run_cycle(cycle):
+        full_optimizer.zero_grad(set_to_none=True)
+        streaming_optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(8000 + cycle)
+        full_input = torch.randn(
+            batch, channels, *image_shape, dtype=torch.float32, requires_grad=True
+        )
+        streaming_input = full_input.detach().clone().requires_grad_(True)
+        upstream = torch.randn_like(full_input)
+
+        full_output = full_module(full_input)
+        streaming_output = streaming(streaming_input)
+        _assert_spatial_regions_match(
+            streaming_output,
+            full_output,
+            query_shape,
+            accumulated_radius,
+            f"cycle {cycle} StreamingCNN output",
+        )
+
+        full_output.backward(upstream)
+        streaming.backward(streaming_input, upstream)
+        _assert_spatial_regions_match(
+            streaming_input.grad,
+            full_input.grad,
+            query_shape,
+            accumulated_radius,
+            f"cycle {cycle} StreamingCNN input gradient",
+        )
+        _assert_named_parameter_state_matches(
+            streaming.stream_module, full_module, attribute="grad"
+        )
+
+        # backward() must reset both independent de-duplication trackers.  The
+        # next cycle then exercises the same StreamingCNN object from scratch.
+        for layer in streamed_layers:
+            assert layer.input_loc is None
+            assert (layer.seen_indices.y, layer.seen_indices.height) == (0, 0)
+            assert (layer.seen_indices.x, layer.seen_indices.width) == (0, 0)
+            assert layer.seen_indices.sides is None
+
+    run_cycle(0)
+    full_optimizer.step()
+    streaming_optimizer.step()
+    _assert_named_parameter_state_matches(streaming.stream_module, full_module)
+    run_cycle(1)
+
+
+@pytest.mark.parametrize(
     ("active_queries", "region"),
     [
         pytest.param(((6, 3),), "horizontal seam", id="one-query-horizontal-seam"),
