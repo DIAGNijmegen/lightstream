@@ -46,6 +46,27 @@ class _LocalNHWCBackend(nn.Module):
 
 def _manual_halo_tiles(module, image, query_shape):
     """Run clipped halo tiles and retain every global query exactly once."""
+    def _enlarge_axis(start, end, query_start, query_end, image_extent, minimum_extent):
+        """Expand an interval to the backend's minimum supported axis extent."""
+        if minimum_extent > image_extent:
+            raise ValueError(
+                f"minimum tile extent {minimum_extent} exceeds image extent {image_extent}"
+            )
+
+        missing = max(0, minimum_extent - (end - start))
+        if start == 0:
+            end += missing
+        elif end == image_extent:
+            start -= missing
+        else:
+            grow_end = min(missing, image_extent - end)
+            end += grow_end
+            start -= missing - grow_end
+
+        assert 0 <= start <= query_start <= query_end <= end <= image_extent
+        assert end - start >= minimum_extent
+        return start, end
+
     support = module.directional_spatial_support
     rows = []
     for query_y in range(0, image.shape[-2], query_shape[0]):
@@ -57,6 +78,22 @@ def _manual_halo_tiles(module, image, query_shape):
             halo_x = max(0, query_x - support.left)
             halo_bottom = min(image.shape[-2], query_bottom + support.bottom)
             halo_right = min(image.shape[-1], query_right + support.right)
+            halo_y, halo_bottom = _enlarge_axis(
+                halo_y,
+                halo_bottom,
+                query_y,
+                query_bottom,
+                image.shape[-2],
+                module.kernel_size[0] * module.dilation[0],
+            )
+            halo_x, halo_right = _enlarge_axis(
+                halo_x,
+                halo_right,
+                query_x,
+                query_right,
+                image.shape[-1],
+                module.kernel_size[1] * module.dilation[1],
+            )
             tile = module(image[:, :, halo_y:halo_bottom, halo_x:halo_right])
             columns.append(
                 tile[
