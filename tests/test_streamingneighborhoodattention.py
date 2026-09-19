@@ -342,3 +342,96 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
         torch.optim.SGD(module.parameters(), lr=0.025).step()
     _assert_named_parameter_state_matches(manual_module, full_module)
     _assert_named_parameter_state_matches(streaming.stream_module, full_module)
+
+
+@pytest.mark.parametrize(
+    ("active_queries", "region"),
+    [
+        pytest.param(((6, 3),), "horizontal seam", id="one-query-horizontal-seam"),
+        pytest.param(((3, 7),), "vertical seam", id="one-query-vertical-seam"),
+        pytest.param(((6, 7),), "seam intersection", id="one-query-seam-intersection"),
+        pytest.param(((16, 18),), "final shifted tile", id="one-query-final-shifted-tile"),
+        pytest.param(
+            ((6, 7), (7, 7)),
+            "adjacent tile rows",
+            id="queries-in-adjacent-tile-rows",
+        ),
+        pytest.param(
+            ((6, 7), (6, 8)),
+            "adjacent tile columns",
+            id="queries-in-adjacent-tile-columns",
+        ),
+    ],
+)
+def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
+    natten_backend, active_queries, region
+):
+    """Sparse query gradients must be owned once, including shifted overlaps."""
+    torch.manual_seed(2468)
+    batch, channels = 1, 8
+    image_shape = (17, 19)
+    query_shape = (6, 7)
+    kernel_size = 3
+    radius = (kernel_size - 1) // 2
+    tile_shape = (query_shape[0] + 2 * radius, query_shape[1] + 2 * radius)
+
+    # Both axes require a shifted final tile.  Its start precedes the next
+    # regular-grid start, so its valid queries overlap those of its predecessor.
+    assert image_shape[0] % query_shape[0] != 0
+    assert image_shape[1] % query_shape[1] != 0
+    final_start = (image_shape[0] - tile_shape[0], image_shape[1] - tile_shape[1])
+    previous_start = (query_shape[0], query_shape[1])
+    assert final_start[0] < previous_start[0] + query_shape[0]
+    assert final_start[1] < previous_start[1] + query_shape[1]
+
+    base = NeighborhoodAttention2D(
+        attention=_make_natten(
+            natten_backend,
+            channels=channels,
+            heads=2,
+            kernel_size=kernel_size,
+            dilation=1,
+        )
+    )
+    full_module = copy.deepcopy(base)
+    streaming = StreamingCNN(
+        copy.deepcopy(base),
+        tile_shape=(batch, channels, *tile_shape),
+        copy_to_gpu=True,
+    )
+    full_input = torch.randn(
+        batch, channels, *image_shape, dtype=torch.float32, requires_grad=True
+    )
+    streaming_input = full_input.detach().clone().requires_grad_(True)
+    upstream = torch.zeros_like(full_input)
+    channel_weights = torch.linspace(-1.0, 1.0, channels)
+    for query_index, (y, x) in enumerate(active_queries, start=1):
+        upstream[0, :, y, x] = query_index * channel_weights
+    assert torch.count_nonzero(upstream) == len(active_queries) * channels
+
+    full_output = full_module(full_input)
+    streaming_output = streaming(streaming_input)
+    full_output.backward(upstream)
+    streaming.backward(streaming_input, upstream)
+
+    torch.testing.assert_close(
+        streaming_input.grad,
+        full_input.grad,
+        rtol=2e-4,
+        atol=2e-5,
+        msg=f"input gradient differs for sparse queries at {region}",
+    )
+    full_parameters = dict(full_module.named_parameters())
+    streaming_parameters = dict(streaming.stream_module.named_parameters())
+    assert full_parameters.keys() == streaming_parameters.keys()
+    for name, full_parameter in full_parameters.items():
+        streamed_gradient = streaming_parameters[name].grad
+        assert full_parameter.grad is not None, f"full-frame gradient missing for {name!r}"
+        assert streamed_gradient is not None, f"streamed gradient missing for {name!r}"
+        torch.testing.assert_close(
+            streamed_gradient,
+            full_parameter.grad,
+            rtol=2e-4,
+            atol=2e-5,
+            msg=f"attention parameter gradient {name!r} differs at {region}",
+        )
