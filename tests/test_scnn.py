@@ -568,6 +568,103 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
     return constructor.prepare_streaming_model()
 
 
+def _seen_indices_by_module(scnn: StreamingCNN):
+    return {
+        name: (
+            module.seen_indices.y,
+            module.seen_indices.height,
+            module.seen_indices.x,
+            module.seen_indices.width,
+            module.seen_indices.sides,
+        )
+        for name, module in scnn.stream_module.named_modules()
+        if hasattr(module, "seen_indices")
+    }
+
+
+def test_scnn_repeated_forward_backward_cycles_and_cached_statistics_reset_state():
+    torch.manual_seed(5)
+
+    def make_model():
+        return nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=1, bias=True),
+            nn.Softplus(),
+            nn.Conv2d(5, 2, kernel_size=1, bias=True),
+        ).eval()
+
+    source = make_model()
+    source_state = {name: value.detach().clone() for name, value in source.state_dict().items()}
+
+    scnn = StreamingCNN(
+        source,
+        tile_shape=(1, 3, 4, 4),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    scnn.gather_input_gradient = True
+    scnn._remove_hooks()
+    scnn._add_hooks_for_streaming()
+
+    cached_source = make_model()
+    cached_source.load_state_dict(source_state)
+    cached_scnn = StreamingCNN(
+        cached_source,
+        tile_shape=(1, 3, 4, 4),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+        state_dict=scnn.get_tile_cache(),
+    )
+    cached_scnn.gather_input_gradient = True
+    cached_scnn._remove_hooks()
+    cached_scnn._add_hooks_for_streaming()
+
+    def run_cycle(streaming_model: StreamingCNN, cycle: int):
+        streaming_model.zero_grad(set_to_none=True)
+        stream_input = (torch.rand(1, 3, 9, 11) + 0.05).requires_grad_(True)
+
+        reference = make_model()
+        reference.load_state_dict(source_state)
+        reference.zero_grad(set_to_none=True)
+        reference_input = stream_input.detach().clone().requires_grad_(True)
+        reference_output = reference(reference_input)
+        output_gradient = torch.full_like(reference_output, 0.19 + cycle * 0.11)
+        torch.autograd.backward(reference_output, output_gradient)
+
+        streaming_output = streaming_model.forward(stream_input)
+        streaming_model.backward(stream_input, output_gradient.detach().clone())
+
+        torch.testing.assert_close(streaming_output, reference_output.detach(), rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(streaming_model.saliency_map, reference_input.grad, rtol=1e-4, atol=1e-5)
+
+        streaming_parameters = dict(streaming_model.stream_module.named_parameters())
+        reference_parameters = dict(reference.named_parameters())
+        assert streaming_parameters.keys() == reference_parameters.keys()
+        for name, reference_parameter in reference_parameters.items():
+            assert reference_parameter.grad is not None, name
+            assert streaming_parameters[name].grad is not None, name
+            torch.testing.assert_close(
+                streaming_parameters[name].grad,
+                reference_parameter.grad,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
+
+        return _seen_indices_by_module(streaming_model)
+
+    first_reset_state = run_cycle(scnn, cycle=0)
+    second_reset_state = run_cycle(scnn, cycle=1)
+    cached_reset_state = run_cycle(cached_scnn, cycle=2)
+
+    assert first_reset_state
+    assert second_reset_state == first_reset_state
+    assert cached_reset_state == first_reset_state
+
+
 def test_scnn_forward_all_reducer_heads_parity():
     torch.manual_seed(7)
     model = AllReducerHeadsNet().eval()

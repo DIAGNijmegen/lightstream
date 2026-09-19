@@ -1659,7 +1659,12 @@ class StreamingCNN(torch.nn.Module):
             tile = self._normalize_on_gpu(tile)
 
         if self.gather_input_gradient:
-            tile.requires_grad = True
+            # A tile sliced from an input that already requires gradients is a
+            # non-leaf view whose flag cannot be assigned. It already tracks
+            # gradients, so only opt in explicitly for tiles from ordinary
+            # inference inputs.
+            if not tile.requires_grad:
+                tile.requires_grad_(True)
             self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
         use_cuda_autocast = self.device.type == "cuda" and torch.cuda.is_available()
