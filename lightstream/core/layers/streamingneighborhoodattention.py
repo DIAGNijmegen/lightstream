@@ -1,0 +1,208 @@
+"""NCHW adapters for NATTEN's native NHWC neighborhood attention layer.
+
+The adapters intentionally do not reimplement neighborhood attention.  NATTEN
+remains the sole numerical backend; layout conversion is kept at this boundary
+so the rest of Lightstream can consistently use NCHW tensors.
+"""
+
+from __future__ import annotations
+
+from importlib import import_module
+
+import torch
+from torch import nn
+
+from lightstream.core.scnn.utils import Box, Lost, _new_value_indices
+
+
+def _pair(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            raise ValueError(f"expected a scalar or pair, got {value!r}")
+        return int(value[0]), int(value[1])
+    return int(value), int(value)
+
+
+def _make_natten_attention(**kwargs):
+    """Construct the installed NATTEN operator without importing it eagerly."""
+    try:
+        cls = import_module("natten").NeighborhoodAttention2D
+    except (ImportError, AttributeError) as error:
+        raise ImportError(
+            "Neighborhood attention requires the optional NATTEN dependency; "
+            "install it with `pip install 'lightstream[nat]'`."
+        ) from error
+    return cls(**kwargs)
+
+
+class NeighborhoodAttention2D(nn.Module):
+    """NCHW-facing reference wrapper around ``natten.NeighborhoodAttention2D``.
+
+    ``attention`` is useful when adapting an already constructed NAT model.  If
+    omitted, all keyword arguments are passed unchanged to the installed NATTEN
+    class.  No attention math is performed by this wrapper.
+    """
+
+    def __init__(self, dim=None, *, attention=None, **kwargs):
+        super().__init__()
+        if attention is not None and (dim is not None or kwargs):
+            raise ValueError("pass either `attention` or NATTEN constructor arguments, not both")
+        if attention is None:
+            if dim is None:
+                raise TypeError("`dim` is required when `attention` is not supplied")
+            attention = _make_natten_attention(dim=dim, **kwargs)
+        self.attention = attention
+        self._set_spatial_metadata()
+
+    def _set_spatial_metadata(self):
+        kernel = _pair(getattr(self.attention, "kernel_size", 3))
+        dilation = _pair(getattr(self.attention, "dilation", 1) or 1)
+        if kernel[0] % 2 == 0 or kernel[1] % 2 == 0:
+            raise ValueError("streaming neighborhood attention requires odd kernel sizes")
+        self.kernel_size = kernel
+        self.dilation = dilation
+        self.stride = (1, 1)
+        radius_h = dilation[0] * (kernel[0] - 1) // 2
+        radius_w = dilation[1] * (kernel[1] - 1) // 2
+        self.directional_spatial_support = Lost(radius_h, radius_w, radius_h, radius_w)
+        self.padding = (radius_h, radius_w)
+        # A concise alias for consumers which do not need to distinguish the
+        # forward support from other module metadata.
+        self.spatial_support = self.directional_spatial_support
+
+    @classmethod
+    def from_natten(cls, module: nn.Module) -> "NeighborhoodAttention2D":
+        return cls(attention=module)
+
+    def to_natten(self) -> nn.Module:
+        return self.attention
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim != 4:
+            raise ValueError(f"expected an NCHW rank-4 tensor, got shape {tuple(input.shape)}")
+        output = self.attention(input.permute(0, 2, 3, 1).contiguous())
+        return output.permute(0, 3, 1, 2).contiguous()
+
+
+class StreamingNeighborhoodAttention2D(NeighborhoodAttention2D):
+    """Streaming form of :class:`NeighborhoodAttention2D`.
+
+    Lightstream supplies overlapping halo tiles and retains unique valid query
+    regions.  NATTEN still computes both the forward and backward math.  The
+    small autograd boundary below only de-duplicates global queries when an
+    uneven final tile is shifted back and overlaps its predecessor; gradients
+    from retained queries continue to flow through every key and value.
+    """
+
+    def __init__(self, dim=None, *, attention=None, **kwargs):
+        super().__init__(dim, attention=attention, **kwargs)
+        self.grad_lost = self.directional_spatial_support
+        self.output_stride = torch.tensor([1, 1, 1], dtype=torch.long)
+        self.reset()
+
+    @classmethod
+    def from_reference(cls, module: NeighborhoodAttention2D):
+        converted = cls(attention=module.attention)
+        converted.train(module.training)
+        return converted
+
+    def to_reference(self) -> NeighborhoodAttention2D:
+        converted = NeighborhoodAttention2D(attention=self.attention)
+        converted.train(self.training)
+        return converted
+
+    def reset(self):
+        self.seen_indices = Box(0, 0, 0, 0, None)
+        self.input_loc = None
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.input_loc is None or not torch.is_grad_enabled():
+            return super().forward(input)
+        parameters = tuple(self.attention.parameters())
+        return _StreamingNeighborhoodAttentionFunction.apply(
+            input,
+            self.attention,
+            self.seen_indices,
+            self.input_loc,
+            self.grad_lost,
+            self.output_stride,
+            *parameters,
+        )
+
+
+class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
+    """Recompute NATTEN while assigning each global query once in backward."""
+
+    @staticmethod
+    def forward(ctx, input, attention, seen, input_loc, grad_lost, output_stride, *parameters):
+        ctx.attention = attention
+        ctx.seen = seen
+        ctx.input_loc = input_loc
+        ctx.grad_lost = grad_lost
+        ctx.output_stride = output_stride
+        ctx.save_for_backward(input, *parameters)
+        with torch.no_grad():
+            output = attention(input.permute(0, 2, 3, 1).contiguous())
+            return output.permute(0, 3, 1, 2).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, *parameters = ctx.saved_tensors
+        sides = ctx.input_loc.sides
+        lost = ctx.grad_lost
+        top = 0 if sides.top else int(lost.top)
+        bottom = 0 if sides.bottom else int(lost.bottom)
+        left = 0 if sides.left else int(lost.left)
+        right = 0 if sides.right else int(lost.right)
+        valid = grad_output[:, :, top : grad_output.shape[-2] - bottom, left : grad_output.shape[-1] - right]
+        stride_h = int(ctx.output_stride[1])
+        stride_w = int(ctx.output_stride[2])
+        location = Box(
+            int(ctx.input_loc.y // stride_h) + top,
+            0,
+            int(ctx.input_loc.x // stride_w) + left,
+            0,
+            sides,
+        )
+        new_box, updated = _new_value_indices(valid.shape, location, ctx.seen)
+        ctx.seen.y, ctx.seen.height = updated.y, updated.height
+        ctx.seen.x, ctx.seen.width = updated.x, updated.width
+        ctx.seen.sides = updated.sides
+
+        unique_grad = torch.zeros_like(grad_output)
+        if new_box.height > 0 and new_box.width > 0:
+            y0, x0 = top + new_box.y, left + new_box.x
+            unique_grad[:, :, y0 : y0 + new_box.height, x0 : x0 + new_box.width] = valid[
+                :, :, new_box.y : new_box.y + new_box.height, new_box.x : new_box.x + new_box.width
+            ]
+
+        with torch.enable_grad():
+            replay_input = input.detach().requires_grad_(True)
+            replay = ctx.attention(replay_input.permute(0, 2, 3, 1).contiguous())
+            replay = replay.permute(0, 3, 1, 2).contiguous()
+            trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
+            targets = (replay_input, *(parameters[index] for index in trainable_indices))
+            computed = torch.autograd.grad(
+                replay,
+                targets,
+                unique_grad,
+                allow_unused=True,
+            )
+        parameter_grads = [None] * len(parameters)
+        for index, gradient in zip(trainable_indices, computed[1:]):
+            parameter_grads[index] = gradient
+        return (computed[0], None, None, None, None, None, *parameter_grads)
+
+
+# Explicit aliases make the layout contract discoverable and retain a short
+# spelling for model conversion code.
+NCHWNeighborhoodAttention2D = NeighborhoodAttention2D
+StreamingNeighborhoodAttention = StreamingNeighborhoodAttention2D
+
+
+__all__ = [
+    "NCHWNeighborhoodAttention2D",
+    "NeighborhoodAttention2D",
+    "StreamingNeighborhoodAttention",
+    "StreamingNeighborhoodAttention2D",
+]
