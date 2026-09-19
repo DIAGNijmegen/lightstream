@@ -125,16 +125,17 @@ def _assert_spatial_regions_match(actual, expected, query_shape, radius, quantit
 
 
 def _make_natten(natten_backend, channels, heads, kernel_size, dilation):
-    # NATTEN 0.21.7's module has no attention-weight dropout option; its
-    # neighborhood attention operation is dropout-free.  Explicitly disable
-    # the projection dropout it does expose.
+    # Keep both attention-weight and projection dropout disabled so tiled and
+    # untiled executions are deterministic and directly comparable.
     attention = natten_backend.NeighborhoodAttention2D(
-        embed_dim=channels,
+        dim=channels,
         num_heads=heads,
         kernel_size=kernel_size,
         dilation=dilation,
+        attn_drop=0.0,
         proj_drop=0.0,
     )
+    assert attention.attn_drop.p == 0.0
     assert attention.proj_drop.p == 0.0
     return attention.float()
 
