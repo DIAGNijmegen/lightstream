@@ -34,6 +34,10 @@ from lightstream.core.layers.streaminglayernorm import (
 from lightstream.core.layers.streaminglayerscale import LayerScale, StreamingLayerScale
 from lightstream.core.layers.statisticsprobe import StatisticsProbe
 from lightstream.core.layers.streamingmerge import StreamingMerge
+from lightstream.core.layers.streamingneighborhoodattention import (
+    NeighborhoodAttention2D,
+    StreamingNeighborhoodAttention2D,
+)
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
@@ -51,6 +55,7 @@ BACKWARD_STREAMING_MODULE_TYPES = (
     StreamingUpsample2d,
     StreamingChannelLayerNorm,
     StreamingLayerScale,
+    StreamingNeighborhoodAttention2D,
 )
 
 
@@ -787,6 +792,17 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, NeighborhoodAttention2D) and not isinstance(
+            module, StreamingNeighborhoodAttention2D
+        ):
+            mod = StreamingNeighborhoodAttention2D.from_reference(module)
+            if module in self._module_stats:
+                stats = self._module_stats[module]
+                mod.grad_lost = stats.get("grad_lost", module.directional_spatial_support)
+                mod.output_stride = stats.get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = stats
+                del self._module_stats[module]
+            return mod
         elif isinstance(module, torch.nn.Upsample):
             mod = StreamingUpsample2d.from_torch_upsample(module)
             if module in self._module_stats:
@@ -875,6 +891,18 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, StreamingNeighborhoodAttention2D):
+            mod = module.to_reference()
+            stats = self._module_stats.pop(module, None)
+            if stats is None:
+                stats = {
+                    "grad_lost": module.grad_lost,
+                    "output_stride": module.output_stride,
+                    "stride": torch.tensor([1, 1, 1]),
+                    "directional_spatial_support": module.directional_spatial_support,
+                }
+            self._module_stats[mod] = stats
+            return mod
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
             if module not in self._module_stats:
@@ -1225,6 +1253,17 @@ class StreamingCNN(torch.nn.Module):
 
         if self.should_normalize:
             tile = self._normalize_on_gpu(tile)
+
+        sides = Sides(
+            input_x == 0,
+            input_y == 0,
+            input_x + tile_width >= image.shape[W_DIM],
+            input_y + tile_height >= image.shape[H_DIM],
+        )
+        input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
+        for mod in self.stream_module.modules():
+            if _is_backward_streaming_module(mod):
+                mod.input_loc = input_loc
 
         tile_output = self.stream_module(tile)
         tile_outputs, _ = self._flatten_output_structure(tile_output)
@@ -2105,8 +2144,9 @@ class StreamingCNN(torch.nn.Module):
             torch.nn.MaxPool2d,
             torch.nn.AvgPool2d,
             torch.nn.Upsample,
+            NeighborhoodAttention2D,
         ),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, NeighborhoodAttention2D),
     ):
         for mod in self.stream_module.modules():
             register_forward = isinstance(mod, forward_modules) or _is_spatial_preserving_pointwise_module(mod)
@@ -2142,6 +2182,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
+        is_neighborhood_attention = isinstance(module, NeighborhoodAttention2D)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
         is_merge = isinstance(module, StreamingMerge)
         if is_pointwise_module:
@@ -2198,6 +2239,15 @@ class StreamingCNN(torch.nn.Module):
             # independent and inherit support from their sole input.
             validity_source = output if is_merge or not is_pointwise_module else inpt[0]
             lost = self._non_max_border_amount(validity_source)
+            if is_neighborhood_attention:
+                support = module.directional_spatial_support
+                input_lost = self._non_max_border_amount(inpt[0])
+                lost = Lost(
+                    input_lost.top + support.top,
+                    input_lost.left + support.left,
+                    input_lost.bottom + support.bottom,
+                    input_lost.right + support.right,
+                )
 
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
@@ -2216,6 +2266,8 @@ class StreamingCNN(torch.nn.Module):
                 "dilation": dilation,
                 "module": module,
             }
+            if is_neighborhood_attention:
+                module_stats["directional_spatial_support"] = module.directional_spatial_support
             if is_upsample:
                 module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
                 module_stats["upsample_forward_output_lost"] = module_stats["lost"]
@@ -2326,6 +2378,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
+        is_neighborhood_attention = isinstance(module, NeighborhoodAttention2D)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
         if is_pointwise_module:
             stride = torch.tensor([1, 1, 1])
@@ -2420,6 +2473,14 @@ class StreamingCNN(torch.nn.Module):
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
+            if is_neighborhood_attention:
+                # A retained query contributes through every key/value in its
+                # halo.  Overlapping replay tiles therefore carry additive,
+                # partial input gradients rather than duplicate gradients to
+                # discard.  Keep the complete tile input active and let tensor
+                # view accumulation assemble those contributions globally.
+                valid_grad.fill_(True)
+
             # When the effective kernel is larger than the stride we have some
             # _overlap_ of gradients, this overlap makes extra positions in the
             # input gradient invalid. Dilation increases the effective receptive
@@ -2438,7 +2499,14 @@ class StreamingCNN(torch.nn.Module):
                     valid_lost.left + overlap_cols : valid_grad.shape[1] - valid_lost.right - overlap_cols,
                 ] = 1
 
-            new_grad_in = valid_grad[None].expand(grad_in[0].shape[1], *valid_grad.shape)[None]
+            # Statistics tiles may contain more than one sample.  Every sample
+            # has the same synthetic spatial validity mask, but a backward hook
+            # must preserve the complete NCHW shape of its input gradient.
+            new_grad_in = valid_grad[None, None].expand(
+                grad_in[0].shape[B_DIM],
+                grad_in[0].shape[C_DIM],
+                *valid_grad.shape,
+            )
             new_grad_in = new_grad_in.type(self.dtype) * 10 - 1
             new_grad_in_lost = self._non_max_border_amount(new_grad_in)
             self._module_stats[module]["backward_valid_lost"] = new_grad_in_lost
