@@ -134,6 +134,8 @@ def test_complete_nat_state_conversion_maps_wrappers_and_mlp_kernels():
         "patch_embed.norm.weight": torch.randn(8),
         "levels.0.blocks.0.norm1.bias": torch.randn(8),
         "levels.0.blocks.0.attn.qkv.weight": torch.randn(24, 8),
+        "levels.0.blocks.0.gamma1": torch.randn(8),
+        "levels.0.blocks.0.gamma2": torch.randn(8),
         "levels.0.blocks.0.mlp.fc1.weight": torch.randn(16, 8),
         "levels.0.downsample.norm.weight": torch.randn(16),
         "norm.bias": torch.randn(64),
@@ -145,11 +147,15 @@ def test_complete_nat_state_conversion_maps_wrappers_and_mlp_kernels():
         "patch_embed.norm.norm.weight",
         "levels.0.blocks.0.norm1.norm.bias",
         "levels.0.blocks.0.attn.attention.qkv.weight",
+        "levels.0.blocks.0.gamma1.weight",
+        "levels.0.blocks.0.gamma2.weight",
         "levels.0.blocks.0.mlp.fc1.weight",
         "levels.0.downsample.norm.norm.weight",
         "norm.norm.bias",
     }
     assert converted["levels.0.blocks.0.mlp.fc1.weight"].shape == (16, 8, 1, 1)
+    assert converted["levels.0.blocks.0.gamma1.weight"].shape == (1, 8, 1, 1)
+    assert converted["levels.0.blocks.0.gamma2.weight"].shape == (1, 8, 1, 1)
     restored = convert_nchw_nat_state_dict(converted)
     assert restored.keys() == original.keys()
     for name in original:
