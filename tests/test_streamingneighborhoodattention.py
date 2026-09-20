@@ -12,15 +12,28 @@ from lightstream.core.layers.streamingneighborhoodattention import (
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
 from lightstream.models.nat import (
+    ConvDownsampler,
     NCHWNATBlock,
     NCHWNATLayer,
     copy_nhwc_nat_block_to_nchw,
     copy_nhwc_nat_to_nchw,
 )
 
-
 SUPPORTED_NATTEN_VERSION = "0.17.5"
 _REL_POS_BIAS_PARAMETER = "rpb"
+
+
+def test_nchw_conv_downsampler_architecture():
+    downsampler = ConvDownsampler(dim=5)
+
+    assert downsampler.reduction.in_channels == 5
+    assert downsampler.reduction.out_channels == 10
+    assert downsampler.reduction.kernel_size == (3, 3)
+    assert downsampler.reduction.stride == (2, 2)
+    assert downsampler.reduction.padding == (1, 1)
+    assert downsampler.reduction.bias is None
+    assert isinstance(downsampler.norm, ChannelLayerNorm)
+    assert downsampler.norm.num_channels == 10
 
 
 @pytest.fixture(scope="session")
@@ -46,9 +59,17 @@ class _LocalNHWCBackend(nn.Module):
     def forward(self, value):
         radius = self.dilation * (self.kernel_size - 1) // 2
         nchw = value.permute(0, 3, 1, 2)
-        weight = torch.ones(
-            nchw.shape[1], 1, self.kernel_size, self.kernel_size, device=nchw.device, dtype=nchw.dtype
-        ) / self.kernel_size**2
+        weight = (
+            torch.ones(
+                nchw.shape[1],
+                1,
+                self.kernel_size,
+                self.kernel_size,
+                device=nchw.device,
+                dtype=nchw.dtype,
+            )
+            / self.kernel_size**2
+        )
         local = torch.nn.functional.conv2d(
             nchw,
             weight,
@@ -62,6 +83,7 @@ class _LocalNHWCBackend(nn.Module):
 
 def _manual_halo_tiles(module, image, query_shape):
     """Run clipped halo tiles and retain every global query exactly once."""
+
     def _enlarge_axis(start, end, query_start, query_end, image_extent, minimum_extent):
         """Expand an interval to the backend's minimum supported axis extent."""
         if minimum_extent > image_extent:
@@ -165,8 +187,12 @@ def _region_masks(height, width, query_shape, radius):
 
 
 def _assert_spatial_regions_match(actual, expected, query_shape, radius, quantity):
-    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5, msg=f"complete {quantity}")
-    for region, mask in _region_masks(*expected.shape[-2:], query_shape, radius).items():
+    torch.testing.assert_close(
+        actual, expected, rtol=2e-4, atol=2e-5, msg=f"complete {quantity}"
+    )
+    for region, mask in _region_masks(
+        *expected.shape[-2:], query_shape, radius
+    ).items():
         assert mask.any(), f"test geometry did not create {region}"
         torch.testing.assert_close(
             actual[..., mask],
@@ -245,6 +271,34 @@ def _nat_parameter_pairs(reference, nchw):
         yield f"mlp.{projection_name}.bias", linear.bias, convolution.bias
 
 
+def _nat_block_parameter_pairs(reference, nchw):
+    """Pair every attention, normalization, MLP, and downsampling parameter."""
+
+    for index, (reference_layer, nchw_layer) in enumerate(
+        zip(reference.blocks, nchw.blocks)
+    ):
+        for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
+            reference_layer, nchw_layer
+        ):
+            yield f"blocks.{index}.{name}", reference_parameter, nchw_parameter
+    if reference.downsample is not None:
+        yield (
+            "downsample.reduction.weight",
+            reference.downsample.reduction.weight,
+            nchw.downsample.reduction.weight,
+        )
+        yield (
+            "downsample.norm.weight",
+            reference.downsample.norm.weight,
+            nchw.downsample.norm.norm.weight,
+        )
+        yield (
+            "downsample.norm.bias",
+            reference.downsample.norm.bias,
+            nchw.downsample.norm.norm.bias,
+        )
+
+
 def _linear_shaped(value, reference):
     """Remove the spatial singleton axes of a pointwise-convolution tensor."""
 
@@ -255,7 +309,9 @@ def _linear_shaped(value, reference):
 
 def test_nchw_wrapper_and_manual_halo_oracle_match_values_gradients_and_step():
     torch.manual_seed(5)
-    reference = NeighborhoodAttention2D(attention=_LocalNHWCBackend(kernel_size=5, dilation=2))
+    reference = NeighborhoodAttention2D(
+        attention=_LocalNHWCBackend(kernel_size=5, dilation=2)
+    )
     tiled = copy.deepcopy(reference)
     reference_image = torch.randn(2, 4, 17, 19, requires_grad=True)
     tiled_image = reference_image.detach().clone().requires_grad_(True)
@@ -314,10 +370,14 @@ def test_streaming_metadata_conversion_cache_and_restoration():
 def test_real_natten_nhwc_matches_untiled_nchw_wrapper(natten_backend):
     """The adapter must be only a layout conversion around NATTEN 0.21.7."""
     torch.manual_seed(101)
-    direct = _make_natten(natten_backend, channels=8, heads=2, kernel_size=3, dilation=1)
+    direct = _make_natten(
+        natten_backend, channels=8, heads=2, kernel_size=3, dilation=1
+    )
     wrapped = NeighborhoodAttention2D(attention=copy.deepcopy(direct))
     direct_input = torch.randn(1, 11, 13, 8, dtype=torch.float32, requires_grad=True)
-    wrapped_input = direct_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+    wrapped_input = (
+        direct_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+    )
     direct_upstream = torch.randn_like(direct_input)
     wrapped_upstream = direct_upstream.permute(0, 3, 1, 2).contiguous()
 
@@ -391,7 +451,9 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
     full_output = full_module(full_input)
     manual_output = _manual_halo_tiles(manual_module, manual_input, query_shape)
     streaming_output = streaming(streaming_input)
-    _assert_spatial_regions_match(manual_output, full_output, query_shape, radius, "manual output")
+    _assert_spatial_regions_match(
+        manual_output, full_output, query_shape, radius, "manual output"
+    )
     _assert_spatial_regions_match(
         streaming_output, full_output, query_shape, radius, "StreamingCNN output"
     )
@@ -406,9 +468,9 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
     ):
         attention_parameters = dict(module.attention.named_parameters())
         assert _REL_POS_BIAS_PARAMETER in attention_parameters
-        assert attention_parameters[_REL_POS_BIAS_PARAMETER].grad is not None, (
-            f"{execution} relative-position-bias gradient is missing"
-        )
+        assert (
+            attention_parameters[_REL_POS_BIAS_PARAMETER].grad is not None
+        ), f"{execution} relative-position-bias gradient is missing"
     _assert_spatial_regions_match(
         manual_input.grad, full_input.grad, query_shape, radius, "manual input gradient"
     )
@@ -565,7 +627,9 @@ def test_two_real_natten_layers_match_and_reset_unique_queries(
         pytest.param(((6, 3),), "horizontal seam", id="one-query-horizontal-seam"),
         pytest.param(((3, 7),), "vertical seam", id="one-query-vertical-seam"),
         pytest.param(((6, 7),), "seam intersection", id="one-query-seam-intersection"),
-        pytest.param(((16, 18),), "final shifted tile", id="one-query-final-shifted-tile"),
+        pytest.param(
+            ((16, 18),), "final shifted tile", id="one-query-final-shifted-tile"
+        ),
         pytest.param(
             ((6, 7), (7, 7)),
             "adjacent tile rows",
@@ -645,7 +709,9 @@ def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
     assert streaming_parameters[relative_bias_name].grad is not None
     for name, full_parameter in full_parameters.items():
         streamed_gradient = streaming_parameters[name].grad
-        assert full_parameter.grad is not None, f"full-frame gradient missing for {name!r}"
+        assert (
+            full_parameter.grad is not None
+        ), f"full-frame gradient missing for {name!r}"
         assert streamed_gradient is not None, f"streamed gradient missing for {name!r}"
         torch.testing.assert_close(
             streamed_gradient,
@@ -740,7 +806,9 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
     # NATTEN owns dropout modules, but the fixture disables them so tiled and
     # untiled executions remain deterministic. The MLPs omit dropout entirely.
     for model in (reference, full_nchw, streaming.stream_module):
-        dropouts = [module for module in model.modules() if isinstance(module, nn.Dropout)]
+        dropouts = [
+            module for module in model.modules() if isinstance(module, nn.Dropout)
+        ]
         assert all(module.p == 0.0 for module in dropouts)
     assert not any(isinstance(module, nn.Dropout) for module in reference.mlp.modules())
     assert not any(isinstance(module, nn.Dropout) for module in full_nchw.mlp.modules())
@@ -753,7 +821,9 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
 
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
     full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
-    streaming_optimizer = torch.optim.SGD(streaming.stream_module.parameters(), lr=0.015)
+    streaming_optimizer = torch.optim.SGD(
+        streaming.stream_module.parameters(), lr=0.015
+    )
 
     for cycle in range(2):
         reference_optimizer.zero_grad(set_to_none=True)
@@ -764,7 +834,10 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
             batch, *image_shape, channels, dtype=torch.float32, requires_grad=True
         )
         nchw_input = (
-            reference_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+            reference_input.detach()
+            .permute(0, 3, 1, 2)
+            .contiguous()
+            .requires_grad_(True)
         )
         streaming_input = nchw_input.detach().clone().requires_grad_(True)
         upstream = torch.randn_like(reference_input)
@@ -812,8 +885,12 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
             for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
                 reference, module
             ):
-                assert reference_parameter.grad is not None, f"missing reference gradient for {name}"
-                assert nchw_parameter.grad is not None, f"missing NCHW gradient for {name}"
+                assert (
+                    reference_parameter.grad is not None
+                ), f"missing reference gradient for {name}"
+                assert (
+                    nchw_parameter.grad is not None
+                ), f"missing NCHW gradient for {name}"
                 torch.testing.assert_close(
                     _linear_shaped(nchw_parameter.grad, reference_parameter.grad),
                     reference_parameter.grad,
@@ -1018,3 +1095,142 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
                             atol=3e-5,
                             msg=f"{implementation} optimizer-updated parameter {name}",
                         )
+
+
+@pytest.mark.parametrize(
+    ("tile_hw", "image_hw", "expected_downsample_lost"),
+    [
+        pytest.param(
+            (18, 20),
+            (27, 31),
+            Lost(top=4, left=4, bottom=3, right=3),
+            id="stride-aligned-tile",
+        ),
+        pytest.param(
+            (19, 21),
+            (29, 33),
+            Lost(top=4, left=4, bottom=4, right=4),
+            id="stride-unaligned-tile",
+        ),
+    ],
+)
+def test_nat_block_downsampler_matches_reference_and_streaming(
+    natten_backend, tile_hw, image_hw, expected_downsample_lost
+):
+    """An odd, non-square NAT stage remains exact across its stride-2 boundary."""
+
+    from lightstream.models.nat.nat import NATBlock
+
+    torch.manual_seed(31001)
+    batch, channels, heads = 1, 8, 2
+    reference = NATBlock(
+        dim=channels,
+        depth=2,
+        num_heads=heads,
+        kernel_size=7,
+        dilations=(1, 1),
+        downsample=True,
+        mlp_ratio=3,
+        drop_path=0.0,
+    ).float()
+    nchw_source = NCHWNATBlock(
+        channels=channels,
+        depth=2,
+        num_heads=heads,
+        kernel_size=7,
+        dilations=(1, 1),
+        downsample=True,
+        mlp_ratio=3,
+    ).float()
+    copy_nhwc_nat_block_to_nchw(reference, nchw_source)
+    full_nchw = copy.deepcopy(nchw_source)
+    streaming = StreamingCNN(
+        nchw_source,
+        tile_shape=(batch, channels, *tile_hw),
+        copy_to_gpu=True,
+    )
+
+    assert image_hw[0] % 2 == 1 and image_hw[1] % 2 == 1
+    assert image_hw[0] != image_hw[1]
+    reduction_stats = streaming.get_tile_cache()["net_stats"]["downsample.reduction"]
+    norm_stats = streaming.get_tile_cache()["net_stats"]["downsample.norm"]
+    assert tuple(reduction_stats["stride"]) == (0, 2, 2)
+    assert reduction_stats["output_stride"].tolist() == [1, 1, 1]
+    assert reduction_stats["lost"] == expected_downsample_lost
+    assert norm_stats["stride"].tolist() == [1, 1, 1]
+    assert norm_stats["output_stride"].tolist() == [1, 2, 2]
+    assert norm_stats["lost"] == expected_downsample_lost
+    assert streaming.output_stride.tolist() == [1, 2, 2]
+
+    implementations = (reference, full_nchw, streaming.stream_module)
+    optimizers = tuple(
+        torch.optim.SGD(module.parameters(), lr=0.015) for module in implementations
+    )
+    reference_input = torch.randn(
+        batch, *image_hw, channels, dtype=torch.float32, requires_grad=True
+    )
+    full_input = (
+        reference_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+    )
+    streaming_input = full_input.detach().clone().requires_grad_(True)
+
+    reference_output = reference(reference_input)
+    full_output = full_nchw(full_input)
+    streaming_output = streaming(streaming_input)
+    expected_output = reference_output.permute(0, 3, 1, 2)
+    assert expected_output.shape == (
+        batch,
+        2 * channels,
+        (image_hw[0] + 1) // 2,
+        (image_hw[1] + 1) // 2,
+    )
+    torch.testing.assert_close(full_output, expected_output, rtol=3e-4, atol=3e-5)
+    torch.testing.assert_close(streaming_output, expected_output, rtol=3e-4, atol=3e-5)
+
+    upstream = torch.randn_like(reference_output)
+    reference_output.backward(upstream)
+    nchw_upstream = upstream.permute(0, 3, 1, 2).contiguous()
+    full_output.backward(nchw_upstream)
+    streaming.backward(streaming_input, nchw_upstream)
+    expected_input_grad = reference_input.grad.permute(0, 3, 1, 2)
+    torch.testing.assert_close(
+        full_input.grad, expected_input_grad, rtol=3e-4, atol=3e-5
+    )
+    torch.testing.assert_close(
+        streaming_input.grad, expected_input_grad, rtol=3e-4, atol=3e-5
+    )
+
+    reference_names = set(dict(reference.named_parameters()))
+    for implementation_name, module in (
+        ("full-frame", full_nchw),
+        ("streaming", streaming.stream_module),
+    ):
+        pairs = list(_nat_block_parameter_pairs(reference, module))
+        assert {name for name, _, _ in pairs} == reference_names
+        for name, reference_parameter, nchw_parameter in pairs:
+            assert reference_parameter.grad is not None
+            assert nchw_parameter.grad is not None
+            torch.testing.assert_close(
+                _linear_shaped(nchw_parameter.grad, reference_parameter.grad),
+                reference_parameter.grad,
+                rtol=3e-4,
+                atol=3e-5,
+                msg=f"{implementation_name} parameter gradient {name}",
+            )
+
+    for optimizer in optimizers:
+        optimizer.step()
+    for implementation_name, module in (
+        ("full-frame", full_nchw),
+        ("streaming", streaming.stream_module),
+    ):
+        for name, reference_parameter, nchw_parameter in _nat_block_parameter_pairs(
+            reference, module
+        ):
+            torch.testing.assert_close(
+                _linear_shaped(nchw_parameter, reference_parameter),
+                reference_parameter,
+                rtol=3e-4,
+                atol=3e-5,
+                msg=f"{implementation_name} optimizer-updated parameter {name}",
+            )
