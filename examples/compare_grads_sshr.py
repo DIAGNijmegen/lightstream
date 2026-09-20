@@ -164,13 +164,22 @@ def _assert_input_gradient_parity(
 
     # Coverage failures identify assembly holes above.  Only after that check
     # succeeds do numerical tolerances enter the regression result.
-    torch.testing.assert_close(
-        stream_input_grad[reference_support],
-        reference_input_grad[reference_support],
-        rtol=rtol,
-        atol=atol,
-        msg="streamed saliency values differ over reference-supported coordinates",
-    )
+    try:
+        torch.testing.assert_close(
+            stream_input_grad[reference_support],
+            reference_input_grad[reference_support],
+            rtol=rtol,
+            atol=atol,
+            msg="streamed saliency values differ over reference-supported coordinates",
+        )
+    except AssertionError:
+        outside_reference_support = stream_input_grad.ne(0) & ~reference_support
+        print(
+            "Streamed nonzero values outside reference support: "
+            f"count={outside_reference_support.count_nonzero().item()}, "
+            f"indices={outside_reference_support.nonzero().tolist()[:20]}"
+        )
+        raise
 
 
 def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor) -> None:
@@ -196,6 +205,17 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
+
+    valid_output_heights, valid_output_widths = network.stream_network._compute_valid_output_sizes()
+    safe_step = network.stream_network._compute_valid_input_step(
+        valid_output_heights, valid_output_widths
+    )
+    if any(size % step == 0 for size, step in zip(img.shape[-2:], safe_step)):
+        raise ValueError(
+            "The SSHR regression input must be non-divisible by the computed safe tile step "
+            f"on both axes; input={tuple(img.shape[-2:])}, safe_step={safe_step}"
+        )
+    print(f"computed safe tile step={safe_step} (shifted boundary tiles required)")
 
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
