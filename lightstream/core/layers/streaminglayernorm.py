@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_bwd, custom_fwd
 
-from lightstream.core.scnn.utils import Box, Lost, _new_value_indices, H_DIM, W_DIM
+from lightstream.core.scnn.utils import Box, Lost
 
 
 class ChannelLayerNorm(nn.Module):
@@ -43,6 +43,8 @@ class StreamingChannelLayerNormF(torch.autograd.Function):
         ctx.eps = eps
         ctx.has_weight = weight is not None
         ctx.has_bias = bias is not None
+        ctx.weight_dtype = weight.dtype if weight is not None else None
+        ctx.bias_dtype = bias.dtype if bias is not None else None
         ctx.grad_lost = grad_lost
         ctx.seen_indices = seen_indices
         ctx.output_stride = output_stride
@@ -77,58 +79,15 @@ class StreamingChannelLayerNormF(torch.autograd.Function):
             grad_in = (grad_norm - grad_mean - x_hat * grad_xhat_mean) * inv_std
 
         grad_weight = grad_bias = None
-        if ctx.has_weight or ctx.has_bias:
-            input_loc = ctx.input_loc
-            sides = input_loc.sides if input_loc is not None else None
-            grad_lost = ctx.grad_lost
-            seen_indices = ctx.seen_indices
-
-            lost_top = grad_lost.top if not (sides is not None and sides.top) else 0
-            lost_bottom = grad_lost.bottom if not (sides is not None and sides.bottom) else 0
-            lost_left = grad_lost.left if not (sides is not None and sides.left) else 0
-            lost_right = grad_lost.right if not (sides is not None and sides.right) else 0
-
-            valid_grad = grad_output[
-                :,
-                :,
-                lost_top : grad_output.shape[H_DIM] - lost_bottom,
-                lost_left : grad_output.shape[W_DIM] - lost_right,
-            ]
-
-            if input_loc is None:
-                data_loc = Box(lost_top, 0, lost_left, 0, sides)
-            else:
-                output_stride = ctx.output_stride
-                stride_h = int(output_stride[1].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[1])
-                stride_w = int(output_stride[2].item()) if isinstance(output_stride, torch.Tensor) else int(output_stride[2])
-                data_loc_y = int(input_loc.y // stride_h) + lost_top
-                data_loc_x = int(input_loc.x // stride_w) + lost_left
-                data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-
-            new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, seen_indices)
-
-            seen_indices.y = updated_total_indices.y
-            seen_indices.height = updated_total_indices.height
-            seen_indices.x = updated_total_indices.x
-            seen_indices.width = updated_total_indices.width
-            seen_indices.sides = updated_total_indices.sides
-
-            if new_output_box.height > 0 and new_output_box.width > 0:
-                y0 = lost_top + new_output_box.y
-                y1 = y0 + new_output_box.height
-                x0 = lost_left + new_output_box.x
-                x1 = x0 + new_output_box.width
-                relevant_grad = grad_output[:, :, y0:y1, x0:x1]
-                if ctx.has_weight:
-                    relevant_x_hat = x_hat[:, :, y0:y1, x0:x1]
-                    grad_weight = (relevant_grad * relevant_x_hat).sum(dim=(0, 2, 3)).to(dtype=weight.dtype)
-                if ctx.has_bias:
-                    grad_bias = relevant_grad.sum(dim=(0, 2, 3)).to(dtype=weight.dtype)
-            else:
-                if ctx.has_weight:
-                    grad_weight = torch.zeros_like(weight)
-                if ctx.has_bias:
-                    grad_bias = torch.zeros_like(weight)
+        # Output-query ownership is resolved downstream before replay reaches
+        # this point.  Every remaining value is therefore a real contribution,
+        # including halo positions used as keys/values by an owned neighborhood
+        # query.  Filtering by activation coordinates here would incorrectly
+        # discard those partial affine gradients.
+        if ctx.has_weight:
+            grad_weight = (grad_output * x_hat).sum(dim=(0, 2, 3)).to(dtype=ctx.weight_dtype)
+        if ctx.has_bias:
+            grad_bias = grad_output.sum(dim=(0, 2, 3)).to(dtype=ctx.bias_dtype)
 
         return grad_in, grad_weight, grad_bias, None, None, None, None, None, None
 

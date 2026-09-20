@@ -350,7 +350,7 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
         torch.testing.assert_close(streaming_grads[name], reference_grads[name])
 
 
-def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
+def test_streaming_channel_layer_norm_affine_grads_include_all_upstream_contributions():
     from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Box, Lost, Sides
 
@@ -368,8 +368,8 @@ def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region(
     with torch.no_grad():
         centered = x - x.mean(dim=1, keepdim=True)
         x_hat = centered * torch.rsqrt(centered.pow(2).mean(dim=1, keepdim=True) + streaming.eps)
-        expected_grad_weight = (grad[:, :, :3, :] * x_hat[:, :, :3, :]).sum(dim=(0, 2, 3))
-        expected_grad_bias = grad[:, :, :3, :].sum(dim=(0, 2, 3))
+        expected_grad_weight = (grad * x_hat).sum(dim=(0, 2, 3))
+        expected_grad_bias = grad.sum(dim=(0, 2, 3))
 
     torch.testing.assert_close(streaming.norm.weight.grad, expected_grad_weight)
     torch.testing.assert_close(streaming.norm.bias.grad, expected_grad_bias)
