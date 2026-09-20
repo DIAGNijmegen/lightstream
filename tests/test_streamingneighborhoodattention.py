@@ -902,11 +902,21 @@ def test_two_complete_nat_layers_match_reference_streaming_and_reset(
     accumulated_radius = sum(radii)
     query_shape = (5, 7)
     tile_hw = tuple(query + 2 * accumulated_radius for query in query_shape)
-    image_shape = tuple(tile + query + 1 for tile, query in zip(tile_hw, query_shape))
+    image_factor = 3
+    image_shape = tuple(
+        tile + image_factor * query + 1
+        for tile, query in zip(tile_hw, query_shape)
+    )
 
     # The physical tile has a nonempty uniquely-owned center after the support
-    # from both attention blocks is removed. Final tiles shift on both axes.
+    # from both attention blocks is removed. Several regular query steps follow
+    # that tile, and final tiles shift on both axes.
     assert all(tile - 2 * accumulated_radius > 0 for tile in tile_hw)
+    assert all(image > tile for image, tile in zip(image_shape, tile_hw))
+    assert all(
+        (image - tile) // query >= image_factor
+        for image, tile, query in zip(image_shape, tile_hw, query_shape)
+    )
     assert all(image % query for image, query in zip(image_shape, query_shape))
 
     reference = nn.Sequential(
