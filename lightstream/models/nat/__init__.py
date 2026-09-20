@@ -3,6 +3,7 @@
 from lightstream.models.nat.nchw import (
     ConvDownsampler,
     NCHWConvDownsampler,
+    NCHWConvTokenizer,
     NCHWNATBlock,
     NCHWNATLayer,
     PointwiseConvMlp,
@@ -10,6 +11,7 @@ from lightstream.models.nat.nchw import (
     convert_nhwc_nat_state_dict,
     copy_nhwc_nat_block_to_nchw,
     copy_nhwc_nat_to_nchw,
+    copy_nhwc_conv_tokenizer_to_nchw,
     linear_to_pointwise_conv,
     pointwise_conv_to_linear,
 )
@@ -17,6 +19,7 @@ from lightstream.models.nat.nchw import (
 __all__ = [
     "ConvDownsampler",
     "NCHWConvDownsampler",
+    "NCHWConvTokenizer",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
@@ -24,6 +27,7 @@ __all__ = [
     "convert_nhwc_nat_state_dict",
     "copy_nhwc_nat_block_to_nchw",
     "copy_nhwc_nat_to_nchw",
+    "copy_nhwc_conv_tokenizer_to_nchw",
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
 ]
