@@ -64,6 +64,12 @@ it with `channels`, `num_heads`, and the usual NAT kernel, dilation, QKV, scale,
 and dropout options, or pass an existing NATTEN attention module through the
 `attention` argument when converting an existing model.
 
+`NCHWNATBlock` composes these layers into a complete stage, with per-layer
+dilations and an optional NCHW downsampler. Its `blocks` and `downsample`
+module names mirror the reference NHWC `NATBlock`. Use
+`copy_nhwc_nat_block_to_nchw` to copy layer normalization, attention (including
+relative-position bias), MLP, and optional downsampling parameters in one call.
+
 Original NAT checkpoints retain their existing key names. `PointwiseConvMlp`
 accepts the original two-dimensional `mlp.fc1.weight` and `mlp.fc2.weight`
 tensors while loading and reshapes them automatically. For conversion outside
