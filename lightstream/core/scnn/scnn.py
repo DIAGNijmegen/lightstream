@@ -2340,6 +2340,27 @@ class StreamingCNN(torch.nn.Module):
             # independent and inherit support from their sole input.
             validity_source = output if is_merge or not is_pointwise_module else inpt[0]
             lost = self._non_max_border_amount(validity_source)
+            if (
+                is_upsample
+                and module.mode == "bilinear"
+                and getattr(module, "align_corners", None) in (None, False)
+            ):
+                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
+                # With align_corners=False, the first and last high-resolution
+                # samples use PyTorch's edge padding.  That padding is valid at
+                # an image boundary but not at an interior tile seam, where the
+                # neighbouring low-resolution sample lives in another tile.
+                # Keep these samples out of the forward-valid region.  This is
+                # independent of the low-resolution dependency mask collected
+                # for bilinear backward replay below.
+                border_h = math.ceil((scale_h - 1.0) / 2.0)
+                border_w = math.ceil((scale_w - 1.0) / 2.0)
+                lost = Lost(
+                    lost.top + border_h,
+                    lost.left + border_w,
+                    lost.bottom + border_h,
+                    lost.right + border_w,
+                )
             if is_neighborhood_attention:
                 support = module.directional_spatial_support
                 input_lost = self._non_max_border_amount(inpt[0])
