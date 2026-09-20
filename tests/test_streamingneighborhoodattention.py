@@ -189,6 +189,7 @@ def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(
     reference_output = reference(reference_input).permute(0, 3, 1, 2)
     full_output = full_nchw(full_input)
     streaming_output = streaming(streaming_input)
+    assert not streaming_output.requires_grad
     expected_shape = (batch, embed_dim, 8, 10)
     assert reference_output.shape == full_output.shape == streaming_output.shape
     assert reference_output.shape == expected_shape
@@ -198,7 +199,7 @@ def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(
     upstream = torch.randn(expected_shape, dtype=torch.double)
     reference_output.backward(upstream)
     full_output.backward(upstream)
-    streaming_output.backward(upstream)
+    streaming.backward(streaming_input, upstream)
     torch.testing.assert_close(full_input.grad, reference_input.grad)
     torch.testing.assert_close(streaming_input.grad, reference_input.grad)
 
