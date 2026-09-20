@@ -1777,6 +1777,13 @@ class StreamingCNN(torch.nn.Module):
 
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+            # Track writes separately from their values: a written gradient may
+            # legitimately be zero, which is different from an input coordinate
+            # that was never visited during backward replay.
+            self.saliency_coverage_map = torch.zeros(image.shape, dtype=torch.bool, device="cpu")
+            self.saliency_nonzero_coverage_map = torch.zeros(
+                image.shape, dtype=torch.bool, device="cpu"
+            )
 
         self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
@@ -2693,13 +2700,22 @@ class StreamingCNN(torch.nn.Module):
                 new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
             ]
 
-            self.saliency_map[
-                :,
-                :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
-            ] = relevant_input_grad.detach().cpu()
+            destination = (
+                slice(None),
+                slice(None),
+                slice(
+                    updated_total_indices.y * stride[1],
+                    updated_total_indices.height * stride[1],
+                ),
+                slice(
+                    updated_total_indices.x * stride[2] - relevant_input_grad.shape[3],
+                    updated_total_indices.x * stride[2],
+                ),
+            )
+            relevant_input_grad = relevant_input_grad.detach().cpu()
+            self.saliency_map[destination] = relevant_input_grad
+            self.saliency_coverage_map[destination] = True
+            self.saliency_nonzero_coverage_map[destination] |= relevant_input_grad.ne(0)
 
             del relevant_input_grad
             del valid_grad_in
