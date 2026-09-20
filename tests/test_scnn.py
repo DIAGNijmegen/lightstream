@@ -95,6 +95,61 @@ def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
     torch.testing.assert_close(actual, expected)
 
 
+def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regions():
+    """SSHR-style replay must add shared dependencies at shifted boundaries."""
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 11, 13, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
+    input_conv.grad_lost = Lost(1, 1, 1, 1)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    expected = torch.zeros_like(scnn.saliency_map)
+
+    # A nominal 6-pixel safe step cannot evenly cover either image axis.
+    # Consequently the last row starts at 3 (not 6), and the last column at 5
+    # (not 6), exercising overlap on both axes just like the SSHR comparison.
+    tile_starts = ((0, 0), (0, 5), (3, 0), (3, 5))
+    for tile_index, (input_y, input_x) in enumerate(tile_starts, start=1):
+        sides = Sides(
+            left=input_x == 0,
+            top=input_y == 0,
+            right=input_x == 5,
+            bottom=input_y == 3,
+        )
+        input_conv.input_loc = Box(input_y, 8, input_x, 8, sides)
+        tile_gradient = torch.full((1, 3, 8, 8), float(tile_index), dtype=torch.double)
+        scnn._backward_saliency_hook(
+            input_conv,
+            (tile_gradient,),
+            (torch.ones(1, 2, 8, 8, dtype=torch.double),),
+        )
+
+        top = 0 if sides.top else 1
+        bottom = 0 if sides.bottom else 1
+        left = 0 if sides.left else 1
+        right = 0 if sides.right else 1
+        expected[
+            :,
+            :,
+            input_y + top : input_y + 8 - bottom,
+            input_x + left : input_x + 8 - right,
+        ].add_(tile_gradient[:, :, top : 8 - bottom, left : 8 - right])
+
+    reference_support = expected.ne(0)
+    missing_support = reference_support & ~scnn.saliency_coverage_map
+    assert not missing_support.any(), missing_support.nonzero().tolist()
+    # Keep numerical disagreement separate from the coverage assertion above.
+    torch.testing.assert_close(
+        scnn.saliency_map[reference_support], expected[reference_support], rtol=0, atol=0
+    )
+    assert scnn.saliency_coverage_map.all()
+    # These locations are in two- and four-tile overlap regions. Assignment
+    # instead of addition would leave the last tile's value (4) at both.
+    assert scnn.saliency_map[0, 0, 5, 6].item() == 10
+    assert scnn.saliency_map[0, 0, 1, 6].item() == 3
+
+
 def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
     """A diagnostic cursor gap must not discard any dependency gradients."""
     torch.manual_seed(93)

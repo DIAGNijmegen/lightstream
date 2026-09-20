@@ -1711,7 +1711,6 @@ class StreamingCNN(torch.nn.Module):
             # inference inputs.
             if not tile.requires_grad:
                 tile.requires_grad_(True)
-            self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
         use_cuda_autocast = self.device.type == "cuda" and torch.cuda.is_available()
         if use_cuda_autocast:
@@ -1777,6 +1776,11 @@ class StreamingCNN(torch.nn.Module):
 
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+            # This is deliberately tracked independently from the accumulated
+            # values.  A valid input gradient can be numerically zero, while a
+            # missing replay write is a tiling/assembly error rather than a
+            # numerical disagreement.
+            self.saliency_coverage_map = torch.zeros(image.shape, dtype=torch.bool, device="cpu")
 
         self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
@@ -2655,28 +2659,7 @@ class StreamingCNN(torch.nn.Module):
         lost_right = grad_lost.right if not sides.right else 0
         lost = Lost(lost_top, lost_left, lost_bottom, lost_right)
 
-        grad = grad_out[0]
-        valid_grad = grad[
-            :,
-            :,
-            lost_top : grad.shape[H_DIM] - lost_bottom,
-            lost_left : grad.shape[W_DIM] - lost_right,
-        ]
-
-        output_stride = module.output_stride * torch.tensor(stride)
         input_loc = module.input_loc
-
-        # Move the location according to how many pixels have been trimmed
-        # this will be the location of the valid gradient of this layer in relation
-        # to the actual gradient in a normal backpass
-        data_loc_y = int(input_loc.y // output_stride[1]) + lost_top
-        data_loc_x = int(input_loc.x // output_stride[2]) + lost_left
-
-        data_loc = Box(data_loc_y, 0, data_loc_x, 0, input_loc.sides)
-
-        # Calculate which part of the gradient is 'new'
-        old_value_indices = self.saliency_old_indices
-        new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, old_value_indices)
 
         if module.in_channels == 3:
             valid_grad_in = grad_in[0][
@@ -2686,22 +2669,24 @@ class StreamingCNN(torch.nn.Module):
                 lost.left * stride[2] : grad_in[0].shape[3] - lost.right * stride[2],
             ]
 
-            relevant_input_grad = valid_grad_in[
-                :,
-                :,
-                new_output_box.y * stride[1] : new_output_box.y * stride[1] + new_output_box.height * stride[1],
-                new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
-            ]
+            # ``input_loc`` is already expressed in input-image coordinates.
+            # Place the complete side-aware valid region instead of deriving
+            # its destination from the output ownership cursor.  In
+            # particular, a shifted final row/column can overlap an earlier
+            # tile on both axes.  Each overlap value is a partial dependency
+            # gradient from distinct, exclusively-owned output queries, so it
+            # must be added rather than replacing the contribution already in
+            # the saliency map.
+            dst_y0 = int(input_loc.y) + lost.top * stride[1]
+            dst_x0 = int(input_loc.x) + lost.left * stride[2]
+            dst_y1 = dst_y0 + valid_grad_in.shape[H_DIM]
+            dst_x1 = dst_x0 + valid_grad_in.shape[W_DIM]
+            destination = (..., slice(dst_y0, dst_y1), slice(dst_x0, dst_x1))
+            tile_gradient = valid_grad_in.detach().cpu()
+            self.saliency_map[destination].add_(tile_gradient)
+            self.saliency_coverage_map[destination] |= tile_gradient.ne(0)
 
-            self.saliency_map[
-                :,
-                :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
-            ] = relevant_input_grad.detach().cpu()
-
-            del relevant_input_grad
+            del tile_gradient
             del valid_grad_in
         return grad_in
 
