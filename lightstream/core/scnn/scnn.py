@@ -1920,6 +1920,14 @@ class StreamingCNN(torch.nn.Module):
             output_heights=output_heights,
             output_widths=output_widths,
         )
+        # Output ownership is assigned once, at the replay head.  Keeping this
+        # separate from layer-level dependency handling is essential for
+        # shifted final tiles: both operands of a residual see the same owned
+        # queries, while spatial operators may still propagate those queries
+        # through halo locations owned as outputs by another tile.
+        self._backward_head_seen_indices = [
+            Box(0, 0, 0, 0, None) for _ in internal_grad_tensors
+        ]
 
         # Reducers can own one-shot backward state even when debug assignment
         # validation is disabled (for example, a single global parameter
@@ -1942,6 +1950,7 @@ class StreamingCNN(torch.nn.Module):
                 reducer.validate_backward_replay_consumed(head_idx=idx)
 
         self._saved_tensors = {}
+        del self._backward_head_seen_indices
 
         for mod in self.stream_module.modules():
             if _is_backward_streaming_module(mod):
@@ -2003,11 +2012,38 @@ class StreamingCNN(torch.nn.Module):
                 output_x=head_output_x + head_lost.left,
             )
 
-        return self._build_non_reducer_backward_pair(
+        paired_output, paired_gradient = self._build_non_reducer_backward_pair(
             trimmed_output=trimmed_output,
             gradient=gradient,
             head_lost=head_lost,
             image=backward_ctx.image,
+        )
+        output_loc = Box(
+            head_output_y + head_lost.top,
+            0,
+            head_output_x + head_lost.left,
+            0,
+            sides,
+        )
+        owned, updated = _new_value_indices(
+            paired_output.shape,
+            output_loc,
+            self._backward_head_seen_indices[head_idx],
+        )
+        self._backward_head_seen_indices[head_idx] = updated
+        return (
+            paired_output[
+                :,
+                :,
+                owned.y : owned.y + owned.height,
+                owned.x : owned.x + owned.width,
+            ],
+            paired_gradient[
+                :,
+                :,
+                owned.y : owned.y + owned.height,
+                owned.x : owned.x + owned.width,
+            ],
         )
 
     def _build_non_reducer_backward_pair(self, trimmed_output, gradient, head_lost, image):
