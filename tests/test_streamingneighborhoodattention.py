@@ -14,10 +14,12 @@ from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
 from lightstream.models.nat import (
     ConvDownsampler,
+    NCHWConvTokenizer,
     NCHWNATBlock,
     NCHWNATLayer,
     copy_nhwc_nat_block_to_nchw,
     copy_nhwc_nat_to_nchw,
+    copy_nhwc_conv_tokenizer_to_nchw,
 )
 
 SUPPORTED_NATTEN_VERSION = "0.17.5"
@@ -135,6 +137,95 @@ def test_nchw_conv_downsampler_architecture():
     assert downsampler.reduction.bias is None
     assert isinstance(downsampler.norm, ChannelLayerNorm)
     assert downsampler.norm.num_channels == 10
+
+
+@pytest.mark.parametrize("tile_hw", [(20, 24), (19, 23)])
+def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(
+    natten_backend, tile_hw
+):
+    """The two tokenizer strides retain forward, backward, and update parity."""
+
+    from lightstream.models.nat.nat import ConvTokenizer
+
+    torch.manual_seed(1701)
+    batch, in_channels, embed_dim = 1, 3, 8
+    image_hw = (31, 37)
+    reference = ConvTokenizer(
+        in_chans=in_channels, embed_dim=embed_dim, norm_layer=nn.LayerNorm
+    ).double()
+    reference.proj[0].weight.requires_grad_(False)
+
+    source = copy_nhwc_conv_tokenizer_to_nchw(
+        reference, NCHWConvTokenizer(in_channels, embed_dim)
+    )
+    full_nchw = copy.deepcopy(source)
+    streaming = StreamingCNN(
+        source,
+        tile_shape=(batch, in_channels, *tile_hw),
+        copy_to_gpu=True,
+    )
+
+    stats = streaming.get_tile_cache()["net_stats"]
+    first_stats, second_stats, norm_stats = (
+        stats["proj.0"],
+        stats["proj.1"],
+        stats["norm"],
+    )
+    assert tuple(first_stats["stride"]) == (0, 2, 2)
+    assert first_stats["output_stride"].tolist() == [1, 1, 1]
+    assert tuple(second_stats["stride"]) == (0, 2, 2)
+    assert second_stats["output_stride"].tolist() == [1, 2, 2]
+    assert norm_stats["stride"].tolist() == [1, 1, 1]
+    assert norm_stats["output_stride"].tolist() == [1, 4, 4]
+    assert norm_stats["lost"] == second_stats["lost"]
+    assert streaming.output_stride.tolist() == [1, 4, 4]
+
+    reference_input = torch.randn(
+        batch, in_channels, *image_hw, dtype=torch.double, requires_grad=True
+    )
+    full_input = reference_input.detach().clone().requires_grad_(True)
+    streaming_input = reference_input.detach().clone().requires_grad_(True)
+
+    reference_output = reference(reference_input).permute(0, 3, 1, 2)
+    full_output = full_nchw(full_input)
+    streaming_output = streaming(streaming_input)
+    expected_shape = (batch, embed_dim, 8, 10)
+    assert reference_output.shape == full_output.shape == streaming_output.shape
+    assert reference_output.shape == expected_shape
+    torch.testing.assert_close(full_output, reference_output)
+    torch.testing.assert_close(streaming_output, reference_output)
+
+    upstream = torch.randn(expected_shape, dtype=torch.double)
+    reference_output.backward(upstream)
+    full_output.backward(upstream)
+    streaming_output.backward(upstream)
+    torch.testing.assert_close(full_input.grad, reference_input.grad)
+    torch.testing.assert_close(streaming_input.grad, reference_input.grad)
+
+    parameter_groups = (
+        list(reference.parameters()),
+        list(full_nchw.parameters()),
+        list(streaming.stream_module.parameters()),
+    )
+    for reference_parameter, full_parameter, streaming_parameter in zip(
+        *parameter_groups
+    ):
+        assert reference_parameter.requires_grad == full_parameter.requires_grad
+        assert reference_parameter.requires_grad == streaming_parameter.requires_grad
+        if reference_parameter.requires_grad:
+            torch.testing.assert_close(full_parameter.grad, reference_parameter.grad)
+            torch.testing.assert_close(
+                streaming_parameter.grad, reference_parameter.grad
+            )
+
+    optimizers = [torch.optim.SGD(parameters, lr=0.025) for parameters in parameter_groups]
+    for optimizer in optimizers:
+        optimizer.step()
+    for reference_parameter, full_parameter, streaming_parameter in zip(
+        *parameter_groups
+    ):
+        torch.testing.assert_close(full_parameter, reference_parameter)
+        torch.testing.assert_close(streaming_parameter, reference_parameter)
 
 
 @pytest.fixture(scope="session")

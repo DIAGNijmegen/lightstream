@@ -138,6 +138,77 @@ class PointwiseConvMlp(nn.Module):
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
+class NCHWConvTokenizer(nn.Module):
+    """NCHW-native equivalent of NAT's convolutional patch tokenizer.
+
+    Unlike the reference tokenizer, the public layout remains NCHW through
+    both convolutions and the channel normalization.  Keeping ``proj`` and
+    ``norm`` as the attribute names also preserves the reference checkpoint
+    key layout.
+    """
+
+    def __init__(self, in_chans: int = 3, embed_dim: int = 96, *, eps: float = 1e-6):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(
+                in_chans,
+                embed_dim // 2,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+            nn.Conv2d(
+                embed_dim // 2,
+                embed_dim,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+            ),
+        )
+        self.norm = ChannelLayerNorm(embed_dim, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.proj(x))
+
+
+def copy_nhwc_conv_tokenizer_to_nchw(
+    reference: nn.Module, target: NCHWConvTokenizer
+) -> NCHWConvTokenizer:
+    """Copy a reference :class:`ConvTokenizer` into its NCHW equivalent.
+
+    Values as well as parameter dtype, device, and ``requires_grad`` state are
+    retained.  A normalized reference tokenizer is required because the NCHW
+    tokenizer always includes its final channel normalization.
+    """
+
+    if len(reference.proj) != 2 or not all(
+        isinstance(layer, nn.Conv2d) for layer in reference.proj
+    ):
+        raise TypeError("reference.proj must contain exactly two Conv2d layers")
+    if not isinstance(reference.norm, nn.LayerNorm):
+        raise TypeError("reference.norm must be an nn.LayerNorm")
+    if tuple(reference.norm.normalized_shape) != (target.norm.num_channels,):
+        raise ValueError("reference and target tokenizer dimensions differ")
+
+    source_parameters = list(reference.parameters())
+    target_parameters = list(target.parameters())
+    if len(source_parameters) != len(target_parameters):
+        raise ValueError("reference and target tokenizer parameters differ")
+
+    # Tokenizers normally have one dtype/device.  Assigning each copied tensor
+    # separately additionally preserves deliberately mixed parameter setups.
+    with torch.no_grad():
+        for source, destination in zip(source_parameters, target_parameters):
+            if source.shape != destination.shape:
+                raise ValueError("reference and target tokenizer dimensions differ")
+            destination.data = source.detach().clone()
+            destination.requires_grad_(source.requires_grad)
+    target.norm.eps = reference.norm.eps
+    target.norm.norm.eps = reference.norm.eps
+    target.train(reference.training)
+    return target
+
+
 class NCHWNATLayer(nn.Module):
     """A NAT layer with an NCHW public layout and explicit residual merges.
 
@@ -304,6 +375,7 @@ def copy_nhwc_nat_block_to_nchw(
 __all__ = [
     "ConvDownsampler",
     "NCHWConvDownsampler",
+    "NCHWConvTokenizer",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
@@ -311,6 +383,7 @@ __all__ = [
     "convert_nhwc_nat_state_dict",
     "copy_nhwc_nat_block_to_nchw",
     "copy_nhwc_nat_to_nchw",
+    "copy_nhwc_conv_tokenizer_to_nchw",
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
 ]
