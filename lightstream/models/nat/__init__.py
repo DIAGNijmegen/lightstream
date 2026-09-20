@@ -1,6 +1,7 @@
 """Neighborhood Attention Transformer models and NCHW building blocks."""
 
 from lightstream.models.nat.nchw import (
+    ConvDownsampler,
     NCHWConvDownsampler,
     NCHWNATBlock,
     NCHWNATLayer,
@@ -14,6 +15,7 @@ from lightstream.models.nat.nchw import (
 )
 
 __all__ = [
+    "ConvDownsampler",
     "NCHWConvDownsampler",
     "NCHWNATBlock",
     "NCHWNATLayer",

@@ -201,15 +201,15 @@ class NCHWNATLayer(nn.Module):
         return self.merge2(x, self.mlp(self.norm2(x)))
 
 
-class NCHWConvDownsampler(nn.Module):
+class ConvDownsampler(nn.Module):
     """NCHW equivalent of NAT's optional stage downsampler."""
 
-    def __init__(self, channels: int):
+    def __init__(self, dim: int):
         super().__init__()
         self.reduction = nn.Conv2d(
-            channels, 2 * channels, kernel_size=3, stride=2, padding=1, bias=False
+            dim, 2 * dim, kernel_size=3, stride=2, padding=1, bias=False
         )
-        self.norm = ChannelLayerNorm(2 * channels)
+        self.norm = ChannelLayerNorm(2 * dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.reduction(x))
@@ -259,7 +259,7 @@ class NCHWNATBlock(nn.Module):
             )
             for index in range(depth)
         )
-        self.downsample = NCHWConvDownsampler(channels) if downsample else None
+        self.downsample = ConvDownsampler(channels) if downsample else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
@@ -302,6 +302,7 @@ def copy_nhwc_nat_block_to_nchw(
 
 
 __all__ = [
+    "ConvDownsampler",
     "NCHWConvDownsampler",
     "NCHWNATBlock",
     "NCHWNATLayer",
@@ -313,3 +314,9 @@ __all__ = [
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
 ]
+
+
+# Kept as a compatibility alias for callers of the initial NCHW NAT API.  The
+# unprefixed name is unambiguous inside this NCHW-only module and matches the
+# corresponding NHWC production component.
+NCHWConvDownsampler = ConvDownsampler
