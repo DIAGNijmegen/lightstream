@@ -13,10 +13,18 @@ from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
 
 
+SUPPORTED_NATTEN_VERSION = "0.17.5"
+
+
 @pytest.fixture(scope="session")
 def natten_backend():
-    """Load the real optional backend only for tests which require it."""
-    return pytest.importorskip("natten")
+    """Load only the production NATTEN API for real-backend parity tests."""
+    backend = pytest.importorskip("natten")
+    assert backend.__version__ == SUPPORTED_NATTEN_VERSION, (
+        "real-NATTEN parity tests require the v0.17.5-blackwell build; "
+        f"found NATTEN {backend.__version__!r}"
+    )
+    return backend
 
 
 class _LocalNHWCBackend(nn.Module):
@@ -171,6 +179,8 @@ def _make_natten(natten_backend, channels, heads, kernel_size, dilation):
         kernel_size=kernel_size,
         dilation=dilation,
         qkv_bias=True,
+        # This is the v0.17.5-blackwell spelling for relative positional bias.
+        # Keeping it explicit makes the expected state dict unambiguous.
         rel_pos_bias=True,
         attn_drop=0.0,
         proj_drop=0.0,

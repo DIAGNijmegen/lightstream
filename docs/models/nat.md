@@ -22,23 +22,35 @@ outside the first validation boundary.
 
 ## Supported dependency and API
 
-Only **PyTorch 2.13.0 with NATTEN 0.21.7** is supported. PyTorch 2.13.0 is the
-newest official PyTorch build for which NATTEN 0.21.7 recommends and publishes
-pre-built `libnatten` wheels in its [installation matrix](https://natten.org/install/).
-Install this optional combination with:
+Only **PyTorch 2.13.0 with the NATTEN `v0.17.5-blackwell` build** is supported.
+That NATTEN branch identifies itself as the ordinary Python version `0.17.5`,
+so a requirement such as `natten==0.17.5-blackwell` is not valid package
+metadata and `natten==0.17.5` could silently select the non-Blackwell release.
+The `nat` extra therefore uses the production branch's immutable source commit
+`0a6a3df544fe478e97bdd77e92fd3ec14cf43cff` rather than a version specifier.
+
+Install the supported combination (and build NATTEN for the CUDA architecture
+visible on the build host) with:
 
 ```console
 pip install 'lightstream[nat]'
 ```
 
-This target uses NATTEN 0.21.7's **newer functional API**,
-`natten.functional.na2d`, rather than the legacy `NeighborhoodAttention2D`
-module. NATTEN is an optional dependency, so installing Lightstream without
-the `nat` extra continues to support existing Lightstream models without
-NATTEN.
+For a controlled Blackwell build where CUDA is not visible during installation,
+install PyTorch first and force the desired architecture while installing the
+same immutable source revision:
 
-NAT implementation code must retrieve the operation through
-`lightstream.models.nat.load_na2d()`. The loader checks both installed versions
-and raises `NATTENCompatibilityError` with the found and expected pair before
-using an incompatible NATTEN installation. If NATTEN is absent, it instead
-explains how to install the optional extra.
+```console
+pip install 'torch==2.13.0'
+NATTEN_WITH_CUDA=1 NATTEN_CUDA_ARCH=10.0 pip install \
+  'natten @ git+https://github.com/SHI-Labs/NATTEN.git@0a6a3df544fe478e97bdd77e92fd3ec14cf43cff'
+pip install --no-deps lightstream
+```
+
+Change `NATTEN_CUDA_ARCH` only when the production GPU has a different compute
+capability. NATTEN is optional, so installing Lightstream without the `nat`
+extra continues to support models that do not use neighborhood attention.
+At runtime Lightstream checks for package version `0.17.5`, and its NAT layer
+uses the `NeighborhoodAttention2D` constructor with `rel_pos_bias=True`
+explicitly. The immutable dependency pin is what distinguishes
+the supported Blackwell source from other builds that report the same version.
