@@ -699,12 +699,19 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         copy_to_gpu=True,
     )
 
-    # The fixture intentionally has no dropout, DropPath, or LayerScale; both
-    # residual additions remain explicit module boundaries after conversion.
-    assert not any(isinstance(module, nn.Dropout) for module in reference.modules())
-    assert not any(isinstance(module, nn.Dropout) for module in streaming.modules())
+    # NATTEN owns dropout modules, but the fixture disables them so tiled and
+    # untiled executions remain deterministic. The MLPs omit dropout entirely.
+    for model in (reference, full_nchw, streaming.stream_module):
+        dropouts = [module for module in model.modules() if isinstance(module, nn.Dropout)]
+        assert all(module.p == 0.0 for module in dropouts)
+    assert not any(isinstance(module, nn.Dropout) for module in reference.mlp.modules())
+    assert not any(isinstance(module, nn.Dropout) for module in full_nchw.mlp.modules())
+
+    # Both residual additions remain explicit module boundaries after conversion.
     assert isinstance(nchw_source.merge1, StreamingMerge)
     assert isinstance(nchw_source.merge2, StreamingMerge)
+    assert nchw_source.merge1.mode == "add"
+    assert nchw_source.merge2.mode == "add"
 
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
     full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
