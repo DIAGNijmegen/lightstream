@@ -233,6 +233,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = None
         self._tile_output_lost = None
         self._output_stride_per_output = None
+        self._output_size_transforms_per_output = None
         self._output_spec = None
         self._module_stats = {}
         self._saved_tensors = {}
@@ -471,6 +472,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = [out.shape for out in output_tensors]
         self._tile_output_shape = self._tile_output_shapes[0]
         self._output_stride_per_output = []
+        self._output_size_transforms_per_output = []
         gradients = []
         for idx, out in enumerate(output_tensors):
             lost = self._tile_output_lost[idx]
@@ -486,10 +488,13 @@ class StreamingCNN(torch.nn.Module):
             p_stats = self._prev_stats(out)
             if p_stats:
                 output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                output_size_transforms = p_stats.get("output_size_transforms")
             else:
                 output_stride = torch.tensor([1, 1, 1])
+                output_size_transforms = []
 
             self._output_stride_per_output.append(output_stride)
+            self._output_size_transforms_per_output.append(output_size_transforms)
 
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
@@ -1087,17 +1092,45 @@ class StreamingCNN(torch.nn.Module):
         return valid_output_heights, valid_output_widths
 
     def _compute_full_output_sizes(self, image):
-        """Return per-head output sizes for the fully stitched image output."""
-        output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1])
-            + tile_shape[H_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-        output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2])
-            + tile_shape[W_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
+        """Return per-head output sizes while retaining every strided layer's phase.
+
+        A total stride is not sufficient to infer an output extent: the result also
+        depends on the padding, effective kernel, and phase at *each* layer.  Replay
+        the spatial size transforms captured during setup instead.  Old tile caches
+        without this metadata retain the previous delta-based fallback.
+        """
+        transforms_per_output = getattr(self, "_output_size_transforms_per_output", None)
+        output_heights = []
+        output_widths = []
+        for idx, tile_shape in enumerate(self._tile_output_shapes):
+            transforms = (
+                transforms_per_output[idx]
+                if transforms_per_output is not None and idx < len(transforms_per_output)
+                else None
+            )
+            if transforms is None:
+                output_heights.append(
+                    (image.shape[H_DIM] - self.tile_shape[H_DIM])
+                    // int(self._output_stride_per_output[idx][1])
+                    + tile_shape[H_DIM]
+                )
+                output_widths.append(
+                    (image.shape[W_DIM] - self.tile_shape[W_DIM])
+                    // int(self._output_stride_per_output[idx][2])
+                    + tile_shape[W_DIM]
+                )
+                continue
+
+            height, width = int(image.shape[H_DIM]), int(image.shape[W_DIM])
+            for transform in transforms:
+                kernel_h, kernel_w = transform["kernel_size"]
+                dilation_h, dilation_w = transform["dilation"]
+                padding_h, padding_w = transform["padding"]
+                stride_h, stride_w = transform["stride"]
+                height = (height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
+                width = (width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
+            output_heights.append(height)
+            output_widths.append(width)
         return output_heights, output_widths
 
     def _compute_valid_input_step(self, valid_output_heights, valid_output_widths):
@@ -1158,6 +1191,7 @@ class StreamingCNN(torch.nn.Module):
         tile_width,
     ):
         """Yield input-space tile coordinates with border-aware side markers."""
+        align_h, align_w = self._compute_internal_alignment()
         for row in range(n_rows):
             for col in range(n_cols):
                 input_y = row * valid_input_height
@@ -1170,9 +1204,21 @@ class StreamingCNN(torch.nn.Module):
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 if sides_bottom:
-                    input_y = max(image.shape[H_DIM] - tile_height, 0)
+                    edge_start = max(image.shape[H_DIM] - tile_height, 0)
+                    # Keep the sampling phase of strided layers at the image
+                    # edge.  The resulting edge tile may be smaller than the
+                    # setup tile, which is preferable to shifting its origin
+                    # off the global stride lattice.
+                    input_y = min(
+                        math.ceil(edge_start / align_h) * align_h,
+                        max(int(image.shape[H_DIM]) - 1, 0),
+                    )
                 if sides_right:
-                    input_x = max(image.shape[W_DIM] - tile_width, 0)
+                    edge_start = max(image.shape[W_DIM] - tile_width, 0)
+                    input_x = min(
+                        math.ceil(edge_start / align_w) * align_w,
+                        max(int(image.shape[W_DIM]) - 1, 0),
+                    )
 
                 input_y = input_y if not sides.top else 0
                 input_x = input_x if not sides.left else 0
@@ -2376,6 +2422,27 @@ class StreamingCNN(torch.nn.Module):
             else:
                 output_stride = prev_output_stride
 
+            previous_transforms = p_stats.get("output_size_transforms") if p_stats else []
+            if previous_transforms is None or is_upsample:
+                # The legacy delta calculation remains the safe fallback for
+                # paths containing transforms that cannot be represented by a
+                # convolution size formula.
+                module_stats["output_size_transforms"] = None
+            elif isinstance(module, torch.nn.Conv2d):
+                module_stats["output_size_transforms"] = [
+                    *previous_transforms,
+                    {
+                        "kernel_size": tuple(int(v) for v in module.kernel_size),
+                        "dilation": tuple(int(v) for v in module.dilation),
+                        "padding": tuple(int(v) for v in module.padding),
+                        "stride": tuple(int(v) for v in module.stride),
+                    },
+                ]
+            elif is_pointwise_module or is_neighborhood_attention:
+                module_stats["output_size_transforms"] = list(previous_transforms)
+            else:
+                module_stats["output_size_transforms"] = None
+
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
@@ -2678,6 +2745,9 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
+        named_stats["output_size_transforms_per_output"] = getattr(
+            self, "_output_size_transforms_per_output", None
+        )
         named_stats["output_spec"] = self._output_spec
         return named_stats
 
@@ -2691,6 +2761,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = state["tile_output_shape"]
         self._tile_output_shapes = state.get("tile_output_shapes", [self._tile_output_shape])
         self._output_stride_per_output = state.get("output_stride_per_output", [self.output_stride])
+        self._output_size_transforms_per_output = state.get("output_size_transforms_per_output")
         self._base_output_stride = self._output_stride_per_output[0].clone()
         for stride in self._output_stride_per_output[1:]:
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))

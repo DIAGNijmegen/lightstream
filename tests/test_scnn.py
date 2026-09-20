@@ -38,6 +38,63 @@ from lightstream.core.reducer import (
 )
 
 
+@pytest.mark.parametrize(
+    ("tile_hw", "image_hw"),
+    [
+        ((8, 8), (17, 17)),  # even setup tile, odd full image
+        ((9, 9), (17, 17)),  # odd setup tile, odd full image
+        ((8, 9), (17, 19)),  # independent height/width phases
+    ],
+)
+def test_strided_conv_full_output_shape_and_tile_placement_preserve_phase(tile_hw, image_hw):
+    torch.manual_seed(91)
+    reference = nn.Conv2d(2, 3, kernel_size=3, stride=2, padding=1).eval()
+    streaming_module = nn.Conv2d(2, 3, kernel_size=3, stride=2, padding=1).eval()
+    streaming_module.load_state_dict(reference.state_dict())
+    streaming = StreamingCNN(
+        streaming_module,
+        tile_shape=(1, 2, *tile_hw),
+        deterministic=True,
+        copy_to_gpu=False,
+    )
+    image = torch.randn(1, 2, *image_hw)
+
+    expected = reference(image)
+    actual = streaming(image)
+
+    assert actual.shape == expected.shape == (1, 3, math.ceil(image_hw[0] / 2), math.ceil(image_hw[1] / 2))
+    torch.testing.assert_close(actual, expected)
+    # More than one tile ensures the assertion covers allocation and placement,
+    # rather than only setup-time shape propagation.
+    assert len(streaming._last_forward_tiles) > 1
+
+
+def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
+    torch.manual_seed(92)
+    reference = nn.Sequential(
+        nn.Conv2d(1, 2, kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1),
+    ).eval()
+    streaming_module = nn.Sequential(
+        nn.Conv2d(1, 2, kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1),
+    ).eval()
+    streaming_module.load_state_dict(reference.state_dict())
+    streaming = StreamingCNN(
+        streaming_module,
+        tile_shape=(1, 1, 16, 16),
+        deterministic=True,
+        copy_to_gpu=False,
+    )
+    image = torch.randn(1, 1, 33, 35)
+
+    expected = reference(image)
+    actual = streaming(image)
+
+    assert actual.shape == expected.shape == (1, 2, 9, 9)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_convert_and_reset_every_supported_layer_type():
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn._streaming_reducers = []
