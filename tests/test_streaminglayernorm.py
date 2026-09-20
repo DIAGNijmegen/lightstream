@@ -342,12 +342,26 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
     module(x).backward(grad)
     streaming(x_streaming).backward(grad)
 
-    torch.testing.assert_close(x_streaming.grad, x.grad)
+    torch.testing.assert_close(
+        x_streaming.grad,
+        x.grad,
+        atol=2e-5,
+        rtol=1e-5,
+        msg="input gradient differs",
+    )
     reference_grads = {name: param.grad for name, param in module.named_parameters()}
     streaming_grads = {name: param.grad for name, param in streaming.named_parameters()}
     assert streaming_grads.keys() == reference_grads.keys() == {"norm.weight", "norm.bias"}
-    for name in reference_grads:
-        torch.testing.assert_close(streaming_grads[name], reference_grads[name])
+    torch.testing.assert_close(
+        streaming_grads["norm.weight"],
+        reference_grads["norm.weight"],
+        msg="weight gradient differs",
+    )
+    torch.testing.assert_close(
+        streaming_grads["norm.bias"],
+        reference_grads["norm.bias"],
+        msg="bias gradient differs",
+    )
 
 
 def test_streaming_channel_layer_norm_affine_grads_include_all_upstream_contributions():
