@@ -77,13 +77,26 @@ def pointwise_conv_to_linear(convolution: nn.Conv2d) -> nn.Linear:
 def convert_nhwc_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
     """Convert NHWC NAT Linear weights into NCHW pointwise-convolution weights.
 
-    Keys are unchanged; only two-dimensional tensors whose key ends in
-    ``mlp.fc1.weight`` or ``mlp.fc2.weight`` gain two singleton dimensions.
-    This makes original NAT checkpoints loadable without manual reshaping.
+    Linear MLP weights gain two singleton dimensions.  LayerNorm and attention
+    keys are also adjusted for the transparent wrapper modules used by the
+    NCHW implementation.  The result can therefore be passed directly to
+    :meth:`NCHWNAT.load_state_dict`.
     """
 
     converted = OrderedDict()
     for key, value in state_dict.items():
+        parts = key.split(".")
+        if "attn" in parts:
+            index = parts.index("attn")
+            parts.insert(index + 1, "attention")
+        for index, part in tuple(enumerate(parts)):
+            if part in {"norm", "norm1", "norm2"}:
+                # Only parameter leaves need the implementation wrapper.  This
+                # covers tokenizer, stage/downsample, layer, and final norms.
+                if index + 1 < len(parts) and parts[index + 1] in {"weight", "bias"}:
+                    parts.insert(index + 1, "norm")
+                break
+        key = ".".join(parts)
         if (
             key.endswith(("mlp.fc1.weight", "mlp.fc2.weight"))
             and isinstance(value, torch.Tensor)
@@ -97,7 +110,7 @@ def convert_nhwc_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
 
 
 def convert_nchw_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
-    """Convert NCHW pointwise MLP weights back to original NHWC NAT shape."""
+    """Convert wrapped NCHW keys and pointwise weights back to original NAT."""
 
     converted = OrderedDict()
     for key, value in state_dict.items():
@@ -109,6 +122,18 @@ def convert_nchw_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
             if value.shape[-2:] != (1, 1):
                 raise ValueError(f"{key!r} is not a pointwise-convolution weight")
             value = value[:, :, 0, 0]
+        parts = key.split(".")
+        for wrapper in ("attention", "norm"):
+            for index in range(1, len(parts)):
+                if parts[index] == wrapper and parts[index - 1] in {
+                    "attn",
+                    "norm",
+                    "norm1",
+                    "norm2",
+                }:
+                    del parts[index]
+                    break
+        key = ".".join(parts)
         converted[key] = value
     if hasattr(state_dict, "_metadata"):
         converted._metadata = state_dict._metadata
@@ -393,7 +418,11 @@ class NCHWNAT(nn.Module):
 
         # These names deliberately match NAT so the stage portions of existing
         # checkpoint keys do not need to be remapped.
-        self.patch_embed = NCHWConvTokenizer(in_chans=in_chans, embed_dim=embed_dim)
+        # Original NAT uses nn.LayerNorm's 1e-5 default throughout.
+        norm_eps = 1e-5
+        self.patch_embed = NCHWConvTokenizer(
+            in_chans=in_chans, embed_dim=embed_dim, eps=norm_eps
+        )
         self.levels = nn.ModuleList(
             NCHWNATBlock(
                 channels=int(embed_dim * 2**index),
@@ -411,6 +440,13 @@ class NCHWNAT(nn.Module):
             for index, depth in enumerate(depths)
         )
         self.norm = ChannelLayerNorm(self.num_features)
+
+        # Nested building blocks retain their historical 1e-6 default when
+        # used independently; a complete NCHWNAT must mirror original NAT.
+        for module in self.modules():
+            if isinstance(module, ChannelLayerNorm):
+                module.eps = norm_eps
+                module.norm.eps = norm_eps
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Return the final normalized NCHW map without pooling or a head."""

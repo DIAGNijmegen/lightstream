@@ -15,8 +15,11 @@ from lightstream.core.scnn.utils import Lost
 from lightstream.models.nat import (
     ConvDownsampler,
     NCHWConvTokenizer,
+    NCHWNAT,
     NCHWNATBlock,
     NCHWNATLayer,
+    convert_nchw_nat_state_dict,
+    convert_nhwc_nat_state_dict,
     copy_nhwc_nat_block_to_nchw,
     copy_nhwc_nat_to_nchw,
     copy_nhwc_conv_tokenizer_to_nchw,
@@ -126,6 +129,33 @@ def test_close_diagnostics_identify_parameter_cycle_and_error_scales():
     assert "max_tensor_magnitude=2" in message
 
 
+def test_complete_nat_state_conversion_maps_wrappers_and_mlp_kernels():
+    original = {
+        "patch_embed.norm.weight": torch.randn(8),
+        "levels.0.blocks.0.norm1.bias": torch.randn(8),
+        "levels.0.blocks.0.attn.qkv.weight": torch.randn(24, 8),
+        "levels.0.blocks.0.mlp.fc1.weight": torch.randn(16, 8),
+        "levels.0.downsample.norm.weight": torch.randn(16),
+        "norm.bias": torch.randn(64),
+    }
+
+    converted = convert_nhwc_nat_state_dict(original)
+
+    assert set(converted) == {
+        "patch_embed.norm.norm.weight",
+        "levels.0.blocks.0.norm1.norm.bias",
+        "levels.0.blocks.0.attn.attention.qkv.weight",
+        "levels.0.blocks.0.mlp.fc1.weight",
+        "levels.0.downsample.norm.norm.weight",
+        "norm.norm.bias",
+    }
+    assert converted["levels.0.blocks.0.mlp.fc1.weight"].shape == (16, 8, 1, 1)
+    restored = convert_nchw_nat_state_dict(converted)
+    assert restored.keys() == original.keys()
+    for name in original:
+        torch.testing.assert_close(restored[name], original[name])
+
+
 def test_nchw_conv_downsampler_architecture():
     downsampler = ConvDownsampler(dim=5)
 
@@ -140,9 +170,7 @@ def test_nchw_conv_downsampler_architecture():
 
 
 @pytest.mark.parametrize("tile_hw", [(20, 24), (19, 23)])
-def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(
-    natten_backend, tile_hw
-):
+def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(natten_backend, tile_hw):
     """The two tokenizer strides retain forward, backward, and update parity."""
 
     from lightstream.models.nat.nat import ConvTokenizer
@@ -219,7 +247,9 @@ def test_conv_tokenizer_matches_nhwc_full_frame_and_streaming(
                 streaming_parameter.grad, reference_parameter.grad
             )
 
-    optimizers = [torch.optim.SGD(parameters, lr=0.025) for parameters in parameter_groups]
+    optimizers = [
+        torch.optim.SGD(parameters, lr=0.025) for parameters in parameter_groups
+    ]
     for optimizer in optimizers:
         optimizer.step()
     for reference_parameter, full_parameter, streaming_parameter in zip(
@@ -1400,6 +1430,177 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
                 optimizer.zero_grad(set_to_none=True)
 
 
+def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
+    natten_backend,
+):
+    """The reduced production backbone preserves training across all boundaries."""
+
+    from lightstream.models.nat.nat import NAT
+
+    torch.manual_seed(42001)
+    configuration = dict(
+        embed_dim=8,
+        mlp_ratio=2,
+        depths=[1, 1, 1, 1],
+        num_heads=[1, 2, 4, 8],
+        drop_path_rate=0.0,
+        kernel_size=3,
+        num_classes=0,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        layer_scale=None,
+    )
+    reference = NAT(**configuration).float()
+    nchw_configuration = {
+        key: value
+        for key, value in configuration.items()
+        if key not in {"num_classes", "layer_scale"}
+    }
+    full_nchw = NCHWNAT(**nchw_configuration).float()
+    converted_state = convert_nhwc_nat_state_dict(reference.state_dict())
+    load_result = full_nchw.load_state_dict(converted_state, strict=False)
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []
+    assert set(converted_state) == set(full_nchw.state_dict())
+
+    tile_shape = (1, 3, 63, 67)
+    streaming = StreamingCNN(
+        copy.deepcopy(full_nchw), tile_shape=tile_shape, copy_to_gpu=True
+    )
+    tile_cache = streaming.get_tile_cache()
+
+    def parameter_pairs(nchw_module):
+        reference_parameters = dict(reference.named_parameters())
+        nchw_parameters = dict(nchw_module.named_parameters())
+        converted_names = {
+            next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
+            for name, parameter in reference_parameters.items()
+        }
+        assert set(converted_names) == set(nchw_parameters)
+        for nchw_name, reference_name in converted_names.items():
+            yield (
+                nchw_name,
+                reference_parameters[reference_name],
+                nchw_parameters[nchw_name],
+            )
+
+    def compare_cycle(streamers, seed):
+        for module in (
+            reference,
+            full_nchw,
+            *(item.stream_module for item in streamers),
+        ):
+            module.zero_grad(set_to_none=True)
+        torch.manual_seed(seed)
+        reference_input = torch.randn(
+            1, 3, 65, 71, dtype=torch.float32, requires_grad=True
+        )
+        full_input = reference_input.detach().clone().requires_grad_(True)
+        stream_inputs = [
+            full_input.detach().clone().requires_grad_(True) for _ in streamers
+        ]
+
+        reference_features = reference.forward_feature_map(reference_input)
+        full_features = full_nchw(full_input)
+        stream_features = [item(value) for item, value in zip(streamers, stream_inputs)]
+        expected_features = reference_features.permute(0, 3, 1, 2)
+        _assert_close_with_diagnostics(
+            full_features,
+            expected_features,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+            quantity="complete four-stage features",
+        )
+        for output in stream_features:
+            torch.testing.assert_close(
+                output, full_features, rtol=_SAME_LAYOUT_RTOL, atol=_SAME_LAYOUT_ATOL
+            )
+
+        torch.manual_seed(seed + 1)
+        upstream = torch.randn_like(full_features)
+        reference_features.backward(upstream.permute(0, 2, 3, 1).contiguous())
+        full_features.backward(upstream)
+        for item, value in zip(streamers, stream_inputs):
+            item.backward(value, upstream)
+        _assert_close_with_diagnostics(
+            full_input.grad,
+            reference_input.grad,
+            rtol=_CROSS_LAYOUT_INPUT_GRAD_RTOL,
+            atol=_CROSS_LAYOUT_INPUT_GRAD_ATOL,
+            quantity="complete four-stage image gradient",
+        )
+        for value in stream_inputs:
+            torch.testing.assert_close(
+                value.grad,
+                full_input.grad,
+                rtol=_SAME_LAYOUT_RTOL,
+                atol=_SAME_LAYOUT_ATOL,
+            )
+
+        full_pairs = list(parameter_pairs(full_nchw))
+        for name, reference_parameter, nchw_parameter in full_pairs:
+            assert (
+                reference_parameter.grad is not None and nchw_parameter.grad is not None
+            )
+            _assert_close_with_diagnostics(
+                _linear_shaped(nchw_parameter.grad, reference_parameter.grad),
+                reference_parameter.grad,
+                rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+                atol=_CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+                quantity="complete four-stage parameter gradient",
+                parameter_name=name,
+            )
+        for item in streamers:
+            for (name, _, full_parameter), (_, _, stream_parameter) in zip(
+                full_pairs, parameter_pairs(item.stream_module)
+            ):
+                torch.testing.assert_close(
+                    stream_parameter.grad,
+                    full_parameter.grad,
+                    rtol=_SAME_LAYOUT_RTOL,
+                    atol=_SAME_LAYOUT_ATOL,
+                    msg=f"streamed parameter gradient {name}",
+                )
+
+    compare_cycle([streaming], 43001)
+    optimizers = [
+        torch.optim.SGD(module.parameters(), lr=0.01)
+        for module in (reference, full_nchw, streaming.stream_module)
+    ]
+    for optimizer in optimizers:
+        optimizer.step()
+    for name, reference_parameter, full_parameter in parameter_pairs(full_nchw):
+        torch.testing.assert_close(
+            _linear_shaped(full_parameter, reference_parameter),
+            reference_parameter,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+            msg=f"optimizer-updated parameter {name}",
+        )
+    for (name, _, full_parameter), (_, _, stream_parameter) in zip(
+        parameter_pairs(full_nchw), parameter_pairs(streaming.stream_module)
+    ):
+        torch.testing.assert_close(
+            stream_parameter,
+            full_parameter,
+            rtol=_SAME_LAYOUT_RTOL,
+            atol=_SAME_LAYOUT_ATOL,
+            msg=f"streamed optimizer-updated parameter {name}",
+        )
+
+    # Make one updated NCHW state canonical, then verify both the reset stream
+    # and a separately constructed stream restored from the saved cache.
+    streaming.stream_module.load_state_dict(full_nchw.state_dict())
+    cached_streaming = StreamingCNN(
+        copy.deepcopy(full_nchw),
+        tile_shape=tile_shape,
+        copy_to_gpu=True,
+        state_dict=tile_cache,
+    )
+    cached_streaming.stream_module.load_state_dict(full_nchw.state_dict())
+    compare_cycle([streaming, cached_streaming], 44001)
+
+
 @pytest.mark.parametrize(
     ("tile_hw", "image_hw", "expected_downsample_lost"),
     [
@@ -1581,16 +1782,13 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
     # must not feed another parity cycle.  Retain a copy of every parameter so
     # the update itself can be compared in addition to its resulting value.
     reference_before_step = {
-        name: parameter.detach().clone()
-        for name, parameter, _ in full_pairs
+        name: parameter.detach().clone() for name, parameter, _ in full_pairs
     }
     full_before_step = {
-        name: parameter.detach().clone()
-        for name, _, parameter in full_pairs
+        name: parameter.detach().clone() for name, _, parameter in full_pairs
     }
     streaming_before_step = {
-        name: parameter.detach().clone()
-        for name, _, parameter in streaming_pairs
+        name: parameter.detach().clone() for name, _, parameter in streaming_pairs
     }
     assert len(reference_before_step) == len(dict(reference.named_parameters()))
     assert len(full_before_step) == len(dict(full_nchw.named_parameters()))

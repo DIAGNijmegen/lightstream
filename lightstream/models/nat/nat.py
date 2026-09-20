@@ -6,6 +6,7 @@ https://arxiv.org/abs/2204.07143
 This source code is licensed under the license found in the
 LICENSE file in the root directory of this source tree.
 """
+
 import torch
 import torch.nn as nn
 from timm.models.layers import trunc_normal_, DropPath
@@ -256,7 +257,7 @@ class NAT(nn.Module):
         attn_drop_rate=0.0,
         norm_layer=nn.LayerNorm,
         layer_scale=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
 
@@ -316,14 +317,24 @@ class NAT(nn.Module):
     def no_weight_decay_keywords(self):
         return {"rpb"}
 
-    def forward_features(self, x):
+    def forward_feature_map(self, x):
+        """Return the final normalized NHWC map before pooling or classification.
+
+        Keeping this boundary explicit provides a reference for spatial feature
+        extractors without changing the established ``forward_features`` API,
+        which returns a globally pooled vector.
+        """
+
         x = self.patch_embed(x)
         x = self.pos_drop(x)
 
         for level in self.levels:
             x = level(x)
 
-        x = self.norm(x).flatten(1, 2)
+        return self.norm(x)
+
+    def forward_features(self, x):
+        x = self.forward_feature_map(x).flatten(1, 2)
         x = self.avgpool(x.transpose(1, 2))
         x = torch.flatten(x, 1)
         return x
@@ -343,7 +354,7 @@ def nat_mini(pretrained=False, **kwargs):
         mlp_ratio=3,
         drop_path_rate=0.2,
         kernel_size=7,
-        **kwargs
+        **kwargs,
     )
     if pretrained:
         url = model_urls["nat_mini_1k"]
@@ -361,7 +372,7 @@ def nat_tiny(pretrained=False, **kwargs):
         mlp_ratio=3,
         drop_path_rate=0.2,
         kernel_size=7,
-        **kwargs
+        **kwargs,
     )
     if pretrained:
         url = model_urls["nat_tiny_1k"]
@@ -380,7 +391,7 @@ def nat_small(pretrained=False, **kwargs):
         drop_path_rate=0.3,
         layer_scale=1e-5,
         kernel_size=7,
-        **kwargs
+        **kwargs,
     )
     if pretrained:
         url = model_urls["nat_small_1k"]
@@ -399,13 +410,14 @@ def nat_base(pretrained=False, **kwargs):
         drop_path_rate=0.5,
         layer_scale=1e-5,
         kernel_size=7,
-        **kwargs
+        **kwargs,
     )
     if pretrained:
         url = model_urls["nat_base_1k"]
         checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
         model.load_state_dict(checkpoint)
     return model
+
 
 if __name__ == "__main__":
     model = nat_mini(pretrained=False)
