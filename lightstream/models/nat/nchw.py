@@ -340,6 +340,90 @@ class NCHWNATBlock(nn.Module):
         return x
 
 
+class NCHWNAT(nn.Module):
+    """NCHW feature extractor corresponding to the four-stage NAT backbone.
+
+    Global pooling and the classification head are intentionally left to the
+    caller so the spatial feature map can be consumed by Lightstream.  NAT's
+    stochastic regularizers are not tile invariant during streamed training,
+    and are consequently rejected rather than silently producing different
+    full-frame and streamed results.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        mlp_ratio: float,
+        depths: list[int] | tuple[int, ...],
+        num_heads: list[int] | tuple[int, ...],
+        drop_path_rate: float = 0.2,
+        in_chans: int = 3,
+        kernel_size: int = 7,
+        dilations: list[list[int]] | tuple[tuple[int, ...], ...] | None = None,
+        qkv_bias: bool = True,
+        qk_scale: float | None = None,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+    ):
+        super().__init__()
+        stochastic = {
+            "drop_rate": drop_rate,
+            "attn_drop_rate": attn_drop_rate,
+            "drop_path_rate": drop_path_rate,
+        }
+        unsupported = [name for name, value in stochastic.items() if value != 0]
+        if unsupported:
+            settings = ", ".join(f"{name}={stochastic[name]!r}" for name in unsupported)
+            raise ValueError(
+                "NCHWNAT requires drop_rate=0, attn_drop_rate=0, and "
+                "drop_path_rate=0 for deterministic streamed training; "
+                f"unsupported setting(s): {settings}"
+            )
+        if len(depths) != 4:
+            raise ValueError("NCHWNAT requires exactly four stages")
+        if len(num_heads) != len(depths):
+            raise ValueError("`num_heads` must contain one value per stage")
+        if dilations is not None and len(dilations) != len(depths):
+            raise ValueError("`dilations` must contain one list per stage")
+
+        self.num_levels = len(depths)
+        self.embed_dim = embed_dim
+        self.num_features = int(embed_dim * 2 ** (self.num_levels - 1))
+        self.mlp_ratio = mlp_ratio
+
+        # These names deliberately match NAT so the stage portions of existing
+        # checkpoint keys do not need to be remapped.
+        self.patch_embed = NCHWConvTokenizer(in_chans=in_chans, embed_dim=embed_dim)
+        self.levels = nn.ModuleList(
+            NCHWNATBlock(
+                channels=int(embed_dim * 2**index),
+                depth=depth,
+                num_heads=num_heads[index],
+                kernel_size=kernel_size,
+                dilations=None if dilations is None else dilations[index],
+                downsample=index < 3,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+            )
+            for index, depth in enumerate(depths)
+        )
+        self.norm = ChannelLayerNorm(self.num_features)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the final normalized NCHW map without pooling or a head."""
+
+        x = self.patch_embed(x)
+        for level in self.levels:
+            x = level(x)
+        return self.norm(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(x)
+
+
 def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
     """Copy an original-layout NAT layer into an NCHW production layer."""
 
@@ -376,6 +460,7 @@ __all__ = [
     "ConvDownsampler",
     "NCHWConvDownsampler",
     "NCHWConvTokenizer",
+    "NCHWNAT",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
