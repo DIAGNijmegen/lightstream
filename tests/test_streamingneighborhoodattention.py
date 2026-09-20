@@ -1,4 +1,5 @@
 import copy
+import os
 
 import pytest
 import torch
@@ -52,7 +53,21 @@ def test_nchw_conv_downsampler_architecture():
 @pytest.fixture(scope="session")
 def natten_backend():
     """Load only the production NATTEN API for real-backend parity tests."""
-    backend = pytest.importorskip("natten")
+    try:
+        import natten as backend
+    except ImportError:
+        if os.environ.get("LIGHTSTREAM_REQUIRE_NATTEN") == "1":
+            pytest.fail(
+                "the production NAT job requires the real NATTEN backend; "
+                "install the pinned 'nat' optional dependency"
+            )
+        pytest.skip("optional NATTEN backend is not installed")
+
+    if os.environ.get("LIGHTSTREAM_REQUIRE_NATTEN") == "1":
+        assert torch.cuda.is_available(), (
+            "the production NAT job requires a CUDA-capable runner; "
+            "torch.cuda.is_available() is false"
+        )
     assert backend.__version__ == SUPPORTED_NATTEN_VERSION, (
         "real-NATTEN parity tests require the v0.17.5-blackwell build; "
         f"found NATTEN {backend.__version__!r}"

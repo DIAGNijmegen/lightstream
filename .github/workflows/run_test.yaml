@@ -4,11 +4,14 @@ on:
     paths:
       - lightstream/**
       - tests/**
+      - pyproject.toml
       - .github/workflows/run_test.yaml
 jobs:
   test_natten:
-    name: Test optional NATTEN backend
-    runs-on: ubuntu-latest
+    # NATTEN's pinned production revision builds CUDA extensions and cannot be
+    # meaningfully validated on GitHub's CPU-only hosted runners.
+    name: Production NAT parity (real NATTEN backend)
+    runs-on: [self-hosted, linux, x64, gpu]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,11 +24,16 @@ jobs:
       - name: Install Lightstream with NATTEN
         run: python -m pip install pytest --editable '.[nat]'
 
-      - name: Run neighborhood attention tests
-        run: python -m pytest tests/test_streamingneighborhoodattention.py
+      - name: Run neighborhood attention tests (skips are reported)
+        env:
+          # Turns the local import-or-skip behavior into a hard CI guard. This
+          # also verifies that the runner exposes the CUDA environment for
+          # which the pinned production backend was built.
+          LIGHTSTREAM_REQUIRE_NATTEN: "1"
+        run: python -m pytest -ra tests/test_streamingneighborhoodattention.py
 
   test_model:
-    name: Test processed code and model
+    name: CPU test suite (optional NATTEN tests may skip)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout 
