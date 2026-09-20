@@ -1148,7 +1148,9 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
             assert (attention.seen_indices.x, attention.seen_indices.width) == (0, 0)
             assert attention.seen_indices.sides is None
 
-        # Step once, then reuse this exact StreamingCNN for a second cycle.
+        # Cycle 0 alone exercises optimizer parity.  The independently computed
+        # cross-layout gradients are only approximately equal, so the three
+        # parameter sets are expected to differ slightly after their steps.
         if cycle == 0:
             for optimizer in (reference_optimizer, full_optimizer, streaming_optimizer):
                 optimizer.step()
@@ -1180,6 +1182,27 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
                         atol=_SAME_LAYOUT_ATOL,
                         msg=f"streaming optimizer-updated parameter {name}",
                     )
+
+            # Make the updated NHWC reference canonical before exercising a
+            # second forward/backward pass.  This keeps cycle 1 focused on
+            # reuse/reset of this exact StreamingCNN rather than compounding
+            # the approximate cross-layout gradients from cycle 0.
+            copy_nhwc_nat_block_to_nchw(reference, full_nchw)
+            copy_nhwc_nat_block_to_nchw(reference, streaming.stream_module)
+            full_parameters = dict(full_nchw.named_parameters())
+            streaming_parameters = dict(streaming.stream_module.named_parameters())
+            assert full_parameters.keys() == streaming_parameters.keys()
+            for name, full_parameter in full_parameters.items():
+                torch.testing.assert_close(
+                    streaming_parameters[name],
+                    full_parameter,
+                    rtol=0,
+                    atol=0,
+                    msg=f"synchronized NCHW parameter {name}",
+                )
+
+            for optimizer in (reference_optimizer, full_optimizer, streaming_optimizer):
+                optimizer.zero_grad(set_to_none=True)
 
 
 @pytest.mark.parametrize(
