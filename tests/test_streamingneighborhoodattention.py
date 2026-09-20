@@ -1487,28 +1487,79 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
             cycle=0,
         )
 
-    for optimizer in optimizers:
-        optimizer.step()
+    # Optimizer validation is deliberately terminal: each independently
+    # accumulated gradient is applied exactly once, and those diverged states
+    # must not feed another parity cycle.  Retain a copy of every parameter so
+    # the update itself can be compared in addition to its resulting value.
+    reference_before_step = {
+        name: parameter.detach().clone()
+        for name, parameter, _ in full_pairs
+    }
+    full_before_step = {
+        name: parameter.detach().clone()
+        for name, _, parameter in full_pairs
+    }
+    streaming_before_step = {
+        name: parameter.detach().clone()
+        for name, _, parameter in streaming_pairs
+    }
+    assert len(reference_before_step) == len(dict(reference.named_parameters()))
+    assert len(full_before_step) == len(dict(full_nchw.named_parameters()))
+    assert len(streaming_before_step) == len(
+        dict(streaming.stream_module.named_parameters())
+    )
+
+    reference_optimizer, full_optimizer, streaming_optimizer = optimizers
+    reference_optimizer.step()
+    full_optimizer.step()
+    streaming_optimizer.step()
+
     full_pairs = list(_nat_block_parameter_pairs(reference, full_nchw))
     streaming_pairs = list(
         _nat_block_parameter_pairs(reference, streaming.stream_module)
     )
     for name, reference_parameter, full_parameter in full_pairs:
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             _linear_shaped(full_parameter, reference_parameter),
             reference_parameter,
             rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
             atol=_CROSS_LAYOUT_OUTPUT_ATOL,
-            msg=f"full-frame optimizer-updated parameter {name}",
+            quantity="cross-layout optimizer-updated parameter value",
+            parameter_name=name,
+            cycle=0,
+        )
+        reference_update = reference_parameter - reference_before_step[name]
+        full_update = full_parameter - full_before_step[name]
+        _assert_close_with_diagnostics(
+            _linear_shaped(full_update, reference_update),
+            reference_update,
+            rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+            atol=0.015 * _CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+            quantity="cross-layout optimizer update delta",
+            parameter_name=name,
+            cycle=0,
         )
     for full_pair, streaming_pair in zip(full_pairs, streaming_pairs):
         name, _, full_parameter = full_pair
         streaming_name, _, streaming_parameter = streaming_pair
         assert name == streaming_name
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             streaming_parameter,
             full_parameter,
             rtol=_SAME_LAYOUT_RTOL,
             atol=_SAME_LAYOUT_ATOL,
-            msg=f"streaming optimizer-updated parameter {name}",
+            quantity="same-layout optimizer-updated parameter value",
+            parameter_name=name,
+            cycle=0,
+        )
+        full_update = full_parameter - full_before_step[name]
+        streaming_update = streaming_parameter - streaming_before_step[name]
+        _assert_close_with_diagnostics(
+            streaming_update,
+            full_update,
+            rtol=_SAME_LAYOUT_RTOL,
+            atol=_SAME_LAYOUT_ATOL,
+            quantity="same-layout optimizer update delta",
+            parameter_name=name,
+            cycle=0,
         )
