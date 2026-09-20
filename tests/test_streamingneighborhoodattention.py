@@ -1463,7 +1463,9 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     assert load_result.unexpected_keys == []
     assert set(converted_state) == set(full_nchw.state_dict())
 
-    tile_shape = (1, 3, 63, 67)
+    # Four-stage NAT needs a minimum tile side of 65 for kernel_size=3; a side
+    # of 63 reaches a final feature-map side of 2, which NATTEN rejects.
+    tile_shape = (1, 3, 65, 67)
     streaming = StreamingCNN(
         copy.deepcopy(full_nchw), tile_shape=tile_shape, copy_to_gpu=True
     )
@@ -1493,7 +1495,7 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
             module.zero_grad(set_to_none=True)
         torch.manual_seed(seed)
         reference_input = torch.randn(
-            1, 3, 65, 71, dtype=torch.float32, requires_grad=True
+            1, 3, 69, 73, dtype=torch.float32, requires_grad=True
         )
         full_input = reference_input.detach().clone().requires_grad_(True)
         stream_inputs = [
