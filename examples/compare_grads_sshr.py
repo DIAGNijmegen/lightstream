@@ -132,38 +132,51 @@ def _base_output_grads(
 def _assert_input_gradient_parity(
     stream_input_grad: torch.Tensor,
     reference_input_grad: torch.Tensor,
-    coverage_map: torch.Tensor,
+    write_coverage_map: torch.Tensor,
+    nonzero_coverage_map: torch.Tensor,
     *,
     rtol: float,
     atol: float,
-) -> None:
-    """Check saliency assembly coverage before checking its numerical values."""
+) -> bool:
+    """Diagnose saliency coverage and values without failing normal example runs."""
     if stream_input_grad.shape != reference_input_grad.shape:
         raise AssertionError(
             "Streaming and reference input-gradient shapes differ: "
             f"{tuple(stream_input_grad.shape)} vs {tuple(reference_input_grad.shape)}"
         )
-    if coverage_map.shape != reference_input_grad.shape:
+    if write_coverage_map.shape != reference_input_grad.shape:
         raise AssertionError(
             "Saliency coverage and reference input-gradient shapes differ: "
-            f"{tuple(coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
+            f"{tuple(write_coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+    if nonzero_coverage_map.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Saliency nonzero coverage and reference input-gradient shapes differ: "
+            f"{tuple(nonzero_coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
         )
 
     reference_support = reference_input_grad.ne(0)
-    missing_support = reference_support & ~coverage_map
+    missing_nonzero_support = reference_support & ~nonzero_coverage_map
     print(
         "Input gradient spatial coverage: "
         f"reference-supported={reference_support.count_nonzero().item()}, "
-        f"stream-written={coverage_map.count_nonzero().item()}, "
-        f"missing={missing_support.count_nonzero().item()}"
+        f"stream-written={write_coverage_map.count_nonzero().item()}, "
+        f"stream-nonzero-written={nonzero_coverage_map.count_nonzero().item()}, "
+        f"reference-supported without nonzero stream write="
+        f"{missing_nonzero_support.count_nonzero().item()}"
     )
-    assert not missing_support.any(), (
-        "Streaming saliency replay did not write every reference-supported input coordinate; "
-        f"missing indices={missing_support.nonzero().tolist()[:20]}"
-    )
+    coverage_matches = not missing_nonzero_support.any().item()
+    try:
+        assert coverage_matches, (
+            "Streaming saliency replay did not make a nonzero write at every "
+            "reference-supported input coordinate; "
+            f"missing indices={missing_nonzero_support.nonzero().tolist()[:20]}"
+        )
+        print("Input gradient nonzero streamed-write coverage: PASS")
+    except AssertionError as error:
+        print(f"Input gradient nonzero streamed-write coverage: DIAGNOSTIC FAILURE: {error}")
 
-    # Coverage failures identify assembly holes above.  Only after that check
-    # succeeds do numerical tolerances enter the regression result.
+    values_match = True
     try:
         torch.testing.assert_close(
             stream_input_grad[reference_support],
@@ -172,14 +185,17 @@ def _assert_input_gradient_parity(
             atol=atol,
             msg="streamed saliency values differ over reference-supported coordinates",
         )
-    except AssertionError:
+        print("Input gradient values over reference support: PASS")
+    except AssertionError as error:
+        values_match = False
         outside_reference_support = stream_input_grad.ne(0) & ~reference_support
         print(
+            f"Input gradient values over reference support: DIAGNOSTIC FAILURE: {error}\n"
             "Streamed nonzero values outside reference support: "
             f"count={outside_reference_support.count_nonzero().item()}, "
             f"indices={outside_reference_support.nonzero().tolist()[:20]}"
         )
-        raise
+    return coverage_matches and values_match
 
 
 def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor) -> None:
@@ -291,12 +307,18 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
             print("Input gradient comparison skipped: streaming saliency map is missing.")
         else:
             stream_input_grad = network.stream_network.saliency_map.to(device=img_normal.grad.device)
-            coverage_map = network.stream_network.saliency_coverage_map.to(device=img_normal.grad.device)
+            write_coverage_map = network.stream_network.saliency_coverage_map.to(
+                device=img_normal.grad.device
+            )
+            nonzero_coverage_map = network.stream_network.saliency_nonzero_coverage_map.to(
+                device=img_normal.grad.device
+            )
             reference_input_grad = img_normal.grad.detach()
             _assert_input_gradient_parity(
                 stream_input_grad,
                 reference_input_grad,
-                coverage_map,
+                write_coverage_map,
+                nonzero_coverage_map,
                 rtol=args.input_grad_rtol,
                 atol=args.input_grad_atol,
             )

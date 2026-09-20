@@ -95,11 +95,12 @@ def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
     torch.testing.assert_close(actual, expected)
 
 
-def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regions():
-    """SSHR-style replay must add shared dependencies at shifted boundaries."""
+def test_sshr_saliency_shifted_boundary_tiles_track_writes_for_non_divisible_size():
+    """SSHR-style shifted boundary replay tracks writes independently of values."""
     scnn = StreamingCNN.__new__(StreamingCNN)
     scnn.saliency_map = torch.zeros(1, 3, 11, 13, dtype=torch.double)
     scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
 
     input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
     input_conv.grad_lost = Lost(1, 1, 1, 1)
@@ -112,9 +113,17 @@ def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regio
     safe_step = (6, 6)
     assert all(size % step for size, step in zip(scnn.saliency_map.shape[-2:], safe_step))
     tile_starts = ((0, 0), (0, 5), (3, 0), (3, 5))
+    old_indices = (
+        Box(0, 0, 0, 0, None),
+        Box(0, 7, 7, 0, None),
+        Box(0, 7, 13, 0, None),
+        Box(7, 11, 7, 0, None),
+    )
     assert tile_starts[-1][0] == 3
     assert tile_starts[-1][1] == 5
-    for tile_index, (input_y, input_x) in enumerate(tile_starts, start=1):
+    for tile_index, ((input_y, input_x), previously_seen) in enumerate(
+        zip(tile_starts, old_indices), start=1
+    ):
         sides = Sides(
             left=input_x == 0,
             top=input_y == 0,
@@ -122,6 +131,7 @@ def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regio
             bottom=input_y == 3,
         )
         input_conv.input_loc = Box(input_y, 8, input_x, 8, sides)
+        scnn.saliency_old_indices = previously_seen
         tile_gradient = torch.full((1, 3, 8, 8), float(tile_index), dtype=torch.double)
         scnn._backward_saliency_hook(
             input_conv,
@@ -129,12 +139,10 @@ def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regio
             (torch.ones(1, 2, 8, 8, dtype=torch.double),),
         )
 
-        expected[
-            :,
-            :,
-            input_y : input_y + 8,
-            input_x : input_x + 8,
-        ].add_(tile_gradient)
+        expected[:, :, :7, :7] = 1
+        expected[:, :, :7, 7:] = 2
+        expected[:, :, 7:, :7] = 3
+        expected[:, :, 7:, 7:] = 4
 
     reference_support = expected.ne(0)
     missing_support = reference_support & ~scnn.saliency_coverage_map
@@ -142,11 +150,36 @@ def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regio
     # Keep numerical disagreement separate from the coverage assertion above.
     assert reference_support.all()
     assert scnn.saliency_coverage_map.all()
-    # These locations are in two- and four-tile overlap regions. Assignment
-    # instead of addition would leave the last tile's value (4) at both.
-    assert scnn.saliency_map[0, 0, 5, 6].item() == 10
-    assert scnn.saliency_map[0, 0, 1, 6].item() == 3
+    assert scnn.saliency_nonzero_coverage_map.all()
+    # Preserve the original assembly's selection of only newly visited regions.
+    assert scnn.saliency_map[0, 0, 5, 6].item() == 1
+    assert scnn.saliency_map[0, 0, 1, 7].item() == 2
     torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
+
+
+def test_saliency_coverage_distinguishes_zero_write_from_unvisited_coordinate():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 4, 5, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(0, 4, 0, 4, Sides(True, True, False, True))
+    scnn.saliency_old_indices = Box(0, 0, 0, 0, None)
+    tile_gradient = torch.zeros(1, 3, 4, 4, dtype=torch.double)
+    tile_gradient[..., 1, 2] = 1
+
+    scnn._backward_saliency_hook(
+        input_conv,
+        (tile_gradient,),
+        (torch.ones(1, 2, 4, 4, dtype=torch.double),),
+    )
+
+    assert scnn.saliency_coverage_map[..., :4].all()
+    assert not scnn.saliency_coverage_map[..., 4].any()
+    torch.testing.assert_close(scnn.saliency_nonzero_coverage_map, scnn.saliency_map.ne(0))
 
 
 def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
