@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import nn
 
+from lightstream.core.layers import ChannelLayerNorm, StreamingMerge
 from lightstream.core.layers.streamingneighborhoodattention import (
     NeighborhoodAttention2D,
     StreamingNeighborhoodAttention2D,
@@ -169,12 +170,112 @@ def _make_natten(natten_backend, channels, heads, kernel_size, dilation):
         num_heads=heads,
         kernel_size=kernel_size,
         dilation=dilation,
+        qkv_bias=True,
+        rel_pos_bias=True,
         attn_drop=0.0,
         proj_drop=0.0,
     )
     assert attention.attn_drop.p == 0.0
     assert attention.proj_drop.p == 0.0
     return attention.float()
+
+
+class _PointwiseConvMlp(nn.Module):
+    """NCHW version of NAT's two-linear-layer pointwise MLP."""
+
+    def __init__(self, channels, hidden_channels):
+        super().__init__()
+        self.fc1 = nn.Conv2d(channels, hidden_channels, kernel_size=1)
+        self.act = nn.GELU()
+        self.fc2 = nn.Conv2d(hidden_channels, channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _NCHWNATLayer(nn.Module):
+    """Minimal, deterministic NAT layer in Lightstream's NCHW layout."""
+
+    def __init__(self, attention, channels, hidden_channels):
+        super().__init__()
+        self.norm1 = ChannelLayerNorm(channels)
+        self.attn = NeighborhoodAttention2D(attention=attention)
+        self.merge1 = StreamingMerge("add")
+        self.norm2 = ChannelLayerNorm(channels)
+        self.mlp = _PointwiseConvMlp(channels, hidden_channels)
+        self.merge2 = StreamingMerge("add")
+
+    def forward(self, x):
+        x = self.merge1(x, self.attn(self.norm1(x)))
+        return self.merge2(x, self.mlp(self.norm2(x)))
+
+
+class _LinearMlp(nn.Module):
+    """Original NHWC NAT MLP, with dropout deliberately omitted."""
+
+    def __init__(self, channels, hidden_channels):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, hidden_channels)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_channels, channels)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _NHWCNATLayer(nn.Module):
+    """Direct-layout oracle using only original NAT/PyTorch operations."""
+
+    def __init__(self, attention, channels, hidden_channels):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(channels, eps=1e-6)
+        self.attn = attention
+        self.norm2 = nn.LayerNorm(channels, eps=1e-6)
+        self.mlp = _LinearMlp(channels, hidden_channels)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        return x + self.mlp(self.norm2(x))
+
+
+def _copy_nhwc_nat_to_nchw(reference, nchw):
+    """Copy an NHWC NAT layer, converting Linear weights to 1x1 kernels."""
+
+    nchw.norm1.norm.load_state_dict(reference.norm1.state_dict())
+    nchw.attn.attention.load_state_dict(reference.attn.state_dict())
+    nchw.norm2.norm.load_state_dict(reference.norm2.state_dict())
+    for name in ("fc1", "fc2"):
+        linear = getattr(reference.mlp, name)
+        convolution = getattr(nchw.mlp, name)
+        with torch.no_grad():
+            convolution.weight.copy_(linear.weight[:, :, None, None])
+            convolution.bias.copy_(linear.bias)
+
+
+def _nat_parameter_pairs(reference, nchw):
+    """Pair every trainable NAT parameter across the two layouts."""
+
+    for norm_name in ("norm1", "norm2"):
+        linear_norm = getattr(reference, norm_name)
+        channel_norm = getattr(nchw, norm_name).norm
+        yield f"{norm_name}.weight", linear_norm.weight, channel_norm.weight
+        yield f"{norm_name}.bias", linear_norm.bias, channel_norm.bias
+    nchw_attention = dict(nchw.attn.attention.named_parameters())
+    for name, parameter in reference.attn.named_parameters():
+        yield f"attn.{name}", parameter, nchw_attention[name]
+    for projection_name in ("fc1", "fc2"):
+        linear = getattr(reference.mlp, projection_name)
+        convolution = getattr(nchw.mlp, projection_name)
+        yield f"mlp.{projection_name}.weight", linear.weight, convolution.weight
+        yield f"mlp.{projection_name}.bias", linear.bias, convolution.bias
+
+
+def _linear_shaped(value, reference):
+    """Remove the spatial singleton axes of a pointwise-convolution tensor."""
+
+    if value.ndim == reference.ndim + 2:
+        return value[:, :, 0, 0]
+    return value
 
 
 def test_nchw_wrapper_and_manual_halo_oracle_match_values_gradients_and_step():
@@ -562,3 +663,136 @@ def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
             atol=2e-5,
             msg=f"attention parameter gradient {name!r} differs at {region}",
         )
+
+
+def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_backend):
+    """A complete kernel-7 NAT layer matches over two streaming cycles."""
+
+    torch.manual_seed(97531)
+    batch, channels, hidden_channels, heads = 1, 8, 24, 2
+    kernel_size = 7
+    radius = (kernel_size - 1) // 2
+    image_shape = (16, 19)
+    query_shape = (5, 7)
+    tile_shape = tuple(query + 2 * radius for query in query_shape)
+
+    # Neither axis ends on the regular query grid. StreamingCNN must shift the
+    # final physical tile back, creating overlap that backward de-duplicates.
+    assert all(image % query for image, query in zip(image_shape, query_shape))
+    assert all(image > tile for image, tile in zip(image_shape, tile_shape))
+
+    reference = _NHWCNATLayer(
+        _make_natten(natten_backend, channels, heads, kernel_size, dilation=1),
+        channels,
+        hidden_channels,
+    ).float()
+    nchw_source = _NCHWNATLayer(
+        _make_natten(natten_backend, channels, heads, kernel_size, dilation=1),
+        channels,
+        hidden_channels,
+    ).float()
+    _copy_nhwc_nat_to_nchw(reference, nchw_source)
+    full_nchw = copy.deepcopy(nchw_source)
+    streaming = StreamingCNN(
+        nchw_source,
+        tile_shape=(batch, channels, *tile_shape),
+        copy_to_gpu=True,
+    )
+
+    # The fixture intentionally has no dropout, DropPath, or LayerScale; both
+    # residual additions remain explicit module boundaries after conversion.
+    assert not any(isinstance(module, nn.Dropout) for module in reference.modules())
+    assert not any(isinstance(module, nn.Dropout) for module in streaming.modules())
+    assert isinstance(nchw_source.merge1, StreamingMerge)
+    assert isinstance(nchw_source.merge2, StreamingMerge)
+
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
+    full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
+    streaming_optimizer = torch.optim.SGD(streaming.stream_module.parameters(), lr=0.015)
+
+    for cycle in range(2):
+        reference_optimizer.zero_grad(set_to_none=True)
+        full_optimizer.zero_grad(set_to_none=True)
+        streaming_optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(11100 + cycle)
+        reference_input = torch.randn(
+            batch, *image_shape, channels, dtype=torch.float32, requires_grad=True
+        )
+        nchw_input = (
+            reference_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+        )
+        streaming_input = nchw_input.detach().clone().requires_grad_(True)
+        upstream = torch.randn_like(reference_input)
+
+        reference_output = reference(reference_input)
+        full_output = full_nchw(nchw_input)
+        streaming_output = streaming(streaming_input)
+        torch.testing.assert_close(
+            full_output,
+            reference_output.permute(0, 3, 1, 2),
+            rtol=3e-4,
+            atol=3e-5,
+            msg=f"cycle {cycle} full-frame NAT output",
+        )
+        torch.testing.assert_close(
+            streaming_output,
+            reference_output.permute(0, 3, 1, 2),
+            rtol=3e-4,
+            atol=3e-5,
+            msg=f"cycle {cycle} complete NAT output",
+        )
+
+        reference_output.backward(upstream)
+        nchw_upstream = upstream.permute(0, 3, 1, 2).contiguous()
+        full_output.backward(nchw_upstream)
+        streaming.backward(streaming_input, nchw_upstream)
+        torch.testing.assert_close(
+            nchw_input.grad,
+            reference_input.grad.permute(0, 3, 1, 2),
+            rtol=3e-4,
+            atol=3e-5,
+            msg=f"cycle {cycle} full-frame NAT input gradient",
+        )
+        torch.testing.assert_close(
+            streaming_input.grad,
+            reference_input.grad.permute(0, 3, 1, 2),
+            rtol=3e-4,
+            atol=3e-5,
+            msg=f"cycle {cycle} streaming NAT input gradient",
+        )
+        for implementation, module in (
+            ("full-frame", full_nchw),
+            ("streaming", streaming.stream_module),
+        ):
+            for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
+                reference, module
+            ):
+                assert reference_parameter.grad is not None, f"missing reference gradient for {name}"
+                assert nchw_parameter.grad is not None, f"missing NCHW gradient for {name}"
+                torch.testing.assert_close(
+                    _linear_shaped(nchw_parameter.grad, reference_parameter.grad),
+                    reference_parameter.grad,
+                    rtol=3e-4,
+                    atol=3e-5,
+                    msg=f"cycle {cycle} {implementation} parameter gradient {name}",
+                )
+        # Exactly one optimizer step is compared. The second cycle verifies
+        # reuse of the same StreamingCNN and its reset state after that step.
+        if cycle == 0:
+            reference_optimizer.step()
+            full_optimizer.step()
+            streaming_optimizer.step()
+            for implementation, module in (
+                ("full-frame", full_nchw),
+                ("streaming", streaming.stream_module),
+            ):
+                for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
+                    reference, module
+                ):
+                    torch.testing.assert_close(
+                        _linear_shaped(nchw_parameter, reference_parameter),
+                        reference_parameter,
+                        rtol=3e-4,
+                        atol=3e-5,
+                        msg=f"{implementation} optimizer-updated parameter {name}",
+                    )
