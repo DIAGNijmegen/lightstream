@@ -6,7 +6,6 @@ import math
 import copy
 import logging
 from dataclasses import dataclass
-from typing import List
 
 import numpy as np
 import torch
@@ -2647,47 +2646,24 @@ class StreamingCNN(torch.nn.Module):
         is_bias=False,
         change_grad=True,
     ):
-        stride: List[int] = _triple(module.stride)  # type:ignore
-
-        # Trim gradient of invalid values
-        sides = module.input_loc.sides
-        grad_lost = module.grad_lost  # type: Lost
-
-        lost_top = grad_lost.top if not sides.top else 0
-        lost_bottom = grad_lost.bottom if not sides.bottom else 0
-        lost_left = grad_lost.left if not sides.left else 0
-        lost_right = grad_lost.right if not sides.right else 0
-        lost = Lost(lost_top, lost_left, lost_bottom, lost_right)
-
         input_loc = module.input_loc
 
         if module.in_channels == 3:
-            valid_grad_in = grad_in[0][
-                :,
-                :,
-                lost.top * stride[1] : grad_in[0].shape[2] - lost.bottom * stride[1],
-                lost.left * stride[2] : grad_in[0].shape[3] - lost.right * stride[2],
-            ]
-
             # ``input_loc`` is already expressed in input-image coordinates.
-            # Place the complete side-aware valid region instead of deriving
-            # its destination from the output ownership cursor.  In
-            # particular, a shifted final row/column can overlap an earlier
-            # tile on both axes.  Each overlap value is a partial dependency
-            # gradient from distinct, exclusively-owned output queries, so it
-            # must be added rather than replacing the contribution already in
-            # the saliency map.
-            dst_y0 = int(input_loc.y) + lost.top * stride[1]
-            dst_x0 = int(input_loc.x) + lost.left * stride[2]
-            dst_y1 = dst_y0 + valid_grad_in.shape[H_DIM]
-            dst_x1 = dst_x0 + valid_grad_in.shape[W_DIM]
+            # The input-facing convolution's complete input gradient uses that
+            # same coordinate system, including dependency gradients at every
+            # tile edge.  Shifted final rows/columns overlap earlier tiles, so
+            # contributions must be accumulated rather than assigned.
+            tile_gradient = grad_in[0].detach().cpu()
+            dst_y0 = int(input_loc.y)
+            dst_x0 = int(input_loc.x)
+            dst_y1 = dst_y0 + tile_gradient.shape[H_DIM]
+            dst_x1 = dst_x0 + tile_gradient.shape[W_DIM]
             destination = (..., slice(dst_y0, dst_y1), slice(dst_x0, dst_x1))
-            tile_gradient = valid_grad_in.detach().cpu()
             self.saliency_map[destination].add_(tile_gradient)
             self.saliency_coverage_map[destination] |= tile_gradient.ne(0)
 
             del tile_gradient
-            del valid_grad_in
         return grad_in
 
     def _prev_stats(self, grad_fn):
