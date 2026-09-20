@@ -54,3 +54,21 @@ At runtime Lightstream checks for package version `0.17.5`, and its NAT layer
 uses the `NeighborhoodAttention2D` constructor with `rel_pos_bias=True`
 explicitly. The immutable dependency pin is what distinguishes
 the supported Blackwell source from other builds that report the same version.
+
+## NCHW NAT layers and checkpoints
+
+`lightstream.models.nat.NCHWNATLayer` is the streaming-friendly NAT layer. It
+uses NCHW tensors, channel-wise layer normalization, explicit streaming-aware
+residual additions, and 1x1 convolutions for the two MLP projections. Construct
+it with `channels`, `num_heads`, and the usual NAT kernel, dilation, QKV, scale,
+and dropout options, or pass an existing NATTEN attention module through the
+`attention` argument when converting an existing model.
+
+Original NAT checkpoints retain their existing key names. `PointwiseConvMlp`
+accepts the original two-dimensional `mlp.fc1.weight` and `mlp.fc2.weight`
+tensors while loading and reshapes them automatically. For conversion outside
+a model load, use `convert_nhwc_nat_state_dict`; use
+`convert_nchw_nat_state_dict` for the inverse operation when an NHWC NAT model
+is the destination. The lower-level `linear_to_pointwise_conv` and
+`pointwise_conv_to_linear` helpers convert modules while preserving parameter
+values, bias presence, dtype, device, training mode, and `requires_grad` flags.

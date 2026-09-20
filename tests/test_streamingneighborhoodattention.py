@@ -11,6 +11,7 @@ from lightstream.core.layers.streamingneighborhoodattention import (
 )
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
+from lightstream.models.nat import NCHWNATLayer, copy_nhwc_nat_to_nchw
 
 
 SUPPORTED_NATTEN_VERSION = "0.17.5"
@@ -193,36 +194,6 @@ def _make_natten(natten_backend, channels, heads, kernel_size, dilation):
     return attention.float()
 
 
-class _PointwiseConvMlp(nn.Module):
-    """NCHW version of NAT's two-linear-layer pointwise MLP."""
-
-    def __init__(self, channels, hidden_channels):
-        super().__init__()
-        self.fc1 = nn.Conv2d(channels, hidden_channels, kernel_size=1)
-        self.act = nn.GELU()
-        self.fc2 = nn.Conv2d(hidden_channels, channels, kernel_size=1)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class _NCHWNATLayer(nn.Module):
-    """Minimal, deterministic NAT layer in Lightstream's NCHW layout."""
-
-    def __init__(self, attention, channels, hidden_channels):
-        super().__init__()
-        self.norm1 = ChannelLayerNorm(channels)
-        self.attn = NeighborhoodAttention2D(attention=attention)
-        self.merge1 = StreamingMerge("add")
-        self.norm2 = ChannelLayerNorm(channels)
-        self.mlp = _PointwiseConvMlp(channels, hidden_channels)
-        self.merge2 = StreamingMerge("add")
-
-    def forward(self, x):
-        x = self.merge1(x, self.attn(self.norm1(x)))
-        return self.merge2(x, self.mlp(self.norm2(x)))
-
-
 class _LinearMlp(nn.Module):
     """Original NHWC NAT MLP, with dropout deliberately omitted."""
 
@@ -249,20 +220,6 @@ class _NHWCNATLayer(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         return x + self.mlp(self.norm2(x))
-
-
-def _copy_nhwc_nat_to_nchw(reference, nchw):
-    """Copy an NHWC NAT layer, converting Linear weights to 1x1 kernels."""
-
-    nchw.norm1.norm.load_state_dict(reference.norm1.state_dict())
-    nchw.attn.attention.load_state_dict(reference.attn.state_dict())
-    nchw.norm2.norm.load_state_dict(reference.norm2.state_dict())
-    for name in ("fc1", "fc2"):
-        linear = getattr(reference.mlp, name)
-        convolution = getattr(nchw.mlp, name)
-        with torch.no_grad():
-            convolution.weight.copy_(linear.weight[:, :, None, None])
-            convolution.bias.copy_(linear.bias)
 
 
 def _nat_parameter_pairs(reference, nchw):
@@ -762,12 +719,12 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         channels,
         hidden_channels,
     ).float()
-    nchw_source = _NCHWNATLayer(
+    nchw_source = NCHWNATLayer(
         _make_natten(natten_backend, channels, heads, kernel_size, dilation=1),
         channels,
         hidden_channels,
     ).float()
-    _copy_nhwc_nat_to_nchw(reference, nchw_source)
+    copy_nhwc_nat_to_nchw(reference, nchw_source)
     full_nchw = copy.deepcopy(nchw_source)
     streaming = StreamingCNN(
         nchw_source,
@@ -931,7 +888,7 @@ def test_two_complete_nat_layers_match_reference_streaming_and_reset(
     ).float()
     nchw_source = nn.Sequential(
         *[
-            _NCHWNATLayer(
+            NCHWNATLayer(
                 _make_natten(natten_backend, channels, heads, kernel_size, dilation),
                 channels,
                 hidden_channels,
@@ -940,7 +897,7 @@ def test_two_complete_nat_layers_match_reference_streaming_and_reset(
         ]
     ).float()
     for reference_layer, nchw_layer in zip(reference, nchw_source):
-        _copy_nhwc_nat_to_nchw(reference_layer, nchw_layer)
+        copy_nhwc_nat_to_nchw(reference_layer, nchw_layer)
 
     full_nchw = copy.deepcopy(nchw_source)
     streaming = StreamingCNN(
