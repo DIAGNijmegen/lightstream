@@ -9,12 +9,14 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping
+from numbers import Number
 
 import torch
 from torch import nn
 
 from lightstream.core.layers import (
     ChannelLayerNorm,
+    LayerScale,
     NeighborhoodAttention2D,
     StreamingMerge,
 )
@@ -85,6 +87,10 @@ def convert_nhwc_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
 
     converted = OrderedDict()
     for key, value in state_dict.items():
+        if key.endswith(("gamma1", "gamma2")):
+            key = f"{key}.weight"
+            if isinstance(value, torch.Tensor) and value.ndim == 1:
+                value = value[None, :, None, None]
         parts = key.split(".")
         if "attn" in parts:
             index = parts.index("attn")
@@ -114,6 +120,12 @@ def convert_nchw_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
 
     converted = OrderedDict()
     for key, value in state_dict.items():
+        if key.endswith(("gamma1.weight", "gamma2.weight")):
+            if isinstance(value, torch.Tensor) and value.ndim == 4:
+                if value.shape[0] != 1 or value.shape[-2:] != (1, 1):
+                    raise ValueError(f"{key!r} is not an NCHW LayerScale weight")
+                value = value[0, :, 0, 0]
+            key = key.removesuffix(".weight")
         if (
             key.endswith(("mlp.fc1.weight", "mlp.fc2.weight"))
             and isinstance(value, torch.Tensor)
@@ -256,6 +268,7 @@ class NCHWNATLayer(nn.Module):
         qk_scale: float | None = None,
         drop: float = 0.0,
         attn_drop: float = 0.0,
+        layer_scale: float | None = None,
     ):
         super().__init__()
         if channels is None:
@@ -287,14 +300,26 @@ class NCHWNATLayer(nn.Module):
 
         self.norm1 = ChannelLayerNorm(channels)
         self.attn = wrapped_attention
+        if layer_scale is not None and not isinstance(layer_scale, Number):
+            raise TypeError("`layer_scale` must be numeric or None")
+        if layer_scale is not None:
+            self.gamma1 = LayerScale((1, channels, 1, 1), layer_scale)
         self.merge1 = StreamingMerge("add")
         self.norm2 = ChannelLayerNorm(channels)
         self.mlp = PointwiseConvMlp(channels, hidden_channels)
+        if layer_scale is not None:
+            self.gamma2 = LayerScale((1, channels, 1, 1), layer_scale)
         self.merge2 = StreamingMerge("add")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.merge1(x, self.attn(self.norm1(x)))
-        return self.merge2(x, self.mlp(self.norm2(x)))
+        attention = self.attn(self.norm1(x))
+        if hasattr(self, "gamma1"):
+            attention = self.gamma1(attention)
+        x = self.merge1(x, attention)
+        mlp = self.mlp(self.norm2(x))
+        if hasattr(self, "gamma2"):
+            mlp = self.gamma2(mlp)
+        return self.merge2(x, mlp)
 
 
 class ConvDownsampler(nn.Module):
@@ -332,6 +357,7 @@ class NCHWNATBlock(nn.Module):
         qk_scale: float | None = None,
         drop: float = 0.0,
         attn_drop: float = 0.0,
+        layer_scale: float | None = None,
     ):
         super().__init__()
         if depth < 0:
@@ -352,6 +378,7 @@ class NCHWNATBlock(nn.Module):
                 qk_scale=qk_scale,
                 drop=drop,
                 attn_drop=attn_drop,
+                layer_scale=layer_scale,
             )
             for index in range(depth)
         )
@@ -389,6 +416,7 @@ class NCHWNAT(nn.Module):
         qk_scale: float | None = None,
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
+        layer_scale: float | None = None,
     ):
         super().__init__()
         stochastic = {
@@ -436,6 +464,7 @@ class NCHWNAT(nn.Module):
                 qk_scale=qk_scale,
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
+                layer_scale=layer_scale,
             )
             for index, depth in enumerate(depths)
         )
@@ -467,6 +496,22 @@ def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNAT
     target.attn.attention.load_state_dict(reference.attn.state_dict())
     target.norm2.norm.load_state_dict(reference.norm2.state_dict())
     target.mlp.load_state_dict(reference.mlp.state_dict())
+    for name in ("gamma1", "gamma2"):
+        source = getattr(reference, name, None)
+        destination = getattr(target, name, None)
+        if (source is None) != (destination is None):
+            raise ValueError("reference and target must use the same layer_scale setting")
+        if source is not None:
+            source_weight = source.weight if isinstance(source, nn.Module) else source
+            if (
+                source_weight.ndim != 1
+                or destination.weight.numel() != source_weight.numel()
+            ):
+                raise ValueError("reference and target LayerScale dimensions differ")
+            destination.weight.data = source_weight.detach().clone().reshape(
+                destination.weight.shape
+            )
+            destination.weight.requires_grad_(source_weight.requires_grad)
     return target
 
 
@@ -492,6 +537,21 @@ def copy_nhwc_nat_block_to_nchw(
     return target
 
 
+def copy_nhwc_nat_model_to_nchw(
+    reference: nn.Module, target: NCHWNAT
+) -> NCHWNAT:
+    """Copy an original-layout NAT backbone into an NCHW backbone."""
+
+    if len(reference.levels) != len(target.levels):
+        raise ValueError("reference and target NAT models have different stage counts")
+    copy_nhwc_conv_tokenizer_to_nchw(reference.patch_embed, target.patch_embed)
+    for reference_level, target_level in zip(reference.levels, target.levels):
+        copy_nhwc_nat_block_to_nchw(reference_level, target_level)
+    target.norm.norm.load_state_dict(reference.norm.state_dict())
+    target.train(reference.training)
+    return target
+
+
 __all__ = [
     "ConvDownsampler",
     "NCHWConvDownsampler",
@@ -503,6 +563,7 @@ __all__ = [
     "convert_nchw_nat_state_dict",
     "convert_nhwc_nat_state_dict",
     "copy_nhwc_nat_block_to_nchw",
+    "copy_nhwc_nat_model_to_nchw",
     "copy_nhwc_nat_to_nchw",
     "copy_nhwc_conv_tokenizer_to_nchw",
     "linear_to_pointwise_conv",
