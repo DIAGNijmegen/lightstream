@@ -131,7 +131,14 @@ class StreamingNeighborhoodAttention2D(NeighborhoodAttention2D):
 
 
 class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
-    """Recompute NATTEN while assigning each global query once in backward."""
+    """Recompute NATTEN with separate dependency and query ownership rules.
+
+    Earlier spatial layers propagate the complete dependency gradient of every
+    replay tile: a halo output can be an activation required by an owned query
+    in a later layer.  Terminal query gradients are de-duplicated, while the
+    dependency fragments produced by already-owned downstream queries remain
+    intact for both input and parameter gradients.
+    """
 
     @staticmethod
     def forward(ctx, input, attention, seen, input_loc, grad_lost, output_stride, *parameters):
@@ -169,10 +176,16 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
         ctx.seen.x, ctx.seen.width = updated.x, updated.width
         ctx.seen.sides = updated.sides
 
-        unique_grad = torch.zeros_like(grad_output)
+        # Query ownership and dependency propagation have separate rules.  A
+        # zero grad_lost marks an earlier spatial layer whose complete tile
+        # output was retained as a dependency of downstream queries.  Such
+        # dependency gradients must all flow back;
+        # at the terminal spatial layer, owned_query_grad also removes the
+        # duplicated loss gradients carried by replay-tile halos.
+        owned_query_grad = torch.zeros_like(grad_output)
         if new_box.height > 0 and new_box.width > 0:
             y0, x0 = top + new_box.y, left + new_box.x
-            unique_grad[:, :, y0 : y0 + new_box.height, x0 : x0 + new_box.width] = valid[
+            owned_query_grad[:, :, y0 : y0 + new_box.height, x0 : x0 + new_box.width] = valid[
                 :, :, new_box.y : new_box.y + new_box.height, new_box.x : new_box.x + new_box.width
             ]
 
@@ -181,17 +194,33 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
             replay = ctx.attention(replay_input.permute(0, 2, 3, 1).contiguous())
             replay = replay.permute(0, 3, 1, 2).contiguous()
             trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
-            targets = (replay_input, *(parameters[index] for index in trainable_indices))
-            computed = torch.autograd.grad(
-                replay,
-                targets,
-                unique_grad,
-                allow_unused=True,
+            # Dependency propagation and terminal-query ownership deliberately
+            # select their masks independently of the rectangular ownership
+            # tracker.  Earlier layers accumulate every fragment induced by an
+            # already-owned downstream query; the terminal layer owns each
+            # global query once.
+            propagates_dependencies = not any(
+                int(value) for value in (lost.top, lost.bottom, lost.left, lost.right)
             )
+            dependency_grad = grad_output if propagates_dependencies else owned_query_grad
+            input_gradient = torch.autograd.grad(
+                replay,
+                replay_input,
+                dependency_grad,
+                retain_graph=bool(trainable_indices),
+            )[0]
+            parameter_gradients = ()
+            if trainable_indices:
+                parameter_gradients = torch.autograd.grad(
+                    replay,
+                    tuple(parameters[index] for index in trainable_indices),
+                    dependency_grad,
+                    allow_unused=True,
+                )
         parameter_grads = [None] * len(parameters)
-        for index, gradient in zip(trainable_indices, computed[1:]):
+        for index, gradient in zip(trainable_indices, parameter_gradients):
             parameter_grads[index] = gradient
-        return (computed[0], None, None, None, None, None, *parameter_grads)
+        return (input_gradient, None, None, None, None, None, *parameter_grads)
 
 
 # Explicit aliases make the layout contract discoverable and retain a short
