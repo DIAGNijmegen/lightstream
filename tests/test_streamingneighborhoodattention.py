@@ -665,6 +665,53 @@ def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
         )
 
 
+def test_channel_layer_norm_affine_gradients_keep_attention_halo_contributions():
+    """LayerNorm affine gradients include halo dependencies of owned queries."""
+    torch.manual_seed(8642)
+    batch, channels = 1, 4
+    image_shape = (17, 19)
+    query_shape = (6, 7)
+    radius = 1
+    tile_shape = tuple(query + 2 * radius for query in query_shape)
+
+    assert all(image % query for image, query in zip(image_shape, query_shape))
+    final_start = tuple(image - tile for image, tile in zip(image_shape, tile_shape))
+    previous_start = query_shape
+    assert all(
+        final < previous + query
+        for final, previous, query in zip(final_start, previous_start, query_shape)
+    )
+    base = nn.Sequential(
+        ChannelLayerNorm(channels),
+        NeighborhoodAttention2D(
+            attention=_LocalNHWCBackend(channels=channels, kernel_size=3)
+        ),
+    )
+    full_module = copy.deepcopy(base)
+    streaming = StreamingCNN(
+        copy.deepcopy(base),
+        tile_shape=(batch, channels, *tile_shape),
+        copy_to_gpu=False,
+    )
+    full_input = torch.randn(batch, channels, *image_shape, requires_grad=True)
+    streaming_input = full_input.detach().clone().requires_grad_(True)
+    upstream = torch.randn_like(full_input)
+
+    full_module(full_input).backward(upstream)
+    streaming(streaming_input)
+    streaming.backward(streaming_input, upstream)
+
+    streaming_norm = streaming.stream_module[0]
+    for name in ("weight", "bias"):
+        torch.testing.assert_close(
+            getattr(streaming_norm.norm, name).grad,
+            getattr(full_module[0].norm, name).grad,
+            rtol=2e-4,
+            atol=2e-5,
+            msg=f"LayerNorm {name} gradient lost an attention halo contribution",
+        )
+
+
 def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_backend):
     """A complete kernel-7 NAT layer matches over two streaming cycles."""
 
