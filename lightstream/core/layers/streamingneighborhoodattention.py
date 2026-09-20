@@ -12,7 +12,7 @@ from importlib import import_module
 import torch
 from torch import nn
 
-from lightstream.core.scnn.utils import Box, Lost, _new_value_indices
+from lightstream.core.scnn.utils import Box, Lost
 
 
 def _pair(value):
@@ -131,13 +131,19 @@ class StreamingNeighborhoodAttention2D(NeighborhoodAttention2D):
 
 
 class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
-    """Recompute NATTEN with separate dependency and query ownership rules.
+    """Recompute NATTEN after output ownership has already been assigned.
 
-    Earlier spatial layers propagate the complete dependency gradient of every
-    replay tile: a halo output can be an activation required by an owned query
-    in a later layer.  Terminal query gradients are de-duplicated, while the
-    dependency fragments produced by already-owned downstream queries remain
-    intact for both input and parameter gradients.
+    ``StreamingCNN`` selects the globally owned output queries before invoking
+    autograd for a replay tile.  Consequently ``grad_output`` is already the
+    exact gradient which must reach the attention operand of a residual merge.
+    Applying the attention module's own rectangular ``seen`` filter here would
+    assign ownership a second time.  In particular, that loses gradients after
+    two residual branches have first been summed at a shared tensor.
+
+    The recomputation deliberately returns its complete input gradient.  Values
+    in a neighbouring tile's *output* ownership region can be key/value halo
+    dependencies of this tile's owned queries and therefore must accumulate in
+    the global input rather than being de-duplicated.
     """
 
     @staticmethod
@@ -155,58 +161,15 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         input, *parameters = ctx.saved_tensors
-        sides = ctx.input_loc.sides
-        lost = ctx.grad_lost
-        top = 0 if sides.top else int(lost.top)
-        bottom = 0 if sides.bottom else int(lost.bottom)
-        left = 0 if sides.left else int(lost.left)
-        right = 0 if sides.right else int(lost.right)
-        valid = grad_output[:, :, top : grad_output.shape[-2] - bottom, left : grad_output.shape[-1] - right]
-        stride_h = int(ctx.output_stride[1])
-        stride_w = int(ctx.output_stride[2])
-        location = Box(
-            int(ctx.input_loc.y // stride_h) + top,
-            0,
-            int(ctx.input_loc.x // stride_w) + left,
-            0,
-            sides,
-        )
-        new_box, updated = _new_value_indices(valid.shape, location, ctx.seen)
-        ctx.seen.y, ctx.seen.height = updated.y, updated.height
-        ctx.seen.x, ctx.seen.width = updated.x, updated.width
-        ctx.seen.sides = updated.sides
-
-        # Query ownership and dependency propagation have separate rules.  A
-        # zero grad_lost marks an earlier spatial layer whose complete tile
-        # output was retained as a dependency of downstream queries.  Such
-        # dependency gradients must all flow back;
-        # at the terminal spatial layer, owned_query_grad also removes the
-        # duplicated loss gradients carried by replay-tile halos.
-        owned_query_grad = torch.zeros_like(grad_output)
-        if new_box.height > 0 and new_box.width > 0:
-            y0, x0 = top + new_box.y, left + new_box.x
-            owned_query_grad[:, :, y0 : y0 + new_box.height, x0 : x0 + new_box.width] = valid[
-                :, :, new_box.y : new_box.y + new_box.height, new_box.x : new_box.x + new_box.width
-            ]
-
         with torch.enable_grad():
             replay_input = input.detach().requires_grad_(True)
             replay = ctx.attention(replay_input.permute(0, 2, 3, 1).contiguous())
             replay = replay.permute(0, 3, 1, 2).contiguous()
             trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
-            # Dependency propagation and terminal-query ownership deliberately
-            # select their masks independently of the rectangular ownership
-            # tracker.  Earlier layers accumulate every fragment induced by an
-            # already-owned downstream query; the terminal layer owns each
-            # global query once.
-            propagates_dependencies = not any(
-                int(value) for value in (lost.top, lost.bottom, lost.left, lost.right)
-            )
-            dependency_grad = grad_output if propagates_dependencies else owned_query_grad
             input_gradient = torch.autograd.grad(
                 replay,
                 replay_input,
-                dependency_grad,
+                grad_output,
                 retain_graph=bool(trainable_indices),
             )[0]
             parameter_gradients = ()
@@ -214,7 +177,7 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
                 parameter_gradients = torch.autograd.grad(
                     replay,
                     tuple(parameters[index] for index in trainable_indices),
-                    dependency_grad,
+                    grad_output,
                     allow_unused=True,
                 )
         parameter_grads = [None] * len(parameters)
