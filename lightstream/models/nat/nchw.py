@@ -13,7 +13,11 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-from lightstream.core.layers import ChannelLayerNorm, NeighborhoodAttention2D, StreamingMerge
+from lightstream.core.layers import (
+    ChannelLayerNorm,
+    NeighborhoodAttention2D,
+    StreamingMerge,
+)
 
 
 def linear_to_pointwise_conv(linear: nn.Linear) -> nn.Conv2d:
@@ -164,7 +168,9 @@ class NCHWNATLayer(nn.Module):
             hidden_channels = int(channels * mlp_ratio)
         if attention is None:
             if num_heads is None:
-                raise TypeError("`num_heads` is required when `attention` is not supplied")
+                raise TypeError(
+                    "`num_heads` is required when `attention` is not supplied"
+                )
             wrapped_attention = NeighborhoodAttention2D(
                 dim=channels,
                 num_heads=num_heads,
@@ -178,7 +184,9 @@ class NCHWNATLayer(nn.Module):
             )
         else:
             if num_heads is not None:
-                raise ValueError("`num_heads` cannot be combined with an existing attention module")
+                raise ValueError(
+                    "`num_heads` cannot be combined with an existing attention module"
+                )
             wrapped_attention = NeighborhoodAttention2D(attention=attention)
 
         self.norm1 = ChannelLayerNorm(channels)
@@ -193,6 +201,74 @@ class NCHWNATLayer(nn.Module):
         return self.merge2(x, self.mlp(self.norm2(x)))
 
 
+class NCHWConvDownsampler(nn.Module):
+    """NCHW equivalent of NAT's optional stage downsampler."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.reduction = nn.Conv2d(
+            channels, 2 * channels, kernel_size=3, stride=2, padding=1, bias=False
+        )
+        self.norm = ChannelLayerNorm(2 * channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.reduction(x))
+
+
+class NCHWNATBlock(nn.Module):
+    """A production NCHW NAT stage composed of :class:`NCHWNATLayer` objects.
+
+    ``blocks`` and ``downsample`` match the reference NHWC implementation's
+    names, keeping checkpoint keys stable apart from converted MLP weights.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        depth: int,
+        num_heads: int,
+        kernel_size: int = 7,
+        dilations: list[int] | tuple[int, ...] | None = None,
+        *,
+        downsample: bool = True,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_scale: float | None = None,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+    ):
+        super().__init__()
+        if depth < 0:
+            raise ValueError("`depth` must be non-negative")
+        if dilations is not None and len(dilations) != depth:
+            raise ValueError("`dilations` must contain exactly `depth` values")
+
+        self.channels = channels
+        self.depth = depth
+        self.blocks = nn.ModuleList(
+            NCHWNATLayer(
+                channels=channels,
+                num_heads=num_heads,
+                kernel_size=kernel_size,
+                dilation=None if dilations is None else dilations[index],
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop,
+                attn_drop=attn_drop,
+            )
+            for index in range(depth)
+        )
+        self.downsample = NCHWConvDownsampler(channels) if downsample else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x
+
+
 def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
     """Copy an original-layout NAT layer into an NCHW production layer."""
 
@@ -203,11 +279,36 @@ def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNAT
     return target
 
 
+def copy_nhwc_nat_block_to_nchw(
+    reference: nn.Module, target: NCHWNATBlock
+) -> NCHWNATBlock:
+    """Copy every parameter of an original-layout NAT block to NCHW."""
+
+    if len(reference.blocks) != len(target.blocks):
+        raise ValueError("reference and target NAT blocks have different depths")
+    for reference_layer, target_layer in zip(reference.blocks, target.blocks):
+        copy_nhwc_nat_to_nchw(reference_layer, target_layer)
+
+    if (reference.downsample is None) != (target.downsample is None):
+        raise ValueError("reference and target must use the same downsample setting")
+    if reference.downsample is not None:
+        target.downsample.reduction.load_state_dict(
+            reference.downsample.reduction.state_dict()
+        )
+        target.downsample.norm.norm.load_state_dict(
+            reference.downsample.norm.state_dict()
+        )
+    return target
+
+
 __all__ = [
+    "NCHWConvDownsampler",
+    "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
     "convert_nchw_nat_state_dict",
     "convert_nhwc_nat_state_dict",
+    "copy_nhwc_nat_block_to_nchw",
     "copy_nhwc_nat_to_nchw",
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
