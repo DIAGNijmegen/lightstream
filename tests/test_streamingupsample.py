@@ -1,9 +1,12 @@
 import pytest
 import torch
+from copy import deepcopy
 
 from lightstream.core.constructor import StreamingConstructor
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.layers import StreamingUpsample2d
+from lightstream.core.layers.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.layers.streamingmerge import StreamingMerge
 from lightstream.core.scnn.utils import Box, Lost, Sides
 
 
@@ -266,7 +269,7 @@ def test_streaming_upsample_backward_valid_lost_does_not_depend_on_seen_indices_
     torch.testing.assert_close(x.grad[:, :, 1:3, 1:3], torch.full((1, 1, 2, 2), 4.0))
 
 
-def test_bilinear_upsample_backward_uses_stat_derived_lowres_lost_region():
+def test_bilinear_upsample_backward_keeps_shared_lowres_dependencies():
     module = StreamingUpsample2d(scale_factor=2, mode="bilinear", align_corners=False)
     # This high-resolution grad-output loss is intentionally different from the
     # low-resolution backward-input loss. The backward pass must not use it to
@@ -278,11 +281,96 @@ def test_bilinear_upsample_backward_uses_stat_derived_lowres_lost_region():
     x = torch.ones(1, 1, 4, 4, requires_grad=True)
     module(x).sum().backward()
 
-    expected = torch.tensor(
-        [[[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 4.0, 4.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]]
-    )
+    # Output-query ownership is established at the replay head. Dependencies
+    # may therefore accumulate into low-resolution border cells shared with
+    # another replay tile.
+    expected = torch.full((1, 1, 4, 4), 4.0)
     torch.testing.assert_close(x.grad, expected)
     assert module.seen_indices == Box(0, 0, 0, 0, None)
+
+
+class _LocalRectificationTopology(torch.nn.Module):
+    """Small channel-count version of SSHR's LocalRectification block."""
+
+    def __init__(self):
+        super().__init__()
+        self.rec_block = torch.nn.Sequential(
+            torch.nn.AvgPool2d(kernel_size=2, stride=2),
+            torch.nn.Conv2d(3, 5, kernel_size=1, bias=False),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(5, 2, kernel_size=1, bias=False),
+            torch.nn.Sigmoid(),
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+        )
+        self.multiply = StreamingMerge("multiply")
+        self.gamma = LayerScale(shape=1, init_value=0.375)
+        self.add = StreamingMerge("add")
+
+    def forward(self, shallow, deep):
+        weights = self.rec_block(deep)
+        return self.add(shallow, self.gamma(self.multiply(shallow, weights)))
+
+
+def test_local_rectification_shifted_tile_gradients_keep_bilinear_dependencies():
+    """Owned high-resolution queries may share low-resolution dependencies."""
+    torch.manual_seed(912)
+    reference = _LocalRectificationTopology().double()
+    streamed = deepcopy(reference)
+    streamed.rec_block[5] = StreamingUpsample2d.from_torch_upsample(streamed.rec_block[5])
+    streamed.gamma = StreamingLayerScale.from_layer_scale(streamed.gamma)
+
+    shallow = torch.randn(1, 2, 12, 14, dtype=torch.double, requires_grad=True)
+    deep = torch.randn(1, 3, 12, 14, dtype=torch.double, requires_grad=True)
+    upstream = torch.randn(1, 2, 12, 14, dtype=torch.double)
+    reference(shallow, deep).backward(upstream)
+    reference_shallow_grad = shallow.grad.detach().clone()
+    reference_deep_grad = deep.grad.detach().clone()
+
+    stream_shallow = shallow.detach().clone().requires_grad_(True)
+    stream_deep = deep.detach().clone().requires_grad_(True)
+    upsample = streamed.rec_block[5]
+    # Both values are expressed on the low-resolution grad_in lattice. The
+    # former implementation wrongly treated the first as an ownership mask.
+    upsample.backward_valid_lost = Lost(0, 0, 0, 0)
+    upsample.upsample_backward_input_lost = Lost(1, 1, 1, 1)
+
+    records = []
+    for y in (0, 4):
+        for x in (0, 4):
+            sides = Sides(left=x == 0, top=y == 0, right=x == 4, bottom=y == 4)
+            input_loc = Box(y, 8, x, 10, sides)
+            upsample.input_loc = input_loc
+            streamed.gamma.input_loc = input_loc
+            tile_output = streamed(
+                stream_shallow[:, :, y : y + 8, x : x + 10],
+                stream_deep[:, :, y : y + 8, x : x + 10],
+            )
+
+            # Shifted final tiles own disjoint output queries, while adjacent
+            # queries retain overlapping dependencies in the pooled lattice.
+            local_y0, local_y1 = ((0, 6) if y == 0 else (2, 8))
+            local_x0, local_x1 = ((0, 7) if x == 0 else (3, 10))
+            tile_output[:, :, local_y0:local_y1, local_x0:local_x1].backward(
+                upstream[:, :, y + local_y0 : y + local_y1, x + local_x0 : x + local_x1]
+            )
+            records.append((deepcopy(input_loc), deepcopy(input_loc.sides)))
+
+    assert [(record.y, record.x) for record, _ in records] == [(0, 0), (0, 4), (4, 0), (4, 4)]
+    assert records[-1][1] == Sides(left=False, top=False, right=True, bottom=True)
+    assert upsample.upsample_backward_input_lost == Lost(1, 1, 1, 1)
+    assert upsample.backward_valid_lost == Lost(0, 0, 0, 0)
+    torch.testing.assert_close(stream_shallow.grad, reference_shallow_grad, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(stream_deep.grad, reference_deep_grad, atol=1e-10, rtol=1e-10)
+    for index in (1, 3):
+        torch.testing.assert_close(
+            streamed.rec_block[index].weight.grad,
+            reference.rec_block[index].weight.grad,
+            atol=1e-10,
+            rtol=1e-10,
+        )
+    torch.testing.assert_close(
+        streamed.gamma.weight.grad, reference.gamma.weight.grad, atol=1e-10, rtol=1e-10
+    )
 
 
 def test_upsample_statistics_store_pre_upsample_output_stride():
