@@ -467,8 +467,7 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     reference.load_state_dict(model.state_dict())
 
     # Odd image dimensions with this tile size make the SCNN pass use overlapping
-    # tiles; this is the case that would double-count affine gradients if
-    # seen_indices tracking regressed.
+    # tiles, exercising output-query ownership and dependency-gradient accumulation.
     image = torch.randn(1, 3, 13, 11)
     upstream_grad = torch.randn(1, 2, 13, 11)
 
@@ -492,14 +491,32 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     assert any(x > 0 for _, x, _ in scnn._last_forward_tiles)
     torch.testing.assert_close(stream_output, ref_output.detach(), atol=1e-5, rtol=1e-4)
 
-    scnn.backward(image.detach().clone(), upstream_grad.detach().clone())
+    stream_image = image.detach().clone().requires_grad_(True)
+    scnn.backward(stream_image, upstream_grad.detach().clone())
 
     stream_module = scnn.stream_module
     reference_grads = {name: param.grad for name, param in reference.named_parameters()}
     streaming_grads = {name: param.grad for name, param in stream_module.named_parameters()}
     assert streaming_grads.keys() == reference_grads.keys()
-    for name in reference_grads:
-        torch.testing.assert_close(streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4)
+
+    def assert_parameter_grad_matches(name: str) -> None:
+        torch.testing.assert_close(
+            streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4, msg=name
+        )
+
+    assert_parameter_grad_matches("upstream.weight")
+    assert_parameter_grad_matches("upstream.bias")
+
+    if elementwise_affine:
+        assert_parameter_grad_matches("norm.norm.weight")
+        assert_parameter_grad_matches("norm.norm.bias")
+
+    assert_parameter_grad_matches("downstream.weight")
+    assert_parameter_grad_matches("downstream.bias")
+
+    torch.testing.assert_close(
+        stream_image.grad, ref_image.grad, atol=1e-5, rtol=1e-4, msg="model input gradient"
+    )
 
     if elementwise_affine:
         assert {"norm.norm.weight", "norm.norm.bias"}.issubset(streaming_grads)
