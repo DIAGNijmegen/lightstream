@@ -537,6 +537,128 @@ def test_scnn_channel_layer_norm_elementwise_affine_false_forward_backward_parit
     _assert_channel_norm_scnn_parity(elementwise_affine=False)
 
 
+def test_scnn_pointwise_after_channel_layer_norm_shifted_overlap_gradients():
+    """Pointwise replay gives non-owned overlap positions zero upstream gradient."""
+    torch.manual_seed(303)
+    channels, output_channels = 4, 3
+    image_shape = (13, 14)
+    tile_shape = (8, 9)
+
+    model = torch.nn.Sequential(
+        ChannelLayerNorm(channels, eps=1e-5, elementwise_affine=True),
+        torch.nn.Conv2d(channels, output_channels, kernel_size=1, bias=True),
+    ).eval()
+    reference = torch.nn.Sequential(
+        ChannelLayerNorm(channels, eps=1e-5, elementwise_affine=True),
+        torch.nn.Conv2d(channels, output_channels, kernel_size=1, bias=True),
+    ).eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = torch.randn(1, channels, *image_shape)
+    upstream = torch.randn(1, output_channels, *image_shape)
+    reference_image = image.detach().clone().requires_grad_(True)
+    reference_output = reference(reference_image)
+    reference_output.backward(upstream)
+
+    try:
+        import numpy  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["numpy"] = types.ModuleType("numpy")
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, channels, *tile_shape),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    streaming_output = scnn.forward(image.detach().clone())
+    torch.testing.assert_close(streaming_output, reference_output.detach())
+
+    tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
+    assert tile_starts == [(0, 0), (0, 5), (5, 0), (5, 5)]
+    assert tile_starts[-1][0] < tile_starts[-2][0] + tile_shape[0]
+    assert tile_starts[-1][1] < tile_starts[1][1] + tile_shape[1]
+
+    # Capture the input and the *actual* upstream gradient seen by LayerNorm in
+    # each replay. With only a pointwise operation after it, an output belongs
+    # to exactly one tile and no owned output can depend on a neighboring
+    # position. Thus shifted-tile overlap positions must receive zero here.
+    norm = scnn.stream_module[0]
+    tile_records = []
+
+    def save_norm_input(module, inputs, output):
+        del output
+        tile_records.append(
+            {
+                "start": (module.input_loc.y, module.input_loc.x),
+                "input": inputs[0].detach().clone(),
+            }
+        )
+
+    def save_norm_grad(module, grad_input, grad_output):
+        del module, grad_input
+        tile_records[-1]["grad_output"] = grad_output[0].detach().clone()
+
+    forward_handle = norm.register_forward_hook(save_norm_input)
+    backward_handle = norm.register_full_backward_hook(save_norm_grad)
+    streaming_image = image.detach().clone().requires_grad_(True)
+    scnn.backward(streaming_image, upstream.detach().clone())
+    forward_handle.remove()
+    backward_handle.remove()
+
+    assert [record["start"] for record in tile_records] == tile_starts
+    owned_globally = torch.zeros(image_shape, dtype=torch.bool)
+    overlap_positions = 0
+    summed_grad_bias = torch.zeros_like(norm.norm.bias)
+    summed_grad_weight = torch.zeros_like(norm.norm.weight)
+    for record in tile_records:
+        y, x = record["start"]
+        tile_input = record["input"]
+        tile_grad = record["grad_output"]
+        height, width = tile_grad.shape[-2:]
+        owned = ~owned_globally[y : y + height, x : x + width]
+        non_owned = ~owned
+        overlap_positions += int(non_owned.sum())
+
+        assert torch.count_nonzero(tile_grad[:, :, non_owned]) == 0
+        owned_globally[y : y + height, x : x + width] = True
+
+        centered = tile_input - tile_input.mean(dim=1, keepdim=True)
+        x_hat = centered * torch.rsqrt(
+            centered.square().mean(dim=1, keepdim=True) + norm.eps
+        )
+        summed_grad_bias += tile_grad.sum(dim=(0, 2, 3))
+        summed_grad_weight += (tile_grad * x_hat).sum(dim=(0, 2, 3))
+
+    assert overlap_positions > 0
+    assert owned_globally.all()
+    torch.testing.assert_close(summed_grad_weight, norm.norm.weight.grad)
+    torch.testing.assert_close(summed_grad_bias, norm.norm.bias.grad)
+
+    reference_parameters = dict(reference.named_parameters())
+    streaming_parameters = dict(scnn.stream_module.named_parameters())
+    assert reference_parameters.keys() == streaming_parameters.keys()
+    for name in ("0.norm.weight", "0.norm.bias", "1.weight", "1.bias"):
+        torch.testing.assert_close(
+            streaming_parameters[name].grad,
+            reference_parameters[name].grad,
+            atol=1e-5,
+            rtol=1e-4,
+            msg=f"parameter gradient differs for {name}",
+        )
+    torch.testing.assert_close(
+        streaming_image.grad,
+        reference_image.grad,
+        atol=1e-5,
+        rtol=1e-4,
+        msg="input gradient differs",
+    )
+
+
 def test_streaming_channel_layer_norm_rejects_non_4d_input():
     module = StreamingChannelLayerNorm(3)
 
