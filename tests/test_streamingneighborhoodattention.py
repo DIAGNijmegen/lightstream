@@ -968,15 +968,25 @@ def test_two_complete_nat_layers_match_reference_streaming_and_reset(
         assert _REL_POS_BIAS_PARAMETER in parameters
         assert layer.attn.qkv.bias is not None
 
-    expected_lost = Lost(
+    first_layer_support = Lost(radii[0], radii[0], radii[0], radii[0])
+    second_layer_support = Lost(radii[1], radii[1], radii[1], radii[1])
+    cumulative_support = Lost(
         accumulated_radius,
         accumulated_radius,
         accumulated_radius,
         accumulated_radius,
     )
     cache = streaming.get_tile_cache()
-    assert cache["net_stats"]["1.attn"]["lost"] == expected_lost
-    assert cache["net_stats"]["1.attn"]["directional_spatial_support"] == expected_lost
+    assert (
+        cache["net_stats"]["0.attn"]["directional_spatial_support"]
+        == first_layer_support
+    )
+    assert cache["net_stats"]["0.attn"]["lost"] == first_layer_support
+    assert (
+        cache["net_stats"]["1.attn"]["directional_spatial_support"]
+        == second_layer_support
+    )
+    assert cache["net_stats"]["1.attn"]["lost"] == cumulative_support
 
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
     full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
