@@ -13,6 +13,9 @@ from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
 
 
+_REL_POS_BIAS_PARAMETER = "rpb"
+
+
 @pytest.fixture(scope="session")
 def natten_backend():
     """Load the real optional backend only for tests which require it."""
@@ -163,18 +166,22 @@ def _assert_spatial_regions_match(actual, expected, query_shape, radius, quantit
 
 
 def _make_natten(natten_backend, channels, heads, kernel_size, dilation):
-    # Keep both attention-weight and projection dropout disabled so tiled and
-    # untiled executions are deterministic and directly comparable.
+    # Spell out the production NAT configuration. Keep both attention-weight
+    # and projection dropout disabled so tiled and untiled executions are
+    # deterministic and directly comparable.
     attention = natten_backend.NeighborhoodAttention2D(
         dim=channels,
         num_heads=heads,
         kernel_size=kernel_size,
         dilation=dilation,
-        qkv_bias=True,
         rel_pos_bias=True,
+        qkv_bias=True,
+        qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
     )
+    attention_parameters = dict(attention.named_parameters())
+    assert _REL_POS_BIAS_PARAMETER in attention_parameters
     assert attention.attn_drop.p == 0.0
     assert attention.proj_drop.p == 0.0
     return attention.float()
@@ -424,6 +431,16 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
     full_output.backward(upstream)
     manual_output.backward(upstream)
     streaming.backward(streaming_input, upstream)
+    for execution, module in (
+        ("full-frame", full_module),
+        ("manual-tiled", manual_module),
+        ("StreamingCNN", streaming.stream_module),
+    ):
+        attention_parameters = dict(module.attention.named_parameters())
+        assert _REL_POS_BIAS_PARAMETER in attention_parameters
+        assert attention_parameters[_REL_POS_BIAS_PARAMETER].grad is not None, (
+            f"{execution} relative-position-bias gradient is missing"
+        )
     _assert_spatial_regions_match(
         manual_input.grad, full_input.grad, query_shape, radius, "manual input gradient"
     )
@@ -575,6 +592,8 @@ def test_two_real_natten_layers_match_and_reset_unique_queries(
 @pytest.mark.parametrize(
     ("active_queries", "region"),
     [
+        pytest.param(((0, 9),), "true edge", id="one-query-true-edge"),
+        pytest.param(((0, 0),), "corner", id="one-query-corner"),
         pytest.param(((6, 3),), "horizontal seam", id="one-query-horizontal-seam"),
         pytest.param(((3, 7),), "vertical seam", id="one-query-vertical-seam"),
         pytest.param(((6, 7),), "seam intersection", id="one-query-seam-intersection"),
@@ -652,6 +671,10 @@ def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
     full_parameters = dict(full_module.named_parameters())
     streaming_parameters = dict(streaming.stream_module.named_parameters())
     assert full_parameters.keys() == streaming_parameters.keys()
+    relative_bias_name = f"attention.{_REL_POS_BIAS_PARAMETER}"
+    assert relative_bias_name in full_parameters
+    assert full_parameters[relative_bias_name].grad is not None
+    assert streaming_parameters[relative_bias_name].grad is not None
     for name, full_parameter in full_parameters.items():
         streamed_gradient = streaming_parameters[name].grad
         assert full_parameter.grad is not None, f"full-frame gradient missing for {name!r}"
