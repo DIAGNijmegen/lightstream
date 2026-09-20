@@ -24,17 +24,106 @@ SUPPORTED_NATTEN_VERSION = "0.17.5"
 _REL_POS_BIAS_PARAMETER = "rpb"
 
 # NHWC NAT uses Linear kernels while the NCHW implementation uses pointwise
-# Conv2d kernels.  Their CUDA reduction order differs enough that comparisons
-# crossing that layout/implementation boundary need a modest absolute bound.
-# These bounds cover repeated runs of both block depths and both downsampling
-# tile geometries below while remaining small relative to substantive errors.
-_CROSS_LAYOUT_RTOL = 3e-4
-_CROSS_LAYOUT_ATOL = 5e-4
+# Conv2d kernels. Their CUDA reduction order affects the three quantities below
+# differently, so do not collapse these back into one cross-layout tolerance.
+# The bounds include a small margin over repeated runs on the pinned NATTEN
+# 0.17.5/CUDA job, for depth 2 and 3 blocks and both downsampler tile shapes.
+_CROSS_LAYOUT_OUTPUT_RTOL = 3e-4
+_CROSS_LAYOUT_OUTPUT_ATOL = 5e-4
+_CROSS_LAYOUT_INPUT_GRAD_RTOL = 4e-4
+_CROSS_LAYOUT_INPUT_GRAD_ATOL = 7e-4
+# Parameter gradients accumulate reductions over every spatial query. The
+# pinned-job diagnostics peaked just below 1.7e-3, hence the 2e-3 absolute
+# bound. Relative error away from zero remained below 4e-4.
+_CROSS_LAYOUT_PARAMETER_GRAD_RTOL = 5e-4
+_CROSS_LAYOUT_PARAMETER_GRAD_ATOL = 2e-3
 
 # Full-frame and streamed NCHW execute the same operators.  Keep this comparison
 # substantially tighter so layout tolerance cannot hide a streaming defect.
 _SAME_LAYOUT_RTOL = 2e-4
 _SAME_LAYOUT_ATOL = 2e-5
+
+
+def _assert_close_with_diagnostics(
+    actual,
+    expected,
+    *,
+    rtol,
+    atol,
+    quantity,
+    parameter_name=None,
+    cycle=None,
+):
+    """Assert closeness and report useful CUDA parity diagnostics on failure."""
+    actual_detached = actual.detach()
+    expected_detached = expected.detach()
+    absolute_difference = (actual_detached - expected_detached).abs()
+    maximum_absolute_difference = absolute_difference.max().item()
+    maximum_magnitude = torch.maximum(
+        actual_detached.abs().max(), expected_detached.abs().max()
+    ).item()
+
+    # Relative errors at numerical zero are uninformative and can be enormous.
+    # Use the assertion's absolute bound as the definition of "near zero".
+    denominator = torch.maximum(actual_detached.abs(), expected_detached.abs())
+    away_from_zero = denominator > max(atol, torch.finfo(denominator.dtype).eps)
+    if away_from_zero.any():
+        maximum_relative_difference = (
+            (absolute_difference[away_from_zero] / denominator[away_from_zero])
+            .max()
+            .item()
+        )
+    else:
+        maximum_relative_difference = 0.0
+
+    context = [quantity]
+    if parameter_name is not None:
+        context.append(f"parameter={parameter_name!r}")
+    if cycle is not None:
+        context.append(f"cycle={cycle}")
+    message = (
+        f"{', '.join(context)}; max_abs_diff={maximum_absolute_difference:.9g}; "
+        f"max_rel_diff_away_from_zero={maximum_relative_difference:.9g}; "
+        f"max_tensor_magnitude={maximum_magnitude:.9g}"
+    )
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, msg=message)
+
+
+def _assert_identical_named_parameters(actual, expected):
+    """Prove the strict same-layout comparison starts from identical weights."""
+    actual_parameters = dict(actual.named_parameters())
+    expected_parameters = dict(expected.named_parameters())
+    assert actual_parameters.keys() == expected_parameters.keys()
+    for name, expected_parameter in expected_parameters.items():
+        _assert_close_with_diagnostics(
+            actual_parameters[name],
+            expected_parameter,
+            rtol=0,
+            atol=0,
+            quantity="initial same-layout parameter",
+            parameter_name=name,
+            cycle=0,
+        )
+
+
+def test_close_diagnostics_identify_parameter_cycle_and_error_scales():
+    with pytest.raises(AssertionError) as error:
+        _assert_close_with_diagnostics(
+            torch.tensor([0.0, 2.0]),
+            torch.tensor([0.0, 1.0]),
+            rtol=0,
+            atol=1e-6,
+            quantity="accumulated parameter gradient",
+            parameter_name="blocks.1.attn.qkv.weight",
+            cycle=2,
+        )
+
+    message = str(error.value)
+    assert "parameter='blocks.1.attn.qkv.weight'" in message
+    assert "cycle=2" in message
+    assert "max_abs_diff=1" in message
+    assert "max_rel_diff_away_from_zero=0.5" in message
+    assert "max_tensor_magnitude=2" in message
 
 
 def test_nchw_conv_downsampler_architecture():
@@ -496,9 +585,9 @@ def test_real_natten_full_manual_and_streaming_match_everywhere(
     ):
         attention_parameters = dict(module.attention.named_parameters())
         assert _REL_POS_BIAS_PARAMETER in attention_parameters
-        assert (
-            attention_parameters[_REL_POS_BIAS_PARAMETER].grad is not None
-        ), f"{execution} relative-position-bias gradient is missing"
+        assert attention_parameters[_REL_POS_BIAS_PARAMETER].grad is not None, (
+            f"{execution} relative-position-bias gradient is missing"
+        )
     _assert_spatial_regions_match(
         manual_input.grad, full_input.grad, query_shape, radius, "manual input gradient"
     )
@@ -737,9 +826,9 @@ def test_shifted_final_tiles_sparse_query_gradients_match_full_frame(
     assert streaming_parameters[relative_bias_name].grad is not None
     for name, full_parameter in full_parameters.items():
         streamed_gradient = streaming_parameters[name].grad
-        assert (
-            full_parameter.grad is not None
-        ), f"full-frame gradient missing for {name!r}"
+        assert full_parameter.grad is not None, (
+            f"full-frame gradient missing for {name!r}"
+        )
         assert streamed_gradient is not None, f"streamed gradient missing for {name!r}"
         torch.testing.assert_close(
             streamed_gradient,
@@ -830,6 +919,7 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         tile_shape=(batch, channels, *tile_shape),
         copy_to_gpu=True,
     )
+    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
 
     # NATTEN owns dropout modules, but the fixture disables them so tiled and
     # untiled executions remain deterministic. The MLPs omit dropout entirely.
@@ -876,8 +966,8 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         torch.testing.assert_close(
             full_output,
             reference_output.permute(0, 3, 1, 2),
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
             msg=f"cycle {cycle} full-frame NAT output",
         )
         torch.testing.assert_close(
@@ -895,8 +985,8 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         torch.testing.assert_close(
             nchw_input.grad,
             reference_input.grad.permute(0, 3, 1, 2),
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
+            rtol=_CROSS_LAYOUT_INPUT_GRAD_RTOL,
+            atol=_CROSS_LAYOUT_INPUT_GRAD_ATOL,
             msg=f"cycle {cycle} full-frame NAT input gradient",
         )
         torch.testing.assert_close(
@@ -911,26 +1001,30 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         for name, reference_parameter, full_parameter in full_pairs:
             assert reference_parameter.grad is not None
             assert full_parameter.grad is not None
-            torch.testing.assert_close(
+            _assert_close_with_diagnostics(
                 _linear_shaped(full_parameter.grad, reference_parameter.grad),
                 reference_parameter.grad,
-                rtol=_CROSS_LAYOUT_RTOL,
-                atol=_CROSS_LAYOUT_ATOL,
-                msg=f"cycle {cycle} full-frame parameter gradient {name}",
+                rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+                atol=_CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+                quantity="cross-layout parameter gradient",
+                parameter_name=name,
+                cycle=cycle,
             )
         for (name, _, full_parameter), (streaming_name, _, streaming_parameter) in zip(
             full_pairs, streaming_pairs
         ):
             assert name == streaming_name
-            assert (
-                streaming_parameter.grad is not None
-            ), f"missing NCHW gradient for {name}"
-            torch.testing.assert_close(
+            assert streaming_parameter.grad is not None, (
+                f"missing NCHW gradient for {name}"
+            )
+            _assert_close_with_diagnostics(
                 streaming_parameter.grad,
                 full_parameter.grad,
                 rtol=_SAME_LAYOUT_RTOL,
                 atol=_SAME_LAYOUT_ATOL,
-                msg=f"cycle {cycle} streaming parameter gradient {name}",
+                quantity="same-layout streaming parameter gradient",
+                parameter_name=name,
+                cycle=cycle,
             )
         # Exactly one optimizer step is compared. The second cycle verifies
         # reuse of the same StreamingCNN and its reset state after that step.
@@ -946,8 +1040,8 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
                 torch.testing.assert_close(
                     _linear_shaped(full_parameter, reference_parameter),
                     reference_parameter,
-                    rtol=_CROSS_LAYOUT_RTOL,
-                    atol=_CROSS_LAYOUT_ATOL,
+                    rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+                    atol=_CROSS_LAYOUT_OUTPUT_ATOL,
                     msg=f"full-frame optimizer-updated parameter {name}",
                 )
             for (name, _, full_parameter), (
@@ -1016,6 +1110,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
     streaming = StreamingCNN(
         nchw_source, tile_shape=(batch, channels, *tile_hw), copy_to_gpu=True
     )
+    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
 
     streamed_attentions = [layer.attn for layer in streaming.stream_module.blocks]
     assert all(
@@ -1076,17 +1171,21 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         full_output = full_nchw(full_input)
         streaming_output = streaming(streaming_input)
         expected_output = reference_output.permute(0, 3, 1, 2)
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             full_output,
             expected_output,
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+            quantity="cross-layout output",
+            cycle=cycle,
         )
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             streaming_output,
             full_output,
             rtol=_SAME_LAYOUT_RTOL,
             atol=_SAME_LAYOUT_ATOL,
+            quantity="same-layout streaming output",
+            cycle=cycle,
         )
 
         reference_output.backward(upstream)
@@ -1094,17 +1193,21 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         full_output.backward(nchw_upstream)
         streaming.backward(streaming_input, nchw_upstream)
         expected_input_grad = reference_input.grad.permute(0, 3, 1, 2)
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             full_input.grad,
             expected_input_grad,
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
+            rtol=_CROSS_LAYOUT_INPUT_GRAD_RTOL,
+            atol=_CROSS_LAYOUT_INPUT_GRAD_ATOL,
+            quantity="cross-layout input gradient",
+            cycle=cycle,
         )
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             streaming_input.grad,
             full_input.grad,
             rtol=_SAME_LAYOUT_RTOL,
             atol=_SAME_LAYOUT_ATOL,
+            quantity="same-layout streaming input gradient",
+            cycle=cycle,
         )
 
         for layer_index, reference_layer in enumerate(reference.blocks):
@@ -1122,24 +1225,28 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
             for name, reference_parameter, full_parameter in full_pairs:
                 assert reference_parameter.grad is not None
                 assert full_parameter.grad is not None
-                torch.testing.assert_close(
+                _assert_close_with_diagnostics(
                     _linear_shaped(full_parameter.grad, reference_parameter.grad),
                     reference_parameter.grad,
-                    rtol=_CROSS_LAYOUT_RTOL,
-                    atol=_CROSS_LAYOUT_ATOL,
-                    msg=f"cycle {cycle} full-frame parameter gradient {name}",
+                    rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+                    atol=_CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+                    quantity="cross-layout accumulated parameter gradient",
+                    parameter_name=f"blocks.{layer_index}.{name}",
+                    cycle=cycle,
                 )
             for full_pair, streaming_pair in zip(full_pairs, streaming_pairs):
                 name, _, full_parameter = full_pair
                 streaming_name, _, streaming_parameter = streaming_pair
                 assert name == streaming_name
                 assert streaming_parameter.grad is not None
-                torch.testing.assert_close(
+                _assert_close_with_diagnostics(
                     streaming_parameter.grad,
                     full_parameter.grad,
                     rtol=_SAME_LAYOUT_RTOL,
                     atol=_SAME_LAYOUT_ATOL,
-                    msg=f"cycle {cycle} streaming parameter gradient {name}",
+                    quantity="same-layout streaming parameter gradient",
+                    parameter_name=f"blocks.{layer_index}.{name}",
+                    cycle=cycle,
                 )
 
         for attention in streamed_attentions:
@@ -1167,8 +1274,8 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
                     torch.testing.assert_close(
                         _linear_shaped(full_parameter, reference_parameter),
                         reference_parameter,
-                        rtol=_CROSS_LAYOUT_RTOL,
-                        atol=_CROSS_LAYOUT_ATOL,
+                        rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+                        atol=_CROSS_LAYOUT_OUTPUT_ATOL,
                         msg=f"full-frame optimizer-updated parameter {name}",
                     )
                 for full_pair, streaming_pair in zip(full_pairs, streaming_pairs):
@@ -1257,6 +1364,7 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
         tile_shape=(batch, channels, *tile_hw),
         copy_to_gpu=True,
     )
+    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
 
     assert image_hw[0] % 2 == 1 and image_hw[1] % 2 == 1
     assert image_hw[0] != image_hw[1]
@@ -1295,8 +1403,8 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
     torch.testing.assert_close(
         full_output,
         expected_output,
-        rtol=_CROSS_LAYOUT_RTOL,
-        atol=_CROSS_LAYOUT_ATOL,
+        rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+        atol=_CROSS_LAYOUT_OUTPUT_ATOL,
     )
     torch.testing.assert_close(
         streaming_output,
@@ -1311,11 +1419,13 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
     full_output.backward(nchw_upstream)
     streaming.backward(streaming_input, nchw_upstream)
     expected_input_grad = reference_input.grad.permute(0, 3, 1, 2)
-    torch.testing.assert_close(
+    _assert_close_with_diagnostics(
         full_input.grad,
         expected_input_grad,
-        rtol=_CROSS_LAYOUT_RTOL,
-        atol=_CROSS_LAYOUT_ATOL,
+        rtol=_CROSS_LAYOUT_INPUT_GRAD_RTOL,
+        atol=_CROSS_LAYOUT_INPUT_GRAD_ATOL,
+        quantity="cross-layout downsampler input gradient",
+        cycle=0,
     )
     torch.testing.assert_close(
         streaming_input.grad,
@@ -1330,27 +1440,51 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
         _nat_block_parameter_pairs(reference, streaming.stream_module)
     )
     assert {name for name, _, _ in full_pairs} == reference_names
+    explicitly_required_names = {
+        "downsample.reduction.weight",
+        "downsample.norm.weight",
+        "downsample.norm.bias",
+    }
+    for layer_index in range(len(reference.blocks)):
+        explicitly_required_names.update(
+            {
+                f"blocks.{layer_index}.norm1.weight",
+                f"blocks.{layer_index}.norm1.bias",
+                f"blocks.{layer_index}.norm2.weight",
+                f"blocks.{layer_index}.norm2.bias",
+                f"blocks.{layer_index}.attn.qkv.weight",
+                f"blocks.{layer_index}.attn.proj.weight",
+                f"blocks.{layer_index}.attn.{_REL_POS_BIAS_PARAMETER}",
+                f"blocks.{layer_index}.mlp.fc1.weight",
+                f"blocks.{layer_index}.mlp.fc2.weight",
+            }
+        )
+    assert explicitly_required_names <= reference_names
     for name, reference_parameter, full_parameter in full_pairs:
         assert reference_parameter.grad is not None
         assert full_parameter.grad is not None
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             _linear_shaped(full_parameter.grad, reference_parameter.grad),
             reference_parameter.grad,
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
-            msg=f"full-frame parameter gradient {name}",
+            rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+            atol=_CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+            quantity="cross-layout accumulated parameter gradient",
+            parameter_name=name,
+            cycle=0,
         )
     for full_pair, streaming_pair in zip(full_pairs, streaming_pairs):
         name, _, full_parameter = full_pair
         streaming_name, _, streaming_parameter = streaming_pair
         assert name == streaming_name
         assert streaming_parameter.grad is not None
-        torch.testing.assert_close(
+        _assert_close_with_diagnostics(
             streaming_parameter.grad,
             full_parameter.grad,
             rtol=_SAME_LAYOUT_RTOL,
             atol=_SAME_LAYOUT_ATOL,
-            msg=f"streaming parameter gradient {name}",
+            quantity="same-layout streaming parameter gradient",
+            parameter_name=name,
+            cycle=0,
         )
 
     for optimizer in optimizers:
@@ -1363,8 +1497,8 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
         torch.testing.assert_close(
             _linear_shaped(full_parameter, reference_parameter),
             reference_parameter,
-            rtol=_CROSS_LAYOUT_RTOL,
-            atol=_CROSS_LAYOUT_ATOL,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
             msg=f"full-frame optimizer-updated parameter {name}",
         )
     for full_pair, streaming_pair in zip(full_pairs, streaming_pairs):
