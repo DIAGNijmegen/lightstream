@@ -472,6 +472,7 @@ def test_converted_nearest_upsample_uses_backward_valid_lost_without_bilinear_in
 
 def test_safe_input_step_accounts_for_upsample_forward_and_backward_lost_regions():
     scnn = StreamingCNN.__new__(StreamingCNN)
+    torch.nn.Module.__init__(scnn)
     scnn.tile_shape = (1, 1, 64, 64)
     scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
     scnn._print_verbose = lambda *args, **kwargs: None
@@ -498,6 +499,7 @@ def test_safe_input_step_accounts_for_upsample_forward_and_backward_lost_regions
 
 def test_single_output_valid_input_step_is_reduced_by_upsample_safe_step_without_losing_alignment():
     scnn = StreamingCNN.__new__(StreamingCNN)
+    torch.nn.Module.__init__(scnn)
     scnn.tile_shape = (1, 1, 64, 64)
     scnn.tile_gradient_lost = Lost(0, 0, 0, 0)
     scnn._tile_output_shapes = [(1, 1, 32, 32)]
