@@ -89,20 +89,18 @@ def _assert_close_with_diagnostics(
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, msg=message)
 
 
-def _assert_identical_named_parameters(actual, expected):
-    """Prove the strict same-layout comparison starts from identical weights."""
-    actual_parameters = dict(actual.named_parameters())
-    expected_parameters = dict(expected.named_parameters())
-    assert actual_parameters.keys() == expected_parameters.keys()
-    for name, expected_parameter in expected_parameters.items():
-        _assert_close_with_diagnostics(
-            actual_parameters[name],
-            expected_parameter,
+def _assert_identical_state_dict(full_nchw, streaming):
+    """Require exact same-layout parameter and persistent-buffer state."""
+    full_state = full_nchw.state_dict()
+    streaming_state = streaming.stream_module.state_dict()
+    assert full_state.keys() == streaming_state.keys()
+    for name, full_value in full_state.items():
+        torch.testing.assert_close(
+            streaming_state[name],
+            full_value,
             rtol=0,
             atol=0,
-            quantity="initial same-layout parameter",
-            parameter_name=name,
-            cycle=0,
+            msg=f"same-layout state value {name!r} differs",
         )
 
 
@@ -919,7 +917,7 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         tile_shape=(batch, channels, *tile_shape),
         copy_to_gpu=True,
     )
-    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
+    _assert_identical_state_dict(full_nchw, streaming)
 
     # NATTEN owns dropout modules, but the fixture disables them so tiled and
     # untiled executions remain deterministic. The MLPs omit dropout entirely.
@@ -960,6 +958,7 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         streaming_input = nchw_input.detach().clone().requires_grad_(True)
         upstream = torch.randn_like(reference_input)
 
+        _assert_identical_state_dict(full_nchw, streaming)
         reference_output = reference(reference_input)
         full_output = full_nchw(nchw_input)
         streaming_output = streaming(streaming_input)
@@ -1058,6 +1057,12 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
                     msg=f"streaming optimizer-updated parameter {name}",
                 )
 
+            # Independently accumulated gradients may introduce small numerical
+            # drift. Restore both NCHW paths before the reset/reuse cycle.
+            copy_nhwc_nat_to_nchw(reference, full_nchw)
+            copy_nhwc_nat_to_nchw(reference, streaming.stream_module)
+            _assert_identical_state_dict(full_nchw, streaming)
+
 
 @pytest.mark.parametrize(
     "dilations",
@@ -1110,7 +1115,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
     streaming = StreamingCNN(
         nchw_source, tile_shape=(batch, channels, *tile_hw), copy_to_gpu=True
     )
-    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
+    _assert_identical_state_dict(full_nchw, streaming)
 
     streamed_attentions = [layer.attn for layer in streaming.stream_module.blocks]
     assert all(
@@ -1167,6 +1172,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         streaming_input = full_input.detach().clone().requires_grad_(True)
         upstream = torch.randn_like(reference_input)
 
+        _assert_identical_state_dict(full_nchw, streaming)
         reference_output = reference(reference_input)
         full_output = full_nchw(full_input)
         streaming_output = streaming(streaming_input)
@@ -1296,17 +1302,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
             # the approximate cross-layout gradients from cycle 0.
             copy_nhwc_nat_block_to_nchw(reference, full_nchw)
             copy_nhwc_nat_block_to_nchw(reference, streaming.stream_module)
-            full_parameters = dict(full_nchw.named_parameters())
-            streaming_parameters = dict(streaming.stream_module.named_parameters())
-            assert full_parameters.keys() == streaming_parameters.keys()
-            for name, full_parameter in full_parameters.items():
-                torch.testing.assert_close(
-                    streaming_parameters[name],
-                    full_parameter,
-                    rtol=0,
-                    atol=0,
-                    msg=f"synchronized NCHW parameter {name}",
-                )
+            _assert_identical_state_dict(full_nchw, streaming)
 
             for optimizer in (reference_optimizer, full_optimizer, streaming_optimizer):
                 optimizer.zero_grad(set_to_none=True)
@@ -1364,7 +1360,7 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
         tile_shape=(batch, channels, *tile_hw),
         copy_to_gpu=True,
     )
-    _assert_identical_named_parameters(streaming.stream_module, full_nchw)
+    _assert_identical_state_dict(full_nchw, streaming)
 
     assert image_hw[0] % 2 == 1 and image_hw[1] % 2 == 1
     assert image_hw[0] != image_hw[1]
@@ -1390,6 +1386,7 @@ def test_nat_block_downsampler_matches_reference_and_streaming(
     )
     streaming_input = full_input.detach().clone().requires_grad_(True)
 
+    _assert_identical_state_dict(full_nchw, streaming)
     reference_output = reference(reference_input)
     full_output = full_nchw(full_input)
     streaming_output = streaming(streaming_input)
