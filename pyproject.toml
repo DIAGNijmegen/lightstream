@@ -23,7 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 nat = [
     "torch==2.13.0",
-    "natten==0.21.7",
+    # The production backend is an unreleased Blackwell branch.  Pin its
+    # immutable revision because the branch reports the ordinary 0.17.5
+    # package version and therefore cannot be selected with `natten==...`.
+    "natten @ git+https://github.com/SHI-Labs/NATTEN.git@0a6a3df544fe478e97bdd77e92fd3ec14cf43cff",
 ]
 docs = [
     "mkdocs",

@@ -13,13 +13,19 @@ from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.scnn.utils import Lost
 
 
+SUPPORTED_NATTEN_VERSION = "0.17.5"
 _REL_POS_BIAS_PARAMETER = "rpb"
 
 
 @pytest.fixture(scope="session")
 def natten_backend():
-    """Load the real optional backend only for tests which require it."""
-    return pytest.importorskip("natten")
+    """Load only the production NATTEN API for real-backend parity tests."""
+    backend = pytest.importorskip("natten")
+    assert backend.__version__ == SUPPORTED_NATTEN_VERSION, (
+        "real-NATTEN parity tests require the v0.17.5-blackwell build; "
+        f"found NATTEN {backend.__version__!r}"
+    )
+    return backend
 
 
 class _LocalNHWCBackend(nn.Module):

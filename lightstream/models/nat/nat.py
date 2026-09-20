@@ -12,7 +12,23 @@ from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
 import natten
 from natten import NeighborhoodAttention2D as NeighborhoodAttention
-is_natten_post_017 = hasattr(natten, "context")
+
+
+SUPPORTED_NATTEN_VERSION = "0.17.5"
+
+
+def _check_natten_compatibility():
+    """Reject NATTEN APIs other than the production Blackwell build API."""
+    version = getattr(natten, "__version__", None)
+    if version != SUPPORTED_NATTEN_VERSION:
+        raise RuntimeError(
+            "Lightstream NAT requires the NATTEN v0.17.5-blackwell build "
+            f"(Python package version {SUPPORTED_NATTEN_VERSION}); found {version!r}. "
+            "Install the pinned `nat` extra described in docs/models/nat.md."
+        )
+
+
+_check_natten_compatibility()
 
 
 model_urls = {
@@ -117,7 +133,6 @@ class NATLayer(nn.Module):
         self.mlp_ratio = mlp_ratio
 
         self.norm1 = norm_layer(dim)
-        extra_args = {"rel_pos_bias": True} if is_natten_post_017 else {"bias": True}
         self.attn = NeighborhoodAttention(
             dim,
             kernel_size=kernel_size,
@@ -127,7 +142,10 @@ class NATLayer(nn.Module):
             qk_scale=qk_scale,
             attn_drop=attn_drop,
             proj_drop=drop,
-            **extra_args,
+            # The v0.17.5-blackwell branch calls relative positional bias
+            # `rel_pos_bias`.  Pass it explicitly: its constructor default
+            # must not determine the architecture or checkpoint parameters.
+            rel_pos_bias=True,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
