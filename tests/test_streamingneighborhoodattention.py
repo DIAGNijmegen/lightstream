@@ -5,7 +5,11 @@ import pytest
 import torch
 from torch import nn
 
-from lightstream.core.layers import ChannelLayerNorm, StreamingMerge
+from lightstream.core.layers import (
+    ChannelLayerNorm,
+    StreamingLayerScale,
+    StreamingMerge,
+)
 from lightstream.core.layers.streamingneighborhoodattention import (
     NeighborhoodAttention2D,
     StreamingNeighborhoodAttention2D,
@@ -484,16 +488,25 @@ class _LinearMlp(nn.Module):
 class _NHWCNATLayer(nn.Module):
     """Direct-layout oracle using only original NAT/PyTorch operations."""
 
-    def __init__(self, attention, channels, hidden_channels):
+    def __init__(self, attention, channels, hidden_channels, layer_scale=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(channels, eps=1e-6)
         self.attn = attention
         self.norm2 = nn.LayerNorm(channels, eps=1e-6)
         self.mlp = _LinearMlp(channels, hidden_channels)
+        if layer_scale is not None:
+            self.gamma1 = nn.Parameter(torch.full((channels,), layer_scale))
+            self.gamma2 = nn.Parameter(torch.full((channels,), layer_scale))
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
+        attention = self.attn(self.norm1(x))
+        if hasattr(self, "gamma1"):
+            attention = self.gamma1 * attention
+        x = x + attention
+        mlp = self.mlp(self.norm2(x))
+        if hasattr(self, "gamma2"):
+            mlp = self.gamma2 * mlp
+        return x + mlp
 
 
 def _nat_parameter_pairs(reference, nchw):
@@ -512,6 +525,13 @@ def _nat_parameter_pairs(reference, nchw):
         convolution = getattr(nchw.mlp, projection_name)
         yield f"mlp.{projection_name}.weight", linear.weight, convolution.weight
         yield f"mlp.{projection_name}.bias", linear.bias, convolution.bias
+    for gamma_name in ("gamma1", "gamma2"):
+        if hasattr(reference, gamma_name):
+            yield (
+                gamma_name,
+                getattr(reference, gamma_name),
+                getattr(nchw, gamma_name).weight,
+            )
 
 
 def _nat_block_parameter_pairs(reference, nchw):
@@ -543,10 +563,12 @@ def _nat_block_parameter_pairs(reference, nchw):
 
 
 def _linear_shaped(value, reference):
-    """Remove the spatial singleton axes of a pointwise-convolution tensor."""
+    """Restore NCHW pointwise parameters to their original NAT shapes."""
 
     if value.ndim == reference.ndim + 2:
         return value[:, :, 0, 0]
+    if value.shape != reference.shape and value.numel() == reference.numel():
+        return value.reshape_as(reference)
     return value
 
 
@@ -1032,11 +1054,13 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
         _make_natten(natten_backend, channels, heads, kernel_size, dilation=1),
         channels,
         hidden_channels,
+        layer_scale=1e-5,
     ).float()
     nchw_source = NCHWNATLayer(
         _make_natten(natten_backend, channels, heads, kernel_size, dilation=1),
         channels,
         hidden_channels,
+        layer_scale=1e-5,
     ).float()
     copy_nhwc_nat_to_nchw(reference, nchw_source)
     full_nchw = copy.deepcopy(nchw_source)
@@ -1062,6 +1086,8 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
     assert isinstance(nchw_source.merge2, StreamingMerge)
     assert nchw_source.merge1.mode == "add"
     assert nchw_source.merge2.mode == "add"
+    assert isinstance(streaming.stream_module.gamma1, StreamingLayerScale)
+    assert isinstance(streaming.stream_module.gamma2, StreamingLayerScale)
 
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
     full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
@@ -1228,6 +1254,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         downsample=False,
         mlp_ratio=mlp_ratio,
         drop_path=0.0,
+        layer_scale=1e-5,
     ).float()
     nchw_source = NCHWNATBlock(
         channels=channels,
@@ -1237,6 +1264,7 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         dilations=dilations,
         downsample=False,
         mlp_ratio=mlp_ratio,
+        layer_scale=1e-5,
     ).float()
     copy_nhwc_nat_block_to_nchw(reference, nchw_source)
     full_nchw = copy.deepcopy(nchw_source)
@@ -1254,6 +1282,11 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
         dilations
     )
     assert reference.downsample is None and full_nchw.downsample is None
+    assert all(
+        isinstance(layer.gamma1, StreamingLayerScale)
+        and isinstance(layer.gamma2, StreamingLayerScale)
+        for layer in streaming.stream_module.blocks
+    )
 
     # Confirm all parameter families requested by the checkpoint conversion are present.
     for layer in reference.blocks:
