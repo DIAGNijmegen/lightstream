@@ -1647,6 +1647,191 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     compare_cycle([streaming, cached_streaming], 44001)
 
 
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
+    """A complete reduced NAT is exact across shifted, multi-tile streaming."""
+
+    from lightstream.models.nat.nat import NAT
+
+    torch.manual_seed(45001)
+    configuration = dict(
+        embed_dim=8,
+        mlp_ratio=2,
+        depths=[1, 1, 1, 1],
+        num_heads=[1, 2, 4, 8],
+        drop_path_rate=0.0,
+        kernel_size=3,
+        num_classes=0,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        layer_scale=None,
+    )
+    reference = NAT(**configuration).float().cuda()
+    nchw_configuration = {
+        key: value
+        for key, value in configuration.items()
+        if key not in {"num_classes", "layer_scale"}
+    }
+    full_nchw = NCHWNAT(**nchw_configuration).float().cuda()
+    full_nchw.load_state_dict(convert_nhwc_nat_state_dict(reference.state_dict()))
+
+    # The full extractor loses a roughly 183-pixel input border. These physical
+    # tiles therefore retain a nonempty aligned interior, while the odd,
+    # non-square image forces a shifted final tile along both axes.
+    tile_shape = (1, 3, 257, 261)
+    image_shape = (339, 351)
+    streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
+    tile_cache = streaming.get_tile_cache()
+
+    def parameter_pairs(nchw_module):
+        reference_parameters = dict(reference.named_parameters())
+        nchw_parameters = dict(nchw_module.named_parameters())
+        converted_names = {
+            next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
+            for name, parameter in reference_parameters.items()
+        }
+        assert set(converted_names) == set(nchw_parameters)
+        for nchw_name, reference_name in converted_names.items():
+            yield nchw_name, reference_parameters[reference_name], nchw_parameters[
+                nchw_name
+            ]
+
+    def compare_cycle(streamers, seed):
+        modules = (reference, full_nchw, *(item.stream_module for item in streamers))
+        for module in modules:
+            module.zero_grad(set_to_none=True)
+
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        reference_input = torch.randn(
+            1, 3, *image_shape, generator=generator, device="cuda", requires_grad=True
+        )
+        full_input = reference_input.detach().clone().requires_grad_(True)
+        stream_inputs = [
+            full_input.detach().clone().requires_grad_(True) for _ in streamers
+        ]
+
+        reference_features = reference.forward_feature_map(reference_input)
+        full_features = full_nchw(full_input)
+        stream_features = [item(value) for item, value in zip(streamers, stream_inputs)]
+        expected_features = reference_features.permute(0, 3, 1, 2)
+        _assert_close_with_diagnostics(
+            full_features,
+            expected_features,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+            quantity="multi-tile complete four-stage features",
+        )
+        for output in stream_features:
+            torch.testing.assert_close(
+                output, full_features, rtol=_SAME_LAYOUT_RTOL, atol=_SAME_LAYOUT_ATOL
+            )
+
+        # Verify the actual forward context, rather than merely relying on the
+        # selected image dimensions: both dimensions traverse multiple tiles,
+        # and neither final tile lies on the regular stepping grid.
+        for item, output in zip(streamers, stream_features):
+            starts = [(y, x) for y, x, _ in item._last_forward_tiles]
+            rows = sorted({y for y, _ in starts})
+            columns = sorted({x for _, x in starts})
+            assert len(rows) >= 2 and len(columns) >= 2
+            valid_heights, valid_widths = item._compute_valid_output_sizes()
+            valid_step_height, valid_step_width = item._compute_valid_input_step(
+                valid_heights, valid_widths
+            )
+            assert output.shape[-2] > valid_heights[0]
+            assert output.shape[-1] > valid_widths[0]
+            assert rows[-1] != (len(rows) - 1) * valid_step_height
+            assert columns[-1] != (len(columns) - 1) * valid_step_width
+
+        upstream = torch.randn(full_features.shape, generator=generator, device="cuda")
+        reference_features.backward(upstream.permute(0, 2, 3, 1).contiguous())
+        full_features.backward(upstream)
+        for item, value in zip(streamers, stream_inputs):
+            item.backward(value, upstream)
+
+        _assert_close_with_diagnostics(
+            full_input.grad,
+            reference_input.grad,
+            rtol=_CROSS_LAYOUT_INPUT_GRAD_RTOL,
+            atol=_CROSS_LAYOUT_INPUT_GRAD_ATOL,
+            quantity="multi-tile complete four-stage image gradient",
+        )
+        for value in stream_inputs:
+            torch.testing.assert_close(
+                value.grad,
+                full_input.grad,
+                rtol=_SAME_LAYOUT_RTOL,
+                atol=_SAME_LAYOUT_ATOL,
+            )
+
+        full_pairs = list(parameter_pairs(full_nchw))
+        for name, reference_parameter, full_parameter in full_pairs:
+            assert (
+                reference_parameter.grad is not None and full_parameter.grad is not None
+            )
+            _assert_close_with_diagnostics(
+                _linear_shaped(full_parameter.grad, reference_parameter.grad),
+                reference_parameter.grad,
+                rtol=_CROSS_LAYOUT_PARAMETER_GRAD_RTOL,
+                atol=_CROSS_LAYOUT_PARAMETER_GRAD_ATOL,
+                quantity="multi-tile complete four-stage parameter gradient",
+                parameter_name=name,
+            )
+        for item in streamers:
+            streamed_pairs = list(parameter_pairs(item.stream_module))
+            for (name, _, full_parameter), (
+                stream_name,
+                _,
+                stream_parameter,
+            ) in zip(
+                full_pairs, streamed_pairs
+            ):
+                assert stream_name == name
+                assert stream_parameter.grad is not None
+                torch.testing.assert_close(
+                    stream_parameter.grad,
+                    full_parameter.grad,
+                    rtol=_SAME_LAYOUT_RTOL,
+                    atol=_SAME_LAYOUT_ATOL,
+                    msg=f"multi-tile streamed parameter gradient {name}",
+                )
+
+    compare_cycle([streaming], 46001)
+    optimizers = [
+        torch.optim.SGD(module.parameters(), lr=0.01)
+        for module in (reference, full_nchw, streaming.stream_module)
+    ]
+    for optimizer in optimizers:
+        optimizer.step()
+    for name, reference_parameter, full_parameter in parameter_pairs(full_nchw):
+        torch.testing.assert_close(
+            _linear_shaped(full_parameter, reference_parameter),
+            reference_parameter,
+            rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+            atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+            msg=f"multi-tile optimizer-updated parameter {name}",
+        )
+    for (name, _, full_parameter), (stream_name, _, stream_parameter) in zip(
+        parameter_pairs(full_nchw), parameter_pairs(streaming.stream_module)
+    ):
+        assert stream_name == name
+        torch.testing.assert_close(
+            stream_parameter,
+            full_parameter,
+            rtol=_SAME_LAYOUT_RTOL,
+            atol=_SAME_LAYOUT_ATOL,
+            msg=f"multi-tile streamed optimizer-updated parameter {name}",
+        )
+
+    streaming.stream_module.load_state_dict(full_nchw.state_dict())
+    cached_streaming = StreamingCNN(
+        copy.deepcopy(full_nchw), tile_shape=tile_shape, state_dict=tile_cache
+    )
+    cached_streaming.stream_module.load_state_dict(full_nchw.state_dict())
+    compare_cycle([streaming, cached_streaming], 47001)
+
+
 @pytest.mark.parametrize(
     ("tile_hw", "image_hw", "expected_downsample_lost"),
     [
