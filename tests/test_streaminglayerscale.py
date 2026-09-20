@@ -188,3 +188,70 @@ def test_scnn_layer_scale_reducer_head_forward_backward_scale_gradient_parity():
         atol=1e-5,
         rtol=1e-4,
     )
+
+
+class SpatiallyDependentLayerScaleNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale_before = LayerScale((1, 3, 1, 1), init_value=0.625)
+        self.spatial = torch.nn.Conv2d(
+            3, 3, kernel_size=3, padding=1, groups=3, bias=False
+        )
+        self.scale_after = LayerScale((1, 3, 1, 1), init_value=1.375)
+
+    def forward(self, x):
+        return self.scale_after(self.spatial(self.scale_before(x)))
+
+
+def test_scnn_layer_scale_accumulates_spatial_dependencies_across_shifted_tiles(
+    monkeypatch,
+):
+    """A pre-spatial scale must retain dependency gradients from tile halos."""
+    monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    torch.manual_seed(406)
+    model = SpatiallyDependentLayerScaleNet().eval()
+    reference = SpatiallyDependentLayerScaleNet().eval()
+    reference.load_state_dict(model.state_dict())
+
+    image_shape = (13, 14)
+    tile_shape = (8, 9)
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, *tile_shape),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+
+    for cycle in range(2):
+        reference.zero_grad(set_to_none=True)
+        scnn.stream_module.zero_grad(set_to_none=True)
+        torch.manual_seed(407 + cycle)
+        image = torch.randn(1, 3, *image_shape)
+        upstream = torch.randn(1, 3, *image_shape)
+
+        reference_output = reference(image)
+        reference_output.backward(upstream)
+        streaming_output = scnn(image)
+        torch.testing.assert_close(streaming_output, reference_output.detach())
+
+        tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
+        assert sorted(set(y for y, _ in tile_starts)) == [0, 4, 5]
+        assert sorted(set(x for _, x in tile_starts)) == [0, 5]
+        # The last replay row is shifted back from the regular grid and
+        # overlaps the preceding row in both its input and dependency halo.
+        assert tile_starts[-2:] == [(5, 0), (5, 5)]
+        scnn.backward(image.detach().clone(), upstream)
+
+        for name in ("scale_before.weight", "scale_after.weight"):
+            torch.testing.assert_close(
+                dict(scnn.stream_module.named_parameters())[name].grad,
+                dict(reference.named_parameters())[name].grad,
+                atol=1e-5,
+                rtol=1e-4,
+                msg=f"cycle {cycle}: {name}",
+            )
