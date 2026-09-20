@@ -2112,6 +2112,13 @@ class StreamingCNN(torch.nn.Module):
             context=f"backward reducer head {head_idx}",
             expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
         )
+        # Reducer forward accumulation owns only the first occurrence of each
+        # global position.  Apply that ownership to the backward surrogate as
+        # well, so both the value/classifier and attention-logit branches see
+        # zero gradient for overlap before their per-tile networks run.
+        valid_mask = reducer.claim_backward_region(
+            (dst_y0, dst_y1, dst_x0, dst_x1), valid_mask
+        )
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
             payload,

@@ -186,6 +186,8 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
         self._replay_cursor: int | None = None
+        self._backward_seen_mask: torch.Tensor | None = None
+        self._backward_replay_regions: list[torch.Tensor] = []
 
     def reset_stream_state(
         self,
@@ -275,13 +277,51 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         return self.finalize_stream()
 
     def start_backward_replay(self):
-        """Prepare replay cursor used by debug backward checks."""
+        """Prepare replay cursor and unique-region ownership for backward."""
+        # Forward accumulation assigns every reducer-domain position to the
+        # first tile that visits it.  Backward must make the identical choice:
+        # shifted final tiles otherwise replay part of the preceding tile and
+        # duplicate gradients in modules which produced the reducer inputs.
+        self._backward_seen_mask = torch.zeros_like(self._stream_seen_mask)
+        self._backward_replay_regions = []
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not available for backward replay.")
             self._replay_cursor = 0
         else:
             self._replay_cursor = None
+
+    def claim_backward_region(
+        self,
+        dst_box: tuple[int, int, int, int],
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return this replay tile's previously-unclaimed reducer positions.
+
+        The returned mask is intended to be applied in the reducer surrogate,
+        before autograd reaches either producer branch.  Global coordinates
+        are retained for diagnostics and regression tests.
+        """
+        if self._backward_seen_mask is None:
+            raise RuntimeError("Reducer backward ownership is not initialized. Call start_backward_replay() first.")
+        y0, y1, x0, x1 = (int(value) for value in dst_box)
+        seen = self._backward_seen_mask[y0:y1, x0:x1]
+        unique = ~seen
+        if valid_mask is not None:
+            if tuple(valid_mask.shape) != tuple(unique.shape):
+                raise ValueError(
+                    f"Reducer backward mask shape {tuple(valid_mask.shape)} does not match "
+                    f"tile region {tuple(unique.shape)}."
+                )
+            effective = unique & valid_mask.to(device=unique.device, dtype=torch.bool)
+        else:
+            effective = unique
+        seen |= unique
+        coordinates = effective.nonzero(as_tuple=False)
+        if coordinates.numel():
+            coordinates = coordinates + coordinates.new_tensor((y0, x0))
+        self._backward_replay_regions.append(coordinates.detach().cpu())
+        return effective
 
     def validate_backward_replay_consumed(self, *, head_idx: int):
         """Validate that backward replay consumed all recorded assignments."""
