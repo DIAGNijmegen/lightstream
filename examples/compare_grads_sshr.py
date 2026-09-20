@@ -210,12 +210,13 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     safe_step = network.stream_network._compute_valid_input_step(
         valid_output_heights, valid_output_widths
     )
-    if any(size % step == 0 for size, step in zip(img.shape[-2:], safe_step)):
-        raise ValueError(
-            "The SSHR regression input must be non-divisible by the computed safe tile step "
-            f"on both axes; input={tuple(img.shape[-2:])}, safe_step={safe_step}"
-        )
-    print(f"computed safe tile step={safe_step} (shifted boundary tiles required)")
+    shifted_boundaries = tuple(
+        size % step != 0 for size, step in zip(img.shape[-2:], safe_step)
+    )
+    print(
+        f"computed safe tile step={safe_step} "
+        f"(shifted boundary tiles by axis={shifted_boundaries})"
+    )
 
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)

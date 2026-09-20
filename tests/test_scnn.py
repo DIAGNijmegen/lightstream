@@ -106,9 +106,11 @@ def test_sshr_saliency_shifted_boundary_tiles_cover_and_add_complete_input_regio
     input_conv.output_stride = torch.tensor([1, 1, 1])
     expected = torch.zeros_like(scnn.saliency_map)
 
-    # A nominal 6-pixel safe step cannot evenly cover either image axis.
+    # This fixed 11x13 fixture is non-divisible by its nominal 6x6 safe step.
     # Consequently the last row starts at 3 (not 6), and the last column at 5
     # (not 6), exercising overlap on both axes just like the SSHR comparison.
+    safe_step = (6, 6)
+    assert all(size % step for size, step in zip(scnn.saliency_map.shape[-2:], safe_step))
     tile_starts = ((0, 0), (0, 5), (3, 0), (3, 5))
     assert tile_starts[-1][0] == 3
     assert tile_starts[-1][1] == 5
