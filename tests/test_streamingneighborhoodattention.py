@@ -879,3 +879,175 @@ def test_complete_nchw_nat_layer_matches_nhwc_reference_and_streaming(natten_bac
                         atol=3e-5,
                         msg=f"{implementation} optimizer-updated parameter {name}",
                     )
+
+
+@pytest.mark.parametrize(
+    ("first_dilation", "second_dilation"),
+    [
+        pytest.param(1, 1, id="d1-then-d1"),
+        pytest.param(1, 2, id="d1-then-d2"),
+        pytest.param(2, 1, id="d2-then-d1"),
+    ],
+)
+def test_two_complete_nat_layers_match_reference_streaming_and_reset(
+    natten_backend, first_dilation, second_dilation
+):
+    """Two complete NAT blocks preserve values, gradients, updates, and stream state."""
+
+    torch.manual_seed(24680 + 10 * first_dilation + second_dilation)
+    batch, channels, hidden_channels, heads = 1, 8, 24, 2
+    kernel_size = 7
+    dilations = (first_dilation, second_dilation)
+    radii = tuple(dilation * (kernel_size - 1) // 2 for dilation in dilations)
+    accumulated_radius = sum(radii)
+    query_shape = (5, 7)
+    tile_hw = tuple(query + 2 * accumulated_radius for query in query_shape)
+    image_shape = tuple(tile + query + 1 for tile, query in zip(tile_hw, query_shape))
+
+    # The physical tile has a nonempty uniquely-owned center after the support
+    # from both attention blocks is removed. Final tiles shift on both axes.
+    assert all(tile - 2 * accumulated_radius > 0 for tile in tile_hw)
+    assert all(image % query for image, query in zip(image_shape, query_shape))
+
+    reference = nn.Sequential(
+        *[
+            _NHWCNATLayer(
+                _make_natten(natten_backend, channels, heads, kernel_size, dilation),
+                channels,
+                hidden_channels,
+            )
+            for dilation in dilations
+        ]
+    ).float()
+    nchw_source = nn.Sequential(
+        *[
+            _NCHWNATLayer(
+                _make_natten(natten_backend, channels, heads, kernel_size, dilation),
+                channels,
+                hidden_channels,
+            )
+            for dilation in dilations
+        ]
+    ).float()
+    for reference_layer, nchw_layer in zip(reference, nchw_source):
+        _copy_nhwc_nat_to_nchw(reference_layer, nchw_layer)
+
+    full_nchw = copy.deepcopy(nchw_source)
+    streaming = StreamingCNN(
+        nchw_source,
+        tile_shape=(batch, channels, *tile_hw),
+        copy_to_gpu=True,
+    )
+    streamed_attentions = [layer.attn for layer in streaming.stream_module]
+    assert all(
+        isinstance(attention, StreamingNeighborhoodAttention2D)
+        for attention in streamed_attentions
+    )
+    assert streamed_attentions[0].seen_indices is not streamed_attentions[1].seen_indices
+
+    # DropPath is intentionally absent and every NATTEN dropout is disabled.
+    for model in (reference, full_nchw, streaming.stream_module):
+        assert not any(type(module).__name__ == "DropPath" for module in model.modules())
+        assert all(
+            module.p == 0.0
+            for module in model.modules()
+            if isinstance(module, nn.Dropout)
+        )
+    for layer in reference:
+        parameters = dict(layer.attn.named_parameters())
+        assert _REL_POS_BIAS_PARAMETER in parameters
+        assert layer.attn.qkv.bias is not None
+
+    expected_lost = Lost(
+        accumulated_radius,
+        accumulated_radius,
+        accumulated_radius,
+        accumulated_radius,
+    )
+    cache = streaming.get_tile_cache()
+    assert cache["net_stats"]["1.attn"]["lost"] == expected_lost
+    assert cache["net_stats"]["1.attn"]["directional_spatial_support"] == expected_lost
+
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.015)
+    full_optimizer = torch.optim.SGD(full_nchw.parameters(), lr=0.015)
+    streaming_optimizer = torch.optim.SGD(streaming.stream_module.parameters(), lr=0.015)
+
+    for cycle in range(2):
+        for optimizer in (reference_optimizer, full_optimizer, streaming_optimizer):
+            optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(26000 + cycle)
+        reference_input = torch.randn(
+            batch, *image_shape, channels, dtype=torch.float32, requires_grad=True
+        )
+        full_input = (
+            reference_input.detach().permute(0, 3, 1, 2).contiguous().requires_grad_(True)
+        )
+        streaming_input = full_input.detach().clone().requires_grad_(True)
+        upstream = torch.randn_like(reference_input)
+
+        reference_output = reference(reference_input)
+        full_output = full_nchw(full_input)
+        streaming_output = streaming(streaming_input)
+        expected_output = reference_output.permute(0, 3, 1, 2)
+        torch.testing.assert_close(full_output, expected_output, rtol=3e-4, atol=3e-5)
+        torch.testing.assert_close(streaming_output, expected_output, rtol=3e-4, atol=3e-5)
+
+        reference_output.backward(upstream)
+        nchw_upstream = upstream.permute(0, 3, 1, 2).contiguous()
+        full_output.backward(nchw_upstream)
+        streaming.backward(streaming_input, nchw_upstream)
+        expected_input_grad = reference_input.grad.permute(0, 3, 1, 2)
+        torch.testing.assert_close(full_input.grad, expected_input_grad, rtol=3e-4, atol=3e-5)
+        torch.testing.assert_close(
+            streaming_input.grad, expected_input_grad, rtol=3e-4, atol=3e-5
+        )
+
+        for layer_index, reference_layer in enumerate(reference):
+            for implementation, layer in (
+                ("full-frame", full_nchw[layer_index]),
+                ("streaming", streaming.stream_module[layer_index]),
+            ):
+                for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
+                    reference_layer, layer
+                ):
+                    assert reference_parameter.grad is not None
+                    assert nchw_parameter.grad is not None
+                    torch.testing.assert_close(
+                        _linear_shaped(nchw_parameter.grad, reference_parameter.grad),
+                        reference_parameter.grad,
+                        rtol=3e-4,
+                        atol=3e-5,
+                        msg=(
+                            f"cycle {cycle} {implementation} layer {layer_index} "
+                            f"parameter gradient {name}"
+                        ),
+                    )
+
+        # Streaming backward must reset both independent query-ownership maps
+        # before the same StreamingCNN instance starts the next cycle.
+        for attention in streamed_attentions:
+            assert attention.input_loc is None
+            assert (attention.seen_indices.y, attention.seen_indices.height) == (0, 0)
+            assert (attention.seen_indices.x, attention.seen_indices.width) == (0, 0)
+            assert attention.seen_indices.sides is None
+
+        for optimizer in (reference_optimizer, full_optimizer, streaming_optimizer):
+            optimizer.step()
+        for layer_index, reference_layer in enumerate(reference):
+            for implementation, layer in (
+                ("full-frame", full_nchw[layer_index]),
+                ("streaming", streaming.stream_module[layer_index]),
+            ):
+                for name, reference_parameter, nchw_parameter in _nat_parameter_pairs(
+                    reference_layer, layer
+                ):
+                    torch.testing.assert_close(
+                        _linear_shaped(nchw_parameter, reference_parameter),
+                        reference_parameter,
+                        rtol=3e-4,
+                        atol=3e-5,
+                        msg=(
+                            f"cycle {cycle} {implementation} layer {layer_index} "
+                            f"optimizer-updated parameter {name}"
+                        ),
+                    )
