@@ -17,7 +17,7 @@ from lightstream.core.layers import (
     StreamingUpsample2d,
 )
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
-from lightstream.core.scnn.utils import Lost
+from lightstream.core.scnn.utils import Box, Lost, Sides
 from lightstream.models.testnet.segment import StreamingTestNet
 
 from lightstream.core.reducer import (
@@ -93,6 +93,53 @@ def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
 
     assert actual.shape == expected.shape == (1, 2, 9, 9)
     torch.testing.assert_close(actual, expected)
+
+
+def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
+    """A diagnostic cursor gap must not discard any dependency gradients."""
+    torch.manual_seed(93)
+    streaming = StreamingConv2d(1, 2, kernel_size=3, stride=2, padding=1).double()
+    reference = streaming.to_torch_conv2d()
+    streaming.output_stride = torch.tensor([1, 1, 1])
+
+    replay_tiles = (
+        (torch.randn(1, 1, 9, 7, dtype=torch.double), 0),
+        (torch.randn(1, 1, 3, 7, dtype=torch.double), 12),
+    )
+    expected_input_gradients = []
+    actual_input_gradients = []
+
+    for index, (tile, input_y) in enumerate(replay_tiles):
+        reference_input = tile.detach().clone().requires_grad_(True)
+        streaming_input = tile.detach().clone().requires_grad_(True)
+        streaming.input_loc = Box(
+            input_y,
+            tile.shape[2],
+            0,
+            tile.shape[3],
+            Sides(True, index == 0, True, index == len(replay_tiles) - 1),
+        )
+
+        reference_output = reference(reference_input)
+        streaming_output = streaming(streaming_input)
+        output_gradient = torch.randn_like(reference_output)
+        reference_output.backward(output_gradient)
+        streaming_output.backward(output_gradient)
+
+        expected_input_gradients.append(reference_input.grad)
+        actual_input_gradients.append(streaming_input.grad)
+        if index == 0:
+            assert streaming.seen_indices.height == 5
+        else:
+            projected_data_y = input_y // streaming.stride[0]
+            assert projected_data_y == 6
+
+    assert streaming.seen_indices.y == 6
+    assert streaming.seen_indices.height == 8
+    for actual, expected in zip(actual_input_gradients, expected_input_gradients):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(streaming.weight.grad, reference.weight.grad)
+    torch.testing.assert_close(streaming.bias.grad, reference.bias.grad)
 
 
 def test_convert_and_reset_every_supported_layer_type():

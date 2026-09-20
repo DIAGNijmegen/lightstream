@@ -12,6 +12,33 @@ from lightstream.core.scnn.utils import (
 )
 
 
+def _update_seen_indices(data_shape, data_loc, seen_indices):
+    """Advance the convolution's diagnostic cursor for one replay tile.
+
+    A shifted final tile can start a new row after a stride-induced gap in the
+    projected output coordinates.  Convolution backward does not use this
+    cursor to assign gradient ownership, so accepting that gap is safe here.
+    Keep ``_new_value_indices`` strict for callers which use it to validate
+    contiguous output ownership.
+    """
+    cursor = seen_indices
+    if data_loc.x == 0 and data_loc.y > seen_indices.height:
+        cursor = Box(
+            seen_indices.y,
+            data_loc.y,
+            seen_indices.x,
+            seen_indices.width,
+            seen_indices.sides,
+        )
+
+    _, updated = _new_value_indices(data_shape, data_loc, cursor)
+    seen_indices.y = updated.y
+    seen_indices.height = updated.height
+    seen_indices.x = updated.x
+    seen_indices.width = updated.width
+    seen_indices.sides = updated.sides
+
+
 class StreamingConv2dF(torch.autograd.Function):
     @staticmethod
     @custom_fwd(
@@ -113,12 +140,7 @@ class StreamingConv2dF(torch.autograd.Function):
             0,
             sides,
         )
-        _, updated = _new_value_indices(valid_grad.shape, data_loc, ctx.seen_indices)
-        ctx.seen_indices.y = updated.y
-        ctx.seen_indices.height = updated.height
-        ctx.seen_indices.x = updated.x
-        ctx.seen_indices.width = updated.width
-        ctx.seen_indices.sides = updated.sides
+        _update_seen_indices(valid_grad.shape, data_loc, ctx.seen_indices)
 
         if bias is not None:
             return (
