@@ -1,5 +1,6 @@
 import sys
 import types
+from copy import deepcopy
 
 import pytest
 import torch
@@ -193,14 +194,12 @@ def test_scnn_layer_scale_reducer_head_forward_backward_scale_gradient_parity():
 class SpatiallyDependentLayerScaleNet(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.scale_before = LayerScale((1, 3, 1, 1), init_value=0.625)
-        self.spatial = torch.nn.Conv2d(
-            3, 3, kernel_size=3, padding=1, groups=3, bias=False
-        )
-        self.scale_after = LayerScale((1, 3, 1, 1), init_value=1.375)
+        self.upstream = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1)
+        self.scale = LayerScale((1, 4, 1, 1), init_value=0.625)
+        self.downstream = torch.nn.Conv2d(4, 3, kernel_size=3, padding=1)
 
     def forward(self, x):
-        return self.scale_after(self.spatial(self.scale_before(x)))
+        return self.downstream(torch.relu(self.scale(self.upstream(x))))
 
 
 def test_scnn_layer_scale_accumulates_spatial_dependencies_across_shifted_tiles(
@@ -227,7 +226,26 @@ def test_scnn_layer_scale_accumulates_spatial_dependencies_across_shifted_tiles(
         normalize_on_gpu=False,
     )
 
+    replay_records = []
+
+    def record_forward(module, inputs, _output):
+        replay_records.append(
+            {
+                "input": inputs[0].detach().clone(),
+                "input_loc": deepcopy(module.input_loc),
+                "grad_lost": deepcopy(module.grad_lost),
+                "ownership": deepcopy(module.input_loc.sides),
+            }
+        )
+
+    def record_backward(_module, _grad_input, grad_output):
+        replay_records[-1]["grad_output"] = grad_output[0].detach().clone()
+
+    scnn.stream_module.scale.register_forward_hook(record_forward)
+    scnn.stream_module.scale.register_full_backward_hook(record_backward)
+
     for cycle in range(2):
+        cycle_record_start = len(replay_records)
         reference.zero_grad(set_to_none=True)
         scnn.stream_module.zero_grad(set_to_none=True)
         torch.manual_seed(407 + cycle)
@@ -240,14 +258,48 @@ def test_scnn_layer_scale_accumulates_spatial_dependencies_across_shifted_tiles(
         torch.testing.assert_close(streaming_output, reference_output.detach())
 
         tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
-        assert sorted(set(y for y, _ in tile_starts)) == [0, 4, 5]
-        assert sorted(set(x for _, x in tile_starts)) == [0, 5]
+        assert any(
+            0 < next_x - x < tile_shape[1]
+            for (y, x), (next_y, next_x) in zip(tile_starts, tile_starts[1:])
+            if y == next_y
+        )
         # The last replay row is shifted back from the regular grid and
         # overlaps the preceding row in both its input and dependency halo.
-        assert tile_starts[-2:] == [(5, 0), (5, 5)]
+        assert tile_starts[-1] == (5, 5)
         scnn.backward(image.detach().clone(), upstream)
 
-        for name in ("scale_before.weight", "scale_after.weight"):
+        cycle_records = replay_records[cycle_record_start + len(tile_starts) :]
+        assert len(cycle_records) == len(tile_starts)
+        assert all(
+            set(record) == {
+                "input",
+                "grad_output",
+                "input_loc",
+                "grad_lost",
+                "ownership",
+            }
+            for record in cycle_records
+        )
+        complete_tile_gradient = sum(
+            (record["grad_output"] * record["input"]).sum_to_size(
+                scnn.stream_module.scale.weight.shape
+            )
+            for record in cycle_records
+        )
+        torch.testing.assert_close(
+            complete_tile_gradient,
+            scnn.stream_module.scale.weight.grad,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+
+        for name in (
+            "scale.weight",
+            "upstream.weight",
+            "upstream.bias",
+            "downstream.weight",
+            "downstream.bias",
+        ):
             torch.testing.assert_close(
                 dict(scnn.stream_module.named_parameters())[name].grad,
                 dict(reference.named_parameters())[name].grad,
