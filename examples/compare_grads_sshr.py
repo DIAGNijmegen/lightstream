@@ -129,6 +129,50 @@ def _base_output_grads(
     return tuple(grad.detach().clone() for grad in grads)
 
 
+def _assert_input_gradient_parity(
+    stream_input_grad: torch.Tensor,
+    reference_input_grad: torch.Tensor,
+    coverage_map: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Check saliency assembly coverage before checking its numerical values."""
+    if stream_input_grad.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Streaming and reference input-gradient shapes differ: "
+            f"{tuple(stream_input_grad.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+    if coverage_map.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Saliency coverage and reference input-gradient shapes differ: "
+            f"{tuple(coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+
+    reference_support = reference_input_grad.ne(0)
+    missing_support = reference_support & ~coverage_map
+    print(
+        "Input gradient spatial coverage: "
+        f"reference-supported={reference_support.count_nonzero().item()}, "
+        f"stream-written={coverage_map.count_nonzero().item()}, "
+        f"missing={missing_support.count_nonzero().item()}"
+    )
+    assert not missing_support.any(), (
+        "Streaming saliency replay did not write every reference-supported input coordinate; "
+        f"missing indices={missing_support.nonzero().tolist()[:20]}"
+    )
+
+    # Coverage failures identify assembly holes above.  Only after that check
+    # succeeds do numerical tolerances enter the regression result.
+    torch.testing.assert_close(
+        stream_input_grad[reference_support],
+        reference_input_grad[reference_support],
+        rtol=rtol,
+        atol=atol,
+        msg="streamed saliency values differ over reference-supported coordinates",
+    )
+
+
 def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor) -> None:
     device = img.device
     dtype = img.dtype
@@ -225,12 +269,21 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         elif not hasattr(network.stream_network, "saliency_map") or network.stream_network.saliency_map is None:
             print("Input gradient comparison skipped: streaming saliency map is missing.")
         else:
-            stream_input_grad = network.stream_network.saliency_map[0].to(device=img_normal.grad.device)
-            input_grad_diff = (img_normal.grad.detach() - stream_input_grad).abs()
+            stream_input_grad = network.stream_network.saliency_map.to(device=img_normal.grad.device)
+            coverage_map = network.stream_network.saliency_coverage_map.to(device=img_normal.grad.device)
+            reference_input_grad = img_normal.grad.detach()
+            _assert_input_gradient_parity(
+                stream_input_grad,
+                reference_input_grad,
+                coverage_map,
+                rtol=args.input_grad_rtol,
+                atol=args.input_grad_atol,
+            )
+            input_grad_diff = (reference_input_grad - stream_input_grad).abs()
             print(
-                "Input gradient stats: "
+                "Input gradient full-tensor stats: "
                 f"stream mean abs={stream_input_grad.abs().mean().item():.6e}, "
-                f"normal mean abs={img_normal.grad.detach().abs().mean().item():.6e}, "
+                f"normal mean abs={reference_input_grad.abs().mean().item():.6e}, "
                 f"mean abs diff={input_grad_diff.mean().item():.6e}, "
                 f"max abs diff={input_grad_diff.max().item():.6e}"
             )
@@ -257,6 +310,8 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=3072)
     parser.add_argument("--input-size", type=int, default=4608)
+    parser.add_argument("--input-grad-rtol", type=float, default=1e-4)
+    parser.add_argument("--input-grad-atol", type=float, default=1e-6)
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
