@@ -6,10 +6,14 @@ import torch
 
 
 def _format_sides(sides: dict) -> str:
-    return "Sides(" + ", ".join(
-        f"{side}={bool(sides.get(side, False))}"
-        for side in ("top", "left", "bottom", "right")
-    ) + ")"
+    return (
+        "Sides("
+        + ", ".join(
+            f"{side}={bool(sides.get(side, False))}"
+            for side in ("top", "left", "bottom", "right")
+        )
+        + ")"
+    )
 
 
 def _report_missing_additive_writes(
@@ -65,7 +69,12 @@ def compare_saliency_candidates(
     rtol: float = 1e-4,
     atol: float = 1e-6,
 ) -> dict[str, bool]:
-    """Compare diagnostic maps with a reference using the requested tolerances."""
+    """Report saliency stages and assert parity for the supported candidates.
+
+    ``raw`` and ``production`` are regression candidates.  The intermediate
+    ``grad_lost`` and ``ownership`` maps exist to characterize the historical
+    transformations and are deliberately not part of the regression result.
+    """
     maps = getattr(stream_network, "saliency_diagnostic_maps", {})
     if not maps:
         print("Saliency candidates are disabled or were not produced.")
@@ -73,19 +82,19 @@ def compare_saliency_candidates(
 
     reference = reference.detach()
     reference_support = reference.abs() > atol
-    first_failure = None
+    earliest_destructive = None
     results = {}
     for name in ("raw", "grad_lost", "ownership", "production"):
         candidate = maps.get(name)
         if candidate is None:
             print(f"\nSaliency candidate {name}: unavailable (allocation failed)")
-            first_failure = first_failure or name
             results[name] = False
             continue
         candidate = candidate.to(device=reference.device, dtype=reference.dtype)
         if candidate.shape != reference.shape:
-            print(f"\nSaliency candidate {name}: shape mismatch {tuple(candidate.shape)} != {tuple(reference.shape)}")
-            first_failure = first_failure or name
+            print(
+                f"\nSaliency candidate {name}: shape mismatch {tuple(candidate.shape)} != {tuple(reference.shape)}"
+            )
             results[name] = False
             continue
 
@@ -112,8 +121,14 @@ def compare_saliency_candidates(
         max_error = absolute_error.max().item() if absolute_error.numel() else 0.0
         failed = bool(missing.any() or extra.any() or mismatch.any())
         results[name] = not failed
-        if failed and first_failure is None:
-            first_failure = name
+        is_characterization = name in ("grad_lost", "ownership")
+        if failed and is_characterization and earliest_destructive is None:
+            earliest_destructive = name
+        tolerance_result = (
+            "EXPECTED DIVERGENCE"
+            if failed and is_characterization
+            else "FAIL" if failed else "PASS"
+        )
         print(
             f"\nSaliency candidate {name}:\n"
             f"  missing reference support: {missing.count_nonzero().item()}\n"
@@ -124,7 +139,7 @@ def compare_saliency_candidates(
             f"  per-row tolerance-mismatch counts: {row_counts}\n"
             f"  per-column tolerance-mismatch counts: {column_counts}"
             f"\n  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
-            f"{'PASS' if not failed else 'FAIL'}"
+            f"{tolerance_result}"
         )
         if name in ("grad_lost", "ownership"):
             raw = maps.get("raw")
@@ -138,5 +153,34 @@ def compare_saliency_candidates(
                     tolerance,
                 )
 
-    print(f"\nEarliest failing saliency transformation: {first_failure or 'none'}")
+    print(
+        "\nEarliest destructive saliency transformation: "
+        f"{earliest_destructive or 'none'}"
+    )
+
+    parity_failures = [
+        name for name in ("raw", "production") if not results.get(name, False)
+    ]
+    if not parity_failures:
+        raw = maps["raw"].to(device=reference.device, dtype=reference.dtype)
+        production = maps["production"].to(
+            device=reference.device, dtype=reference.dtype
+        )
+        try:
+            torch.testing.assert_close(
+                raw,
+                production,
+                rtol=rtol,
+                atol=atol,
+                msg="raw and production saliency candidates differ",
+            )
+            print("Raw/production parity check: PASS")
+        except AssertionError:
+            print("Raw/production parity check: FAIL")
+            raise
+    else:
+        raise AssertionError(
+            "Saliency parity candidate(s) failed reference tolerance: "
+            + ", ".join(parity_failures)
+        )
     return results

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from examples.saliency_diagnostics import compare_saliency_candidates
@@ -18,7 +19,7 @@ def test_candidate_summary_uses_gradient_tolerance_for_errors(capsys):
             "raw": raw,
             "grad_lost": grad_lost,
             "ownership": grad_lost,
-            "production": grad_lost,
+            "production": raw.clone(),
         }
     )
 
@@ -30,13 +31,18 @@ def test_candidate_summary_uses_gradient_tolerance_for_errors(capsys):
         "raw": True,
         "grad_lost": False,
         "ownership": False,
-        "production": False,
+        "production": True,
     }
     report = capsys.readouterr().out
     assert "error bounding box [top, left, bottom, right): (1, 2, 2, 3)" in report
     assert "per-row tolerance-mismatch counts: [0, 1]" in report
     assert "per-column tolerance-mismatch counts: [0, 0, 1]" in report
-    assert "Earliest failing saliency transformation: grad_lost" in report
+    assert (
+        "tolerance check (rtol=0.000e+00, atol=1.000e-06): EXPECTED DIVERGENCE"
+        in report
+    )
+    assert "Earliest destructive saliency transformation: grad_lost" in report
+    assert "Raw/production parity check: PASS" in report
 
 
 def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
@@ -44,8 +50,7 @@ def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
     candidate = torch.full_like(reference, 1e-17)
     stream_network = SimpleNamespace(
         saliency_diagnostic_maps={
-            name: candidate
-            for name in ("raw", "grad_lost", "ownership", "production")
+            name: candidate for name in ("raw", "grad_lost", "ownership", "production")
         }
     )
 
@@ -56,7 +61,44 @@ def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
     assert all(results.values())
     report = capsys.readouterr().out
     assert "exact maximum absolute error: 1.00000000000000007e-17" in report
-    assert "Earliest failing saliency transformation: none" in report
+    assert "Earliest destructive saliency transformation: none" in report
+
+
+def test_production_disagreement_fails_the_regression(capsys):
+    reference = torch.ones((1, 1, 1, 1), dtype=torch.float64)
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": reference.clone(),
+            "grad_lost": reference + 1.0,
+            "ownership": reference + 1.0,
+            "production": reference + 1e-3,
+        }
+    )
+
+    with pytest.raises(AssertionError, match="production"):
+        compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
+
+    report = capsys.readouterr().out
+    assert "Saliency candidate production:" in report
+    assert "tolerance check (rtol=0.000e+00, atol=1.000e-06): FAIL" in report
+    assert "Earliest destructive saliency transformation: grad_lost" in report
+
+
+def test_raw_and_production_must_match_each_other(capsys):
+    reference = torch.tensor([[[[100.0]]]], dtype=torch.float64)
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": reference - 9.0,
+            "grad_lost": reference.clone(),
+            "ownership": reference.clone(),
+            "production": reference + 9.0,
+        }
+    )
+
+    with pytest.raises(AssertionError, match="raw and production"):
+        compare_saliency_candidates(stream_network, reference, rtol=0.1, atol=0)
+
+    assert "Raw/production parity check: FAIL" in capsys.readouterr().out
 
 
 def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
@@ -76,13 +118,15 @@ def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
             "production": raw,
         },
         saliency_diagnostic_write_count_maps=count_maps,
-        saliency_diagnostic_records=[{
-            "candidate_destination_slices": {
-                "grad_lost": (0, 0, 1, 2),
-                "ownership": (0, 0, 1, 2),
-            },
-            "sides": {"top": True, "left": False, "bottom": False, "right": True},
-        }],
+        saliency_diagnostic_records=[
+            {
+                "candidate_destination_slices": {
+                    "grad_lost": (0, 0, 1, 2),
+                    "ownership": (0, 0, 1, 2),
+                },
+                "sides": {"top": True, "left": False, "bottom": False, "right": True},
+            }
+        ],
     )
 
     compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
@@ -90,4 +134,6 @@ def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
     report = capsys.readouterr().out
     assert "error: [(0, 0)]" in report
     assert "boundary=(0, 0, 1, 2)" in report
-    assert "Sides(top=True, left=False, bottom=False, right=True): 1 coordinates" in report
+    assert (
+        "Sides(top=True, left=False, bottom=False, right=True): 1 coordinates" in report
+    )
