@@ -79,6 +79,7 @@ def _assert_close_with_diagnostics(
     quantity,
     parameter_name=None,
     cycle=None,
+    streaming=None,
 ):
     """Assert closeness and report useful CUDA parity diagnostics on failure."""
     actual_detached = actual.detach()
@@ -107,6 +108,52 @@ def _assert_close_with_diagnostics(
         context.append(f"parameter={parameter_name!r}")
     if cycle is not None:
         context.append(f"cycle={cycle}")
+    if actual_detached.ndim >= 4:
+        flat_index = int(absolute_difference.argmax().item())
+        maximum_index = []
+        for size in reversed(absolute_difference.shape):
+            maximum_index.append(flat_index % size)
+            flat_index //= size
+        maximum_index.reverse()
+        context.append(
+            "max_diff_index="
+            f"(channel={maximum_index[-3]}, y={maximum_index[-2]}, "
+            f"x={maximum_index[-1]})"
+        )
+    if streaming is not None and actual_detached.ndim >= 4:
+        starts = [(int(y), int(x)) for y, x, _ in streaming._last_forward_tiles]
+        context.append(f"input_tile_starts={starts}")
+
+        valid_heights, valid_widths = streaming._compute_valid_output_sizes()
+        step_y, step_x = streaming._compute_valid_input_step(
+            valid_heights, valid_widths
+        )
+        stride = streaming._output_stride_per_output[0]
+        feature_y, feature_x = maximum_index[-2:]
+        input_y = feature_y * int(stride[1])
+        input_x = feature_x * int(stride[2])
+        rows = sorted({y for y, _ in starts})
+        columns = sorted({x for _, x in starts})
+
+        def boundary_kind(coordinate, axis_starts, step, valid_size, axis_stride):
+            boundaries = set()
+            shifted_boundaries = set()
+            for position, start in enumerate(axis_starts):
+                output_start = start // axis_stride
+                output_end = output_start + valid_size
+                boundaries.update((output_start, output_end))
+                if start != position * step:
+                    shifted_boundaries.update((output_start, output_end))
+            if coordinate not in boundaries:
+                return "not-on-tile-boundary"
+            return "shifted" if coordinate in shifted_boundaries else "regular"
+
+        context.append(f"max_diff_input_coordinate=(y={input_y}, x={input_x})")
+        context.append(
+            "tile_boundary="
+            f"(y={boundary_kind(feature_y, rows, step_y, valid_heights[0], int(stride[1]))}, "
+            f"x={boundary_kind(feature_x, columns, step_x, valid_widths[0], int(stride[2]))})"
+        )
     message = (
         f"{', '.join(context)}; max_abs_diff={maximum_absolute_difference:.9g}; "
         f"max_rel_diff_away_from_zero={maximum_relative_difference:.9g}; "
@@ -1740,13 +1787,15 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             quantity="multi-tile complete four-stage features",
             cycle=phase,
         )
-        for output in stream_features:
-            torch.testing.assert_close(
+        for item, output in zip(streamers, stream_features):
+            _assert_close_with_diagnostics(
                 output,
                 full_features,
                 rtol=_SAME_LAYOUT_RTOL,
                 atol=_SAME_LAYOUT_ATOL,
-                msg=f"{phase} streamed feature map",
+                quantity="multi-tile complete four-stage streamed feature map",
+                cycle=phase,
+                streaming=item,
             )
 
         # Verify the actual forward context, rather than merely relying on the
@@ -1861,6 +1910,60 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         [streaming, cached_streaming],
         phase="post-optimizer cycle (reused and tile-cache-reconstructed streamers)",
         seed=47001,
+    )
+
+
+def test_first_nat_stage_shifted_tiles_preserve_downsampler_phase(natten_backend):
+    """The first complete stage stays exact at the shifted stride-2 boundary.
+
+    This uses the physical tile and image sizes from the four-stage integration
+    test.  Keeping the tokenizer in the prefix is important: the downsampler's
+    stride is cumulative with the tokenization stride, rather than relative to
+    the stage input.
+    """
+
+    torch.manual_seed(45001)
+    model = NCHWNAT(
+        embed_dim=8,
+        mlp_ratio=2,
+        depths=[1, 1, 1, 1],
+        num_heads=[1, 2, 4, 8],
+        drop_path_rate=0.0,
+        kernel_size=3,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        layer_scale=None,
+    ).float()
+    prefix = nn.Sequential(
+        copy.deepcopy(model.patch_embed), copy.deepcopy(model.levels[0])
+    )
+    full_prefix = copy.deepcopy(prefix)
+    tile_shape = (1, 3, 257, 261)
+    image_shape = (339, 351)
+    streaming = StreamingCNN(prefix, tile_shape=tile_shape, copy_to_gpu=True)
+
+    value = torch.randn(1, 3, *image_shape)
+    expected = full_prefix(value)
+    actual = streaming(value)
+    starts = [(y, x) for y, x, _ in streaming._last_forward_tiles]
+    rows = sorted({y for y, _ in starts})
+    columns = sorted({x for _, x in starts})
+    valid_heights, valid_widths = streaming._compute_valid_output_sizes()
+    step_y, step_x = streaming._compute_valid_input_step(valid_heights, valid_widths)
+
+    assert len(rows) >= 2 and len(columns) >= 2
+    assert rows[-1] != (len(rows) - 1) * step_y
+    assert columns[-1] != (len(columns) - 1) * step_x
+    # Tokenizer stride 4 followed by the stage downsampler stride 2.
+    assert streaming.output_stride.tolist() == [1, 8, 8]
+    assert all(y % 8 == 0 and x % 8 == 0 for y, x in starts)
+    _assert_close_with_diagnostics(
+        actual,
+        expected,
+        rtol=_SAME_LAYOUT_RTOL,
+        atol=_SAME_LAYOUT_ATOL,
+        quantity="first NAT stage shifted-tile downsampler output",
+        streaming=streaming,
     )
 
 
