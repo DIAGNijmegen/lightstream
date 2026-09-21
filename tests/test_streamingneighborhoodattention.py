@@ -414,6 +414,41 @@ class _LocalNHWCBackend(nn.Module):
         return (local * self.scale[None, :, None, None]).permute(0, 2, 3, 1)
 
 
+class _LinearNHWCBackend(nn.Module):
+    """Exercise autocast-sensitive matrix multiplication in replay."""
+
+    def __init__(self, channels=4):
+        super().__init__()
+        self.kernel_size = 3
+        self.dilation = 1
+        self.projection = nn.Linear(channels, channels)
+
+    def forward(self, value):
+        return self.projection(value)
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_streaming_attention_backward_restores_cuda_autocast_state():
+    attention = StreamingNeighborhoodAttention2D(
+        attention=_LinearNHWCBackend()
+    ).cuda()
+    attention.input_loc = Box(0, 0, 0, 0, None)
+    input = torch.randn(1, 4, 5, 5, device="cuda", requires_grad=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        output = attention(input)
+        assert output.dtype == torch.bfloat16
+
+    # Backward deliberately starts after the user autocast context has ended.
+    # custom_bwd must restore the forward state while constructing the replay
+    # graph, otherwise Linear backward mixes BFloat16 and Float matrices.
+    output.sum().backward()
+
+    assert input.grad is not None
+    assert attention.attention.projection.weight.grad is not None
+
+
 def _manual_halo_tiles(module, image, query_shape):
     """Run clipped halo tiles and retain every global query exactly once."""
 
