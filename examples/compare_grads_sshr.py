@@ -212,10 +212,13 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network = StreamingSSHR(
         "resnet18",
         args.tile_size,
+        weights=None,
         additional_modules=None,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
+        copy_to_gpu=device.type == "cuda",
+        statistics_on_cpu=device.type == "cuda",
         saliency=args.input_grad,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
@@ -332,7 +335,12 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
                 f"mean abs diff={input_grad_diff.mean().item():.6e}, "
                 f"max abs diff={input_grad_diff.max().item():.6e}"
             )
-            compare_saliency_candidates(network.stream_network, reference_input_grad)
+            compare_saliency_candidates(
+                network.stream_network,
+                reference_input_grad,
+                rtol=args.input_grad_rtol,
+                atol=args.input_grad_atol,
+            )
 
     _compare_selected_grads(
         network.stream_network.stream_module,
@@ -358,6 +366,7 @@ def main() -> None:
     parser.add_argument("--input-size", type=int, default=4608)
     parser.add_argument("--input-grad-rtol", type=float, default=1e-4)
     parser.add_argument("--input-grad-atol", type=float, default=1e-6)
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
@@ -370,7 +379,10 @@ def main() -> None:
 
     torch.manual_seed(0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available() else
+        "cpu" if args.device == "auto" else args.device
+    )
     dtype = _parse_dtype(args.dtype)
 
     img = torch.rand((1, 3, args.input_size, args.input_size), device=device, dtype=dtype)

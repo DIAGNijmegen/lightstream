@@ -91,11 +91,17 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=1280)
     parser.add_argument("--input-size", type=int, default=2560)
+    parser.add_argument("--input-grad-rtol", type=float, default=1e-4)
+    parser.add_argument("--input-grad-atol", type=float, default=1e-6)
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     args = parser.parse_args()
 
     torch.manual_seed(0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available() else
+        "cpu" if args.device == "auto" else args.device
+    )
     dtype = _parse_dtype(args.dtype)
     tile_size = args.tile_size
     input_size = args.input_size
@@ -107,11 +113,14 @@ def main() -> None:
     network = StreamingResNet(
         "resnet50",
         tile_size,
+        weights=None,
         replace_stride_with_dilation= [False, True, True],
         remove_last_block=True,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
+        copy_to_gpu=device.type == "cuda",
+        statistics_on_cpu=device.type == "cuda",
         saliency=True,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
@@ -119,6 +128,10 @@ def main() -> None:
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
     network.stream_network.saliency_diagnostics = True
+    valid_heights, valid_widths = network.stream_network._compute_valid_output_sizes()
+    safe_step = network.stream_network._compute_valid_input_step(valid_heights, valid_widths)
+    shifted = tuple(size % step != 0 for size, step in zip(img.shape[-2:], safe_step))
+    print(f"computed safe tile step={safe_step} (shifted boundary tiles by axis={shifted})")
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
@@ -148,7 +161,12 @@ def main() -> None:
     if img_normal.grad is not None:
         input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
         print(f"Input gradient max diff: {input_grad_diff.max()}")
-        compare_saliency_candidates(network.stream_network, img_normal.grad)
+        compare_saliency_candidates(
+            network.stream_network,
+            img_normal.grad,
+            rtol=args.input_grad_rtol,
+            atol=args.input_grad_atol,
+        )
 
     _compare_grads(streaming_param_grads, normal_param_grads)
     _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)

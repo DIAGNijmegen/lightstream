@@ -5,33 +5,43 @@ from __future__ import annotations
 import torch
 
 
-def compare_saliency_candidates(stream_network, reference: torch.Tensor) -> None:
-    """Compare every allocated diagnostic map with a reference input gradient."""
+def compare_saliency_candidates(
+    stream_network,
+    reference: torch.Tensor,
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-6,
+) -> dict[str, bool]:
+    """Compare diagnostic maps with a reference using the requested tolerances."""
     maps = getattr(stream_network, "saliency_diagnostic_maps", {})
     if not maps:
         print("Saliency candidates are disabled or were not produced.")
-        return
+        return {}
 
     reference = reference.detach()
-    reference_support = reference.ne(0)
+    reference_support = reference.abs() > atol
     first_failure = None
+    results = {}
     for name in ("raw", "grad_lost", "ownership", "production"):
         candidate = maps.get(name)
         if candidate is None:
             print(f"\nSaliency candidate {name}: unavailable (allocation failed)")
+            results[name] = False
             continue
         candidate = candidate.to(device=reference.device, dtype=reference.dtype)
         if candidate.shape != reference.shape:
             print(f"\nSaliency candidate {name}: shape mismatch {tuple(candidate.shape)} != {tuple(reference.shape)}")
             first_failure = first_failure or name
+            results[name] = False
             continue
 
-        candidate_support = candidate.ne(0)
+        candidate_support = candidate.abs() > atol
         missing = reference_support & ~candidate_support
         extra = candidate_support & ~reference_support
         absolute_error = (candidate - reference).abs()
         supported_error = absolute_error[reference_support]
-        error_support = absolute_error.ne(0)
+        tolerance = atol + rtol * reference.abs()
+        error_support = absolute_error > tolerance
         spatial_error = error_support.any(dim=tuple(range(error_support.ndim - 2)))
         coordinates = spatial_error.nonzero(as_tuple=False)
         error_box = None
@@ -47,6 +57,7 @@ def compare_saliency_candidates(stream_network, reference: torch.Tensor) -> None
         mean_error = supported_error.mean().item() if supported_error.numel() else 0.0
         max_error = supported_error.max().item() if supported_error.numel() else 0.0
         failed = bool(missing.any() or extra.any() or error_support.any())
+        results[name] = not failed
         if failed and first_failure is None:
             first_failure = name
         print(
@@ -57,6 +68,9 @@ def compare_saliency_candidates(stream_network, reference: torch.Tensor) -> None
             f"  error bounding box [top, left, bottom, right): {error_box}\n"
             f"  per-row missing-support counts: {row_counts}\n"
             f"  per-column missing-support counts: {column_counts}"
+            f"\n  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
+            f"{'PASS' if not failed else 'FAIL'}"
         )
 
     print(f"\nEarliest failing saliency transformation: {first_failure or 'none'}")
+    return results
