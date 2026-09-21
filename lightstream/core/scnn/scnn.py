@@ -183,7 +183,7 @@ class StreamingCNN(torch.nn.Module):
         verbose=False,
         deterministic=False,
         saliency=False,
-        saliency_diagnostics=False,
+        diagnose_saliency_assembly=False,
         eps=1e-5,
         copy_to_gpu=True,
         dtype=None,
@@ -202,8 +202,8 @@ class StreamingCNN(torch.nn.Module):
                 module's logger at DEBUG level (default is False).
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
-            saliency_diagnostics (bool): retain per-tile saliency transformation metadata and
-                best-effort candidate maps. This is diagnostic-only and implies ``saliency``.
+            diagnose_saliency_assembly (bool): additionally retain per-tile saliency
+                transformation metadata and counterfactual candidate maps when saliency is enabled.
             eps (float): epsilon error to compare floating values
         """
         super().__init__()
@@ -217,8 +217,8 @@ class StreamingCNN(torch.nn.Module):
         if dtype is not None:
             self.dtype = dtype
         self.tile_shape = tile_shape
-        self.saliency_diagnostics = bool(saliency_diagnostics)
-        self.gather_input_gradient = bool(saliency or saliency_diagnostics)
+        self.diagnose_saliency_assembly = bool(diagnose_saliency_assembly)
+        self.gather_input_gradient = bool(saliency)
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
 
@@ -254,9 +254,6 @@ class StreamingCNN(torch.nn.Module):
         self._prepared_reducer_domain_masks = {}
         self._current_output_heights = None
         self._current_output_widths = None
-        self.saliency_diagnostic_records = []
-        self.saliency_diagnostic_maps = {}
-
         if state_dict is None:
             self._configure()
         else:
@@ -1783,24 +1780,18 @@ class StreamingCNN(torch.nn.Module):
 
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
-            # Track writes separately from their values: a written gradient may
-            # legitimately be zero, which is different from an input coordinate
-            # that was never visited during backward replay.
-            self.saliency_coverage_map = torch.zeros(image.shape, dtype=torch.bool, device="cpu")
-            self.saliency_nonzero_coverage_map = torch.zeros(
-                image.shape, dtype=torch.bool, device="cpu"
-            )
-            if getattr(self, "saliency_diagnostics", False):
-                diagnose_assembly = self.saliency_diagnostics != "parity"
+            if getattr(self, "diagnose_saliency_assembly", False):
+                self.saliency_coverage_map = torch.zeros(image.shape, dtype=torch.bool, device="cpu")
+                self.saliency_nonzero_coverage_map = torch.zeros(
+                    image.shape, dtype=torch.bool, device="cpu"
+                )
                 self.saliency_diagnostic_records = []
                 self._saliency_diagnostic_destination_coverage = torch.zeros(
                     image.shape[-2:], dtype=torch.bool, device="cpu"
                 )
                 self.saliency_diagnostic_maps = {}
                 self.saliency_diagnostic_write_count_maps = {}
-                candidate_names = ["raw", "production"]
-                if diagnose_assembly:
-                    candidate_names[1:1] = ["grad_lost", "ownership"]
+                candidate_names = ["raw", "grad_lost", "ownership", "production"]
                 for name in candidate_names:
                     try:
                         self.saliency_diagnostic_maps[name] = torch.zeros(
@@ -1813,7 +1804,7 @@ class StreamingCNN(torch.nn.Module):
                             name,
                         )
                         self.saliency_diagnostic_maps[name] = None
-                count_names = ("raw", "grad_lost", "ownership") if diagnose_assembly else ()
+                count_names = ("raw", "grad_lost", "ownership")
                 for name in count_names:
                     try:
                         self.saliency_diagnostic_write_count_maps[name] = torch.zeros(
@@ -2784,8 +2775,10 @@ class StreamingCNN(torch.nn.Module):
                 ),
             )
 
-            if getattr(self, "saliency_diagnostics", False):
-                diagnose_assembly = self.saliency_diagnostics != "parity"
+            diagnose_saliency_assembly = getattr(
+                self, "diagnose_saliency_assembly", False
+            )
+            if diagnose_saliency_assembly:
                 destination_bounds = (
                     destination[2].start,
                     destination[2].stop,
@@ -2797,8 +2790,7 @@ class StreamingCNN(torch.nn.Module):
                 ]
                 overlaps_previous = bool(destination_2d.any().item())
                 destination_2d.fill_(True)
-                if diagnose_assembly:
-                    self.saliency_diagnostic_records.append(
+                self.saliency_diagnostic_records.append(
                     {
                         "input_loc": {"y": int(input_loc.y), "x": int(input_loc.x)},
                         "sides": {
@@ -2847,7 +2839,7 @@ class StreamingCNN(torch.nn.Module):
                         },
                         "destination_overlaps_previous": overlaps_previous,
                     }
-                    )
+                )
                 raw_cpu = raw_input_grad.detach().cpu()
                 valid_cpu = valid_grad_in.detach().cpu()
                 relevant_cpu = relevant_input_grad.detach().cpu()
@@ -2908,8 +2900,9 @@ class StreamingCNN(torch.nn.Module):
                 slice(int(input_loc.x), int(input_loc.x) + raw_input_grad.shape[3]),
             )
             self.saliency_map[raw_destination] += raw_input_grad
-            self.saliency_coverage_map[raw_destination] = True
-            self.saliency_nonzero_coverage_map[raw_destination] |= raw_input_grad.ne(0)
+            if diagnose_saliency_assembly or hasattr(self, "saliency_coverage_map"):
+                self.saliency_coverage_map[raw_destination] = True
+                self.saliency_nonzero_coverage_map[raw_destination] |= raw_input_grad.ne(0)
 
             del relevant_input_grad
             del valid_grad_in

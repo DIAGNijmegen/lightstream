@@ -220,16 +220,12 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         copy_to_gpu=device.type == "cuda",
         statistics_on_cpu=device.type == "cuda",
         saliency=args.input_grad,
+        diagnose_saliency_assembly=args.diagnose_saliency_assembly,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.stream_network.saliency_diagnostics = (
-        ("assembly" if args.diagnose_saliency_assembly else "parity")
-        if args.input_grad
-        else False
-    )
 
     valid_output_heights, valid_output_widths = network.stream_network._compute_valid_output_sizes()
     safe_step = network.stream_network._compute_valid_input_step(
@@ -316,21 +312,20 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
             print("Input gradient comparison skipped: streaming saliency map is missing.")
         else:
             stream_input_grad = network.stream_network.saliency_map.to(device=img_normal.grad.device)
-            write_coverage_map = network.stream_network.saliency_coverage_map.to(
-                device=img_normal.grad.device
-            )
-            nonzero_coverage_map = network.stream_network.saliency_nonzero_coverage_map.to(
-                device=img_normal.grad.device
-            )
             reference_input_grad = img_normal.grad.detach()
-            _assert_input_gradient_parity(
-                stream_input_grad,
-                reference_input_grad,
-                write_coverage_map,
-                nonzero_coverage_map,
-                rtol=args.input_grad_rtol,
-                atol=args.input_grad_atol,
-            )
+            if args.diagnose_saliency_assembly:
+                _assert_input_gradient_parity(
+                    stream_input_grad,
+                    reference_input_grad,
+                    network.stream_network.saliency_coverage_map.to(
+                        device=img_normal.grad.device
+                    ),
+                    network.stream_network.saliency_nonzero_coverage_map.to(
+                        device=img_normal.grad.device
+                    ),
+                    rtol=args.input_grad_rtol,
+                    atol=args.input_grad_atol,
+                )
             input_grad_diff = (reference_input_grad - stream_input_grad).abs()
             print(
                 "Input gradient full-tensor stats: "

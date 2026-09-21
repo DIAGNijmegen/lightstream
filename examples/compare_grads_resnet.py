@@ -104,6 +104,11 @@ def main() -> None:
         help="Print complete saliency coordinate and mismatch-count diagnostics.",
     )
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument(
+        "--no-input-grad", dest="input_grad", action="store_false",
+        help="Disable streaming saliency/input-gradient gathering and skip input-gradient comparison.",
+    )
+    parser.set_defaults(input_grad=True)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -131,15 +136,13 @@ def main() -> None:
         normalize_on_gpu=False,
         copy_to_gpu=device.type == "cuda",
         statistics_on_cpu=device.type == "cuda",
-        saliency=True,
+        saliency=args.input_grad,
+        diagnose_saliency_assembly=args.diagnose_saliency_assembly,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.stream_network.saliency_diagnostics = (
-        "assembly" if args.diagnose_saliency_assembly else "parity"
-    )
     valid_heights, valid_widths = network.stream_network._compute_valid_output_sizes()
     safe_step = network.stream_network._compute_valid_input_step(valid_heights, valid_widths)
     shifted = tuple(size % step != 0 for size, step in zip(img.shape[-2:], safe_step))
@@ -170,7 +173,7 @@ def main() -> None:
     normal_loss.backward()
     normal_param_grads = _gather_param_grads(normal_net)
 
-    if img_normal.grad is not None:
+    if args.input_grad and img_normal.grad is not None:
         input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
         print(f"Input gradient max diff: {input_grad_diff.max()}")
         compare_saliency_candidates(
