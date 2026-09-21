@@ -1762,10 +1762,9 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     full_nchw = NCHWNAT(**nchw_configuration).float().cuda()
     full_nchw.load_state_dict(convert_nhwc_nat_state_dict(reference.state_dict()))
 
-    # The full extractor loses a roughly 183-pixel input border. This is the
-    # smallest candidate (in 32-pixel increments) whose valid interior exceeds
-    # the model's internal alignment on both axes.
-    tile_shape = (1, 3, 321, 325)
+    # Use physical tile dimensions whose measured valid interior exceeds the
+    # model's internal alignment on both axes.
+    tile_shape = (1, 3, 353, 357)
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
 
@@ -1791,6 +1790,9 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         tile_shape[-2] + height_excess,
         tile_shape[-1] + width_excess,
     )
+    assert image_shape[0] % 2 == 1
+    assert image_shape[1] % 2 == 1
+    assert image_shape[0] != image_shape[1]
     n_rows, n_cols = streaming._compute_tile_grid(
         *image_shape,
         tile_shape[-2],
