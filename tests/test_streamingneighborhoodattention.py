@@ -1762,11 +1762,10 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     full_nchw = NCHWNAT(**nchw_configuration).float().cuda()
     full_nchw.load_state_dict(convert_nhwc_nat_state_dict(reference.state_dict()))
 
-    # The full extractor loses a roughly 183-pixel input border. These physical
-    # tiles retain an aligned interior of at least 64 pixels on both axes, while
-    # the odd, non-square image forces a shifted final tile along both axes.
-    tile_shape = (1, 3, 289, 293)
-    image_shape = (371, 383)
+    # The full extractor loses a roughly 183-pixel input border. This is the
+    # smallest candidate (in 32-pixel increments) whose valid interior exceeds
+    # the model's internal alignment on both axes.
+    tile_shape = (1, 3, 321, 325)
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
 
@@ -1777,8 +1776,21 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     valid_step_height, valid_step_width = streaming._compute_valid_input_step(
         valid_heights, valid_widths
     )
-    assert valid_step_height >= 64
-    assert valid_step_width >= 64
+    align_height, align_width = (
+        int(value) for value in streaming._compute_internal_alignment()
+    )
+    assert valid_step_height > align_height
+    assert valid_step_width > align_width
+
+    # An aligned excess between one and two valid steps guarantees that the
+    # final tile is shifted from the regular grid. Since both the tile and image
+    # dimensions are odd, this also retains the odd, non-square coverage case.
+    height_excess = valid_step_height + align_height
+    width_excess = valid_step_width + align_width
+    image_shape = (
+        tile_shape[-2] + height_excess,
+        tile_shape[-1] + width_excess,
+    )
     n_rows, n_cols = streaming._compute_tile_grid(
         *image_shape,
         tile_shape[-2],
@@ -1805,11 +1817,8 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     assert len(expected_columns) >= 2
     assert expected_rows[-1] != (n_rows - 1) * valid_step_height
     assert expected_columns[-1] != (n_cols - 1) * valid_step_width
-    internal_stride_height, internal_stride_width = (
-        int(value) for value in streaming._compute_internal_alignment()
-    )
-    assert expected_rows[-1] % internal_stride_height == 0
-    assert expected_columns[-1] % internal_stride_width == 0
+    assert expected_rows[-1] % align_height == 0
+    assert expected_columns[-1] % align_width == 0
     full_heights, full_widths = streaming._compute_full_output_sizes(shape_only_image)
     assert full_heights[0] > valid_heights[0]
     assert full_widths[0] > valid_widths[0]
