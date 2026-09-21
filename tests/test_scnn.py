@@ -182,6 +182,37 @@ def test_saliency_coverage_distinguishes_zero_write_from_unvisited_coordinate():
     torch.testing.assert_close(scnn.saliency_nonzero_coverage_map, scnn.saliency_map.ne(0))
 
 
+def test_saliency_diagnostics_capture_stages_without_changing_production_map():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_diagnostics = True
+    scnn.saliency_map = torch.zeros(1, 3, 6, 6)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_diagnostic_records = []
+    scnn.saliency_diagnostic_maps = {
+        name: torch.zeros_like(scnn.saliency_map)
+        for name in ("raw", "grad_lost", "ownership", "production")
+    }
+    scnn._saliency_diagnostic_destination_coverage = torch.zeros(6, 6, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1)
+    input_conv.grad_lost = Lost(1, 1, 1, 1)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(0, 6, 0, 6, Sides(True, True, False, False))
+    scnn.saliency_old_indices = Box(0, 0, 0, 0, None)
+    raw = torch.ones(1, 3, 6, 6)
+
+    scnn._backward_saliency_hook(input_conv, (raw,), (torch.ones(1, 2, 6, 6),))
+
+    record = scnn.saliency_diagnostic_records[0]
+    assert record["raw_shape"] == (1, 3, 6, 6)
+    assert record["post_grad_lost_shape"] == (1, 3, 5, 5)
+    assert record["post_ownership_shape"] == (1, 3, 5, 5)
+    assert record["raw_nonzero"] == 108
+    assert record["destination_overlaps_previous"] is False
+    torch.testing.assert_close(scnn.saliency_diagnostic_maps["production"], scnn.saliency_map)
+
+
 def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
     """A diagnostic cursor gap must not discard any dependency gradients."""
     torch.manual_seed(93)
