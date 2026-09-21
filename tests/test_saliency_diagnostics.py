@@ -57,3 +57,37 @@ def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
     report = capsys.readouterr().out
     assert "exact maximum absolute error: 1.00000000000000007e-17" in report
     assert "Earliest failing saliency transformation: none" in report
+
+
+def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
+    reference = torch.tensor([[[[2.0, 2.0]]]])
+    raw = reference.clone()
+    cropped = torch.tensor([[[[1.0, 2.0]]]])
+    count_maps = {
+        "raw": torch.tensor([[[[2, 1]]]], dtype=torch.int32),
+        "grad_lost": torch.ones((1, 1, 1, 2), dtype=torch.int32),
+        "ownership": torch.ones((1, 1, 1, 2), dtype=torch.int32),
+    }
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": raw,
+            "grad_lost": cropped,
+            "ownership": cropped,
+            "production": raw,
+        },
+        saliency_diagnostic_write_count_maps=count_maps,
+        saliency_diagnostic_records=[{
+            "candidate_destination_slices": {
+                "grad_lost": (0, 0, 1, 2),
+                "ownership": (0, 0, 1, 2),
+            },
+            "sides": {"top": True, "left": False, "bottom": False, "right": True},
+        }],
+    )
+
+    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
+
+    report = capsys.readouterr().out
+    assert "error: [(0, 0)]" in report
+    assert "boundary=(0, 0, 1, 2)" in report
+    assert "Sides(top=True, left=False, bottom=False, right=True): 1 coordinates" in report
