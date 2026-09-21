@@ -146,16 +146,12 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         std=[1, 1, 1],
         normalize_on_gpu=False,
         saliency=args.input_grad,
+        diagnose_saliency_assembly=args.diagnose_saliency_assembly,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.stream_network.saliency_diagnostics = (
-        ("assembly" if args.diagnose_saliency_assembly else "parity")
-        if args.input_grad
-        else False
-    )
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
     print(

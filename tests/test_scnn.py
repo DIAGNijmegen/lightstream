@@ -18,6 +18,41 @@ from lightstream.core.layers import (
     StreamingUpsample2d,
 )
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
+
+
+@pytest.mark.parametrize(
+    ("saliency", "diagnose_saliency_assembly", "expect_saliency", "expect_diagnostics"),
+    [
+        (False, False, False, False),
+        (True, False, True, False),
+        (True, True, True, True),
+        (False, True, False, False),
+    ],
+)
+def test_saliency_diagnostic_state_is_opt_in(
+    saliency, diagnose_saliency_assembly, expect_saliency, expect_diagnostics
+):
+    scnn = StreamingCNN(
+        torch.nn.Sequential(torch.nn.Conv2d(3, 2, kernel_size=3, padding=1)),
+        tile_shape=(1, 3, 4, 4),
+        saliency=saliency,
+        diagnose_saliency_assembly=diagnose_saliency_assembly,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+    )
+
+    scnn(torch.rand(1, 3, 4, 4))
+
+    assert hasattr(scnn, "saliency_map") is expect_saliency
+    for name in (
+        "saliency_coverage_map",
+        "saliency_nonzero_coverage_map",
+        "saliency_diagnostic_maps",
+        "saliency_diagnostic_write_count_maps",
+        "saliency_diagnostic_records",
+        "_saliency_diagnostic_destination_coverage",
+    ):
+        assert hasattr(scnn, name) is expect_diagnostics
 from lightstream.core.scnn.utils import Box, Lost, Sides
 from lightstream.models.testnet.segment import StreamingTestNet
 from lightstream.models.testnet.testnet import StreamingTestNet as SaliencyTestNet
@@ -255,7 +290,7 @@ def test_saliency_raw_placement_uses_input_coordinates_for_strided_first_conv():
 
 def test_saliency_diagnostics_capture_stages_without_changing_production_map():
     scnn = StreamingCNN.__new__(StreamingCNN)
-    scnn.saliency_diagnostics = True
+    scnn.diagnose_saliency_assembly = True
     scnn.saliency_map = torch.zeros(1, 3, 6, 6)
     scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
     scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
@@ -321,7 +356,7 @@ def test_testnet_raw_saliency_candidate_characterizes_later_stage_regressions(tm
     scnn.dtype = dtype
     scnn.mean = scnn.mean.to(device=device, dtype=dtype)
     scnn.std = scnn.std.to(device=device, dtype=dtype)
-    scnn.saliency_diagnostics = True
+    scnn.diagnose_saliency_assembly = True
     for module in scnn.stream_module.modules():
         if isinstance(module, nn.BatchNorm2d):
             module.eval()

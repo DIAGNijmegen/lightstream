@@ -95,6 +95,9 @@ def compare_saliency_candidates(
     The default report is limited to the production regression result.
     """
     maps = getattr(stream_network, "saliency_diagnostic_maps", {})
+    if not diagnose_assembly and not maps:
+        production = getattr(stream_network, "saliency_map", None)
+        maps = {"production": production} if production is not None else {}
     if not maps:
         print("Saliency candidates are disabled or were not produced.")
         return {}
