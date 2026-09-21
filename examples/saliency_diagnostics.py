@@ -83,14 +83,16 @@ def compare_saliency_candidates(
     rtol: float = 1e-4,
     atol: float = 1e-6,
     verbose: bool = False,
+    diagnose_assembly: bool = False,
 ) -> dict[str, bool]:
     """Report saliency stages and assert parity for the supported candidates.
 
     ``raw`` and ``production`` are regression candidates.  The intermediate
     ``grad_lost`` and ``ownership`` maps exist to characterize the historical
     transformations and are deliberately not part of the regression result.
-    Set ``verbose`` to print the complete per-row and per-column mismatch arrays;
-    the default report remains compact for large images.
+    Set ``diagnose_assembly`` to report the counterfactual assembly stages and
+    ``verbose`` to print their complete per-row and per-column mismatch arrays.
+    The default report is limited to the production regression result.
     """
     maps = getattr(stream_network, "saliency_diagnostic_maps", {})
     if not maps:
@@ -99,6 +101,43 @@ def compare_saliency_candidates(
 
     reference = reference.detach()
     reference_support = reference.abs() > atol
+    if not diagnose_assembly:
+        production = maps.get("production")
+        if production is None or production.shape != reference.shape:
+            raise AssertionError("production saliency candidate is unavailable or has the wrong shape")
+        production = production.to(device=reference.device, dtype=reference.dtype)
+        production_support = production.abs() > atol
+        missing = reference_support & ~production_support
+        extra = production_support & ~reference_support
+        error = (production - reference).abs()
+        supported_error = error[reference_support]
+        passed = not bool(
+            missing.any() or extra.any() or (error > atol + rtol * reference.abs()).any()
+        )
+        print(
+            "Saliency production comparison:\n"
+            f"  reference support: {reference_support.count_nonzero().item()}\n"
+            f"  production support: {production_support.count_nonzero().item()}\n"
+            "  production reference-support mean absolute error: "
+            f"{supported_error.mean().item() if supported_error.numel() else 0.0:.6e}\n"
+            f"  production maximum absolute error: {error.max().item() if error.numel() else 0.0:.17e}\n"
+            f"  production tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
+            f"{'PASS' if passed else 'FAIL'}"
+        )
+        raw = maps.get("raw")
+        raw_parity = True
+        if raw is not None and raw.shape == production.shape:
+            raw = raw.to(device=reference.device, dtype=reference.dtype)
+            raw_parity = bool(torch.all(
+                (raw - production).abs() <= atol + rtol * production.abs()
+            ))
+            print(f"Raw/production parity check: {'PASS' if raw_parity else 'FAIL'}")
+        if not passed:
+            raise AssertionError("production saliency candidate failed reference tolerance")
+        if not raw_parity:
+            raise AssertionError("raw and production saliency candidates differ")
+        return {"production": passed, **({"raw": raw_parity} if raw is not None else {})}
+
     earliest_destructive = None
     results = {}
     for name in ("raw", "grad_lost", "ownership", "production"):

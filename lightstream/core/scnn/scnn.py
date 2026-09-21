@@ -1791,13 +1791,17 @@ class StreamingCNN(torch.nn.Module):
                 image.shape, dtype=torch.bool, device="cpu"
             )
             if getattr(self, "saliency_diagnostics", False):
+                diagnose_assembly = self.saliency_diagnostics != "parity"
                 self.saliency_diagnostic_records = []
                 self._saliency_diagnostic_destination_coverage = torch.zeros(
                     image.shape[-2:], dtype=torch.bool, device="cpu"
                 )
                 self.saliency_diagnostic_maps = {}
                 self.saliency_diagnostic_write_count_maps = {}
-                for name in ("raw", "grad_lost", "ownership", "production"):
+                candidate_names = ["raw", "production"]
+                if diagnose_assembly:
+                    candidate_names[1:1] = ["grad_lost", "ownership"]
+                for name in candidate_names:
                     try:
                         self.saliency_diagnostic_maps[name] = torch.zeros(
                             image.shape, dtype=self.dtype, device="cpu"
@@ -1809,7 +1813,8 @@ class StreamingCNN(torch.nn.Module):
                             name,
                         )
                         self.saliency_diagnostic_maps[name] = None
-                for name in ("raw", "grad_lost", "ownership"):
+                count_names = ("raw", "grad_lost", "ownership") if diagnose_assembly else ()
+                for name in count_names:
                     try:
                         self.saliency_diagnostic_write_count_maps[name] = torch.zeros(
                             image.shape, dtype=torch.int32, device="cpu"
@@ -2780,6 +2785,7 @@ class StreamingCNN(torch.nn.Module):
             )
 
             if getattr(self, "saliency_diagnostics", False):
+                diagnose_assembly = self.saliency_diagnostics != "parity"
                 destination_bounds = (
                     destination[2].start,
                     destination[2].stop,
@@ -2791,7 +2797,8 @@ class StreamingCNN(torch.nn.Module):
                 ]
                 overlaps_previous = bool(destination_2d.any().item())
                 destination_2d.fill_(True)
-                self.saliency_diagnostic_records.append(
+                if diagnose_assembly:
+                    self.saliency_diagnostic_records.append(
                     {
                         "input_loc": {"y": int(input_loc.y), "x": int(input_loc.x)},
                         "sides": {
@@ -2840,7 +2847,7 @@ class StreamingCNN(torch.nn.Module):
                         },
                         "destination_overlaps_previous": overlaps_previous,
                     }
-                )
+                    )
                 raw_cpu = raw_input_grad.detach().cpu()
                 valid_cpu = valid_grad_in.detach().cpu()
                 relevant_cpu = relevant_input_grad.detach().cpu()
