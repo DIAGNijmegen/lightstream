@@ -2824,7 +2824,7 @@ class StreamingCNN(torch.nn.Module):
                     ("raw", raw_destination, raw_cpu, True),
                     ("grad_lost", valid_destination, valid_cpu, True),
                     ("ownership", destination, relevant_cpu, True),
-                    ("production", destination, relevant_cpu, False),
+                    ("production", raw_destination, raw_cpu, True),
                 ):
                     candidate = self.saliency_diagnostic_maps.get(name)
                     if candidate is not None:
@@ -2833,10 +2833,21 @@ class StreamingCNN(torch.nn.Module):
                         else:
                             candidate[target] = source
 
-            relevant_input_grad = relevant_input_grad.detach().cpu()
-            self.saliency_map[destination] = relevant_input_grad
-            self.saliency_coverage_map[destination] = True
-            self.saliency_nonzero_coverage_map[destination] |= relevant_input_grad.ne(0)
+            # Input-tile gradients are dependency contributions, not mutually
+            # exclusive output ownership regions.  Accumulate the complete
+            # gradient at the input tile's true image location.  In particular,
+            # ``input_loc`` is already in input pixels and must not be scaled by
+            # the first convolution's stride.
+            raw_input_grad = raw_input_grad.detach().cpu()
+            raw_destination = (
+                slice(None),
+                slice(None),
+                slice(int(input_loc.y), int(input_loc.y) + raw_input_grad.shape[2]),
+                slice(int(input_loc.x), int(input_loc.x) + raw_input_grad.shape[3]),
+            )
+            self.saliency_map[raw_destination] += raw_input_grad
+            self.saliency_coverage_map[raw_destination] = True
+            self.saliency_nonzero_coverage_map[raw_destination] |= raw_input_grad.ne(0)
 
             del relevant_input_grad
             del valid_grad_in

@@ -40,6 +40,7 @@ class StreamingResNet(StreamingModule):
         encoder: str,
         tile_size: int,
         additional_modules: nn.Module | None = None,
+        weights: str | None = "DEFAULT",
         remove_last_block=False,
         replace_stride_with_dilation: Optional[list[bool]] = None,
         verbose: bool = True,
@@ -61,7 +62,7 @@ class StreamingResNet(StreamingModule):
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
-        resnet = model_choices[encoder](weights="DEFAULT", replace_stride_with_dilation=replace_stride_with_dilation)
+        resnet = model_choices[encoder](weights=weights, replace_stride_with_dilation=replace_stride_with_dilation)
 
         if additional_modules is not None:
             stream_network = Sequential(

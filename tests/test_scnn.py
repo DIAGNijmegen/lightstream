@@ -138,11 +138,10 @@ def test_sshr_saliency_shifted_boundary_tiles_track_writes_for_non_divisible_siz
             (tile_gradient,),
             (torch.ones(1, 2, 8, 8, dtype=torch.double),),
         )
-
-        expected[:, :, :7, :7] = 1
-        expected[:, :, :7, 7:] = 2
-        expected[:, :, 7:, :7] = 3
-        expected[:, :, 7:, 7:] = 4
+        expected[
+            :, :, input_y : input_y + tile_gradient.shape[-2],
+            input_x : input_x + tile_gradient.shape[-1],
+        ] += tile_gradient
 
     reference_support = expected.ne(0)
     missing_support = reference_support & ~scnn.saliency_coverage_map
@@ -151,9 +150,9 @@ def test_sshr_saliency_shifted_boundary_tiles_track_writes_for_non_divisible_siz
     assert reference_support.all()
     assert scnn.saliency_coverage_map.all()
     assert scnn.saliency_nonzero_coverage_map.all()
-    # Preserve the original assembly's selection of only newly visited regions.
-    assert scnn.saliency_map[0, 0, 5, 6].item() == 1
-    assert scnn.saliency_map[0, 0, 1, 7].item() == 2
+    # Both shifted last-axis tiles contribute in the overlapping corner.
+    assert scnn.saliency_map[0, 0, 5, 6].item() == 10
+    assert scnn.saliency_map[0, 0, 1, 7].item() == 3
     torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
 
 
@@ -180,6 +179,32 @@ def test_saliency_coverage_distinguishes_zero_write_from_unvisited_coordinate():
     assert scnn.saliency_coverage_map[..., :4].all()
     assert not scnn.saliency_coverage_map[..., 4].any()
     torch.testing.assert_close(scnn.saliency_nonzero_coverage_map, scnn.saliency_map.ne(0))
+
+
+def test_saliency_raw_placement_uses_input_coordinates_for_strided_first_conv():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 12, 13, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=3, stride=2, padding=1).double()
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(3, 4, 5, 6, Sides(False, False, True, True))
+    # The legacy ownership calculation still runs for the diagnostic candidates.
+    scnn.saliency_old_indices = Box(1, 0, 2, 0, None)
+    raw = torch.arange(72, dtype=torch.double).reshape(1, 3, 4, 6)
+
+    scnn._backward_saliency_hook(
+        input_conv,
+        (raw,),
+        (torch.ones(1, 2, 2, 3, dtype=torch.double),),
+    )
+
+    expected = torch.zeros_like(scnn.saliency_map)
+    expected[:, :, 3:7, 5:11] = raw
+    torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
+    assert scnn.saliency_coverage_map[:, :, 3:7, 5:11].all()
 
 
 def test_saliency_diagnostics_capture_stages_without_changing_production_map():
