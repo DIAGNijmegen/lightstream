@@ -102,6 +102,7 @@ def _assert_close_with_diagnostics(
     parameter_name=None,
     cycle=None,
     streaming=None,
+    coordinate_space=None,
 ):
     """Assert closeness and report useful CUDA parity diagnostics on failure."""
     actual_detached = actual.detach()
@@ -142,6 +143,11 @@ def _assert_close_with_diagnostics(
             f"(channel={maximum_index[-3]}, y={maximum_index[-2]}, "
             f"x={maximum_index[-1]})"
         )
+    if streaming is not None and coordinate_space not in {"input", "output"}:
+        raise ValueError(
+            "coordinate_space must be 'input' or 'output' when streaming "
+            "diagnostics are requested"
+        )
     if streaming is not None and actual_detached.ndim >= 4:
         starts = [(int(y), int(x)) for y, x, _ in streaming._last_forward_tiles]
         context.append(f"input_tile_starts={starts}")
@@ -150,31 +156,46 @@ def _assert_close_with_diagnostics(
         step_y, step_x = streaming._compute_valid_input_step(
             valid_heights, valid_widths
         )
-        stride = streaming._output_stride_per_output[0]
-        feature_y, feature_x = maximum_index[-2:]
-        input_y = feature_y * int(stride[1])
-        input_x = feature_x * int(stride[2])
         rows = sorted({y for y, _ in starts})
         columns = sorted({x for _, x in starts})
 
-        def boundary_kind(coordinate, axis_starts, step, valid_size, axis_stride):
-            boundaries = set()
+        def boundary_kind(coordinate, boundaries, axis_starts, step):
             shifted_boundaries = set()
             for position, start in enumerate(axis_starts):
-                output_start = start // axis_stride
-                output_end = output_start + valid_size
-                boundaries.update((output_start, output_end))
                 if start != position * step:
-                    shifted_boundaries.update((output_start, output_end))
+                    shifted_boundaries.update(boundaries[position])
+            boundaries = {value for pair in boundaries for value in pair}
             if coordinate not in boundaries:
                 return "not-on-tile-boundary"
             return "shifted" if coordinate in shifted_boundaries else "regular"
 
+        y, x = maximum_index[-2:]
+        if coordinate_space == "input":
+            input_y, input_x = maximum_index[-2:]
+            y_boundaries = [
+                (start, start + int(streaming.tile_shape[-2])) for start in rows
+            ]
+            x_boundaries = [
+                (start, start + int(streaming.tile_shape[-1])) for start in columns
+            ]
+        else:
+            stride = streaming._output_stride_per_output[0]
+            stride_y, stride_x = int(stride[1]), int(stride[2])
+            input_y, input_x = y * stride_y, x * stride_x
+            y_boundaries = [
+                (start // stride_y, start // stride_y + valid_heights[0])
+                for start in rows
+            ]
+            x_boundaries = [
+                (start // stride_x, start // stride_x + valid_widths[0])
+                for start in columns
+            ]
+
         context.append(f"max_diff_input_coordinate=(y={input_y}, x={input_x})")
         context.append(
             "tile_boundary="
-            f"(y={boundary_kind(feature_y, rows, step_y, valid_heights[0], int(stride[1]))}, "
-            f"x={boundary_kind(feature_x, columns, step_x, valid_widths[0], int(stride[2]))})"
+            f"(y={boundary_kind(y, y_boundaries, rows, step_y)}, "
+            f"x={boundary_kind(x, x_boundaries, columns, step_x)})"
         )
     message = (
         f"{', '.join(context)}; max_abs_diff={maximum_absolute_difference:.9g}; "
@@ -217,6 +238,43 @@ def test_close_diagnostics_identify_parameter_cycle_and_error_scales():
     assert "max_abs_diff=1" in message
     assert "max_rel_diff_away_from_zero=0.5" in message
     assert "max_tensor_magnitude=2" in message
+
+
+def test_close_diagnostics_keep_image_gradients_in_input_coordinates():
+    class FakeStreaming:
+        tile_shape = (1, 3, 10, 10)
+        _output_stride_per_output = [torch.tensor([1, 4, 4])]
+        _last_forward_tiles = [
+            (y, x, None) for y in (0, 6, 8) for x in (0, 6, 8)
+        ]
+
+        @staticmethod
+        def _compute_valid_output_sizes():
+            return [2], [2]
+
+        @staticmethod
+        def _compute_valid_input_step(valid_heights, valid_widths):
+            assert (valid_heights, valid_widths) == ([2], [2])
+            return 6, 6
+
+    actual = torch.zeros(1, 1, 19, 19)
+    expected = actual.clone()
+    expected[..., 18, 18] = 1
+
+    with pytest.raises(AssertionError) as error:
+        _assert_close_with_diagnostics(
+            actual,
+            expected,
+            rtol=0,
+            atol=0,
+            quantity="streamed image gradient",
+            streaming=FakeStreaming(),
+            coordinate_space="input",
+        )
+
+    message = str(error.value)
+    assert "max_diff_input_coordinate=(y=18, x=18)" in message
+    assert "tile_boundary=(y=shifted, x=shifted)" in message
 
 
 def test_complete_nat_state_conversion_maps_wrappers_and_mlp_kernels():
@@ -1941,6 +1999,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
                 quantity="multi-tile complete four-stage streamed feature map",
                 cycle=f"{phase}, {streamer_name}",
                 streaming=item,
+                coordinate_space="output",
             )
 
         # Verify the actual forward context, rather than merely relying on the
@@ -2008,6 +2067,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
                 quantity="multi-tile complete four-stage streamed image gradient",
                 cycle=f"{phase}, {streamer_name}",
                 streaming=item,
+                coordinate_space="input",
             )
 
         full_pairs = list(parameter_pairs(full_nchw))
@@ -2143,6 +2203,7 @@ def test_first_nat_stage_shifted_tiles_preserve_downsampler_phase(natten_backend
         atol=_SAME_LAYOUT_ATOL,
         quantity="first NAT stage shifted-tile downsampler output",
         streaming=streaming,
+        coordinate_space="output",
     )
 
 
