@@ -153,6 +153,8 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
         ctx.input_loc = input_loc
         ctx.grad_lost = grad_lost
         ctx.output_stride = output_stride
+        ctx.autocast_enabled = torch.is_autocast_enabled(input.device.type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(input.device.type)
         ctx.save_for_backward(input, *parameters)
         with torch.no_grad():
             output = attention(input.permute(0, 2, 3, 1).contiguous())
@@ -163,7 +165,14 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
         input, *parameters = ctx.saved_tensors
         with torch.enable_grad():
             replay_input = input.detach().requires_grad_(True)
-            replay = ctx.attention(replay_input.permute(0, 2, 3, 1).contiguous())
+            with torch.autocast(
+                device_type=input.device.type,
+                dtype=ctx.autocast_dtype,
+                enabled=ctx.autocast_enabled,
+            ):
+                replay = ctx.attention(
+                    replay_input.permute(0, 2, 3, 1).contiguous()
+                )
             replay = replay.permute(0, 3, 1, 2).contiguous()
             trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
             input_gradient = torch.autograd.grad(
