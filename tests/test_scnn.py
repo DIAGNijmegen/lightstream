@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 
@@ -96,64 +97,108 @@ def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
     torch.testing.assert_close(actual, expected)
 
 
-def test_sshr_saliency_shifted_boundary_tiles_track_writes_for_non_divisible_size():
-    """SSHR-style shifted boundary replay tracks writes independently of values."""
+def test_saliency_backward_matches_reference_for_shifted_boundary_tiles():
+    """Production replay preserves input and parameter gradients at shifted edges."""
+    torch.manual_seed(94)
+    dtype = torch.float64
+    rtol, atol = 1e-7, 1e-9
+    tile_height, tile_width = 8, 8
+    image_height, image_width = 11, 13
+
+    model = nn.Sequential(
+        nn.Conv2d(3, 4, kernel_size=3, padding=1),
+        nn.Softplus(),
+        nn.Conv2d(4, 2, kernel_size=3, padding=1),
+    ).to(dtype=dtype).eval()
+    reference = copy.deepcopy(model)
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, tile_height, tile_width),
+        deterministic=True,
+        saliency=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    image = torch.randn(1, 3, image_height, image_width, dtype=dtype)
+
+    streamed_output = scnn(image)
+    safe_height, safe_width = scnn._compute_internal_safe_input_step()
+    assert image_height % safe_height
+    assert image_width % safe_width
+
+    tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
+    final_row_start = image_height - tile_height
+    final_column_start = image_width - tile_width
+    assert final_row_start % safe_height
+    assert final_column_start % safe_width
+    assert any(y == final_row_start for y, _ in tile_starts)
+    assert any(x == final_column_start for _, x in tile_starts)
+
+    output_gradient = torch.randn_like(streamed_output)
+    scnn.backward(image, output_gradient)
+
+    reference_input = image.detach().clone().requires_grad_(True)
+    reference_output = reference(reference_input)
+    torch.autograd.backward(reference_output, output_gradient)
+    reference_saliency = reference_input.grad
+
+    tolerance = atol + rtol * reference_saliency.abs()
+    reference_support = reference_saliency.abs() > tolerance
+    production_support = scnn.saliency_map.abs() > tolerance
+
+    # Keep these checks ordered from missing support, through excess support and
+    # complete numeric parity, to the independent parameter-gradient contract.
+    assert not (reference_support & ~production_support).any()
+    assert not (production_support & ~reference_support).any()
+    torch.testing.assert_close(scnn.saliency_map, reference_saliency, rtol=rtol, atol=atol)
+
+    streaming_parameters = dict(scnn.stream_module.named_parameters())
+    reference_parameters = dict(reference.named_parameters())
+    assert streaming_parameters.keys() == reference_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        assert streaming_parameters[name].grad is not None, name
+        assert reference_parameter.grad is not None, name
+        torch.testing.assert_close(
+            streaming_parameters[name].grad,
+            reference_parameter.grad,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
+
+
+def test_saliency_hook_adds_overlapping_input_gradient_contributions():
+    """The hook-level fixture specifically covers additive overlap arithmetic."""
     scnn = StreamingCNN.__new__(StreamingCNN)
-    scnn.saliency_map = torch.zeros(1, 3, 11, 13, dtype=torch.double)
+    scnn.saliency_map = torch.zeros(1, 3, 4, 7, dtype=torch.double)
     scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
     scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
 
     input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
-    input_conv.grad_lost = Lost(1, 1, 1, 1)
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
     input_conv.output_stride = torch.tensor([1, 1, 1])
     expected = torch.zeros_like(scnn.saliency_map)
 
-    # This fixed 11x13 fixture is non-divisible by its nominal 6x6 safe step.
-    # Consequently the last row starts at 3 (not 6), and the last column at 5
-    # (not 6), exercising overlap on both axes just like the SSHR comparison.
-    safe_step = (6, 6)
-    assert all(size % step for size, step in zip(scnn.saliency_map.shape[-2:], safe_step))
-    tile_starts = ((0, 0), (0, 5), (3, 0), (3, 5))
-    old_indices = (
-        Box(0, 0, 0, 0, None),
-        Box(0, 7, 7, 0, None),
-        Box(0, 7, 13, 0, None),
-        Box(7, 11, 7, 0, None),
+    contributions = (
+        (1.0, (0, 0), Box(0, 0, 0, 0, None)),
+        (2.0, (0, 3), Box(0, 4, 4, 0, None)),
     )
-    assert tile_starts[-1][0] == 3
-    assert tile_starts[-1][1] == 5
-    for tile_index, ((input_y, input_x), previously_seen) in enumerate(
-        zip(tile_starts, old_indices), start=1
-    ):
-        sides = Sides(
-            left=input_x == 0,
-            top=input_y == 0,
-            right=input_x == 5,
-            bottom=input_y == 3,
-        )
-        input_conv.input_loc = Box(input_y, 8, input_x, 8, sides)
+    for value, (input_y, input_x), previously_seen in contributions:
+        input_conv.input_loc = Box(input_y, 4, input_x, 4, Sides(False, False, False, False))
         scnn.saliency_old_indices = previously_seen
-        tile_gradient = torch.full((1, 3, 8, 8), float(tile_index), dtype=torch.double)
+        tile_gradient = torch.full((1, 3, 4, 4), value, dtype=torch.double)
         scnn._backward_saliency_hook(
             input_conv,
             (tile_gradient,),
-            (torch.ones(1, 2, 8, 8, dtype=torch.double),),
+            (torch.ones(1, 2, 4, 4, dtype=torch.double),),
         )
         expected[
             :, :, input_y : input_y + tile_gradient.shape[-2],
             input_x : input_x + tile_gradient.shape[-1],
         ] += tile_gradient
 
-    reference_support = expected.ne(0)
-    missing_support = reference_support & ~scnn.saliency_coverage_map
-    assert not missing_support.any(), missing_support.nonzero().tolist()
-    # Keep numerical disagreement separate from the coverage assertion above.
-    assert reference_support.all()
-    assert scnn.saliency_coverage_map.all()
-    assert scnn.saliency_nonzero_coverage_map.all()
-    # Both shifted last-axis tiles contribute in the overlapping corner.
-    assert scnn.saliency_map[0, 0, 5, 6].item() == 10
-    assert scnn.saliency_map[0, 0, 1, 7].item() == 3
+    assert scnn.saliency_map[0, 0, 0, 3].item() == 3
     torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
 
 
