@@ -24,7 +24,7 @@ def test_candidate_summary_uses_gradient_tolerance_for_errors(capsys):
     )
 
     results = compare_saliency_candidates(
-        stream_network, reference, rtol=0.0, atol=1e-6
+        stream_network, reference, rtol=0.0, atol=1e-6, diagnose_assembly=True
     )
 
     assert results == {
@@ -61,7 +61,7 @@ def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
     )
 
     results = compare_saliency_candidates(
-        stream_network, reference, rtol=1e-7, atol=1e-9
+        stream_network, reference, rtol=1e-7, atol=1e-9, diagnose_assembly=True
     )
 
     assert all(results.values())
@@ -85,7 +85,7 @@ def test_verbose_candidate_summary_includes_complete_mismatch_arrays(capsys):
     )
 
     compare_saliency_candidates(
-        stream_network, reference, rtol=0, atol=1e-6, verbose=True
+        stream_network, reference, rtol=0, atol=1e-6, verbose=True, diagnose_assembly=True
     )
 
     report = capsys.readouterr().out
@@ -108,9 +108,9 @@ def test_production_disagreement_fails_the_regression(capsys):
         compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
 
     report = capsys.readouterr().out
-    assert "Saliency candidate production:" in report
-    assert "tolerance check (rtol=0.000e+00, atol=1.000e-06): FAIL" in report
-    assert "Earliest destructive saliency transformation: grad_lost" in report
+    assert "Saliency production comparison:" in report
+    assert "production tolerance check (rtol=0.000e+00, atol=1.000e-06): FAIL" in report
+    assert "Earliest destructive saliency transformation" not in report
 
 
 def test_raw_and_production_must_match_each_other(capsys):
@@ -125,7 +125,7 @@ def test_raw_and_production_must_match_each_other(capsys):
     )
 
     with pytest.raises(AssertionError, match="raw and production"):
-        compare_saliency_candidates(stream_network, reference, rtol=0.1, atol=0)
+        compare_saliency_candidates(stream_network, reference, rtol=0.1, atol=0, diagnose_assembly=True)
 
     assert "Raw/production parity check: FAIL" in capsys.readouterr().out
 
@@ -158,7 +158,7 @@ def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
         ],
     )
 
-    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
+    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6, diagnose_assembly=True)
 
     report = capsys.readouterr().out
     assert (
@@ -191,7 +191,7 @@ def test_missing_additive_write_coordinates_are_bounded_unless_verbose(capsys):
         saliency_diagnostic_records=[],
     )
 
-    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
+    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6, diagnose_assembly=True)
     report = capsys.readouterr().out
     assert "total=25" in report
     assert "(0, 19)" in report
@@ -200,8 +200,34 @@ def test_missing_additive_write_coordinates_are_bounded_unless_verbose(capsys):
     assert "bounding box [top, left, bottom, right)=(0, 0, 1, 25)" in report
 
     compare_saliency_candidates(
-        stream_network, reference, rtol=0, atol=1e-6, verbose=True
+        stream_network, reference, rtol=0, atol=1e-6, verbose=True, diagnose_assembly=True
     )
     verbose_report = capsys.readouterr().out
     assert "(0, 24)" in verbose_report
     assert "additional coordinates omitted" not in verbose_report
+
+
+def test_default_report_is_compact_and_ignores_counterfactual_divergence(capsys):
+    reference = torch.ones((1, 1, 2, 2))
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": reference.clone(),
+            "grad_lost": torch.zeros_like(reference),
+            "ownership": torch.zeros_like(reference),
+            "production": reference.clone(),
+        }
+    )
+
+    results = compare_saliency_candidates(stream_network, reference)
+
+    assert results == {"production": True, "raw": True}
+    report = capsys.readouterr().out
+    assert "reference support: 4" in report
+    assert "production support: 4" in report
+    assert "production reference-support mean absolute error: 0.000000e+00" in report
+    assert "production maximum absolute error: 0.00000000000000000e+00" in report
+    assert "production tolerance check" in report
+    assert "Raw/production parity check: PASS" in report
+    assert "grad_lost" not in report
+    assert "ownership" not in report
+    assert "Earliest destructive" not in report

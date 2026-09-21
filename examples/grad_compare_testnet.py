@@ -151,7 +151,11 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
-    network.stream_network.saliency_diagnostics = args.input_grad
+    network.stream_network.saliency_diagnostics = (
+        ("assembly" if args.diagnose_saliency_assembly else "parity")
+        if args.input_grad
+        else False
+    )
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
     print(
@@ -236,6 +240,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
                 rtol=args.input_grad_rtol,
                 atol=args.input_grad_atol,
                 verbose=args.verbose_saliency_coordinates,
+                diagnose_assembly=args.diagnose_saliency_assembly,
             )
 
     _compare_selected_grads(
@@ -262,6 +267,11 @@ def main() -> None:
     parser.add_argument("--input-size", type=int, default=3520)
     parser.add_argument("--input-grad-rtol", type=float, default=1e-7)
     parser.add_argument("--input-grad-atol", type=float, default=1e-9)
+    parser.add_argument(
+        "--diagnose-saliency-assembly",
+        action="store_true",
+        help="Construct and report grad-loss/ownership saliency counterfactuals.",
+    )
     parser.add_argument(
         "--verbose-saliency-coordinates",
         action="store_true",
