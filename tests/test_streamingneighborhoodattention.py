@@ -430,23 +430,35 @@ class _LinearNHWCBackend(nn.Module):
 @pytest.mark.cuda_integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_streaming_attention_backward_restores_cuda_autocast_state():
-    attention = StreamingNeighborhoodAttention2D(
-        attention=_LinearNHWCBackend()
-    ).cuda()
+    backend = _LinearNHWCBackend().cuda()
+    reference = copy.deepcopy(backend)
+    attention = StreamingNeighborhoodAttention2D(attention=backend)
     attention.input_loc = Box(0, 0, 0, 0, None)
     input = torch.randn(1, 4, 5, 5, device="cuda", requires_grad=True)
+    reference_input = input.detach().clone().requires_grad_(True)
+
+    reference_output = reference(
+        reference_input.permute(0, 2, 3, 1).contiguous()
+    )
+    reference_output.sum().backward()
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         output = attention(input)
         assert output.dtype == torch.bfloat16
 
     # Backward deliberately starts after the user autocast context has ended.
-    # custom_bwd must restore the forward state while constructing the replay
-    # graph, otherwise Linear backward mixes BFloat16 and Float matrices.
+    # Its nested replay must use the parameters' Float32 dtype rather than
+    # restoring the forward autocast state and silently recomputing in BF16.
     output.sum().backward()
 
-    assert input.grad is not None
-    assert attention.attention.projection.weight.grad is not None
+    torch.testing.assert_close(input.grad, reference_input.grad, rtol=1e-5, atol=1e-6)
+    for parameter, reference_parameter in zip(
+        attention.attention.parameters(), reference.parameters()
+    ):
+        assert parameter.grad.dtype == parameter.dtype
+        torch.testing.assert_close(
+            parameter.grad, reference_parameter.grad, rtol=1e-5, atol=1e-6
+        )
 
 
 def _manual_halo_tiles(module, image, query_shape):
