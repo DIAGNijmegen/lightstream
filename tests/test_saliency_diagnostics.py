@@ -161,8 +161,47 @@ def test_missing_additive_writes_are_reported_by_boundary_and_sides(capsys):
     compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
 
     report = capsys.readouterr().out
-    assert "error: [(0, 0)]" in report
+    assert (
+        "error: total=1, coordinates=[(0, 0)], bounding box "
+        "[top, left, bottom, right)=(0, 0, 1, 1)" in report
+    )
     assert "boundary=(0, 0, 1, 2)" in report
     assert (
         "Sides(top=True, left=False, bottom=False, right=True): 1 coordinates" in report
     )
+
+
+def test_missing_additive_write_coordinates_are_bounded_unless_verbose(capsys):
+    width = 25
+    reference = torch.full((1, 1, 1, width), 2.0)
+    cropped = torch.ones_like(reference)
+    counts = {
+        "raw": torch.full_like(reference, 2, dtype=torch.int32),
+        "grad_lost": torch.ones_like(reference, dtype=torch.int32),
+        "ownership": torch.ones_like(reference, dtype=torch.int32),
+    }
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": reference,
+            "grad_lost": cropped,
+            "ownership": cropped,
+            "production": reference,
+        },
+        saliency_diagnostic_write_count_maps=counts,
+        saliency_diagnostic_records=[],
+    )
+
+    compare_saliency_candidates(stream_network, reference, rtol=0, atol=1e-6)
+    report = capsys.readouterr().out
+    assert "total=25" in report
+    assert "(0, 19)" in report
+    assert "(0, 20)" not in report
+    assert "... 5 additional coordinates omitted" in report
+    assert "bounding box [top, left, bottom, right)=(0, 0, 1, 25)" in report
+
+    compare_saliency_candidates(
+        stream_network, reference, rtol=0, atol=1e-6, verbose=True
+    )
+    verbose_report = capsys.readouterr().out
+    assert "(0, 24)" in verbose_report
+    assert "additional coordinates omitted" not in verbose_report

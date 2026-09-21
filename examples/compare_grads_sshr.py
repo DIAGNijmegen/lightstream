@@ -340,6 +340,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
                 reference_input_grad,
                 rtol=args.input_grad_rtol,
                 atol=args.input_grad_atol,
+                verbose=args.verbose_saliency_coordinates,
             )
 
     _compare_selected_grads(
@@ -366,6 +367,11 @@ def main() -> None:
     parser.add_argument("--input-size", type=int, default=4608)
     parser.add_argument("--input-grad-rtol", type=float, default=1e-4)
     parser.add_argument("--input-grad-atol", type=float, default=1e-6)
+    parser.add_argument(
+        "--verbose-saliency-coordinates",
+        action="store_true",
+        help="Print complete saliency coordinate and mismatch-count diagnostics.",
+    )
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument(
         "--no-input-grad",

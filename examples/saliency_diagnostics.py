@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 
-_MISMATCH_PREVIEW_LIMIT = 5
+_PREVIEW_LIMIT = 20
 
 
 def _format_sides(sides: dict) -> str:
@@ -20,7 +20,7 @@ def _format_sides(sides: dict) -> str:
 
 
 def _report_missing_additive_writes(
-    stream_network, raw, candidate, name, reference, tolerance
+    stream_network, raw, candidate, name, reference, tolerance, *, verbose
 ) -> None:
     """Report non-hole errors associated with fewer additive tile writes."""
     count_maps = getattr(stream_network, "saliency_diagnostic_write_count_maps", None)
@@ -40,10 +40,21 @@ def _report_missing_additive_writes(
         & (candidate - reference).abs().gt(tolerance)
     )
     spatial_mask = mask.any(dim=tuple(range(mask.ndim - 2)))
-    coordinates = [tuple(point) for point in spatial_mask.nonzero().tolist()]
+    coordinates = spatial_mask.nonzero(as_tuple=False)
+    total = coordinates.shape[0]
+    displayed = coordinates if verbose else coordinates[:_PREVIEW_LIMIT]
+    preview = [tuple(point) for point in displayed.tolist()]
+    omitted = total - len(preview)
+    suffix = f" ... {omitted} additional coordinates omitted" if omitted else ""
+    bounding_box = None
+    if total:
+        minimum = coordinates.min(dim=0).values.tolist()
+        maximum = coordinates.max(dim=0).values.tolist()
+        bounding_box = (minimum[0], minimum[1], maximum[0] + 1, maximum[1] + 1)
     print(
         f"  nonzero coordinates with fewer writes than raw and tolerance-significant "
-        f"error: {coordinates}"
+        f"error: total={total}, coordinates={preview}{suffix}, "
+        f"bounding box [top, left, bottom, right)={bounding_box}"
     )
 
     print("  missing-additive-write summary by tile boundary and Sides:")
@@ -121,13 +132,17 @@ def compare_saliency_candidates(
 
         reduce_dims = tuple(range(mismatch.ndim - 2))
         mismatch_spatial_counts = mismatch.sum(dim=reduce_dims)
-        row_counts = mismatch_spatial_counts.sum(dim=1).tolist()
-        column_counts = mismatch_spatial_counts.sum(dim=0).tolist()
+        row_counts = mismatch_spatial_counts.sum(dim=1)
+        column_counts = mismatch_spatial_counts.sum(dim=0)
+        nonzero_row_indices = row_counts.nonzero(as_tuple=False).flatten()
+        nonzero_column_indices = column_counts.nonzero(as_tuple=False).flatten()
         nonzero_rows = [
-            (index, count) for index, count in enumerate(row_counts) if count
+            (int(index), int(row_counts[index]))
+            for index in nonzero_row_indices[:_PREVIEW_LIMIT]
         ]
         nonzero_columns = [
-            (index, count) for index, count in enumerate(column_counts) if count
+            (int(index), int(column_counts[index]))
+            for index in nonzero_column_indices[:_PREVIEW_LIMIT]
         ]
         mean_error = supported_error.mean().item() if supported_error.numel() else 0.0
         max_error = absolute_error.max().item() if absolute_error.numel() else 0.0
@@ -150,22 +165,25 @@ def compare_saliency_candidates(
         )
         if mismatch.any():
             print(
-                f"  total mismatching rows: {len(nonzero_rows)}\n"
-                f"  total mismatching columns: {len(nonzero_columns)}\n"
-                f"  maximum mismatches in any row: {max(row_counts)}\n"
-                f"  maximum mismatches in any column: {max(column_counts)}\n"
+                f"  total mismatching rows: {nonzero_row_indices.numel()}\n"
+                f"  total mismatching columns: {nonzero_column_indices.numel()}\n"
+                f"  maximum mismatches in any row: {row_counts.max().item()}\n"
+                f"  maximum mismatches in any column: {column_counts.max().item()}\n"
                 "  first nonzero row mismatch counts (index, count): "
-                f"{nonzero_rows[:_MISMATCH_PREVIEW_LIMIT]}\n"
+                f"{nonzero_rows}\n"
                 "  first nonzero column mismatch counts (index, count): "
-                f"{nonzero_columns[:_MISMATCH_PREVIEW_LIMIT]}\n"
+                f"{nonzero_columns}\n"
                 f"  error bounding box [top, left, bottom, right): {error_box}"
             )
         else:
-            print("  all tolerance-mismatch counts are zero")
+            print(
+                "  all tolerance-mismatch counts are zero "
+                "(per-row and per-column: all zero)"
+            )
         if verbose:
             print(
-                f"  per-row tolerance-mismatch counts: {row_counts}\n"
-                f"  per-column tolerance-mismatch counts: {column_counts}"
+                f"  per-row tolerance-mismatch counts: {row_counts.tolist()}\n"
+                f"  per-column tolerance-mismatch counts: {column_counts.tolist()}"
             )
         print(
             f"  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
@@ -181,6 +199,7 @@ def compare_saliency_candidates(
                     name,
                     reference,
                     tolerance,
+                    verbose=verbose,
                 )
 
     print(
