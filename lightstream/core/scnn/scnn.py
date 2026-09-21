@@ -1796,6 +1796,7 @@ class StreamingCNN(torch.nn.Module):
                     image.shape[-2:], dtype=torch.bool, device="cpu"
                 )
                 self.saliency_diagnostic_maps = {}
+                self.saliency_diagnostic_write_count_maps = {}
                 for name in ("raw", "grad_lost", "ownership", "production"):
                     try:
                         self.saliency_diagnostic_maps[name] = torch.zeros(
@@ -1808,6 +1809,23 @@ class StreamingCNN(torch.nn.Module):
                             name,
                         )
                         self.saliency_diagnostic_maps[name] = None
+                for name in ("raw", "grad_lost", "ownership"):
+                    try:
+                        self.saliency_diagnostic_write_count_maps[name] = torch.zeros(
+                            image.shape, dtype=torch.int32, device="cpu"
+                        )
+                    except (RuntimeError, MemoryError):
+                        logger.warning(
+                            "Unable to allocate saliency diagnostic write-count map %r; "
+                            "continuing without write-count diagnostics.",
+                            name,
+                        )
+                        self.saliency_diagnostic_write_count_maps[name] = None
+                # Keep the shorter name as an alias for callers that treat these
+                # alongside ``saliency_diagnostic_maps``.
+                self.saliency_diagnostic_count_maps = (
+                    self.saliency_diagnostic_write_count_maps
+                )
 
         self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
@@ -2803,6 +2821,23 @@ class StreamingCNN(torch.nn.Module):
                             "width": int(updated_total_indices.width),
                         },
                         "destination_slices": destination_bounds,
+                        "candidate_destination_slices": {
+                            "raw": (
+                                int(input_loc.y), int(input_loc.x),
+                                int(input_loc.y) + raw_input_grad.shape[2],
+                                int(input_loc.x) + raw_input_grad.shape[3],
+                            ),
+                            "grad_lost": (
+                                int(input_loc.y) + lost.top * stride[1],
+                                int(input_loc.x) + lost.left * stride[2],
+                                int(input_loc.y) + lost.top * stride[1] + valid_grad_in.shape[2],
+                                int(input_loc.x) + lost.left * stride[2] + valid_grad_in.shape[3],
+                            ),
+                            "ownership": (
+                                destination[2].start, destination[3].start,
+                                destination[2].stop, destination[3].stop,
+                            ),
+                        },
                         "destination_overlaps_previous": overlaps_previous,
                     }
                 )
@@ -2832,6 +2867,26 @@ class StreamingCNN(torch.nn.Module):
                             candidate[target] += source
                         else:
                             candidate[target] = source
+                    if name != "production":
+                        count_maps = getattr(
+                            self, "saliency_diagnostic_write_count_maps", None
+                        )
+                        if count_maps is None:
+                            # Support diagnostic hooks invoked directly by tests
+                            # and downstream tooling, without a forward setup.
+                            count_maps = {
+                                key: torch.zeros_like(value, dtype=torch.int32)
+                                if value is not None else None
+                                for key, value in self.saliency_diagnostic_maps.items()
+                                if key != "production"
+                            }
+                            self.saliency_diagnostic_write_count_maps = count_maps
+                            self.saliency_diagnostic_count_maps = count_maps
+                        count_map = count_maps.get(name)
+                        if count_map is not None:
+                            # Count each contribution before accumulation.  The
+                            # accumulated value cannot reveal writes that cancel.
+                            count_map[target] += source.ne(0).to(count_map.dtype)
 
             # Input-tile gradients are dependency contributions, not mutually
             # exclusive output ownership regions.  Accumulate the complete

@@ -5,6 +5,59 @@ from __future__ import annotations
 import torch
 
 
+def _format_sides(sides: dict) -> str:
+    return "Sides(" + ", ".join(
+        f"{side}={bool(sides.get(side, False))}"
+        for side in ("top", "left", "bottom", "right")
+    ) + ")"
+
+
+def _report_missing_additive_writes(
+    stream_network, raw, candidate, name, reference, tolerance
+) -> None:
+    """Report non-hole errors associated with fewer additive tile writes."""
+    count_maps = getattr(stream_network, "saliency_diagnostic_write_count_maps", None)
+    if count_maps is None:
+        count_maps = getattr(stream_network, "saliency_diagnostic_count_maps", {})
+    raw_counts = count_maps.get("raw") if count_maps else None
+    candidate_counts = count_maps.get(name) if count_maps else None
+    if raw_counts is None or candidate_counts is None:
+        return
+
+    raw_counts = raw_counts.to(reference.device)
+    candidate_counts = candidate_counts.to(reference.device)
+    mask = (
+        raw.ne(0)
+        & candidate.ne(0)
+        & raw_counts.gt(candidate_counts)
+        & (candidate - reference).abs().gt(tolerance)
+    )
+    spatial_mask = mask.any(dim=tuple(range(mask.ndim - 2)))
+    coordinates = [tuple(point) for point in spatial_mask.nonzero().tolist()]
+    print(
+        f"  nonzero coordinates with fewer writes than raw and tolerance-significant "
+        f"error: {coordinates}"
+    )
+
+    print("  missing-additive-write summary by tile boundary and Sides:")
+    found = False
+    for record in getattr(stream_network, "saliency_diagnostic_records", []):
+        boundaries = record.get("candidate_destination_slices", {})
+        boundary = boundaries.get(name)
+        if not boundary:
+            continue
+        top, left, bottom, right = boundary
+        count = int(spatial_mask[top:bottom, left:right].count_nonzero().item())
+        if count:
+            found = True
+            print(
+                f"    boundary={(top, left, bottom, right)}, "
+                f"{_format_sides(record.get('sides', {}))}: {count} coordinates"
+            )
+    if not found:
+        print("    none")
+
+
 def compare_saliency_candidates(
     stream_network,
     reference: torch.Tensor,
@@ -73,6 +126,17 @@ def compare_saliency_candidates(
             f"\n  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
             f"{'PASS' if not failed else 'FAIL'}"
         )
+        if name in ("grad_lost", "ownership"):
+            raw = maps.get("raw")
+            if raw is not None and raw.shape == reference.shape:
+                _report_missing_additive_writes(
+                    stream_network,
+                    raw.to(device=reference.device, dtype=reference.dtype),
+                    candidate,
+                    name,
+                    reference,
+                    tolerance,
+                )
 
     print(f"\nEarliest failing saliency transformation: {first_failure or 'none'}")
     return results

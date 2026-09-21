@@ -219,6 +219,10 @@ def test_saliency_diagnostics_capture_stages_without_changing_production_map():
         name: torch.zeros_like(scnn.saliency_map)
         for name in ("raw", "grad_lost", "ownership", "production")
     }
+    scnn.saliency_diagnostic_write_count_maps = {
+        name: torch.zeros_like(scnn.saliency_map, dtype=torch.int32)
+        for name in ("raw", "grad_lost", "ownership")
+    }
     scnn._saliency_diagnostic_destination_coverage = torch.zeros(6, 6, dtype=torch.bool)
 
     input_conv = StreamingConv2d(3, 2, kernel_size=1)
@@ -237,6 +241,10 @@ def test_saliency_diagnostics_capture_stages_without_changing_production_map():
     assert record["raw_nonzero"] == 108
     assert record["destination_overlaps_previous"] is False
     torch.testing.assert_close(scnn.saliency_diagnostic_maps["production"], scnn.saliency_map)
+    assert scnn.saliency_diagnostic_write_count_maps["raw"].eq(1).all()
+    assert scnn.saliency_diagnostic_write_count_maps["grad_lost"][..., :5, :5].eq(1).all()
+    assert scnn.saliency_diagnostic_write_count_maps["grad_lost"][..., 5, :].eq(0).all()
+    assert scnn.saliency_diagnostic_write_count_maps["ownership"][..., :5, :5].eq(1).all()
 
 
 @pytest.mark.cuda_integration
