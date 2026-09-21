@@ -19,6 +19,7 @@ from lightstream.core.layers import (
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
 from lightstream.core.scnn.utils import Box, Lost, Sides
 from lightstream.models.testnet.segment import StreamingTestNet
+from lightstream.models.testnet.testnet import StreamingTestNet as SaliencyTestNet
 
 from lightstream.core.reducer import (
     BaseReducer,
@@ -211,6 +212,82 @@ def test_saliency_diagnostics_capture_stages_without_changing_production_map():
     assert record["raw_nonzero"] == 108
     assert record["destination_overlaps_previous"] is False
     torch.testing.assert_close(scnn.saliency_diagnostic_maps["production"], scnn.saliency_map)
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_testnet_raw_saliency_candidate_characterizes_later_stage_regressions(tmp_path):
+    """Characterize the TestNet result before extending this to ResNet and SSHR."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float64
+    rtol, atol = 1e-7, 1e-9
+
+    # These are deliberately the dimensions used by grad_compare_testnet.py,
+    # rather than a reduced unit-test proxy: shifted final tiles are part of
+    # the diagnostic result being locked down here.
+    tile_size = 960
+    input_size = 3520
+    image = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    network = SaliencyTestNet(
+        tile_size,
+        verbose=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        normalize_on_gpu=False,
+        saliency=True,
+        tile_cache_path=tmp_path / "testnet_saliency_tile_cache",
+    ).to(device=device, dtype=dtype)
+    scnn = network.stream_network
+    scnn.device = device
+    scnn.dtype = dtype
+    scnn.mean = scnn.mean.to(device=device, dtype=dtype)
+    scnn.std = scnn.std.to(device=device, dtype=dtype)
+    scnn.saliency_diagnostics = True
+    for module in scnn.stream_module.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+
+    streamed_output = network(image)
+    if not isinstance(streamed_output, torch.Tensor):
+        assert len(streamed_output) == 1
+        streamed_output = streamed_output[0]
+    target = torch.tensor(50.0, device=device, dtype=dtype)
+    loss = nn.MSELoss()(torch.sigmoid(streamed_output.mean()), target)
+    (output_gradient,) = torch.autograd.grad(loss, streamed_output)
+    scnn.backward(image, output_gradient.detach())
+
+    candidates = scnn.saliency_diagnostic_maps
+    scnn.disable()
+    reference_input = image.detach().clone().requires_grad_(True)
+    reference_output = scnn.stream_module(reference_input)
+    torch.autograd.backward(reference_output, output_gradient.detach())
+    reference = reference_input.grad.detach().cpu()
+
+    raw = candidates["raw"].to(dtype=dtype)
+    cropped = candidates["grad_lost"].to(dtype=dtype)
+    owned = candidates["ownership"].to(dtype=dtype)
+    reference_support = reference.ne(0)
+
+    raw_support = raw.ne(0)
+    assert not (reference_support & ~raw_support).any()
+    assert not (raw_support & ~reference_support).any()
+    torch.testing.assert_close(raw, reference, rtol=rtol, atol=atol)
+
+    # Cropping itself changes values beyond the float64 parity tolerance.
+    cropped_error = (cropped - reference).abs()
+    cropped_tolerance = atol + rtol * reference.abs()
+    assert (cropped_error > cropped_tolerance).any()
+
+    # Ownership selection is a separate, later diagnostic: it removes support
+    # that was still present after the side-aware grad_lost crop. Avoid locking
+    # down its current count, which can vary with supported PyTorch versions.
+    cropped_support = cropped.ne(0)
+    owned_support = owned.ne(0)
+    additional_missing_support = reference_support & cropped_support & ~owned_support
+    assert additional_missing_support.any()
 
 
 def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
