@@ -214,6 +214,45 @@ before_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] |
 after_streaming_init_callbacks: list[Callable[[torch.nn.modules], None], ...] | None = None,
 ```
 
+The `saliency=False` default affects only collection of the input gradient; it
+does **not** disable parameter gradients or parameter training. Use
+`saliency=True` when a production run needs `StreamingCNN.backward` to assemble
+an input `saliency_map`. Select this at construction time rather than mutating
+`gather_input_gradient` after input-gradient hooks have been installed. See
+[Saliency and input gradients](../modules/scnn.md#saliency-and-input-gradients)
+for the complete mode table and lifecycle guidance.
+
+The gradient-comparison scripts collect input gradients by default, while
+keeping expensive assembly diagnostics off:
+
+```bash
+# Ordinary comparison with production saliency parity.
+python examples/compare_grads_sshr.py
+
+# Detailed raw/grad_lost/ownership characterization.
+python examples/compare_grads_sshr.py --diagnose-saliency-assembly
+
+# Disable input-gradient gathering and comparison entirely.
+python examples/compare_grads_sshr.py --no-input-grad
+```
+
+The same modes are available for the ResNet and TestNet comparisons:
+
+```bash
+python examples/compare_grads_resnet.py
+python examples/compare_grads_resnet.py --diagnose-saliency-assembly
+python examples/compare_grads_resnet.py --no-input-grad
+
+python examples/grad_compare_testnet.py
+python examples/grad_compare_testnet.py --diagnose-saliency-assembly
+python examples/grad_compare_testnet.py --no-input-grad
+```
+
+Full-resolution saliency and diagnostic candidate maps scale with the complete
+NCHW input tensor. A float64 RGB 4608 × 4608 map is approximately 486 MiB;
+detailed diagnostics may allocate several such maps. Diagnostic candidate and
+write-count maps are not allocated during ordinary training.
+
 ### Constructor default behaviour
 By default, the constructor will perform the following steps:   
 1. All layers except convolution, local max pooling, and local average pooling layers are set to `nn.Identity`   
