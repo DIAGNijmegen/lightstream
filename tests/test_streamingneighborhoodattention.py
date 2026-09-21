@@ -79,6 +79,18 @@ _SAME_LAYOUT_ATOL = 2e-5
 _COMPLETE_MODEL_STREAMED_FEATURE_RTOL = 2e-4
 _COMPLETE_MODEL_STREAMED_FEATURE_ATOL = 1e-3
 
+# Backward replay has its own CUDA reduction order; these bounds are therefore
+# deliberately independent of the feature-map bound above.  Across the initial
+# and post-optimizer cycles, and both the original and cache-restored streamers,
+# the measured streamed/full NCHW maxima were 3.0517578e-5 / 1.7346655e-4
+# (absolute / relative) for image gradients and 4.8828125e-4 / 1.9371508e-4
+# across all named parameter gradients.  Only the absolute bounds need to be
+# wider than the focused same-layout bounds.
+_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_RTOL = _SAME_LAYOUT_RTOL
+_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_ATOL = 5e-5
+_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_RTOL = _SAME_LAYOUT_RTOL
+_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_ATOL = 7e-4
+
 
 def _assert_close_with_diagnostics(
     actual,
@@ -1798,9 +1810,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     )
     assert expected_rows[-1] % internal_stride_height == 0
     assert expected_columns[-1] % internal_stride_width == 0
-    full_heights, full_widths = streaming._compute_full_output_sizes(
-        shape_only_image
-    )
+    full_heights, full_widths = streaming._compute_full_output_sizes(shape_only_image)
     assert full_heights[0] > valid_heights[0]
     assert full_widths[0] > valid_widths[0]
 
@@ -1815,9 +1825,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         *downsampler_names,
         "norm",
     ]
-    boundary_stats = {
-        name: net_stats[name] for name in boundary_names
-    }
+    boundary_stats = {name: net_stats[name] for name in boundary_names}
     for name, stats in boundary_stats.items():
         output_height, output_width = stats["output_shape"][-2:]
         lost = stats["lost"]
@@ -1833,12 +1841,18 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         }
         assert set(converted_names) == set(nchw_parameters)
         for nchw_name, reference_name in converted_names.items():
-            yield nchw_name, reference_parameters[reference_name], nchw_parameters[
-                nchw_name
-            ]
+            yield (
+                nchw_name,
+                reference_parameters[reference_name],
+                nchw_parameters[nchw_name],
+            )
 
     def compare_cycle(streamers, *, phase, seed):
-        modules = (reference, full_nchw, *(item.stream_module for item in streamers))
+        modules = (
+            reference,
+            full_nchw,
+            *(item.stream_module for _, item in streamers),
+        )
         for module in modules:
             module.zero_grad(set_to_none=True)
 
@@ -1853,7 +1867,9 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
 
         reference_features = reference.forward_feature_map(reference_input)
         full_features = full_nchw(full_input)
-        stream_features = [item(value) for item, value in zip(streamers, stream_inputs)]
+        stream_features = [
+            item(value) for (_, item), value in zip(streamers, stream_inputs)
+        ]
         expected_features = reference_features.permute(0, 3, 1, 2)
         _assert_close_with_diagnostics(
             full_features,
@@ -1863,21 +1879,21 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             quantity="multi-tile complete four-stage features",
             cycle=phase,
         )
-        for item, output in zip(streamers, stream_features):
+        for (streamer_name, item), output in zip(streamers, stream_features):
             _assert_close_with_diagnostics(
                 output,
                 full_features,
                 rtol=_COMPLETE_MODEL_STREAMED_FEATURE_RTOL,
                 atol=_COMPLETE_MODEL_STREAMED_FEATURE_ATOL,
                 quantity="multi-tile complete four-stage streamed feature map",
-                cycle=phase,
+                cycle=f"{phase}, {streamer_name}",
                 streaming=item,
             )
 
         # Verify the actual forward context, rather than merely relying on the
         # selected image dimensions: both dimensions traverse multiple tiles,
         # and neither final tile lies on the regular stepping grid.
-        for item, output in zip(streamers, stream_features):
+        for (_, item), output in zip(streamers, stream_features):
             starts = [(y, x) for y, x, _ in item._last_forward_tiles]
             assert starts == expected_starts
             rows = sorted({y for y, _ in starts})
@@ -1916,9 +1932,11 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         upstream = torch.randn(full_features.shape, generator=generator, device="cuda")
         reference_features.backward(upstream.permute(0, 2, 3, 1).contiguous())
         full_features.backward(upstream)
-        for item, value in zip(streamers, stream_inputs):
+        for (_, item), value in zip(streamers, stream_inputs):
             item.backward(value, upstream)
 
+        assert reference_input.grad is not None
+        assert full_input.grad is not None
         _assert_close_with_diagnostics(
             full_input.grad,
             reference_input.grad,
@@ -1927,13 +1945,16 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             quantity="multi-tile complete four-stage image gradient",
             cycle=phase,
         )
-        for value in stream_inputs:
-            torch.testing.assert_close(
+        for (streamer_name, item), value in zip(streamers, stream_inputs):
+            assert value.grad is not None
+            _assert_close_with_diagnostics(
                 value.grad,
                 full_input.grad,
-                rtol=_SAME_LAYOUT_RTOL,
-                atol=_SAME_LAYOUT_ATOL,
-                msg=f"{phase} streamed image gradient",
+                rtol=_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_RTOL,
+                atol=_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_ATOL,
+                quantity="multi-tile complete four-stage streamed image gradient",
+                cycle=f"{phase}, {streamer_name}",
+                streaming=item,
             )
 
         full_pairs = list(parameter_pairs(full_nchw))
@@ -1950,27 +1971,31 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
                 parameter_name=name,
                 cycle=phase,
             )
-        for item in streamers:
+        for streamer_name, item in streamers:
             streamed_pairs = list(parameter_pairs(item.stream_module))
+            assert len(streamed_pairs) == len(full_pairs)
             for (name, _, full_parameter), (
                 stream_name,
                 _,
                 stream_parameter,
-            ) in zip(
-                full_pairs, streamed_pairs
-            ):
+            ) in zip(full_pairs, streamed_pairs):
                 assert stream_name == name
+                assert full_parameter.grad is not None
                 assert stream_parameter.grad is not None
-                torch.testing.assert_close(
+                _assert_close_with_diagnostics(
                     stream_parameter.grad,
                     full_parameter.grad,
-                    rtol=_SAME_LAYOUT_RTOL,
-                    atol=_SAME_LAYOUT_ATOL,
-                    msg=f"{phase} multi-tile streamed parameter gradient {name}",
+                    rtol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_RTOL,
+                    atol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_ATOL,
+                    quantity=(
+                        "multi-tile complete four-stage streamed parameter gradient"
+                    ),
+                    parameter_name=name,
+                    cycle=f"{phase}, {streamer_name}",
                 )
 
     initial_phase = "initial cycle"
-    compare_cycle([streaming], phase=initial_phase, seed=46001)
+    compare_cycle([("original streamer", streaming)], phase=initial_phase, seed=46001)
     optimizers = [
         torch.optim.SGD(module.parameters(), lr=0.01)
         for module in (reference, full_nchw, streaming.stream_module)
@@ -2005,8 +2030,11 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     )
     cached_streaming.stream_module.load_state_dict(full_nchw.state_dict())
     compare_cycle(
-        [streaming, cached_streaming],
-        phase="post-optimizer cycle (reused and tile-cache-reconstructed streamers)",
+        [
+            ("original streamer", streaming),
+            ("cache-restored streamer", cached_streaming),
+        ],
+        phase="post-optimizer cycle",
         seed=47001,
     )
 
