@@ -370,7 +370,10 @@ def main() -> None:
     parser.add_argument(
         "--diagnose-saliency-assembly",
         action="store_true",
-        help="Construct and report grad-loss/ownership saliency counterfactuals.",
+        help=(
+            "Enable expensive raw/grad_lost/ownership saliency assembly "
+            "counterfactual diagnostics (off by default)."
+        ),
     )
     parser.add_argument(
         "--verbose-saliency-coordinates",
@@ -382,7 +385,7 @@ def main() -> None:
         "--no-input-grad",
         dest="input_grad",
         action="store_false",
-        help="Disable streaming saliency/input-gradient gathering and skip input-gradient comparison.",
+        help="Disable input saliency entirely: do not gather or compare input gradients.",
     )
     parser.set_defaults(input_grad=True)
 
