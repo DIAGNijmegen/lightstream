@@ -26,6 +26,7 @@ def compare_saliency_candidates(
         candidate = maps.get(name)
         if candidate is None:
             print(f"\nSaliency candidate {name}: unavailable (allocation failed)")
+            first_failure = first_failure or name
             results[name] = False
             continue
         candidate = candidate.to(device=reference.device, dtype=reference.dtype)
@@ -41,8 +42,8 @@ def compare_saliency_candidates(
         absolute_error = (candidate - reference).abs()
         supported_error = absolute_error[reference_support]
         tolerance = atol + rtol * reference.abs()
-        error_support = absolute_error > tolerance
-        spatial_error = error_support.any(dim=tuple(range(error_support.ndim - 2)))
+        mismatch = absolute_error > tolerance
+        spatial_error = mismatch.any(dim=tuple(range(mismatch.ndim - 2)))
         coordinates = spatial_error.nonzero(as_tuple=False)
         error_box = None
         if coordinates.numel():
@@ -50,13 +51,13 @@ def compare_saliency_candidates(
             maximum = coordinates.max(dim=0).values.tolist()
             error_box = (minimum[0], minimum[1], maximum[0] + 1, maximum[1] + 1)
 
-        reduce_dims = tuple(range(missing.ndim - 2))
-        missing_spatial_counts = missing.sum(dim=reduce_dims)
-        row_counts = missing_spatial_counts.sum(dim=1).tolist()
-        column_counts = missing_spatial_counts.sum(dim=0).tolist()
+        reduce_dims = tuple(range(mismatch.ndim - 2))
+        mismatch_spatial_counts = mismatch.sum(dim=reduce_dims)
+        row_counts = mismatch_spatial_counts.sum(dim=1).tolist()
+        column_counts = mismatch_spatial_counts.sum(dim=0).tolist()
         mean_error = supported_error.mean().item() if supported_error.numel() else 0.0
-        max_error = supported_error.max().item() if supported_error.numel() else 0.0
-        failed = bool(missing.any() or extra.any() or error_support.any())
+        max_error = absolute_error.max().item() if absolute_error.numel() else 0.0
+        failed = bool(missing.any() or extra.any() or mismatch.any())
         results[name] = not failed
         if failed and first_failure is None:
             first_failure = name
@@ -64,10 +65,11 @@ def compare_saliency_candidates(
             f"\nSaliency candidate {name}:\n"
             f"  missing reference support: {missing.count_nonzero().item()}\n"
             f"  extra streamed support: {extra.count_nonzero().item()}\n"
-            f"  reference-support absolute error: mean={mean_error:.6e}, max={max_error:.6e}\n"
+            f"  reference-support mean absolute error: {mean_error:.6e}\n"
+            f"  exact maximum absolute error: {max_error:.17e}\n"
             f"  error bounding box [top, left, bottom, right): {error_box}\n"
-            f"  per-row missing-support counts: {row_counts}\n"
-            f"  per-column missing-support counts: {column_counts}"
+            f"  per-row tolerance-mismatch counts: {row_counts}\n"
+            f"  per-column tolerance-mismatch counts: {column_counts}"
             f"\n  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
             f"{'PASS' if not failed else 'FAIL'}"
         )
