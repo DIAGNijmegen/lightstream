@@ -5,6 +5,9 @@ from __future__ import annotations
 import torch
 
 
+_MISMATCH_PREVIEW_LIMIT = 5
+
+
 def _format_sides(sides: dict) -> str:
     return (
         "Sides("
@@ -68,12 +71,15 @@ def compare_saliency_candidates(
     *,
     rtol: float = 1e-4,
     atol: float = 1e-6,
+    verbose: bool = False,
 ) -> dict[str, bool]:
     """Report saliency stages and assert parity for the supported candidates.
 
     ``raw`` and ``production`` are regression candidates.  The intermediate
     ``grad_lost`` and ``ownership`` maps exist to characterize the historical
     transformations and are deliberately not part of the regression result.
+    Set ``verbose`` to print the complete per-row and per-column mismatch arrays;
+    the default report remains compact for large images.
     """
     maps = getattr(stream_network, "saliency_diagnostic_maps", {})
     if not maps:
@@ -117,6 +123,12 @@ def compare_saliency_candidates(
         mismatch_spatial_counts = mismatch.sum(dim=reduce_dims)
         row_counts = mismatch_spatial_counts.sum(dim=1).tolist()
         column_counts = mismatch_spatial_counts.sum(dim=0).tolist()
+        nonzero_rows = [
+            (index, count) for index, count in enumerate(row_counts) if count
+        ]
+        nonzero_columns = [
+            (index, count) for index, count in enumerate(column_counts) if count
+        ]
         mean_error = supported_error.mean().item() if supported_error.numel() else 0.0
         max_error = absolute_error.max().item() if absolute_error.numel() else 0.0
         failed = bool(missing.any() or extra.any() or mismatch.any())
@@ -134,11 +146,29 @@ def compare_saliency_candidates(
             f"  missing reference support: {missing.count_nonzero().item()}\n"
             f"  extra streamed support: {extra.count_nonzero().item()}\n"
             f"  reference-support mean absolute error: {mean_error:.6e}\n"
-            f"  exact maximum absolute error: {max_error:.17e}\n"
-            f"  error bounding box [top, left, bottom, right): {error_box}\n"
-            f"  per-row tolerance-mismatch counts: {row_counts}\n"
-            f"  per-column tolerance-mismatch counts: {column_counts}"
-            f"\n  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
+            f"  exact maximum absolute error: {max_error:.17e}"
+        )
+        if mismatch.any():
+            print(
+                f"  total mismatching rows: {len(nonzero_rows)}\n"
+                f"  total mismatching columns: {len(nonzero_columns)}\n"
+                f"  maximum mismatches in any row: {max(row_counts)}\n"
+                f"  maximum mismatches in any column: {max(column_counts)}\n"
+                "  first nonzero row mismatch counts (index, count): "
+                f"{nonzero_rows[:_MISMATCH_PREVIEW_LIMIT]}\n"
+                "  first nonzero column mismatch counts (index, count): "
+                f"{nonzero_columns[:_MISMATCH_PREVIEW_LIMIT]}\n"
+                f"  error bounding box [top, left, bottom, right): {error_box}"
+            )
+        else:
+            print("  all tolerance-mismatch counts are zero")
+        if verbose:
+            print(
+                f"  per-row tolerance-mismatch counts: {row_counts}\n"
+                f"  per-column tolerance-mismatch counts: {column_counts}"
+            )
+        print(
+            f"  tolerance check (rtol={rtol:.3e}, atol={atol:.3e}): "
             f"{tolerance_result}"
         )
         if name in ("grad_lost", "ownership"):

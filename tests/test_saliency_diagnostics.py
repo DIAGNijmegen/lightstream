@@ -35,8 +35,14 @@ def test_candidate_summary_uses_gradient_tolerance_for_errors(capsys):
     }
     report = capsys.readouterr().out
     assert "error bounding box [top, left, bottom, right): (1, 2, 2, 3)" in report
-    assert "per-row tolerance-mismatch counts: [0, 1]" in report
-    assert "per-column tolerance-mismatch counts: [0, 0, 1]" in report
+    assert "total mismatching rows: 1" in report
+    assert "total mismatching columns: 1" in report
+    assert "maximum mismatches in any row: 1" in report
+    assert "maximum mismatches in any column: 1" in report
+    assert "first nonzero row mismatch counts (index, count): [(1, 1)]" in report
+    assert "first nonzero column mismatch counts (index, count): [(2, 1)]" in report
+    assert "per-row tolerance-mismatch counts" not in report
+    assert "per-column tolerance-mismatch counts" not in report
     assert (
         "tolerance check (rtol=0.000e+00, atol=1.000e-06): EXPECTED DIVERGENCE"
         in report
@@ -61,7 +67,30 @@ def test_candidate_with_only_sub_tolerance_zero_noise_passes(capsys):
     assert all(results.values())
     report = capsys.readouterr().out
     assert "exact maximum absolute error: 1.00000000000000007e-17" in report
+    assert report.count("all tolerance-mismatch counts are zero") == 4
     assert "Earliest destructive saliency transformation: none" in report
+
+
+def test_verbose_candidate_summary_includes_complete_mismatch_arrays(capsys):
+    reference = torch.zeros((1, 1, 2, 3))
+    divergent = reference.clone()
+    divergent[0, 0, 1, 2] = 1.0
+    stream_network = SimpleNamespace(
+        saliency_diagnostic_maps={
+            "raw": reference,
+            "grad_lost": divergent,
+            "ownership": divergent,
+            "production": reference,
+        }
+    )
+
+    compare_saliency_candidates(
+        stream_network, reference, rtol=0, atol=1e-6, verbose=True
+    )
+
+    report = capsys.readouterr().out
+    assert "per-row tolerance-mismatch counts: [0, 1]" in report
+    assert "per-column tolerance-mismatch counts: [0, 0, 1]" in report
 
 
 def test_production_disagreement_fails_the_regression(capsys):
