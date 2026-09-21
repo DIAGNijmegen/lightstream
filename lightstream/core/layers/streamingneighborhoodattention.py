@@ -11,6 +11,7 @@ from importlib import import_module
 
 import torch
 from torch import nn
+from torch.amp import custom_bwd, custom_fwd
 
 from lightstream.core.scnn.utils import Box, Lost
 
@@ -147,32 +148,27 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
     """
 
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, input, attention, seen, input_loc, grad_lost, output_stride, *parameters):
         ctx.attention = attention
         ctx.seen = seen
         ctx.input_loc = input_loc
         ctx.grad_lost = grad_lost
         ctx.output_stride = output_stride
-        ctx.autocast_enabled = torch.is_autocast_enabled(input.device.type)
-        ctx.autocast_dtype = torch.get_autocast_dtype(input.device.type)
         ctx.save_for_backward(input, *parameters)
         with torch.no_grad():
             output = attention(input.permute(0, 2, 3, 1).contiguous())
             return output.permute(0, 3, 1, 2).contiguous()
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         input, *parameters = ctx.saved_tensors
         with torch.enable_grad():
             replay_input = input.detach().requires_grad_(True)
-            with torch.autocast(
-                device_type=input.device.type,
-                dtype=ctx.autocast_dtype,
-                enabled=ctx.autocast_enabled,
-            ):
-                replay = ctx.attention(
-                    replay_input.permute(0, 2, 3, 1).contiguous()
-                )
+            replay = ctx.attention(
+                replay_input.permute(0, 2, 3, 1).contiguous()
+            )
             replay = replay.permute(0, 3, 1, 2).contiguous()
             trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
             input_gradient = torch.autograd.grad(
