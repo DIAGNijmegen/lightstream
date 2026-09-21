@@ -2422,6 +2422,7 @@ class StreamingCNN(torch.nn.Module):
 
             module_stats = {
                 "lost": lost,
+                "output_shape": tuple(output.shape),
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,

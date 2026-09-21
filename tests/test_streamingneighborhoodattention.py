@@ -1748,6 +1748,26 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
 
+    net_stats = tile_cache["net_stats"]
+    attention_names = [name for name in net_stats if name.endswith(".attn")]
+    downsampler_names = [
+        name for name in net_stats if name.endswith(".downsample.norm")
+    ]
+    boundary_names = [
+        "patch_embed.norm",
+        *attention_names,
+        *downsampler_names,
+        "norm",
+    ]
+    boundary_stats = {
+        name: net_stats[name] for name in boundary_names
+    }
+    for name, stats in boundary_stats.items():
+        output_height, output_width = stats["output_shape"][-2:]
+        lost = stats["lost"]
+        assert output_height - lost.top - lost.bottom > 0, name
+        assert output_width - lost.left - lost.right > 0, name
+
     def parameter_pairs(nchw_module):
         reference_parameters = dict(reference.named_parameters())
         nchw_parameters = dict(nchw_module.named_parameters())
@@ -1814,6 +1834,27 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             assert output.shape[-1] > valid_widths[0]
             assert rows[-1] != (len(rows) - 1) * valid_step_height
             assert columns[-1] != (len(columns) - 1) * valid_step_width
+
+            regular_rows = rows[:-1]
+            regular_columns = columns[:-1]
+            shifted_row = rows[-1]
+            shifted_column = columns[-1]
+            strided_boundary_names = ["patch_embed.norm", *downsampler_names]
+            for name in strided_boundary_names:
+                stats = boundary_stats[name]
+                stride_y, stride_x = (
+                    int(value) for value in stats["output_stride"][-2:]
+                )
+                assert all(row % stride_y == 0 for row in regular_rows), name
+                assert all(column % stride_x == 0 for column in regular_columns), name
+                assert shifted_row % stride_y == 0, name
+                assert shifted_column % stride_x == 0, name
+
+            final_stride_y, final_stride_x = (
+                int(value) for value in boundary_stats["norm"]["output_stride"][-2:]
+            )
+            assert (shifted_row - regular_rows[-1]) // final_stride_y >= 1
+            assert (shifted_column - regular_columns[-1]) // final_stride_x >= 1
 
         upstream = torch.randn(full_features.shape, generator=generator, device="cuda")
         reference_features.backward(upstream.permute(0, 2, 3, 1).contiguous())
