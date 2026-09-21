@@ -1762,9 +1762,11 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     full_nchw = NCHWNAT(**nchw_configuration).float().cuda()
     full_nchw.load_state_dict(convert_nhwc_nat_state_dict(reference.state_dict()))
 
-    # Use physical tile dimensions whose measured valid interior exceeds the
-    # model's internal alignment on both axes.
-    tile_shape = (1, 3, 353, 357)
+    # The approximately 183-pixel value is the model's forward receptive field,
+    # while backward-safe streaming statistics require the larger 385×389
+    # physical tile used here.
+    tile_shape = (1, 3, 385, 389)
+    image_shape = (481, 485)
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
 
@@ -1778,21 +1780,17 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     align_height, align_width = (
         int(value) for value in streaming._compute_internal_alignment()
     )
-    assert valid_step_height > align_height
-    assert valid_step_width > align_width
-
-    # An aligned excess between one and two valid steps guarantees that the
-    # final tile is shifted from the regular grid. Since both the tile and image
-    # dimensions are odd, this also retains the odd, non-square coverage case.
-    height_excess = valid_step_height + align_height
-    width_excess = valid_step_width + align_width
-    image_shape = (
-        tile_shape[-2] + height_excess,
-        tile_shape[-1] + width_excess,
+    assert (align_height, align_width) == (32, 32)
+    assert (valid_step_height, valid_step_width) == (64, 64), (
+        streaming.tile_gradient_lost,
+        streaming._compute_internal_safe_input_step(),
+        streaming._tile_output_shapes[0],
+        streaming._tile_output_lost[0],
     )
     assert image_shape[0] % 2 == 1
     assert image_shape[1] % 2 == 1
     assert image_shape[0] != image_shape[1]
+    assert all(image > tile for image, tile in zip(image_shape, tile_shape[-2:]))
     n_rows, n_cols = streaming._compute_tile_grid(
         *image_shape,
         tile_shape[-2],
@@ -1800,6 +1798,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         valid_step_height,
         valid_step_width,
     )
+    assert (n_rows, n_cols) == (3, 3)
     shape_only_image = torch.empty(1, 3, *image_shape, device="meta")
     expected_starts = [
         (y, x)
@@ -1813,14 +1812,10 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             tile_shape[-1],
         )
     ]
-    expected_rows = sorted({y for y, _ in expected_starts})
-    expected_columns = sorted({x for _, x in expected_starts})
-    assert len(expected_rows) >= 2
-    assert len(expected_columns) >= 2
-    assert expected_rows[-1] != (n_rows - 1) * valid_step_height
-    assert expected_columns[-1] != (n_cols - 1) * valid_step_width
-    assert expected_rows[-1] % align_height == 0
-    assert expected_columns[-1] % align_width == 0
+    rows = sorted({y for y, _ in expected_starts})
+    columns = sorted({x for _, x in expected_starts})
+    assert rows == [0, 64, 96]
+    assert columns == [0, 64, 96]
     full_heights, full_widths = streaming._compute_full_output_sizes(shape_only_image)
     assert full_heights[0] > valid_heights[0]
     assert full_widths[0] > valid_widths[0]
