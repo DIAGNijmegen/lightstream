@@ -15,7 +15,7 @@ from lightstream.core.layers.streamingneighborhoodattention import (
     StreamingNeighborhoodAttention2D,
 )
 from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.core.scnn.utils import Lost
+from lightstream.core.scnn.utils import Box, Lost
 from lightstream.models.nat import (
     ConvDownsampler,
     NCHWConvTokenizer,
