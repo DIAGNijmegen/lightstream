@@ -183,6 +183,7 @@ class StreamingCNN(torch.nn.Module):
         verbose=False,
         deterministic=False,
         saliency=False,
+        saliency_diagnostics=False,
         eps=1e-5,
         copy_to_gpu=True,
         dtype=None,
@@ -201,6 +202,8 @@ class StreamingCNN(torch.nn.Module):
                 module's logger at DEBUG level (default is False).
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
+            saliency_diagnostics (bool): retain per-tile saliency transformation metadata and
+                best-effort candidate maps. This is diagnostic-only and implies ``saliency``.
             eps (float): epsilon error to compare floating values
         """
         super().__init__()
@@ -214,7 +217,8 @@ class StreamingCNN(torch.nn.Module):
         if dtype is not None:
             self.dtype = dtype
         self.tile_shape = tile_shape
-        self.gather_input_gradient = saliency
+        self.saliency_diagnostics = bool(saliency_diagnostics)
+        self.gather_input_gradient = bool(saliency or saliency_diagnostics)
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
 
@@ -250,6 +254,8 @@ class StreamingCNN(torch.nn.Module):
         self._prepared_reducer_domain_masks = {}
         self._current_output_heights = None
         self._current_output_widths = None
+        self.saliency_diagnostic_records = []
+        self.saliency_diagnostic_maps = {}
 
         if state_dict is None:
             self._configure()
@@ -1784,6 +1790,24 @@ class StreamingCNN(torch.nn.Module):
             self.saliency_nonzero_coverage_map = torch.zeros(
                 image.shape, dtype=torch.bool, device="cpu"
             )
+            if getattr(self, "saliency_diagnostics", False):
+                self.saliency_diagnostic_records = []
+                self._saliency_diagnostic_destination_coverage = torch.zeros(
+                    image.shape[-2:], dtype=torch.bool, device="cpu"
+                )
+                self.saliency_diagnostic_maps = {}
+                for name in ("raw", "grad_lost", "ownership", "production"):
+                    try:
+                        self.saliency_diagnostic_maps[name] = torch.zeros(
+                            image.shape, dtype=self.dtype, device="cpu"
+                        )
+                    except (RuntimeError, MemoryError):
+                        logger.warning(
+                            "Unable to allocate saliency diagnostic candidate map %r; "
+                            "continuing with metadata only.",
+                            name,
+                        )
+                        self.saliency_diagnostic_maps[name] = None
 
         self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
@@ -2235,6 +2259,8 @@ class StreamingCNN(torch.nn.Module):
                         self.saliency_input_module = mod
                         back_handle = mod.register_full_backward_hook(back_lambda)
                         self._hooks.append(back_handle)
+                        # Saliency describes the model input, not later RGB-like feature maps.
+                        break
 
     def _add_hooks(
         self,
@@ -2672,6 +2698,7 @@ class StreamingCNN(torch.nn.Module):
         change_grad=True,
     ):
         stride: List[int] = _triple(module.stride)  # type:ignore
+        raw_input_grad = grad_in[0]
 
         # Trim gradient of invalid values
         sides = module.input_loc.sides
@@ -2707,7 +2734,7 @@ class StreamingCNN(torch.nn.Module):
         new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, old_value_indices)
 
         if module.in_channels == 3:
-            valid_grad_in = grad_in[0][
+            valid_grad_in = raw_input_grad[
                 :,
                 :,
                 lost.top * stride[1] : grad_in[0].shape[2] - lost.bottom * stride[1],
@@ -2733,6 +2760,79 @@ class StreamingCNN(torch.nn.Module):
                     updated_total_indices.x * stride[2],
                 ),
             )
+
+            if getattr(self, "saliency_diagnostics", False):
+                destination_bounds = (
+                    destination[2].start,
+                    destination[2].stop,
+                    destination[3].start,
+                    destination[3].stop,
+                )
+                destination_2d = self._saliency_diagnostic_destination_coverage[
+                    destination[2], destination[3]
+                ]
+                overlaps_previous = bool(destination_2d.any().item())
+                destination_2d.fill_(True)
+                self.saliency_diagnostic_records.append(
+                    {
+                        "input_loc": {"y": int(input_loc.y), "x": int(input_loc.x)},
+                        "sides": {
+                            "top": bool(sides.top), "left": bool(sides.left),
+                            "bottom": bool(sides.bottom), "right": bool(sides.right),
+                        },
+                        "stride": tuple(int(value) for value in stride),
+                        "output_stride": tuple(int(value) for value in module.output_stride),
+                        "grad_lost": {
+                            "top": int(grad_lost.top), "left": int(grad_lost.left),
+                            "bottom": int(grad_lost.bottom), "right": int(grad_lost.right),
+                        },
+                        "raw_shape": tuple(raw_input_grad.shape),
+                        "post_grad_lost_shape": tuple(valid_grad_in.shape),
+                        "post_ownership_shape": tuple(relevant_input_grad.shape),
+                        "raw_nonzero": int(raw_input_grad.count_nonzero().item()),
+                        "post_grad_lost_nonzero": int(valid_grad_in.count_nonzero().item()),
+                        "post_ownership_nonzero": int(relevant_input_grad.count_nonzero().item()),
+                        "new_output_box": {
+                            "y": int(new_output_box.y), "height": int(new_output_box.height),
+                            "x": int(new_output_box.x), "width": int(new_output_box.width),
+                        },
+                        "updated_total_indices": {
+                            "y": int(updated_total_indices.y),
+                            "height": int(updated_total_indices.height),
+                            "x": int(updated_total_indices.x),
+                            "width": int(updated_total_indices.width),
+                        },
+                        "destination_slices": destination_bounds,
+                        "destination_overlaps_previous": overlaps_previous,
+                    }
+                )
+                raw_cpu = raw_input_grad.detach().cpu()
+                valid_cpu = valid_grad_in.detach().cpu()
+                relevant_cpu = relevant_input_grad.detach().cpu()
+                raw_destination = (
+                    slice(None), slice(None),
+                    slice(int(input_loc.y), int(input_loc.y) + raw_cpu.shape[2]),
+                    slice(int(input_loc.x), int(input_loc.x) + raw_cpu.shape[3]),
+                )
+                valid_y = int(input_loc.y) + lost.top * stride[1]
+                valid_x = int(input_loc.x) + lost.left * stride[2]
+                valid_destination = (
+                    slice(None), slice(None), slice(valid_y, valid_y + valid_cpu.shape[2]),
+                    slice(valid_x, valid_x + valid_cpu.shape[3]),
+                )
+                for name, target, source, additive in (
+                    ("raw", raw_destination, raw_cpu, True),
+                    ("grad_lost", valid_destination, valid_cpu, True),
+                    ("ownership", destination, relevant_cpu, True),
+                    ("production", destination, relevant_cpu, False),
+                ):
+                    candidate = self.saliency_diagnostic_maps.get(name)
+                    if candidate is not None:
+                        if additive:
+                            candidate[target] += source
+                        else:
+                            candidate[target] = source
+
             relevant_input_grad = relevant_input_grad.detach().cpu()
             self.saliency_map[destination] = relevant_input_grad
             self.saliency_coverage_map[destination] = True

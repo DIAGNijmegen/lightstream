@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from lightstream.models.resnet.resnet import StreamingResNet
+from saliency_diagnostics import compare_saliency_candidates
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -117,6 +118,7 @@ def main() -> None:
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
+    network.stream_network.saliency_diagnostics = True
     _freeze_batchnorm(network.stream_network.stream_module)
 
     _zero_grads(network.stream_network.stream_module.parameters())
@@ -146,6 +148,7 @@ def main() -> None:
     if img_normal.grad is not None:
         input_grad_diff = img_normal.grad.detach().cpu().numpy() - network.stream_network.saliency_map[0].numpy()
         print(f"Input gradient max diff: {input_grad_diff.max()}")
+        compare_saliency_candidates(network.stream_network, img_normal.grad)
 
     _compare_grads(streaming_param_grads, normal_param_grads)
     _compare_conv_weight_grads(streaming_param_grads, normal_param_grads)

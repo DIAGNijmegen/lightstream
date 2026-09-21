@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from time import time
 from lightstream.models.sshr.streamingsshr import StreamingSSHR
+from saliency_diagnostics import compare_saliency_candidates
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -221,6 +222,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
+    network.stream_network.saliency_diagnostics = args.input_grad
 
     valid_output_heights, valid_output_widths = network.stream_network._compute_valid_output_sizes()
     safe_step = network.stream_network._compute_valid_input_step(
@@ -330,6 +332,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
                 f"mean abs diff={input_grad_diff.mean().item():.6e}, "
                 f"max abs diff={input_grad_diff.max().item():.6e}"
             )
+            compare_saliency_candidates(network.stream_network, reference_input_grad)
 
     _compare_selected_grads(
         network.stream_network.stream_module,
