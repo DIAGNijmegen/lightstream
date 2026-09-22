@@ -495,9 +495,10 @@ def test_streaming_attention_supports_explicit_cuda_bfloat16_autocast():
     input = torch.randn(1, 4, 5, 5, device="cuda", requires_grad=True)
     reference_input = input.detach().clone().requires_grad_(True)
 
-    reference_output = reference(
-        reference_input.permute(0, 2, 3, 1).contiguous()
-    )
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        reference_output = reference(
+            reference_input.permute(0, 2, 3, 1).contiguous()
+        )
     reference_output.sum().backward()
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):

@@ -20,6 +20,70 @@ from lightstream.core.layers import (
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
 
 
+class _BackwardReplayPrecisionProbe(StreamingConv2d):
+    """Record the precision selected for the activation entering replay."""
+
+    def __init__(self, channels):
+        super().__init__(channels, channels, kernel_size=1)
+        self.record_replay = False
+        self.replay_states = []
+
+    def forward(self, input):
+        if self.record_replay:
+            self.replay_states.append(
+                (torch.is_autocast_enabled("cuda"), input.dtype)
+            )
+        return super().forward(input)
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("streaming_dtype", "expected_autocast", "expected_activation_dtype"),
+    [
+        (torch.float32, False, torch.float32),
+        (torch.bfloat16, True, torch.bfloat16),
+    ],
+)
+def test_backward_replay_uses_autocast_only_for_low_precision(
+    streaming_dtype, expected_autocast, expected_activation_dtype
+):
+    if streaming_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA bfloat16 is required")
+
+    module = nn.Sequential(
+        StreamingConv2d(3, 4, kernel_size=1),
+        _BackwardReplayPrecisionProbe(4),
+    ).to(device="cuda", dtype=streaming_dtype)
+    streaming = StreamingCNN(
+        module,
+        tile_shape=(1, 3, 4, 4),
+        dtype=streaming_dtype,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    assert all(parameter.dtype == streaming_dtype for parameter in module.parameters())
+
+    image = torch.randn(1, 3, 4, 4, device="cuda", dtype=streaming_dtype)
+    output = streaming(image)
+    probe = next(
+        child
+        for child in streaming.stream_module.modules()
+        if isinstance(child, _BackwardReplayPrecisionProbe)
+    )
+    probe.replay_states.clear()
+    probe.record_replay = True
+
+    streaming.backward(image, torch.ones_like(output))
+
+    assert probe.replay_states
+    assert all(
+        state == (expected_autocast, expected_activation_dtype)
+        for state in probe.replay_states
+    )
+
+
 @pytest.mark.parametrize(
     ("saliency", "diagnose_saliency_assembly", "expect_saliency", "expect_diagnostics"),
     [
