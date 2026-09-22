@@ -21,6 +21,12 @@ from lightstream.models.nat.nchw import (
     copy_nhwc_conv_tokenizer_to_nchw,
     linear_to_pointwise_conv,
     pointwise_conv_to_linear,
+    nchw_nat_base,
+    nchw_nat_mini,
+    nchw_nat_nano,
+    nchw_nat_pico,
+    nchw_nat_small,
+    nchw_nat_tiny,
 )
 from lightstream.models.nat.streaming import StreamingNAT
 
@@ -47,6 +53,12 @@ __all__ = [
     "copy_nhwc_conv_tokenizer_to_nchw",
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
+    "nchw_nat_base",
+    "nchw_nat_mini",
+    "nchw_nat_nano",
+    "nchw_nat_pico",
+    "nchw_nat_small",
+    "nchw_nat_tiny",
     "StreamingNAT",
     "StreamingNat",
 ]
