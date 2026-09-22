@@ -40,7 +40,7 @@ from lightstream.models.nat.streaming import StreamingNAT
 
 
 VARIANTS = {
-    "nat_mini": dict(depths=[3, ], num_heads=[2, ], embed_dim=64,
+    "nat_mini": dict(depths=[3, 4, 6, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
                      mlp_ratio=3, kernel_size=7, layer_scale=None,
                      nchw=NCHWNatMini, checkpoint="nat_mini_1k"),
     "nat_small": dict(depths=[3, 4, 18, 5], num_heads=[3, 6, 12, 24], embed_dim=96,
@@ -166,8 +166,8 @@ def main() -> None:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--checkpoint", help="local official/checkpoint state-dict path")
     source.add_argument("--pretrained", action="store_true", help="download the official ImageNet checkpoint")
-    parser.add_argument("--tile-size", type=int, default=512)
-    parser.add_argument("--input-size", type=int, default=7681)
+    parser.add_argument("--tile-size", type=int, default=4680)
+    parser.add_argument("--input-size", type=int, default=5120)
     parser.add_argument("--tile-cache", type=Path)
     parser.add_argument("--fresh-tile-statistics", action="store_true")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
@@ -209,7 +209,6 @@ def main() -> None:
     # Own the source checkpoint independently of all three model instances.
     initial = _reference(args.variant)
     loaded = _checkpoint(args.checkpoint, args.pretrained, args.variant)
-    loaded = None
     if loaded is not None:
         _strict_load(initial, loaded, "checkpoint source")
     checkpoint = {name: value.detach().cpu().clone() for name, value in initial.state_dict().items()}
@@ -220,15 +219,15 @@ def main() -> None:
     feature_state = {name: value for name, value in checkpoint.items() if not name.startswith("head.")}
     full = VARIANTS[args.variant]["nchw"]()
     converted = convert_nhwc_nat_state_dict(feature_state)
-    #_strict_load(full, converted, "full NCHW")
+    _strict_load(full, converted, "full NCHW")
     stream = StreamingNAT(
-        args.variant, args.tile_size, pretrained=False, tile_cache_path=args.tile_cache,
+        args.variant, args.tile_size, pretrained=checkpoint, tile_cache_path=args.tile_cache,
         device=device, verbose=True, saliency=True, statistics_on_cpu=False,
         normalize_on_gpu=False, mean=[0, 0, 0], std=[1, 1, 1], drop_rate=0.0,
         attn_drop_rate=0.0, drop_path_rate=0.0,
     )
     # Make the third ownership boundary and strict load explicit after conversion.
-    #_strict_load(stream.stream_module, converted, "streamed NCHW")
+    _strict_load(stream.stream_module, converted, "streamed NCHW")
     reference.to(device=device, dtype=dtype).eval()
     full.to(device=device, dtype=dtype).eval()
     stream.to(device=device, dtype=dtype).eval()
