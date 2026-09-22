@@ -382,6 +382,46 @@ def nat_tiny(pretrained=False, **kwargs):
 
 
 @register_model
+def nat_nano(pretrained=False, **kwargs):
+    """Build the synthetic Nano NAT variant used for implementation comparisons."""
+
+    if pretrained:
+        raise ValueError("no pretrained checkpoint exists for nat_nano")
+    kwargs.setdefault("drop_rate", 0.0)
+    kwargs.setdefault("attn_drop_rate", 0.0)
+    kwargs.setdefault("drop_path_rate", 0.0)
+    return NAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[1, 2, 4, 8],
+        embed_dim=32,
+        mlp_ratio=2,
+        kernel_size=7,
+        layer_scale=None,
+        **kwargs,
+    )
+
+
+@register_model
+def nat_pico(pretrained=False, **kwargs):
+    """Build the synthetic Pico NAT variant used for implementation comparisons."""
+
+    if pretrained:
+        raise ValueError("no pretrained checkpoint exists for nat_pico")
+    kwargs.setdefault("drop_rate", 0.0)
+    kwargs.setdefault("attn_drop_rate", 0.0)
+    kwargs.setdefault("drop_path_rate", 0.0)
+    return NAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[1, 2, 4, 8],
+        embed_dim=16,
+        mlp_ratio=2,
+        kernel_size=7,
+        layer_scale=None,
+        **kwargs,
+    )
+
+
+@register_model
 def nat_small(pretrained=False, **kwargs):
     model = NAT(
         depths=[3, 4, 18, 5],

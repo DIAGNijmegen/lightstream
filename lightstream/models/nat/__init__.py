@@ -1,5 +1,6 @@
 """Neighborhood Attention Transformer models and NCHW building blocks."""
 
+from lightstream.models.nat.nat import nat_nano, nat_pico
 from lightstream.models.nat.nchw import (
     ConvDownsampler,
     NCHWConvDownsampler,
@@ -59,6 +60,8 @@ __all__ = [
     "nchw_nat_pico",
     "nchw_nat_small",
     "nchw_nat_tiny",
+    "nat_nano",
+    "nat_pico",
     "StreamingNAT",
     "StreamingNat",
 ]
