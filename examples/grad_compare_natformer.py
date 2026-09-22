@@ -41,10 +41,6 @@ NHWC_MODEL_CHOICES = {
 PRETRAINED_CHOICES = ("nat_mini", "nat_tiny", "nat_small", "nat_base")
 
 
-def _reference(factory, *, pretrained: bool = False):
-    return factory(pretrained=pretrained)
-
-
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -226,7 +222,7 @@ def main() -> None:
         f"device={device}, dtype={dtype}, encoder={args.variant}, "
         f"tile_size={args.tile_size}, input_size={args.input_size}"
     )
-    reference = _reference(nhwc_factory, pretrained=True)
+    reference = nhwc_factory(pretrained=True)
     full = nchw_factory(pretrained=True)
     stream = StreamingNAT(
         args.variant,
