@@ -1,13 +1,11 @@
-"""NCHW building blocks for Neighborhood Attention Transformer layers.
+"""NCHW-native Neighborhood Attention Transformer building blocks and models.
 
-The conversion helpers in this module provide an explicit checkpoint boundary
-between the original NHWC NAT representation (``nn.Linear`` MLP projections)
-and Lightstream's NCHW representation (pointwise ``nn.Conv2d`` projections).
+The implementation keeps feature maps in NCHW layout, uses pointwise
+convolutions for MLP projections, and supports deterministic tiled execution.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Mapping
 from numbers import Number
 
@@ -67,136 +65,6 @@ def _load_pretrained_nchw(
     return model
 
 
-def linear_to_pointwise_conv(linear: nn.Linear) -> nn.Conv2d:
-    """Return a 1x1 convolution equivalent to ``linear``.
-
-    Parameter values, dtype, device, and per-parameter ``requires_grad`` flags
-    are retained.  The returned module does not share parameters with the
-    input module.
-    """
-
-    if not isinstance(linear, nn.Linear):
-        raise TypeError(f"expected nn.Linear, got {type(linear).__name__}")
-    convolution = nn.Conv2d(
-        linear.in_features,
-        linear.out_features,
-        kernel_size=1,
-        bias=linear.bias is not None,
-        device=linear.weight.device,
-        dtype=linear.weight.dtype,
-    )
-    with torch.no_grad():
-        convolution.weight.copy_(linear.weight[:, :, None, None])
-        if linear.bias is not None:
-            convolution.bias.copy_(linear.bias)
-    convolution.weight.requires_grad_(linear.weight.requires_grad)
-    if linear.bias is not None:
-        convolution.bias.requires_grad_(linear.bias.requires_grad)
-    convolution.train(linear.training)
-    return convolution
-
-
-def pointwise_conv_to_linear(convolution: nn.Conv2d) -> nn.Linear:
-    """Return an ``nn.Linear`` equivalent to a 1x1 convolution."""
-
-    if not isinstance(convolution, nn.Conv2d) or convolution.kernel_size != (1, 1):
-        raise TypeError("expected an nn.Conv2d with kernel_size=1")
-    if convolution.groups != 1:
-        raise ValueError("a grouped convolution cannot be represented by nn.Linear")
-    linear = nn.Linear(
-        convolution.in_channels,
-        convolution.out_channels,
-        bias=convolution.bias is not None,
-        device=convolution.weight.device,
-        dtype=convolution.weight.dtype,
-    )
-    with torch.no_grad():
-        linear.weight.copy_(convolution.weight[:, :, 0, 0])
-        if convolution.bias is not None:
-            linear.bias.copy_(convolution.bias)
-    linear.weight.requires_grad_(convolution.weight.requires_grad)
-    if convolution.bias is not None:
-        linear.bias.requires_grad_(convolution.bias.requires_grad)
-    linear.train(convolution.training)
-    return linear
-
-
-def convert_nhwc_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
-    """Convert NHWC NAT Linear weights into NCHW pointwise-convolution weights.
-
-    Linear MLP weights gain two singleton dimensions.  LayerNorm and attention
-    keys are also adjusted for the transparent wrapper modules used by the
-    NCHW implementation.  The result can therefore be passed directly to
-    :meth:`NCHWNAT.load_state_dict`.
-    """
-
-    converted = OrderedDict()
-    for key, value in state_dict.items():
-        if key.endswith(("gamma1", "gamma2")):
-            key = f"{key}.weight"
-            if isinstance(value, torch.Tensor) and value.ndim == 1:
-                value = value[None, :, None, None]
-        parts = key.split(".")
-        if "attn" in parts:
-            index = parts.index("attn")
-            parts.insert(index + 1, "attention")
-        for index, part in tuple(enumerate(parts)):
-            if part in {"norm", "norm1", "norm2"}:
-                # Only parameter leaves need the implementation wrapper.  This
-                # covers tokenizer, stage/downsample, layer, and final norms.
-                if index + 1 < len(parts) and parts[index + 1] in {"weight", "bias"}:
-                    parts.insert(index + 1, "norm")
-                break
-        key = ".".join(parts)
-        if (
-            key.endswith(("mlp.fc1.weight", "mlp.fc2.weight"))
-            and isinstance(value, torch.Tensor)
-            and value.ndim == 2
-        ):
-            value = value[:, :, None, None]
-        converted[key] = value
-    if hasattr(state_dict, "_metadata"):
-        converted._metadata = state_dict._metadata
-    return converted
-
-
-def convert_nchw_nat_state_dict(state_dict: Mapping[str, torch.Tensor]):
-    """Convert wrapped NCHW keys and pointwise weights back to original NAT."""
-
-    converted = OrderedDict()
-    for key, value in state_dict.items():
-        if key.endswith(("gamma1.weight", "gamma2.weight")):
-            if isinstance(value, torch.Tensor) and value.ndim == 4:
-                if value.shape[0] != 1 or value.shape[-2:] != (1, 1):
-                    raise ValueError(f"{key!r} is not an NCHW LayerScale weight")
-                value = value[0, :, 0, 0]
-            key = key.removesuffix(".weight")
-        if (
-            key.endswith(("mlp.fc1.weight", "mlp.fc2.weight"))
-            and isinstance(value, torch.Tensor)
-            and value.ndim == 4
-        ):
-            if value.shape[-2:] != (1, 1):
-                raise ValueError(f"{key!r} is not a pointwise-convolution weight")
-            value = value[:, :, 0, 0]
-        parts = key.split(".")
-        for wrapper in ("attention", "norm"):
-            for index in range(1, len(parts)):
-                if parts[index] == wrapper and parts[index - 1] in {
-                    "attn",
-                    "norm",
-                    "norm1",
-                    "norm2",
-                }:
-                    del parts[index]
-                    break
-        key = ".".join(parts)
-        converted[key] = value
-    if hasattr(state_dict, "_metadata"):
-        converted._metadata = state_dict._metadata
-    return converted
-
-
 class PointwiseConvMlp(nn.Module):
     """NCHW equivalent of NAT's two-linear-layer pointwise MLP."""
 
@@ -251,44 +119,6 @@ class NCHWConvTokenizer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.proj(x))
-
-
-def copy_nhwc_conv_tokenizer_to_nchw(
-    reference: nn.Module, target: NCHWConvTokenizer
-) -> NCHWConvTokenizer:
-    """Copy a reference :class:`ConvTokenizer` into its NCHW equivalent.
-
-    Values as well as parameter dtype, device, and ``requires_grad`` state are
-    retained.  A normalized reference tokenizer is required because the NCHW
-    tokenizer always includes its final channel normalization.
-    """
-
-    if len(reference.proj) != 2 or not all(
-        isinstance(layer, nn.Conv2d) for layer in reference.proj
-    ):
-        raise TypeError("reference.proj must contain exactly two Conv2d layers")
-    if not isinstance(reference.norm, nn.LayerNorm):
-        raise TypeError("reference.norm must be an nn.LayerNorm")
-    if tuple(reference.norm.normalized_shape) != (target.norm.num_channels,):
-        raise ValueError("reference and target tokenizer dimensions differ")
-
-    source_parameters = list(reference.parameters())
-    target_parameters = list(target.parameters())
-    if len(source_parameters) != len(target_parameters):
-        raise ValueError("reference and target tokenizer parameters differ")
-
-    # Tokenizers normally have one dtype/device.  Assigning each copied tensor
-    # separately additionally preserves deliberately mixed parameter setups.
-    with torch.no_grad():
-        for source, destination in zip(source_parameters, target_parameters):
-            if source.shape != destination.shape:
-                raise ValueError("reference and target tokenizer dimensions differ")
-            destination.data = source.detach().clone()
-            destination.requires_grad_(source.requires_grad)
-    target.norm.eps = reference.norm.eps
-    target.norm.norm.eps = reference.norm.eps
-    target.train(reference.training)
-    return target
 
 
 class NCHWNATLayer(nn.Module):
@@ -657,70 +487,6 @@ NCHWNatPico = nchw_nat_pico
 NCHWNatSmall = nchw_nat_small
 NCHWNatBase = nchw_nat_base
 
-
-def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
-    """Copy an original-layout NAT layer into an NCHW production layer."""
-
-    target.norm1.norm.load_state_dict(reference.norm1.state_dict())
-    target.attn.attention.load_state_dict(reference.attn.state_dict())
-    target.norm2.norm.load_state_dict(reference.norm2.state_dict())
-    target.mlp.load_state_dict(reference.mlp.state_dict())
-    for name in ("gamma1", "gamma2"):
-        source = getattr(reference, name, None)
-        destination = getattr(target, name, None)
-        if (source is None) != (destination is None):
-            raise ValueError(
-                "reference and target must use the same layer_scale setting"
-            )
-        if source is not None:
-            source_weight = source.weight if isinstance(source, nn.Module) else source
-            if (
-                source_weight.ndim != 1
-                or destination.weight.numel() != source_weight.numel()
-            ):
-                raise ValueError("reference and target LayerScale dimensions differ")
-            destination.weight.data = (
-                source_weight.detach().clone().reshape(destination.weight.shape)
-            )
-            destination.weight.requires_grad_(source_weight.requires_grad)
-    return target
-
-
-def copy_nhwc_nat_block_to_nchw(
-    reference: nn.Module, target: NCHWNATBlock
-) -> NCHWNATBlock:
-    """Copy every parameter of an original-layout NAT block to NCHW."""
-
-    if len(reference.blocks) != len(target.blocks):
-        raise ValueError("reference and target NAT blocks have different depths")
-    for reference_layer, target_layer in zip(reference.blocks, target.blocks):
-        copy_nhwc_nat_to_nchw(reference_layer, target_layer)
-
-    if (reference.downsample is None) != (target.downsample is None):
-        raise ValueError("reference and target must use the same downsample setting")
-    if reference.downsample is not None:
-        target.downsample.reduction.load_state_dict(
-            reference.downsample.reduction.state_dict()
-        )
-        target.downsample.norm.norm.load_state_dict(
-            reference.downsample.norm.state_dict()
-        )
-    return target
-
-
-def copy_nhwc_nat_model_to_nchw(reference: nn.Module, target: NCHWNAT) -> NCHWNAT:
-    """Copy an original-layout NAT backbone into an NCHW backbone."""
-
-    if len(reference.levels) != len(target.levels):
-        raise ValueError("reference and target NAT models have different stage counts")
-    copy_nhwc_conv_tokenizer_to_nchw(reference.patch_embed, target.patch_embed)
-    for reference_level, target_level in zip(reference.levels, target.levels):
-        copy_nhwc_nat_block_to_nchw(reference_level, target_level)
-    target.norm.norm.load_state_dict(reference.norm.state_dict())
-    target.train(reference.training)
-    return target
-
-
 __all__ = [
     "ConvDownsampler",
     "NCHWConvDownsampler",
@@ -740,16 +506,7 @@ __all__ = [
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
-    "convert_nchw_nat_state_dict",
-    "convert_nhwc_nat_state_dict",
-    "copy_nhwc_nat_block_to_nchw",
-    "copy_nhwc_nat_model_to_nchw",
-    "copy_nhwc_nat_to_nchw",
-    "copy_nhwc_conv_tokenizer_to_nchw",
-    "linear_to_pointwise_conv",
-    "pointwise_conv_to_linear",
 ]
-
 
 # Kept as a compatibility alias for callers of the initial NCHW NAT API.  The
 # unprefixed name is unambiguous inside this NCHW-only module and matches the
