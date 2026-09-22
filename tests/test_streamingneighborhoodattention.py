@@ -1769,6 +1769,169 @@ def test_nat_mini_factory_strict_checkpoint_and_full_frame_feature_parity(
     assert actual.shape == (1, 512, 2, 3)
 
 
+def test_streaming_nat_small_checkpoint_smoke_has_layer_scale(natten_backend):
+    """The public LayerScale variant accepts an offline, production-shaped state."""
+
+    from lightstream.models.nat.nat import NAT
+
+    torch.manual_seed(42000)
+    reference = NAT(
+        depths=[3, 4, 18, 5],
+        num_heads=[3, 6, 12, 24],
+        embed_dim=96,
+        mlp_ratio=2,
+        kernel_size=7,
+        num_classes=1000,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=1e-5,
+    )
+    model = StreamingNAT(
+        "nat_small",
+        tile_size=385,
+        pretrained=reference.state_dict(),
+        defer_prepare=True,
+        verbose=False,
+    )
+
+    source_modules = dict(model._source_stream_network.named_modules())
+    gamma_modules = {
+        name: module
+        for name, module in source_modules.items()
+        if name.endswith((".gamma1", ".gamma2"))
+    }
+    assert len(gamma_modules) == 2 * sum([3, 4, 18, 5])
+    assert all(
+        module.__class__.__name__ == "LayerScale" for module in gamma_modules.values()
+    )
+    assert not any(
+        module.__class__.__name__ == "DropPath" for module in source_modules.values()
+    )
+    assert all(
+        module.p == 0
+        for module in source_modules.values()
+        if isinstance(module, nn.Dropout)
+    )
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_streaming_nat_mini_public_wrapper_multi_tile_gradient_and_cache_parity(
+    natten_backend,
+):
+    """Exercise the production-depth public constructor without downloading weights."""
+
+    from lightstream.models.nat.nat import NAT
+
+    torch.manual_seed(48001)
+    reference = NAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[2, 4, 8, 16],
+        embed_dim=64,
+        mlp_ratio=3,
+        kernel_size=7,
+        num_classes=1000,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+    )
+    checkpoint = reference.state_dict()
+    del reference
+    feature_state = {
+        name: value
+        for name, value in checkpoint.items()
+        if not name.startswith("head.")
+    }
+    full = NCHWNatMini().cuda()
+    full.load_state_dict(convert_nhwc_nat_state_dict(feature_state), strict=True)
+
+    streamer = StreamingNAT(
+        "nat_mini", tile_size=385, pretrained=checkpoint, device="cuda", verbose=False
+    )
+    cache = copy.deepcopy(streamer.get_tile_cache())
+    restored = StreamingNAT(
+        "nat_mini",
+        tile_size=385,
+        pretrained=checkpoint,
+        tile_cache=cache,
+        device="cuda",
+        verbose=False,
+    )
+    # Loading explicitly makes the cache-restored comparison independent of
+    # constructor initialization and mirrors applications restoring a model.
+    restored.stream_module.load_state_dict(streamer.stream_module.state_dict())
+
+    expected_attention_count = sum([3, 4, 6, 5])
+    for item in (streamer, restored):
+        modules = list(item.stream_module.modules())
+        assert (
+            sum(
+                isinstance(module, StreamingNeighborhoodAttention2D)
+                for module in modules
+            )
+            == expected_attention_count
+        )
+        assert not any(type(module) is NeighborhoodAttention2D for module in modules)
+        assert not any(isinstance(module, StreamingLayerScale) for module in modules)
+        assert not any(module.__class__.__name__ == "DropPath" for module in modules)
+        assert all(
+            module.p == 0 for module in modules if isinstance(module, nn.Dropout)
+        )
+
+    def parity_cycle(item, seed):
+        full.zero_grad(set_to_none=True)
+        item.stream_module.zero_grad(set_to_none=True)
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        full_image = torch.randn(
+            1, 3, 481, 485, generator=generator, device="cuda", requires_grad=True
+        )
+        tiled_image = full_image.detach().clone().requires_grad_(True)
+        expected = full(full_image)
+        actual = item(tiled_image)
+        _assert_close_with_diagnostics(
+            actual,
+            expected,
+            rtol=_COMPLETE_MODEL_STREAMED_FEATURE_RTOL,
+            atol=_COMPLETE_MODEL_STREAMED_FEATURE_ATOL,
+            quantity="public nat_mini streamed feature map",
+            streaming=item,
+            coordinate_space="output",
+        )
+        assert len(item._last_forward_tiles) > 1
+
+        upstream = torch.randn(expected.shape, generator=generator, device="cuda")
+        expected.backward(upstream)
+        item.backward(tiled_image, upstream)
+        _assert_close_with_diagnostics(
+            tiled_image.grad,
+            full_image.grad,
+            rtol=_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_RTOL,
+            atol=_COMPLETE_MODEL_STREAMED_IMAGE_GRAD_ATOL,
+            quantity="public nat_mini streamed image gradient",
+            streaming=item,
+            coordinate_space="input",
+        )
+        full_parameters = dict(full.named_parameters())
+        streamed_parameters = dict(item.stream_module.named_parameters())
+        assert set(streamed_parameters) == set(full_parameters)
+        for name, parameter in full_parameters.items():
+            assert parameter.grad is not None
+            assert streamed_parameters[name].grad is not None
+            _assert_close_with_diagnostics(
+                streamed_parameters[name].grad,
+                parameter.grad,
+                rtol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_RTOL,
+                atol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_ATOL,
+                quantity="public nat_mini streamed parameter gradient",
+                parameter_name=name,
+            )
+
+    parity_cycle(streamer, 48002)
+    parity_cycle(restored, 48003)
+
+
 def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     natten_backend,
 ):
