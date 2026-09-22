@@ -81,3 +81,44 @@ def test_streaming_nat_fresh_statistics_preserve_natten_projections(monkeypatch)
     assert type(proj) is original_proj_type
     assert [parameter.shape for parameter in qkv.parameters()] == original_qkv_shapes
     assert [parameter.shape for parameter in proj.parameters()] == original_proj_shapes
+
+
+def test_prepared_streaming_nat_exposes_converted_backbone(monkeypatch):
+    monkeypatch.setattr(nn.Module, "cuda", lambda self, *args, **kwargs: self)
+    source = nn.Sequential(
+        NeighborhoodAttention2D(attention=_MinimalNattenAttention())
+    )
+    supplied_state = copy.deepcopy(source.state_dict())
+
+    monkeypatch.setattr(
+        streaming_nat,
+        "_VARIANTS",
+        {
+            "minimal": {
+                "reference": {},
+                "nchw": lambda: copy.deepcopy(source),
+                "checkpoint": "unused",
+            }
+        },
+    )
+    monkeypatch.setattr(streaming_nat, "NAT", lambda **kwargs: copy.deepcopy(source))
+    monkeypatch.setattr(
+        streaming_nat, "convert_nhwc_nat_state_dict", lambda state: state
+    )
+
+    stream = streaming_nat.StreamingNAT(
+        "minimal",
+        tile_size=8,
+        pretrained=supplied_state,
+        tile_cache={},
+        verbose=False,
+    )
+
+    assert stream._is_prepared
+    converted_backbone = stream.stream_network.stream_module
+    assert isinstance(converted_backbone, nn.Sequential)
+    assert isinstance(converted_backbone[0], StreamingNeighborhoodAttention2D)
+    assert torch.equal(
+        converted_backbone[0].attention.qkv.weight,
+        supplied_state["0.attention.qkv.weight"],
+    )
