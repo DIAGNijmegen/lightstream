@@ -514,6 +514,40 @@ def NCHWNatMini(**kwargs) -> NCHWNAT:
     )
 
 
+def NCHWNatNano(**kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW synthetic Nano NAT variant."""
+
+    return NCHWNAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[1, 2, 4, 8],
+        embed_dim=32,
+        mlp_ratio=2,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+        **kwargs,
+    )
+
+
+def NCHWNatPico(**kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW synthetic Pico NAT variant."""
+
+    return NCHWNAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[1, 2, 4, 8],
+        embed_dim=16,
+        mlp_ratio=2,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+        **kwargs,
+    )
+
+
 def NCHWNatSmall(**kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_small`."""
 
@@ -617,6 +651,8 @@ __all__ = [
     "NCHWConvTokenizer",
     "NCHWNAT",
     "NCHWNatMini",
+    "NCHWNatNano",
+    "NCHWNatPico",
     "NCHWNatSmall",
     "NCHWNatBase",
     "NCHWNATBlock",
