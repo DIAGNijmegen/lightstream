@@ -1842,7 +1842,12 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
 
 @pytest.mark.cuda_integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
+@pytest.mark.parametrize(
+    "layer_scale",
+    [None, 1e-5],
+    ids=["without-layer-scale", "with-layer-scale"],
+)
+def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend, layer_scale):
     """A complete reduced NAT is exact across shifted, multi-tile streaming."""
 
     from lightstream.models.nat.nat import NAT
@@ -1858,16 +1863,30 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         num_classes=0,
         drop_rate=0.0,
         attn_drop_rate=0.0,
-        layer_scale=None,
+        layer_scale=layer_scale,
     )
     reference = NAT(**configuration).float().cuda()
     nchw_configuration = {
-        key: value
-        for key, value in configuration.items()
-        if key not in {"num_classes", "layer_scale"}
+        key: value for key, value in configuration.items() if key != "num_classes"
     }
     full_nchw = NCHWNAT(**nchw_configuration).float().cuda()
-    full_nchw.load_state_dict(convert_nhwc_nat_state_dict(reference.state_dict()))
+    reference_state = reference.state_dict()
+    converted_state = convert_nhwc_nat_state_dict(reference_state)
+    incompatible = full_nchw.load_state_dict(converted_state)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+
+    original_gamma_names = {
+        name for name in reference_state if name.endswith((".gamma1", ".gamma2"))
+    }
+    converted_gamma_names = {
+        name
+        for name in converted_state
+        if name.endswith((".gamma1.weight", ".gamma2.weight"))
+    }
+    assert len(converted_gamma_names) == len(original_gamma_names)
+    assert converted_gamma_names == {f"{name}.weight" for name in original_gamma_names}
+    assert (len(original_gamma_names) == 8) == (layer_scale is not None)
 
     # The approximately 183-pixel value is the model's forward receptive field,
     # while backward-safe streaming statistics require the larger 385×389
@@ -1876,6 +1895,22 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     image_shape = (481, 485)
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
+
+    def assert_streaming_layer_scales(item):
+        streamed_gamma_modules = {
+            name: module
+            for name, module in item.stream_module.named_modules()
+            if name.endswith((".gamma1", ".gamma2"))
+        }
+        assert set(streamed_gamma_modules) == {
+            name.removesuffix(".weight") for name in converted_gamma_names
+        }
+        assert all(
+            isinstance(module, StreamingLayerScale)
+            for module in streamed_gamma_modules.values()
+        )
+
+    assert_streaming_layer_scales(streaming)
 
     # Establish the intended traversal before starting either expensive parity
     # cycle. In particular, guard against receptive-field changes shrinking the
@@ -2093,6 +2128,12 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             )
 
         full_pairs = list(parameter_pairs(full_nchw))
+        gamma_names = {
+            name
+            for name, _, _ in full_pairs
+            if name.endswith((".gamma1.weight", ".gamma2.weight"))
+        }
+        assert gamma_names == converted_gamma_names
         for name, reference_parameter, full_parameter in full_pairs:
             assert (
                 reference_parameter.grad is not None and full_parameter.grad is not None
@@ -2102,7 +2143,11 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
                 reference_parameter.grad,
                 rtol=_COMPLETE_MODEL_PARAMETER_GRAD_RTOL,
                 atol=_COMPLETE_MODEL_PARAMETER_GRAD_ATOL,
-                quantity="multi-tile complete four-stage parameter gradient",
+                quantity=(
+                    "multi-tile complete four-stage gamma gradient"
+                    if name in gamma_names
+                    else "multi-tile complete four-stage remaining parameter gradient"
+                ),
                 parameter_name=name,
                 cycle=phase,
             )
@@ -2123,7 +2168,9 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
                     rtol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_RTOL,
                     atol=_COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_ATOL,
                     quantity=(
-                        "multi-tile complete four-stage streamed parameter gradient"
+                        "multi-tile complete four-stage streamed gamma gradient"
+                        if name in gamma_names
+                        else "multi-tile complete four-stage streamed remaining parameter gradient"
                     ),
                     parameter_name=name,
                     cycle=f"{phase}, {streamer_name}",
@@ -2143,7 +2190,11 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
             reference_parameter,
             rtol=_COMPLETE_MODEL_PARAMETER_RTOL,
             atol=_COMPLETE_MODEL_PARAMETER_ATOL,
-            quantity="multi-tile optimizer-updated parameter",
+            quantity=(
+                "multi-tile optimizer-updated gamma parameter"
+                if name in converted_gamma_names
+                else "multi-tile optimizer-updated remaining parameter"
+            ),
             parameter_name=name,
             cycle=initial_phase,
         )
@@ -2163,6 +2214,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
     cached_streaming = StreamingCNN(
         copy.deepcopy(full_nchw), tile_shape=tile_shape, state_dict=tile_cache
     )
+    assert_streaming_layer_scales(cached_streaming)
     cached_streaming.stream_module.load_state_dict(full_nchw.state_dict())
     compare_cycle(
         [
