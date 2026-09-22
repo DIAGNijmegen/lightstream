@@ -4,10 +4,11 @@ import torch
 pytest.importorskip("timm")
 pytest.importorskip("natten")
 
-from lightstream.models.nat import NCHWNatNano, NCHWNatPico, nat_nano, nat_pico
-from lightstream.models.nat.nchw import (
+from lightstream.models.nat import (
     nchw_nat_nano,
     nchw_nat_pico,
+    nat_nano,
+    nat_pico,
 )
 from lightstream.models.nat.streaming import _VARIANTS, _checkpoint_state
 
@@ -49,8 +50,8 @@ def test_synthetic_nhwc_factories_reject_pretrained(factory):
 @pytest.mark.parametrize(
     ("variant", "factory", "embed_dim"),
     [
-        ("nat_nano", NCHWNatNano, 32),
-        ("nat_pico", NCHWNatPico, 16),
+        ("nat_nano", nchw_nat_nano, 32),
+        ("nat_pico", nchw_nat_pico, 16),
     ],
 )
 def test_synthetic_variant_accepts_direct_nchw_state_dict(variant, factory, embed_dim):

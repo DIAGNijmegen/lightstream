@@ -480,23 +480,10 @@ def nchw_nat_base(pretrained: bool = False, **kwargs) -> NCHWNAT:
     return _load_pretrained_nchw(model, pretrained, "nat_base_1k")
 
 
-# Backward-compatible names from the original NCHW public API.
-NCHWNatMini = nchw_nat_mini
-NCHWNatNano = nchw_nat_nano
-NCHWNatPico = nchw_nat_pico
-NCHWNatSmall = nchw_nat_small
-NCHWNatBase = nchw_nat_base
-
 __all__ = [
     "ConvDownsampler",
-    "NCHWConvDownsampler",
     "NCHWConvTokenizer",
     "NCHWNAT",
-    "NCHWNatMini",
-    "NCHWNatNano",
-    "NCHWNatPico",
-    "NCHWNatSmall",
-    "NCHWNatBase",
     "nchw_nat_mini",
     "nchw_nat_tiny",
     "nchw_nat_small",
@@ -507,8 +494,3 @@ __all__ = [
     "NCHWNATLayer",
     "PointwiseConvMlp",
 ]
-
-# Kept as a compatibility alias for callers of the initial NCHW NAT API.  The
-# unprefixed name is unambiguous inside this NCHW-only module and matches the
-# corresponding NHWC production component.
-NCHWConvDownsampler = ConvDownsampler
