@@ -2379,11 +2379,24 @@ class StreamingCNN(torch.nn.Module):
             # constant setup tensors can make the actual output all zeros, so
             # derive validity from the input.
 
-            # A merge's valid support is the intersection encoded by its actual
-            # numerical result.  Other pointwise boundaries remain value
-            # independent and inherit support from their sole input.
-            validity_source = output if is_merge or not is_pointwise_module else inpt[0]
-            lost = self._non_max_border_amount(validity_source)
+            # Neighborhood attention has known spatial support, so its output
+            # values are neither necessary nor reliable as a validity mask.
+            # A merge is different: its result encodes the intersection of its
+            # branch masks and must still be inspected.  Other pointwise
+            # boundaries inherit validity from their sole input.
+            if is_neighborhood_attention:
+                input_lost = self._non_max_border_amount(inpt[0])
+                support = module.directional_spatial_support
+                lost = Lost(
+                    input_lost.top + support.top,
+                    input_lost.left + support.left,
+                    input_lost.bottom + support.bottom,
+                    input_lost.right + support.right,
+                )
+            elif is_merge or not is_pointwise_module:
+                lost = self._non_max_border_amount(output)
+            else:
+                lost = self._non_max_border_amount(inpt[0])
             if (
                 is_upsample
                 and module.mode == "bilinear"
@@ -2405,16 +2418,6 @@ class StreamingCNN(torch.nn.Module):
                     lost.bottom + border_h,
                     lost.right + border_w,
                 )
-            if is_neighborhood_attention:
-                support = module.directional_spatial_support
-                input_lost = self._non_max_border_amount(inpt[0])
-                lost = Lost(
-                    input_lost.top + support.top,
-                    input_lost.left + support.left,
-                    input_lost.bottom + support.bottom,
-                    input_lost.right + support.right,
-                )
-
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
             output[
