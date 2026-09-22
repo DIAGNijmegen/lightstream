@@ -111,6 +111,29 @@ def test_streaming_nat_rejects_stochastic_settings(setting):
         )
 
 
+def test_nchw_nat_constructor_defaults_stochastic_rates_to_zero():
+    model = NCHWNAT(
+        embed_dim=8,
+        mlp_ratio=2,
+        depths=[0, 0, 0, 0],
+        num_heads=[1, 2, 4, 8],
+    )
+
+    assert len(model.levels) == 4
+
+
+@pytest.mark.parametrize("setting", ["drop_rate", "attn_drop_rate", "drop_path_rate"])
+def test_nchw_nat_rejects_nonzero_stochastic_rates(setting):
+    with pytest.raises(ValueError, match=setting):
+        NCHWNAT(
+            embed_dim=8,
+            mlp_ratio=2,
+            depths=[0, 0, 0, 0],
+            num_heads=[1, 2, 4, 8],
+            **{setting: 0.1},
+        )
+
+
 def _assert_close_with_diagnostics(
     actual,
     expected,
