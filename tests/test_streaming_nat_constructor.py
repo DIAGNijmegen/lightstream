@@ -32,9 +32,7 @@ class _MinimalNattenAttention(nn.Module):
 
 def test_streaming_nat_fresh_statistics_preserve_natten_projections(monkeypatch):
     monkeypatch.setattr(nn.Module, "cuda", lambda self, *args, **kwargs: self)
-    source = nn.Sequential(
-        NeighborhoodAttention2D(attention=_MinimalNattenAttention())
-    )
+    source = nn.Sequential(NeighborhoodAttention2D(attention=_MinimalNattenAttention()))
     original_attention = source[0].attention
     original_qkv_type = type(original_attention.qkv)
     original_proj_type = type(original_attention.proj)
@@ -57,9 +55,6 @@ def test_streaming_nat_fresh_statistics_preserve_natten_projections(monkeypatch)
         },
     )
     monkeypatch.setattr(streaming_nat, "NAT", lambda **kwargs: copy.deepcopy(source))
-    monkeypatch.setattr(
-        streaming_nat, "convert_nhwc_nat_state_dict", lambda state: state
-    )
 
     model = streaming_nat.StreamingNAT(
         "minimal",
@@ -85,9 +80,7 @@ def test_streaming_nat_fresh_statistics_preserve_natten_projections(monkeypatch)
 
 def test_prepared_streaming_nat_exposes_converted_backbone(monkeypatch):
     monkeypatch.setattr(nn.Module, "cuda", lambda self, *args, **kwargs: self)
-    source = nn.Sequential(
-        NeighborhoodAttention2D(attention=_MinimalNattenAttention())
-    )
+    source = nn.Sequential(NeighborhoodAttention2D(attention=_MinimalNattenAttention()))
     supplied_state = copy.deepcopy(source.state_dict())
 
     monkeypatch.setattr(
@@ -102,9 +95,6 @@ def test_prepared_streaming_nat_exposes_converted_backbone(monkeypatch):
         },
     )
     monkeypatch.setattr(streaming_nat, "NAT", lambda **kwargs: copy.deepcopy(source))
-    monkeypatch.setattr(
-        streaming_nat, "convert_nhwc_nat_state_dict", lambda state: state
-    )
 
     stream = streaming_nat.StreamingNAT(
         "minimal",
