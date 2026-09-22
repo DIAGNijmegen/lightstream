@@ -55,11 +55,7 @@ def _begin_measure(device: torch.device) -> float:
 
 def _end_measure(start: float, device: torch.device) -> tuple[float, str]:
     _sync(device)
-    peak = (
-        f"{torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB"
-        if device.type == "cuda"
-        else "n/a (CPU)"
-    )
+    peak = f"{torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB" if device.type == "cuda" else "n/a (CPU)"
     return perf_counter() - start, peak
 
 
@@ -95,9 +91,7 @@ def _linear_shape(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _difference(
-    label: str, left: torch.Tensor, right: torch.Tensor, rtol: float, atol: float
-) -> tuple[float, bool]:
+def _difference(label: str, left: torch.Tensor, right: torch.Tensor, rtol: float, atol: float) -> tuple[float, bool]:
     diff = (left - right).abs()
     maximum = diff.max().item() if diff.numel() else 0.0
     mean = diff.mean().item() if diff.numel() else 0.0
@@ -118,9 +112,7 @@ def _parameter_comparison(
     rtol: float,
     atol: float,
 ) -> tuple[bool, list[tuple[float, str]]]:
-    left_params, right_params = dict(left.named_parameters()), dict(
-        right.named_parameters()
-    )
+    left_params, right_params = dict(left.named_parameters()), dict(right.named_parameters())
     mapping = right_to_left or {name: name for name in right_params}
     ok, worst = True, []
     print(f"\n{label} ({len(mapping)} named parameter gradients):")
@@ -132,20 +124,12 @@ def _parameter_comparison(
             ok = False
             continue
         if lp.grad is None or rp.grad is None:
-            missing = [
-                side
-                for side, grad in (("left", lp.grad), ("right", rp.grad))
-                if grad is None
-            ]
-            print(
-                f"  {left_name} <-> {right_name}: MISSING GRADIENT ({', '.join(missing)})"
-            )
+            missing = [side for side, grad in (("left", lp.grad), ("right", rp.grad)) if grad is None]
+            print(f"  {left_name} <-> {right_name}: MISSING GRADIENT ({', '.join(missing)})")
             ok = False
             continue
         rg = _linear_shape(rp.grad, lp.grad)
-        maximum, passed = _difference(
-            f"  {left_name} <-> {right_name}", lp.grad, rg, rtol, atol
-        )
+        maximum, passed = _difference(f"  {left_name} <-> {right_name}", lp.grad, rg, rtol, atol)
         worst.append((maximum, f"{left_name} <-> {right_name}"))
         ok &= passed
     print("Worst parameters:")
@@ -155,34 +139,25 @@ def _parameter_comparison(
 
 
 def _optimizer_deltas(model: nn.Module, lr: float) -> dict[str, torch.Tensor]:
-    before = {
-        name: parameter.detach().clone() for name, parameter in model.named_parameters()
-    }
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     torch.optim.SGD(model.parameters(), lr=lr).step()
-    return {
-        name: parameter.detach() - before[name]
-        for name, parameter in model.named_parameters()
-    }
+    return {name: parameter.detach() - before[name] for name, parameter in model.named_parameters()}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--variant",
         "--encoder",
         default="nat_mini",
         choices=PRETRAINED_CHOICES,
     )
-    parser.add_argument("--tile-size", type=int, default=4680)
-    parser.add_argument("--input-size", type=int, default=5120)
+    parser.add_argument("--tile-size", type=int, default=2560)
+    parser.add_argument("--input-size", type=int, default=3072)
     parser.add_argument("--tile-cache", type=Path)
     parser.add_argument("--fresh-tile-statistics", action="store_true")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
-    parser.add_argument(
-        "--dtype", choices=("float16", "float32", "float64"), default="float64"
-    )
+    parser.add_argument("--dtype", choices=("float16", "float32", "float64"), default="float64")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--forward-rtol", type=float, default=2e-4)
@@ -199,14 +174,10 @@ def main() -> None:
     nchw_factory = StreamingNAT.get_model_choices()[args.variant]
 
     if args.input_size <= args.tile_size:
-        parser.error(
-            "--input-size must exceed --tile-size (multi-tile traversal is required)"
-        )
+        parser.error("--input-size must exceed --tile-size (multi-tile traversal is required)")
     if args.fresh_tile_statistics:
         if args.tile_cache is None:
-            args.tile_cache = Path.cwd() / (
-                f"{args.variant}_tile_cache_1_3_{args.tile_size}_{args.tile_size}"
-            )
+            args.tile_cache = Path.cwd() / (f"{args.variant}_tile_cache_1_3_{args.tile_size}_{args.tile_size}")
         if args.tile_cache.exists():
             args.tile_cache.unlink()
             print(f"Removed tile cache for fresh statistics: {args.tile_cache}")
@@ -215,7 +186,9 @@ def main() -> None:
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
-        else "cpu" if args.device == "auto" else args.device
+        else "cpu"
+        if args.device == "auto"
+        else args.device
     )
     dtype = getattr(torch, args.dtype)
     print(
@@ -264,12 +237,8 @@ def main() -> None:
         device=device,
         dtype=dtype,
     )
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype)[
-        None, :, None, None
-    ]
-    std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype)[
-        None, :, None, None
-    ]
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype)[None, :, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype)[None, :, None, None]
     normalized = (raw - mean) / std
     ref_image = normalized.detach().clone().requires_grad_(True)
     full_image = normalized.detach().clone().requires_grad_(True)
@@ -298,9 +267,7 @@ def main() -> None:
     if len(starts) <= 1:
         raise RuntimeError("streaming did not genuinely traverse multiple tiles")
 
-    upstream = torch.randn(
-        full_output.shape, generator=generator, device=device, dtype=dtype
-    )
+    upstream = torch.randn(full_output.shape, generator=generator, device=device, dtype=dtype)
     start = _begin_measure(device)
     ref_output.backward(upstream)
     ref_backward_time, ref_backward_peak = _end_measure(start, device)
@@ -312,9 +279,7 @@ def main() -> None:
     stream_backward_time, stream_backward_peak = _end_measure(start, device)
 
     print("\nRuntime / peak CUDA memory:")
-    print(
-        f"  NHWC: forward={ref_time:.3f}s ({ref_peak}), backward={ref_backward_time:.3f}s ({ref_backward_peak})"
-    )
+    print(f"  NHWC: forward={ref_time:.3f}s ({ref_peak}), backward={ref_backward_time:.3f}s ({ref_backward_peak})")
     print(
         f"  full NCHW: forward={full_time:.3f}s ({full_peak}), backward={full_backward_time:.3f}s ({full_backward_peak})"
     )
@@ -332,11 +297,7 @@ def main() -> None:
     )
     failures += [] if passed else ["NHWC/full forward"]
     _, passed = _difference(
-        "full NCHW vs streamed NCHW forward",
-        full_output,
-        stream_output,
-        args.forward_rtol,
-        args.forward_atol,
+        "full NCHW vs streamed NCHW forward", full_output, stream_output, args.forward_rtol, args.forward_atol
     )
     failures += [] if passed else ["full/stream forward"]
     stream_image_grad = scnn.saliency_map.to(device=device, dtype=dtype)
@@ -352,9 +313,7 @@ def main() -> None:
             print(f"{label}: MISSING GRADIENT")
             failures.append(label)
         else:
-            _, passed = _difference(
-                label, left, right, args.image_grad_rtol, args.image_grad_atol
-            )
+            _, passed = _difference(label, left, right, args.image_grad_rtol, args.image_grad_atol)
             failures += [] if passed else [label]
 
     mapping = _mapped_names(reference)
@@ -377,9 +336,9 @@ def main() -> None:
     )
     failures += [] if passed else ["full/stream parameter gradients"]
 
-    ref_delta, full_delta = _optimizer_deltas(
-        reference, args.learning_rate
-    ), _optimizer_deltas(full, args.learning_rate)
+    ref_delta, full_delta = _optimizer_deltas(reference, args.learning_rate), _optimizer_deltas(
+        full, args.learning_rate
+    )
     stream_delta = _optimizer_deltas(streamed_model, args.learning_rate)
     print("\nOptimizer update-delta differences:")
     for label, left, right, names in (
