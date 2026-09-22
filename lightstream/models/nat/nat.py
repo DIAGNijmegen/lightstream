@@ -9,11 +9,10 @@ LICENSE file in the root directory of this source tree.
 
 import torch
 import torch.nn as nn
-from timm.models.layers import trunc_normal_, DropPath
-from timm.models.registry import register_model
+from timm.layers import trunc_normal_, DropPath
+from timm.models import register_model
 import natten
 from natten import NeighborhoodAttention2D as NeighborhoodAttention
-
 
 SUPPORTED_NATTEN_VERSION = "0.17.5"
 
@@ -33,10 +32,10 @@ _check_natten_compatibility()
 
 
 model_urls = {
-    "nat_mini_1k": "https://shi-labs.com/projects/nat/checkpoints/CLS/nat_mini.pth",
-    "nat_tiny_1k": "https://shi-labs.com/projects/nat/checkpoints/CLS/nat_tiny.pth",
-    "nat_small_1k": "https://shi-labs.com/projects/nat/checkpoints/CLS/nat_small.pth",
-    "nat_base_1k": "https://shi-labs.com/projects/nat/checkpoints/CLS/nat_base.pth",
+    "nat_mini_1k": "https://huggingface.co/itsjustafleshwound/nat-mini/resolve/main/nat_mini.pth",
+    "nat_tiny_1k": "https://huggingface.co/itsjustafleshwound/nat-tiny/resolve/main/nat_tiny.pth",
+    "nat_small_1k": "https://huggingface.co/itsjustafleshwound/nat-small/resolve/main/nat_small.pth",
+    "nat_base_1k": "https://huggingface.co/itsjustafleshwound/nat-base/resolve/main/nat_base.pth",
 }
 
 
@@ -217,9 +216,9 @@ class NATBlock(nn.Module):
                     qk_scale=qk_scale,
                     drop=drop,
                     attn_drop=attn_drop,
-                    drop_path=drop_path[i]
-                    if isinstance(drop_path, list)
-                    else drop_path,
+                    drop_path=(
+                        drop_path[i] if isinstance(drop_path, list) else drop_path
+                    ),
                     norm_layer=norm_layer,
                     layer_scale=layer_scale,
                 )

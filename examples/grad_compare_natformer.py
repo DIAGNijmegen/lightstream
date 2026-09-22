@@ -1,18 +1,10 @@
 """Compare NHWC, NCHW, and streamed NAT feature-map gradients.
 
-Examples
---------
-Random, identically initialized weights::
+Example
+-------
+Compare the hosted NHWC and NCHW ImageNet checkpoints::
 
     python examples/grad_compare_natformer.py --variant nat_mini
-
-An official ImageNet checkpoint already downloaded locally::
-
-    python examples/grad_compare_natformer.py --variant nat_mini --checkpoint nat_mini.pth
-
-Download the official checkpoint (the equivalent of ``pretrained=True``)::
-
-    python examples/grad_compare_natformer.py --variant nat_mini --pretrained
 
 To deliberately regenerate statistics, add ``--fresh-tile-statistics``.  Without
 that flag ``--tile-cache PATH`` loads a compatible existing cache (and creates
@@ -22,33 +14,35 @@ and saves it when it does not yet exist).
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
 from pathlib import Path
 from time import perf_counter
 
 import torch
 from torch import nn
 
-import lightstream.models.nat.nat as nhwc_nat
-import lightstream.models.nat.nchw as nchw_nat
-from lightstream.models.nat.nchw import convert_nhwc_nat_state_dict
+from lightstream.models.nat.nat import (
+    nat_base,
+    nat_mini,
+    nat_nano,
+    nat_pico,
+    nat_small,
+    nat_tiny,
+)
 from lightstream.models.nat.streaming import StreamingNAT
+
+NHWC_MODEL_CHOICES = {
+    "nat_mini": nat_mini,
+    "nat_tiny": nat_tiny,
+    "nat_small": nat_small,
+    "nat_base": nat_base,
+    "nat_nano": nat_nano,
+    "nat_pico": nat_pico,
+}
+PRETRAINED_CHOICES = ("nat_mini", "nat_tiny", "nat_small", "nat_base")
 
 
 def _reference(factory, *, pretrained: bool = False):
     return factory(pretrained=pretrained)
-
-
-def _strict_load(
-    model: nn.Module, state: Mapping[str, torch.Tensor], label: str
-) -> None:
-    incompatible = model.load_state_dict(state, strict=True)
-    print(
-        f"{label} checkpoint: missing={incompatible.missing_keys}, "
-        f"unexpected={incompatible.unexpected_keys}"
-    )
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise RuntimeError(f"{label}: strict checkpoint load was not complete")
 
 
 def _sync(device: torch.device) -> None:
@@ -74,17 +68,34 @@ def _end_measure(start: float, device: torch.device) -> tuple[float, str]:
 
 
 def _mapped_names(reference: nn.Module) -> dict[str, str]:
-    return {
-        next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
-        for name, parameter in reference.named_parameters()
-        if not name.startswith("head.")
-    }
+    """Map only the representation wrappers used by the NCHW implementation."""
+    mapped = {}
+    for name, parameter in reference.named_parameters():
+        if name.startswith("head."):
+            continue
+        parts = name.split(".")
+        if "attn" in parts:
+            parts.insert(parts.index("attn") + 1, "attention")
+        for index, part in tuple(enumerate(parts)):
+            if part in {"norm", "norm1", "norm2"} and index + 1 < len(parts):
+                if parts[index + 1] in {"weight", "bias"}:
+                    parts.insert(index + 1, "norm")
+                break
+        if name.endswith(("gamma1", "gamma2")):
+            parts.append("weight")
+        target = ".".join(parts)
+        if target in mapped:
+            raise RuntimeError(f"duplicate NCHW counterpart for {name!r}")
+        mapped[target] = name
+    return mapped
 
 
 def _linear_shape(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Remove only the two singleton dimensions introduced for pointwise convs."""
+    """Adapt pointwise-convolution and NCHW layer-scale parameter shapes."""
     if tensor.ndim == 4 and tensor.shape[-2:] == (1, 1) and target.ndim == 2:
         return tensor[:, :, 0, 0]
+    if tensor.ndim == 4 and tensor.shape[:1] == (1,) and target.ndim == 1:
+        return tensor[0, :, 0, 0]
     return tensor
 
 
@@ -166,16 +177,7 @@ def main() -> None:
         "--variant",
         "--encoder",
         default="nat_mini",
-        choices=StreamingNAT.get_model_names(),
-    )
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument(
-        "--checkpoint", help="local official/checkpoint state-dict path"
-    )
-    source.add_argument(
-        "--pretrained",
-        action="store_true",
-        help="download the official ImageNet checkpoint",
+        choices=PRETRAINED_CHOICES,
     )
     parser.add_argument("--tile-size", type=int, default=4680)
     parser.add_argument("--input-size", type=int, default=5120)
@@ -197,19 +199,8 @@ def main() -> None:
     parser.add_argument("--update-atol", type=float, default=1e-7)
     args = parser.parse_args()
 
-    try:
-        nhwc_factory = getattr(nhwc_nat, args.variant)
-    except AttributeError:
-        raise RuntimeError(
-            f"Missing original-layout factory {nhwc_nat.__name__}.{args.variant}"
-        ) from None
-    nchw_factory_name = f"nchw_{args.variant}"
-    try:
-        nchw_factory = getattr(nchw_nat, nchw_factory_name)
-    except AttributeError:
-        raise RuntimeError(
-            f"Missing NCHW factory {nchw_nat.__name__}.{nchw_factory_name}"
-        ) from None
+    nhwc_factory = NHWC_MODEL_CHOICES[args.variant]
+    nchw_factory = StreamingNAT.get_model_choices()[args.variant]
 
     if args.input_size <= args.tile_size:
         parser.error(
@@ -235,34 +226,12 @@ def main() -> None:
         f"device={device}, dtype={dtype}, encoder={args.variant}, "
         f"tile_size={args.tile_size}, input_size={args.input_size}"
     )
-    # Own the source checkpoint independently of all three model instances.
-    initial = _reference(nhwc_factory, pretrained=args.pretrained)
-    loaded = None
-    if args.checkpoint is not None:
-        loaded = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-        if "state_dict" in loaded and isinstance(loaded["state_dict"], Mapping):
-            loaded = loaded["state_dict"]
-        _strict_load(initial, loaded, "checkpoint source")
-    checkpoint = {
-        name: value.detach().cpu().clone()
-        for name, value in initial.state_dict().items()
-    }
-    del initial, loaded
-
-    reference = _reference(nhwc_factory)
-    _strict_load(reference, checkpoint, "NHWC reference")
-    feature_state = {
-        name: value
-        for name, value in checkpoint.items()
-        if not name.startswith("head.")
-    }
-    full = nchw_factory(pretrained=False)
-    converted = convert_nhwc_nat_state_dict(feature_state)
-    _strict_load(full, converted, "full NCHW")
+    reference = _reference(nhwc_factory, pretrained=True)
+    full = nchw_factory(pretrained=True)
     stream = StreamingNAT(
         args.variant,
         args.tile_size,
-        pretrained=checkpoint,
+        pretrained=True,
         tile_cache_path=args.tile_cache,
         device=device,
         verbose=True,
@@ -277,8 +246,13 @@ def main() -> None:
     )
     scnn = stream.stream_network
     streamed_model = scnn.stream_module
-    # Make the third ownership boundary and strict load explicit after conversion.
-    _strict_load(streamed_model, converted, "streamed NCHW")
+    full_state = full.state_dict()
+    streamed_state = streamed_model.state_dict()
+    if full_state.keys() != streamed_state.keys() or any(
+        not torch.equal(value, streamed_state[name])
+        for name, value in full_state.items()
+    ):
+        raise RuntimeError("full and streamed NCHW checkpoints are not identical")
     reference.to(device=device, dtype=dtype).eval()
     full.to(device=device, dtype=dtype).eval()
     stream.to(device=device, dtype=dtype).eval()
