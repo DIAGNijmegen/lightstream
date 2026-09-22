@@ -397,9 +397,10 @@ class NCHWNAT(nn.Module):
 
     Global pooling and the classification head are intentionally left to the
     caller so the spatial feature map can be consumed by Lightstream.  NAT's
-    stochastic regularizers are not tile invariant during streamed training,
-    and are consequently rejected rather than silently producing different
-    full-frame and streamed results.
+    stochastic regularizers are not tile invariant during streamed training.
+    They are intentionally unsupported for deterministic tiled training and
+    must remain zero, so nonzero values are rejected rather than silently
+    producing different full-frame and streamed results.
     """
 
     def __init__(
@@ -408,7 +409,7 @@ class NCHWNAT(nn.Module):
         mlp_ratio: float,
         depths: list[int] | tuple[int, ...],
         num_heads: list[int] | tuple[int, ...],
-        drop_path_rate: float = 0.2,
+        drop_path_rate: float = 0.0,
         in_chans: int = 3,
         kernel_size: int = 7,
         dilations: list[list[int]] | tuple[tuple[int, ...], ...] | None = None,
