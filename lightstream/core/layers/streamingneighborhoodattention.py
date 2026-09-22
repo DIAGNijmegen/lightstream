@@ -11,7 +11,7 @@ from importlib import import_module
 
 import torch
 from torch import nn
-from torch.amp import custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 
 from lightstream.core.scnn.utils import Box, Lost
 
@@ -161,15 +161,11 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
             return output.permute(0, 3, 1, 2).contiguous()
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         input, *parameters = ctx.saved_tensors
         with torch.enable_grad():
-            replay_dtype = next(
-                parameter.dtype
-                for parameter in parameters
-                if parameter.is_floating_point()
-            )
-            replay_input = input.detach().to(dtype=replay_dtype).requires_grad_(True)
+            replay_input = input.detach().requires_grad_(True)
             replay = ctx.attention(
                 replay_input.permute(0, 2, 3, 1).contiguous()
             )
@@ -189,7 +185,6 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
                     grad_output,
                     allow_unused=True,
                 )
-        input_gradient = input_gradient.to(dtype=input.dtype)
         parameter_grads = [None] * len(parameters)
         for index, gradient in zip(trainable_indices, parameter_gradients):
             parameter_grads[index] = gradient

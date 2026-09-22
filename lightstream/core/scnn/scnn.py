@@ -1716,7 +1716,11 @@ class StreamingCNN(torch.nn.Module):
                 tile.requires_grad_(True)
             self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-        use_cuda_autocast = self.device.type == "cuda" and torch.cuda.is_available()
+        use_cuda_autocast = (
+            self.device.type == "cuda"
+            and torch.cuda.is_available()
+            and self.dtype in {torch.float16, torch.bfloat16}
+        )
         if use_cuda_autocast:
             with torch.autocast(device_type="cuda", dtype=self.dtype):
                 tile_output = self.stream_module(tile)
