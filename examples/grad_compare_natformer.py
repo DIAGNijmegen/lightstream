@@ -29,72 +29,40 @@ from time import perf_counter
 import torch
 from torch import nn
 
-from lightstream.models.nat.nat import NAT, model_urls
-from lightstream.models.nat.nchw import (
-    nchw_nat_base,
-    nchw_nat_mini,
-    nchw_nat_nano,
-    nchw_nat_pico,
-    nchw_nat_small,
-    nchw_nat_tiny,
-    convert_nhwc_nat_state_dict,
-)
+import lightstream.models.nat.nat as nhwc_nat
+import lightstream.models.nat.nchw as nchw_nat
+from lightstream.models.nat.nchw import convert_nhwc_nat_state_dict
 from lightstream.models.nat.streaming import StreamingNAT
 
 
-VARIANTS = {
-    "nat_nano": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=32,
-                     mlp_ratio=2, kernel_size=7, layer_scale=None,
-                     nchw=nchw_nat_nano, checkpoint=None),
-    "nat_pico": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=16,
-                     mlp_ratio=2, kernel_size=7, layer_scale=None,
-                     nchw=nchw_nat_pico, checkpoint=None),
-    "nat_mini": dict(depths=[3, 4, 6, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
-                     mlp_ratio=3, kernel_size=7, layer_scale=None,
-                     nchw=nchw_nat_mini, checkpoint="nat_mini_1k"),
-    "nat_tiny": dict(depths=[3, 4, 18, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
-                     mlp_ratio=3, kernel_size=7, layer_scale=None,
-                     nchw=nchw_nat_tiny, checkpoint="nat_tiny_1k"),
-    "nat_small": dict(depths=[3, 4, 18, 5], num_heads=[3, 6, 12, 24], embed_dim=96,
-                      mlp_ratio=2, kernel_size=7, layer_scale=1e-5,
-                      nchw=nchw_nat_small, checkpoint="nat_small_1k"),
-    "nat_base": dict(depths=[3, 4, 18, 5], num_heads=[4, 8, 16, 32], embed_dim=128,
-                     mlp_ratio=2, kernel_size=7, layer_scale=1e-5,
-                     nchw=nchw_nat_base, checkpoint="nat_base_1k"),
-}
+def _factories(variant: str):
+    """Resolve matching, conventionally named NHWC and NCHW factories."""
 
-
-def _checkpoint(selection: str | None, pretrained: bool, variant: str) -> Mapping[str, torch.Tensor] | None:
-    if selection is None and not pretrained:
-        return None
-    checkpoint_name = VARIANTS[variant]["checkpoint"]
-    if pretrained and checkpoint_name is None:
+    model_name = variant if variant.startswith("nat_") else f"nat_{variant}"
+    if not model_name.removeprefix("nat_").isidentifier():
+        raise ValueError(f"invalid NAT variant: {variant!r}")
+    nhwc_factory = getattr(nhwc_nat, model_name, None)
+    nchw_name = f"nchw_{model_name}"
+    nchw_factory = getattr(nchw_nat, nchw_name, None)
+    if not callable(nhwc_factory) or not callable(nchw_factory):
         raise ValueError(
-            f"{variant!r} is a synthetic variant with no official pretrained weights; "
-            "use --checkpoint with a local checkpoint or omit --pretrained"
+            f"{variant!r} must resolve to callable {model_name!r} and {nchw_name!r} factories"
         )
-    source = model_urls[checkpoint_name] if pretrained else selection
-    assert source is not None
-    if source.startswith(("http://", "https://")):
-        state = torch.hub.load_state_dict_from_url(source, map_location="cpu")
-    else:
-        state = torch.load(source, map_location="cpu", weights_only=True)
-    if "state_dict" in state and isinstance(state["state_dict"], Mapping):
-        state = state["state_dict"]
-    return state
+    return model_name, nhwc_factory, nchw_factory
 
 
-def _reference(variant: str) -> NAT:
-    config = {key: value for key, value in VARIANTS[variant].items()
-              if key not in {"nchw", "checkpoint"}}
-    return NAT(**config, num_classes=1000, drop_rate=0.0, attn_drop_rate=0.0,
-               drop_path_rate=0.0)
+def _reference(factory, *, pretrained: bool = False):
+    return factory(pretrained=pretrained)
 
 
-def _strict_load(model: nn.Module, state: Mapping[str, torch.Tensor], label: str) -> None:
+def _strict_load(
+    model: nn.Module, state: Mapping[str, torch.Tensor], label: str
+) -> None:
     incompatible = model.load_state_dict(state, strict=True)
-    print(f"{label} checkpoint: missing={incompatible.missing_keys}, "
-          f"unexpected={incompatible.unexpected_keys}")
+    print(
+        f"{label} checkpoint: missing={incompatible.missing_keys}, "
+        f"unexpected={incompatible.unexpected_keys}"
+    )
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError(f"{label}: strict checkpoint load was not complete")
 
@@ -113,15 +81,20 @@ def _begin_measure(device: torch.device) -> float:
 
 def _end_measure(start: float, device: torch.device) -> tuple[float, str]:
     _sync(device)
-    peak = (f"{torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB"
-            if device.type == "cuda" else "n/a (CPU)")
+    peak = (
+        f"{torch.cuda.max_memory_allocated(device) / 2**20:.1f} MiB"
+        if device.type == "cuda"
+        else "n/a (CPU)"
+    )
     return perf_counter() - start, peak
 
 
 def _mapped_names(reference: nn.Module) -> dict[str, str]:
-    return {next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
-            for name, parameter in reference.named_parameters()
-            if not name.startswith("head.")}
+    return {
+        next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
+        for name, parameter in reference.named_parameters()
+        if not name.startswith("head.")
+    }
 
 
 def _linear_shape(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -131,22 +104,32 @@ def _linear_shape(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _difference(label: str, left: torch.Tensor, right: torch.Tensor,
-                rtol: float, atol: float) -> tuple[float, bool]:
+def _difference(
+    label: str, left: torch.Tensor, right: torch.Tensor, rtol: float, atol: float
+) -> tuple[float, bool]:
     diff = (left - right).abs()
     maximum = diff.max().item() if diff.numel() else 0.0
     mean = diff.mean().item() if diff.numel() else 0.0
     finite = bool(torch.isfinite(left).all() and torch.isfinite(right).all())
     passed = finite and torch.allclose(left, right, rtol=rtol, atol=atol)
-    print(f"{label}: mean_abs={mean:.6e}, max_abs={maximum:.6e}, "
-          f"finite={finite}, pass={passed} (rtol={rtol:g}, atol={atol:g})")
+    print(
+        f"{label}: mean_abs={mean:.6e}, max_abs={maximum:.6e}, "
+        f"finite={finite}, pass={passed} (rtol={rtol:g}, atol={atol:g})"
+    )
     return maximum, passed
 
 
-def _parameter_comparison(label: str, left: nn.Module, right: nn.Module,
-                          right_to_left: dict[str, str] | None, rtol: float,
-                          atol: float) -> tuple[bool, list[tuple[float, str]]]:
-    left_params, right_params = dict(left.named_parameters()), dict(right.named_parameters())
+def _parameter_comparison(
+    label: str,
+    left: nn.Module,
+    right: nn.Module,
+    right_to_left: dict[str, str] | None,
+    rtol: float,
+    atol: float,
+) -> tuple[bool, list[tuple[float, str]]]:
+    left_params, right_params = dict(left.named_parameters()), dict(
+        right.named_parameters()
+    )
     mapping = right_to_left or {name: name for name in right_params}
     ok, worst = True, []
     print(f"\n{label} ({len(mapping)} named parameter gradients):")
@@ -158,12 +141,20 @@ def _parameter_comparison(label: str, left: nn.Module, right: nn.Module,
             ok = False
             continue
         if lp.grad is None or rp.grad is None:
-            missing = [side for side, grad in (("left", lp.grad), ("right", rp.grad)) if grad is None]
-            print(f"  {left_name} <-> {right_name}: MISSING GRADIENT ({', '.join(missing)})")
+            missing = [
+                side
+                for side, grad in (("left", lp.grad), ("right", rp.grad))
+                if grad is None
+            ]
+            print(
+                f"  {left_name} <-> {right_name}: MISSING GRADIENT ({', '.join(missing)})"
+            )
             ok = False
             continue
         rg = _linear_shape(rp.grad, lp.grad)
-        maximum, passed = _difference(f"  {left_name} <-> {right_name}", lp.grad, rg, rtol, atol)
+        maximum, passed = _difference(
+            f"  {left_name} <-> {right_name}", lp.grad, rg, rtol, atol
+        )
         worst.append((maximum, f"{left_name} <-> {right_name}"))
         ok &= passed
     print("Worst parameters:")
@@ -173,23 +164,38 @@ def _parameter_comparison(label: str, left: nn.Module, right: nn.Module,
 
 
 def _optimizer_deltas(model: nn.Module, lr: float) -> dict[str, torch.Tensor]:
-    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    before = {
+        name: parameter.detach().clone() for name, parameter in model.named_parameters()
+    }
     torch.optim.SGD(model.parameters(), lr=lr).step()
-    return {name: parameter.detach() - before[name] for name, parameter in model.named_parameters()}
+    return {
+        name: parameter.detach() - before[name]
+        for name, parameter in model.named_parameters()
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--variant", "--encoder", choices=VARIANTS, default="nat_mini")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--variant", "--encoder", default="nat_mini")
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--checkpoint", help="local official/checkpoint state-dict path")
-    source.add_argument("--pretrained", action="store_true", help="download the official ImageNet checkpoint")
+    source.add_argument(
+        "--checkpoint", help="local official/checkpoint state-dict path"
+    )
+    source.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="download the official ImageNet checkpoint",
+    )
     parser.add_argument("--tile-size", type=int, default=4680)
     parser.add_argument("--input-size", type=int, default=5120)
     parser.add_argument("--tile-cache", type=Path)
     parser.add_argument("--fresh-tile-statistics", action="store_true")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
-    parser.add_argument("--dtype", choices=("float16", "float32", "float64"), default="float64")
+    parser.add_argument(
+        "--dtype", choices=("float16", "float32", "float64"), default="float64"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--forward-rtol", type=float, default=2e-4)
@@ -202,8 +208,15 @@ def main() -> None:
     parser.add_argument("--update-atol", type=float, default=1e-7)
     args = parser.parse_args()
 
+    try:
+        args.variant, nhwc_factory, nchw_factory = _factories(args.variant)
+    except ValueError as error:
+        parser.error(str(error))
+
     if args.input_size <= args.tile_size:
-        parser.error("--input-size must exceed --tile-size (multi-tile traversal is required)")
+        parser.error(
+            "--input-size must exceed --tile-size (multi-tile traversal is required)"
+        )
     if args.fresh_tile_statistics:
         if args.tile_cache is None:
             args.tile_cache = Path.cwd() / (
@@ -215,9 +228,9 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(
-        "cuda" if args.device == "auto" and torch.cuda.is_available()
-        else "cpu" if args.device == "auto"
-        else args.device
+        "cuda"
+        if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto" else args.device
     )
     dtype = getattr(torch, args.dtype)
     print(
@@ -225,24 +238,44 @@ def main() -> None:
         f"tile_size={args.tile_size}, input_size={args.input_size}"
     )
     # Own the source checkpoint independently of all three model instances.
-    initial = _reference(args.variant)
-    loaded = _checkpoint(args.checkpoint, args.pretrained, args.variant)
-    if loaded is not None:
+    initial = _reference(nhwc_factory, pretrained=args.pretrained)
+    loaded = None
+    if args.checkpoint is not None:
+        loaded = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if "state_dict" in loaded and isinstance(loaded["state_dict"], Mapping):
+            loaded = loaded["state_dict"]
         _strict_load(initial, loaded, "checkpoint source")
-    checkpoint = {name: value.detach().cpu().clone() for name, value in initial.state_dict().items()}
+    checkpoint = {
+        name: value.detach().cpu().clone()
+        for name, value in initial.state_dict().items()
+    }
     del initial, loaded
 
-    reference = _reference(args.variant)
+    reference = _reference(nhwc_factory)
     _strict_load(reference, checkpoint, "NHWC reference")
-    feature_state = {name: value for name, value in checkpoint.items() if not name.startswith("head.")}
-    full = VARIANTS[args.variant]["nchw"]()
+    feature_state = {
+        name: value
+        for name, value in checkpoint.items()
+        if not name.startswith("head.")
+    }
+    full = nchw_factory(pretrained=False)
     converted = convert_nhwc_nat_state_dict(feature_state)
     _strict_load(full, converted, "full NCHW")
     stream = StreamingNAT(
-        args.variant, args.tile_size, pretrained=checkpoint, tile_cache_path=args.tile_cache,
-        device=device, verbose=True, saliency=True, statistics_on_cpu=False,
-        normalize_on_gpu=False, mean=[0, 0, 0], std=[1, 1, 1], drop_rate=0.0,
-        attn_drop_rate=0.0, drop_path_rate=0.0,
+        args.variant,
+        args.tile_size,
+        pretrained=checkpoint,
+        tile_cache_path=args.tile_cache,
+        device=device,
+        verbose=True,
+        saliency=True,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
     )
     scnn = stream.stream_network
     streamed_model = scnn.stream_module
@@ -254,10 +287,18 @@ def main() -> None:
     scnn.device, scnn.dtype = device, dtype
 
     generator = torch.Generator(device=device).manual_seed(args.seed + 1)
-    raw = torch.rand((1, 3, args.input_size, args.input_size), generator=generator,
-                     device=device, dtype=dtype)
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype)[None, :, None, None]
-    std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype)[None, :, None, None]
+    raw = torch.rand(
+        (1, 3, args.input_size, args.input_size),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype)[
+        None, :, None, None
+    ]
+    std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype)[
+        None, :, None, None
+    ]
     normalized = (raw - mean) / std
     ref_image = normalized.detach().clone().requires_grad_(True)
     full_image = normalized.detach().clone().requires_grad_(True)
@@ -286,7 +327,9 @@ def main() -> None:
     if len(starts) <= 1:
         raise RuntimeError("streaming did not genuinely traverse multiple tiles")
 
-    upstream = torch.randn(full_output.shape, generator=generator, device=device, dtype=dtype)
+    upstream = torch.randn(
+        full_output.shape, generator=generator, device=device, dtype=dtype
+    )
     start = _begin_measure(device)
     ref_output.backward(upstream)
     ref_backward_time, ref_backward_peak = _end_measure(start, device)
@@ -298,45 +341,94 @@ def main() -> None:
     stream_backward_time, stream_backward_peak = _end_measure(start, device)
 
     print("\nRuntime / peak CUDA memory:")
-    print(f"  NHWC: forward={ref_time:.3f}s ({ref_peak}), backward={ref_backward_time:.3f}s ({ref_backward_peak})")
-    print(f"  full NCHW: forward={full_time:.3f}s ({full_peak}), backward={full_backward_time:.3f}s ({full_backward_peak})")
-    print(f"  streamed NCHW: forward={stream_forward_time:.3f}s ({stream_peak}), backward={stream_backward_time:.3f}s ({stream_backward_peak})")
+    print(
+        f"  NHWC: forward={ref_time:.3f}s ({ref_peak}), backward={ref_backward_time:.3f}s ({ref_backward_peak})"
+    )
+    print(
+        f"  full NCHW: forward={full_time:.3f}s ({full_peak}), backward={full_backward_time:.3f}s ({full_backward_peak})"
+    )
+    print(
+        f"  streamed NCHW: forward={stream_forward_time:.3f}s ({stream_peak}), backward={stream_backward_time:.3f}s ({stream_backward_peak})"
+    )
 
     failures = []
-    _, passed = _difference("NHWC vs full NCHW forward", ref_output, full_output,
-                            args.forward_rtol, args.forward_atol)
+    _, passed = _difference(
+        "NHWC vs full NCHW forward",
+        ref_output,
+        full_output,
+        args.forward_rtol,
+        args.forward_atol,
+    )
     failures += [] if passed else ["NHWC/full forward"]
-    _, passed = _difference("full NCHW vs streamed NCHW forward", full_output, stream_output,
-                            args.forward_rtol, args.forward_atol)
+    _, passed = _difference(
+        "full NCHW vs streamed NCHW forward",
+        full_output,
+        stream_output,
+        args.forward_rtol,
+        args.forward_atol,
+    )
     failures += [] if passed else ["full/stream forward"]
     stream_image_grad = scnn.saliency_map.to(device=device, dtype=dtype)
-    for label, left, right in (("NHWC vs full NCHW image gradient", ref_image.grad, full_image.grad),
-                               ("full NCHW vs streamed NCHW image gradient", full_image.grad, stream_image_grad)):
+    for label, left, right in (
+        ("NHWC vs full NCHW image gradient", ref_image.grad, full_image.grad),
+        (
+            "full NCHW vs streamed NCHW image gradient",
+            full_image.grad,
+            stream_image_grad,
+        ),
+    ):
         if left is None or right is None:
             print(f"{label}: MISSING GRADIENT")
             failures.append(label)
         else:
-            _, passed = _difference(label, left, right, args.image_grad_rtol, args.image_grad_atol)
+            _, passed = _difference(
+                label, left, right, args.image_grad_rtol, args.image_grad_atol
+            )
             failures += [] if passed else [label]
 
     mapping = _mapped_names(reference)
-    passed, _ = _parameter_comparison("NHWC vs full NCHW", reference, full, mapping,
-                                      args.param_grad_rtol, args.param_grad_atol)
+    passed, _ = _parameter_comparison(
+        "NHWC vs full NCHW",
+        reference,
+        full,
+        mapping,
+        args.param_grad_rtol,
+        args.param_grad_atol,
+    )
     failures += [] if passed else ["NHWC/full parameter gradients"]
-    passed, _ = _parameter_comparison("full NCHW vs streamed NCHW", full, streamed_model,
-                                      None, args.param_grad_rtol, args.param_grad_atol)
+    passed, _ = _parameter_comparison(
+        "full NCHW vs streamed NCHW",
+        full,
+        streamed_model,
+        None,
+        args.param_grad_rtol,
+        args.param_grad_atol,
+    )
     failures += [] if passed else ["full/stream parameter gradients"]
 
-    ref_delta, full_delta = _optimizer_deltas(reference, args.learning_rate), _optimizer_deltas(full, args.learning_rate)
+    ref_delta, full_delta = _optimizer_deltas(
+        reference, args.learning_rate
+    ), _optimizer_deltas(full, args.learning_rate)
     stream_delta = _optimizer_deltas(streamed_model, args.learning_rate)
     print("\nOptimizer update-delta differences:")
-    for label, left, right, names in (("NHWC vs full NCHW", ref_delta, full_delta, mapping),
-                                      ("full NCHW vs streamed NCHW", full_delta, stream_delta,
-                                       {name: name for name in stream_delta})):
+    for label, left, right, names in (
+        ("NHWC vs full NCHW", ref_delta, full_delta, mapping),
+        (
+            "full NCHW vs streamed NCHW",
+            full_delta,
+            stream_delta,
+            {name: name for name in stream_delta},
+        ),
+    ):
         for right_name, left_name in sorted(names.items()):
             right_value = _linear_shape(right[right_name], left[left_name])
-            _, passed = _difference(f"  {label}: {left_name} <-> {right_name}", left[left_name],
-                                    right_value, args.update_rtol, args.update_atol)
+            _, passed = _difference(
+                f"  {label}: {left_name} <-> {right_name}",
+                left[left_name],
+                right_value,
+                args.update_rtol,
+                args.update_atol,
+            )
             failures += [] if passed else [f"{label} optimizer update {right_name}"]
 
     if failures:

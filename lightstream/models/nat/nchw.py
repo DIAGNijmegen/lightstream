@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping
 from numbers import Number
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -21,17 +22,50 @@ from lightstream.core.layers import (
     StreamingMerge,
 )
 
+_Pretrained = bool | str | Path | Mapping[str, torch.Tensor] | None
 
-def _load_pretrained_nchw(model: "NCHWNAT", checkpoint: str) -> "NCHWNAT":
-    """Load an official NHWC NAT checkpoint into an NCHW backbone."""
+
+def _load_pretrained_nchw(
+    model: "NCHWNAT",
+    pretrained: _Pretrained,
+    checkpoint: str | None,
+) -> "NCHWNAT":
+    """Resolve an NHWC checkpoint and strictly load it into an NCHW backbone."""
+
+    if pretrained is False or pretrained is None:
+        return model
 
     # Import lazily so the NCHW building blocks do not eagerly import the
     # reference implementation (and its timm model registrations).
     from lightstream.models.nat.nat import model_urls
 
-    state_dict = torch.hub.load_state_dict_from_url(
-        model_urls[checkpoint], map_location="cpu"
-    )
+    if isinstance(pretrained, Mapping):
+        state_dict = pretrained
+    elif pretrained is True:
+        if checkpoint is None:
+            raise ValueError(
+                "synthetic variant with no official checkpoint; pass a local path, "
+                "URL, state dict, or pretrained=False"
+            )
+        state_dict = torch.hub.load_state_dict_from_url(
+            model_urls[checkpoint], map_location="cpu"
+        )
+    elif isinstance(pretrained, (str, Path)):
+        selection = str(pretrained)
+        if selection in model_urls:
+            state_dict = torch.hub.load_state_dict_from_url(
+                model_urls[selection], map_location="cpu"
+            )
+        elif selection.startswith(("http://", "https://")):
+            state_dict = torch.hub.load_state_dict_from_url(
+                selection, map_location="cpu"
+            )
+        else:
+            state_dict = torch.load(selection, map_location="cpu", weights_only=True)
+    else:
+        raise TypeError(
+            "`pretrained` must be a bool, checkpoint name/path, or state dict"
+        )
     if (
         isinstance(state_dict, Mapping)
         and "state_dict" in state_dict
@@ -39,9 +73,7 @@ def _load_pretrained_nchw(model: "NCHWNAT", checkpoint: str) -> "NCHWNAT":
     ):
         state_dict = state_dict["state_dict"]
     state_dict = {
-        key: value
-        for key, value in state_dict.items()
-        if not key.startswith("head.")
+        key: value for key, value in state_dict.items() if not key.startswith("head.")
     }
     model.load_state_dict(convert_nhwc_nat_state_dict(state_dict), strict=True)
     return model
@@ -515,7 +547,7 @@ class NCHWNAT(nn.Module):
         return self.forward_features(x)
 
 
-def nchw_nat_mini(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_mini(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_mini`.
 
     The original factory's stochastic-depth default is intentionally replaced
@@ -537,10 +569,10 @@ def nchw_nat_mini(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=None,
         **kwargs,
     )
-    return _load_pretrained_nchw(model, "nat_mini_1k") if pretrained else model
+    return _load_pretrained_nchw(model, pretrained, "nat_mini_1k")
 
 
-def nchw_nat_tiny(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_tiny(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_tiny`."""
 
     model = NCHWNAT(
@@ -555,15 +587,13 @@ def nchw_nat_tiny(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=None,
         **kwargs,
     )
-    return _load_pretrained_nchw(model, "nat_tiny_1k") if pretrained else model
+    return _load_pretrained_nchw(model, pretrained, "nat_tiny_1k")
 
 
-def nchw_nat_nano(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_nano(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW synthetic Nano NAT variant."""
 
-    if pretrained:
-        raise ValueError("no official pretrained checkpoint exists for NCHW NAT Nano")
-    return NCHWNAT(
+    model = NCHWNAT(
         depths=[3, 4, 6, 5],
         num_heads=[1, 2, 4, 8],
         embed_dim=32,
@@ -575,14 +605,13 @@ def nchw_nat_nano(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=None,
         **kwargs,
     )
+    return _load_pretrained_nchw(model, pretrained, None)
 
 
-def nchw_nat_pico(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_pico(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW synthetic Pico NAT variant."""
 
-    if pretrained:
-        raise ValueError("no official pretrained checkpoint exists for NCHW NAT Pico")
-    return NCHWNAT(
+    model = NCHWNAT(
         depths=[3, 4, 6, 5],
         num_heads=[1, 2, 4, 8],
         embed_dim=16,
@@ -594,9 +623,10 @@ def nchw_nat_pico(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=None,
         **kwargs,
     )
+    return _load_pretrained_nchw(model, pretrained, None)
 
 
-def nchw_nat_small(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_small(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_small`."""
 
     model = NCHWNAT(
@@ -611,10 +641,10 @@ def nchw_nat_small(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=1e-5,
         **kwargs,
     )
-    return _load_pretrained_nchw(model, "nat_small_1k") if pretrained else model
+    return _load_pretrained_nchw(model, pretrained, "nat_small_1k")
 
 
-def nchw_nat_base(pretrained: bool = False, **kwargs) -> NCHWNAT:
+def nchw_nat_base(pretrained: _Pretrained = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_base`."""
 
     model = NCHWNAT(
@@ -629,7 +659,7 @@ def nchw_nat_base(pretrained: bool = False, **kwargs) -> NCHWNAT:
         layer_scale=1e-5,
         **kwargs,
     )
-    return _load_pretrained_nchw(model, "nat_base_1k") if pretrained else model
+    return _load_pretrained_nchw(model, pretrained, "nat_base_1k")
 
 
 # Compatibility aliases for the initial public NCHW API.
@@ -651,7 +681,9 @@ def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNAT
         source = getattr(reference, name, None)
         destination = getattr(target, name, None)
         if (source is None) != (destination is None):
-            raise ValueError("reference and target must use the same layer_scale setting")
+            raise ValueError(
+                "reference and target must use the same layer_scale setting"
+            )
         if source is not None:
             source_weight = source.weight if isinstance(source, nn.Module) else source
             if (
@@ -659,8 +691,8 @@ def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNAT
                 or destination.weight.numel() != source_weight.numel()
             ):
                 raise ValueError("reference and target LayerScale dimensions differ")
-            destination.weight.data = source_weight.detach().clone().reshape(
-                destination.weight.shape
+            destination.weight.data = (
+                source_weight.detach().clone().reshape(destination.weight.shape)
             )
             destination.weight.requires_grad_(source_weight.requires_grad)
     return target
@@ -688,9 +720,7 @@ def copy_nhwc_nat_block_to_nchw(
     return target
 
 
-def copy_nhwc_nat_model_to_nchw(
-    reference: nn.Module, target: NCHWNAT
-) -> NCHWNAT:
+def copy_nhwc_nat_model_to_nchw(reference: nn.Module, target: NCHWNAT) -> NCHWNAT:
     """Copy an original-layout NAT backbone into an NCHW backbone."""
 
     if len(reference.levels) != len(target.levels):
