@@ -495,9 +495,10 @@ def test_streaming_attention_backward_restores_cuda_autocast_state():
     input = torch.randn(1, 4, 5, 5, device="cuda", requires_grad=True)
     reference_input = input.detach().clone().requires_grad_(True)
 
-    reference_output = reference(
-        reference_input.permute(0, 2, 3, 1).contiguous()
-    )
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        reference_output = reference(
+            reference_input.permute(0, 2, 3, 1).contiguous()
+        )
     reference_output.sum().backward()
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -505,8 +506,8 @@ def test_streaming_attention_backward_restores_cuda_autocast_state():
         assert output.dtype == torch.bfloat16
 
     # Backward deliberately starts after the user autocast context has ended.
-    # Its nested replay must use the parameters' Float32 dtype rather than
-    # restoring the forward autocast state and silently recomputing in BF16.
+    # The custom autograd boundary must restore the forward BF16 autocast state
+    # so its nested replay can consume NATTEN's Float32 parameters correctly.
     output.sum().backward()
 
     torch.testing.assert_close(input.grad, reference_input.grad, rtol=1e-5, atol=1e-6)
