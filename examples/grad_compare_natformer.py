@@ -226,12 +226,14 @@ def main() -> None:
         normalize_on_gpu=False, mean=[0, 0, 0], std=[1, 1, 1], drop_rate=0.0,
         attn_drop_rate=0.0, drop_path_rate=0.0,
     )
+    scnn = stream.stream_network
+    streamed_model = scnn.stream_module
     # Make the third ownership boundary and strict load explicit after conversion.
-    _strict_load(stream.stream_module, converted, "streamed NCHW")
+    _strict_load(streamed_model, converted, "streamed NCHW")
     reference.to(device=device, dtype=dtype).eval()
     full.to(device=device, dtype=dtype).eval()
     stream.to(device=device, dtype=dtype).eval()
-    stream.stream_network.device, stream.stream_network.dtype = device, dtype
+    scnn.device, scnn.dtype = device, dtype
 
     generator = torch.Generator(device=device).manual_seed(args.seed + 1)
     raw = torch.rand((1, 3, args.input_size, args.input_size), generator=generator,
@@ -253,7 +255,6 @@ def main() -> None:
     stream_output = stream(stream_image)
     stream_forward_time, stream_peak = _end_measure(start, device)
 
-    scnn = stream.stream_network
     starts = scnn._tile_start_list(scnn._last_forward_tiles)
     rows, cols = len({y for y, _ in starts}), len({x for _, x in starts})
     valid_sizes = scnn._compute_valid_output_sizes()
@@ -304,12 +305,12 @@ def main() -> None:
     passed, _ = _parameter_comparison("NHWC vs full NCHW", reference, full, mapping,
                                       args.param_grad_rtol, args.param_grad_atol)
     failures += [] if passed else ["NHWC/full parameter gradients"]
-    passed, _ = _parameter_comparison("full NCHW vs streamed NCHW", full, stream.stream_module,
+    passed, _ = _parameter_comparison("full NCHW vs streamed NCHW", full, streamed_model,
                                       None, args.param_grad_rtol, args.param_grad_atol)
     failures += [] if passed else ["full/stream parameter gradients"]
 
     ref_delta, full_delta = _optimizer_deltas(reference, args.learning_rate), _optimizer_deltas(full, args.learning_rate)
-    stream_delta = _optimizer_deltas(stream.stream_module, args.learning_rate)
+    stream_delta = _optimizer_deltas(streamed_model, args.learning_rate)
     print("\nOptimizer update-delta differences:")
     for label, left, right, names in (("NHWC vs full NCHW", ref_delta, full_delta, mapping),
                                       ("full NCHW vs streamed NCHW", full_delta, stream_delta,
