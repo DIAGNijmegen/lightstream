@@ -35,22 +35,6 @@ from lightstream.models.nat.nchw import convert_nhwc_nat_state_dict
 from lightstream.models.nat.streaming import StreamingNAT
 
 
-def _factories(variant: str):
-    """Resolve matching, conventionally named NHWC and NCHW factories."""
-
-    model_name = variant if variant.startswith("nat_") else f"nat_{variant}"
-    if not model_name.removeprefix("nat_").isidentifier():
-        raise ValueError(f"invalid NAT variant: {variant!r}")
-    nhwc_factory = getattr(nhwc_nat, model_name, None)
-    nchw_name = f"nchw_{model_name}"
-    nchw_factory = getattr(nchw_nat, nchw_name, None)
-    if not callable(nhwc_factory) or not callable(nchw_factory):
-        raise ValueError(
-            f"{variant!r} must resolve to callable {model_name!r} and {nchw_name!r} factories"
-        )
-    return model_name, nhwc_factory, nchw_factory
-
-
 def _reference(factory, *, pretrained: bool = False):
     return factory(pretrained=pretrained)
 
@@ -178,7 +162,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--variant", "--encoder", default="nat_mini")
+    parser.add_argument(
+        "--variant",
+        "--encoder",
+        default="nat_mini",
+        choices=StreamingNAT.get_model_names(),
+    )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--checkpoint", help="local official/checkpoint state-dict path"
@@ -209,9 +198,18 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        args.variant, nhwc_factory, nchw_factory = _factories(args.variant)
-    except ValueError as error:
-        parser.error(str(error))
+        nhwc_factory = getattr(nhwc_nat, args.variant)
+    except AttributeError:
+        raise RuntimeError(
+            f"Missing original-layout factory {nhwc_nat.__name__}.{args.variant}"
+        ) from None
+    nchw_factory_name = f"nchw_{args.variant}"
+    try:
+        nchw_factory = getattr(nchw_nat, nchw_factory_name)
+    except AttributeError:
+        raise RuntimeError(
+            f"Missing NCHW factory {nchw_nat.__name__}.{nchw_factory_name}"
+        ) from None
 
     if args.input_size <= args.tile_size:
         parser.error(
