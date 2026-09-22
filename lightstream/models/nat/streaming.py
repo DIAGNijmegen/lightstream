@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from lightstream.core.layers import NeighborhoodAttention2D
 from lightstream.models.nat.nat import NAT, model_urls
 from lightstream.models.nat.nchw import (
     NCHWNatBase,
@@ -164,6 +165,7 @@ class StreamingNAT(StreamingModule):
             std = [0.229, 0.224, 0.225]
         super().__init__(
             network, tile_size, tile_cache_path, defer_prepare=defer_prepare,
+            add_keep_modules=[NeighborhoodAttention2D],
             verbose=verbose, deterministic=deterministic, saliency=saliency,
             diagnose_saliency_assembly=diagnose_saliency_assembly,
             copy_to_gpu=copy_to_gpu, statistics_on_cpu=statistics_on_cpu,
