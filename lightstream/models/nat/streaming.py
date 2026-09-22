@@ -13,6 +13,8 @@ from lightstream.models.nat.nat import NAT, model_urls
 from lightstream.models.nat.nchw import (
     NCHWNatBase,
     NCHWNatMini,
+    NCHWNatNano,
+    NCHWNatPico,
     NCHWNatSmall,
     convert_nhwc_nat_state_dict,
 )
@@ -20,6 +22,22 @@ from lightstream.modules.streaming import StreamingModule
 
 
 _VARIANTS = {
+    "nat_nano": {
+        "reference": dict(
+            depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8],
+            embed_dim=32, mlp_ratio=2, kernel_size=7, layer_scale=None,
+        ),
+        "nchw": NCHWNatNano,
+        "checkpoint": None,
+    },
+    "nat_pico": {
+        "reference": dict(
+            depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8],
+            embed_dim=16, mlp_ratio=2, kernel_size=7, layer_scale=None,
+        ),
+        "nchw": NCHWNatPico,
+        "checkpoint": None,
+    },
     "nat_mini": {
         "reference": dict(
             depths=[3, 4, 6, 5], num_heads=[2, 4, 8, 16],
@@ -58,11 +76,25 @@ def _checkpoint_state(
     if isinstance(pretrained, Mapping):
         state = pretrained
     elif pretrained is True:
+        checkpoint_name = _VARIANTS[variant]["checkpoint"]
+        if checkpoint_name is None:
+            raise ValueError(
+                f"{variant!r} is a synthetic variant with no official checkpoint; "
+                "pass a local path, URL, state dict, or pretrained=False"
+            )
         state = torch.hub.load_state_dict_from_url(
-            model_urls[_VARIANTS[variant]["checkpoint"]], map_location="cpu"
+            model_urls[checkpoint_name], map_location="cpu"
         )
     elif isinstance(pretrained, (str, Path)):
         selection = str(pretrained)
+        if (
+            _VARIANTS[variant]["checkpoint"] is None
+            and selection == f"{variant}_1k"
+        ):
+            raise ValueError(
+                f"{variant!r} is a synthetic variant with no official checkpoint "
+                f"named {selection!r}; pass a local path, URL, or state dict"
+            )
         if selection in model_urls:
             state = torch.hub.load_state_dict_from_url(
                 model_urls[selection], map_location="cpu"

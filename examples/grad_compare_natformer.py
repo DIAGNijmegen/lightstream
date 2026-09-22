@@ -33,6 +33,8 @@ from lightstream.models.nat.nat import NAT, model_urls
 from lightstream.models.nat.nchw import (
     NCHWNatBase,
     NCHWNatMini,
+    NCHWNatNano,
+    NCHWNatPico,
     NCHWNatSmall,
     convert_nhwc_nat_state_dict,
 )
@@ -40,6 +42,12 @@ from lightstream.models.nat.streaming import StreamingNAT
 
 
 VARIANTS = {
+    "nat_nano": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=32,
+                     mlp_ratio=2, kernel_size=7, layer_scale=None,
+                     nchw=NCHWNatNano, checkpoint=None),
+    "nat_pico": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=16,
+                     mlp_ratio=2, kernel_size=7, layer_scale=None,
+                     nchw=NCHWNatPico, checkpoint=None),
     "nat_mini": dict(depths=[3, 4, 6, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
                      mlp_ratio=3, kernel_size=7, layer_scale=None,
                      nchw=NCHWNatMini, checkpoint="nat_mini_1k"),
@@ -55,7 +63,13 @@ VARIANTS = {
 def _checkpoint(selection: str | None, pretrained: bool, variant: str) -> Mapping[str, torch.Tensor] | None:
     if selection is None and not pretrained:
         return None
-    source = model_urls[VARIANTS[variant]["checkpoint"]] if pretrained else selection
+    checkpoint_name = VARIANTS[variant]["checkpoint"]
+    if pretrained and checkpoint_name is None:
+        raise ValueError(
+            f"{variant!r} is a synthetic variant with no official pretrained weights; "
+            "use --checkpoint with a local checkpoint or omit --pretrained"
+        )
+    source = model_urls[checkpoint_name] if pretrained else selection
     assert source is not None
     if source.startswith(("http://", "https://")):
         state = torch.hub.load_state_dict_from_url(source, map_location="cpu")
