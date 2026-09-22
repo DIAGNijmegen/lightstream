@@ -513,6 +513,40 @@ def NCHWNatMini(**kwargs) -> NCHWNAT:
     )
 
 
+def NCHWNatSmall(**kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW counterpart of :func:`nat_small`."""
+
+    return NCHWNAT(
+        depths=[3, 4, 18, 5],
+        num_heads=[3, 6, 12, 24],
+        embed_dim=96,
+        mlp_ratio=2,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=1e-5,
+        **kwargs,
+    )
+
+
+def NCHWNatBase(**kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW counterpart of :func:`nat_base`."""
+
+    return NCHWNAT(
+        depths=[3, 4, 18, 5],
+        num_heads=[4, 8, 16, 32],
+        embed_dim=128,
+        mlp_ratio=2,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=1e-5,
+        **kwargs,
+    )
+
+
 def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
     """Copy an original-layout NAT layer into an NCHW production layer."""
 
@@ -582,6 +616,8 @@ __all__ = [
     "NCHWConvTokenizer",
     "NCHWNAT",
     "NCHWNatMini",
+    "NCHWNatSmall",
+    "NCHWNatBase",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",

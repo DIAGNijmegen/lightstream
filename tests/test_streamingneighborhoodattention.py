@@ -28,6 +28,7 @@ from lightstream.models.nat import (
     copy_nhwc_nat_block_to_nchw,
     copy_nhwc_nat_to_nchw,
     copy_nhwc_conv_tokenizer_to_nchw,
+    StreamingNAT,
 )
 
 SUPPORTED_NATTEN_VERSION = "0.17.5"
@@ -91,6 +92,23 @@ _COMPLETE_MODEL_STREAMED_IMAGE_GRAD_RTOL = _SAME_LAYOUT_RTOL
 _COMPLETE_MODEL_STREAMED_IMAGE_GRAD_ATOL = 5e-5
 _COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_RTOL = _SAME_LAYOUT_RTOL
 _COMPLETE_MODEL_STREAMED_PARAMETER_GRAD_ATOL = 7e-4
+
+
+def test_streaming_nat_validates_public_variant_before_construction():
+    with pytest.raises(ValueError, match="Invalid NAT variant"):
+        StreamingNAT("nat_tiny", tile_size=32, pretrained=False, defer_prepare=True)
+
+
+@pytest.mark.parametrize("setting", ["drop_rate", "attn_drop_rate", "drop_path_rate"])
+def test_streaming_nat_rejects_stochastic_settings(setting):
+    with pytest.raises(ValueError, match=setting):
+        StreamingNAT(
+            "nat_mini",
+            tile_size=32,
+            pretrained=False,
+            defer_prepare=True,
+            **{setting: 0.1},
+        )
 
 
 def _assert_close_with_diagnostics(
