@@ -6,6 +6,8 @@ from lightstream.models.nat.nchw import (
     NCHWConvTokenizer,
     NCHWNAT,
     NCHWNatMini,
+    NCHWNatSmall,
+    NCHWNatBase,
     NCHWNATBlock,
     NCHWNATLayer,
     PointwiseConvMlp,
@@ -18,6 +20,9 @@ from lightstream.models.nat.nchw import (
     linear_to_pointwise_conv,
     pointwise_conv_to_linear,
 )
+from lightstream.models.nat.streaming import StreamingNAT
+
+StreamingNat = StreamingNAT
 
 __all__ = [
     "ConvDownsampler",
@@ -25,6 +30,8 @@ __all__ = [
     "NCHWConvTokenizer",
     "NCHWNAT",
     "NCHWNatMini",
+    "NCHWNatSmall",
+    "NCHWNatBase",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
@@ -36,4 +43,6 @@ __all__ = [
     "copy_nhwc_conv_tokenizer_to_nchw",
     "linear_to_pointwise_conv",
     "pointwise_conv_to_linear",
+    "StreamingNAT",
+    "StreamingNat",
 ]
