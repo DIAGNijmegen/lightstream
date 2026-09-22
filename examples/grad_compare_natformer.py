@@ -31,11 +31,12 @@ from torch import nn
 
 from lightstream.models.nat.nat import NAT, model_urls
 from lightstream.models.nat.nchw import (
-    NCHWNatBase,
-    NCHWNatMini,
-    NCHWNatNano,
-    NCHWNatPico,
-    NCHWNatSmall,
+    nchw_nat_base,
+    nchw_nat_mini,
+    nchw_nat_nano,
+    nchw_nat_pico,
+    nchw_nat_small,
+    nchw_nat_tiny,
     convert_nhwc_nat_state_dict,
 )
 from lightstream.models.nat.streaming import StreamingNAT
@@ -44,19 +45,22 @@ from lightstream.models.nat.streaming import StreamingNAT
 VARIANTS = {
     "nat_nano": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=32,
                      mlp_ratio=2, kernel_size=7, layer_scale=None,
-                     nchw=NCHWNatNano, checkpoint=None),
+                     nchw=nchw_nat_nano, checkpoint=None),
     "nat_pico": dict(depths=[3, 4, 6, 5], num_heads=[1, 2, 4, 8], embed_dim=16,
                      mlp_ratio=2, kernel_size=7, layer_scale=None,
-                     nchw=NCHWNatPico, checkpoint=None),
+                     nchw=nchw_nat_pico, checkpoint=None),
     "nat_mini": dict(depths=[3, 4, 6, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
                      mlp_ratio=3, kernel_size=7, layer_scale=None,
-                     nchw=NCHWNatMini, checkpoint="nat_mini_1k"),
+                     nchw=nchw_nat_mini, checkpoint="nat_mini_1k"),
+    "nat_tiny": dict(depths=[3, 4, 18, 5], num_heads=[2, 4, 8, 16], embed_dim=64,
+                     mlp_ratio=3, kernel_size=7, layer_scale=None,
+                     nchw=nchw_nat_tiny, checkpoint="nat_tiny_1k"),
     "nat_small": dict(depths=[3, 4, 18, 5], num_heads=[3, 6, 12, 24], embed_dim=96,
                       mlp_ratio=2, kernel_size=7, layer_scale=1e-5,
-                      nchw=NCHWNatSmall, checkpoint="nat_small_1k"),
+                      nchw=nchw_nat_small, checkpoint="nat_small_1k"),
     "nat_base": dict(depths=[3, 4, 18, 5], num_heads=[4, 8, 16, 32], embed_dim=128,
                      mlp_ratio=2, kernel_size=7, layer_scale=1e-5,
-                     nchw=NCHWNatBase, checkpoint="nat_base_1k"),
+                     nchw=nchw_nat_base, checkpoint="nat_base_1k"),
 }
 
 

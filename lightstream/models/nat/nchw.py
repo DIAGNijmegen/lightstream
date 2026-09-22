@@ -22,6 +22,31 @@ from lightstream.core.layers import (
 )
 
 
+def _load_pretrained_nchw(model: "NCHWNAT", checkpoint: str) -> "NCHWNAT":
+    """Load an official NHWC NAT checkpoint into an NCHW backbone."""
+
+    # Import lazily so the NCHW building blocks do not eagerly import the
+    # reference implementation (and its timm model registrations).
+    from lightstream.models.nat.nat import model_urls
+
+    state_dict = torch.hub.load_state_dict_from_url(
+        model_urls[checkpoint], map_location="cpu"
+    )
+    if (
+        isinstance(state_dict, Mapping)
+        and "state_dict" in state_dict
+        and isinstance(state_dict["state_dict"], Mapping)
+    ):
+        state_dict = state_dict["state_dict"]
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith("head.")
+    }
+    model.load_state_dict(convert_nhwc_nat_state_dict(state_dict), strict=True)
+    return model
+
+
 def linear_to_pointwise_conv(linear: nn.Linear) -> nn.Conv2d:
     """Return a 1x1 convolution equivalent to ``linear``.
 
@@ -490,7 +515,7 @@ class NCHWNAT(nn.Module):
         return self.forward_features(x)
 
 
-def NCHWNatMini(**kwargs) -> NCHWNAT:
+def nchw_nat_mini(pretrained: bool = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_mini`.
 
     The original factory's stochastic-depth default is intentionally replaced
@@ -500,7 +525,7 @@ def NCHWNatMini(**kwargs) -> NCHWNAT:
     silently drifting apart.
     """
 
-    return NCHWNAT(
+    model = NCHWNAT(
         depths=[3, 4, 6, 5],
         num_heads=[2, 4, 8, 16],
         embed_dim=64,
@@ -512,11 +537,32 @@ def NCHWNatMini(**kwargs) -> NCHWNAT:
         layer_scale=None,
         **kwargs,
     )
+    return _load_pretrained_nchw(model, "nat_mini_1k") if pretrained else model
 
 
-def NCHWNatNano(**kwargs) -> NCHWNAT:
+def nchw_nat_tiny(pretrained: bool = False, **kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW counterpart of :func:`nat_tiny`."""
+
+    model = NCHWNAT(
+        depths=[3, 4, 18, 5],
+        num_heads=[2, 4, 8, 16],
+        embed_dim=64,
+        mlp_ratio=3,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+        **kwargs,
+    )
+    return _load_pretrained_nchw(model, "nat_tiny_1k") if pretrained else model
+
+
+def nchw_nat_nano(pretrained: bool = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW synthetic Nano NAT variant."""
 
+    if pretrained:
+        raise ValueError("no official pretrained checkpoint exists for NCHW NAT Nano")
     return NCHWNAT(
         depths=[3, 4, 6, 5],
         num_heads=[1, 2, 4, 8],
@@ -531,9 +577,11 @@ def NCHWNatNano(**kwargs) -> NCHWNAT:
     )
 
 
-def NCHWNatPico(**kwargs) -> NCHWNAT:
+def nchw_nat_pico(pretrained: bool = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW synthetic Pico NAT variant."""
 
+    if pretrained:
+        raise ValueError("no official pretrained checkpoint exists for NCHW NAT Pico")
     return NCHWNAT(
         depths=[3, 4, 6, 5],
         num_heads=[1, 2, 4, 8],
@@ -548,10 +596,10 @@ def NCHWNatPico(**kwargs) -> NCHWNAT:
     )
 
 
-def NCHWNatSmall(**kwargs) -> NCHWNAT:
+def nchw_nat_small(pretrained: bool = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_small`."""
 
-    return NCHWNAT(
+    model = NCHWNAT(
         depths=[3, 4, 18, 5],
         num_heads=[3, 6, 12, 24],
         embed_dim=96,
@@ -563,12 +611,13 @@ def NCHWNatSmall(**kwargs) -> NCHWNAT:
         layer_scale=1e-5,
         **kwargs,
     )
+    return _load_pretrained_nchw(model, "nat_small_1k") if pretrained else model
 
 
-def NCHWNatBase(**kwargs) -> NCHWNAT:
+def nchw_nat_base(pretrained: bool = False, **kwargs) -> NCHWNAT:
     """Build the deterministic NCHW counterpart of :func:`nat_base`."""
 
-    return NCHWNAT(
+    model = NCHWNAT(
         depths=[3, 4, 18, 5],
         num_heads=[4, 8, 16, 32],
         embed_dim=128,
@@ -580,6 +629,15 @@ def NCHWNatBase(**kwargs) -> NCHWNAT:
         layer_scale=1e-5,
         **kwargs,
     )
+    return _load_pretrained_nchw(model, "nat_base_1k") if pretrained else model
+
+
+# Compatibility aliases for the initial public NCHW API.
+NCHWNatMini = nchw_nat_mini
+NCHWNatNano = nchw_nat_nano
+NCHWNatPico = nchw_nat_pico
+NCHWNatSmall = nchw_nat_small
+NCHWNatBase = nchw_nat_base
 
 
 def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
@@ -655,6 +713,12 @@ __all__ = [
     "NCHWNatPico",
     "NCHWNatSmall",
     "NCHWNatBase",
+    "nchw_nat_mini",
+    "nchw_nat_tiny",
+    "nchw_nat_small",
+    "nchw_nat_base",
+    "nchw_nat_nano",
+    "nchw_nat_pico",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",
