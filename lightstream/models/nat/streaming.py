@@ -1,63 +1,32 @@
 """Public streamed Neighborhood Attention Transformer feature extractors."""
 
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
+from torch import nn
 
 from lightstream.core.layers import NeighborhoodAttention2D
-import lightstream.models.nat.nchw as nchw
+from lightstream.models.nat.nchw import (
+    nchw_nat_base,
+    nchw_nat_mini,
+    nchw_nat_nano,
+    nchw_nat_pico,
+    nchw_nat_small,
+    nchw_nat_tiny,
+)
 from lightstream.modules.streaming import StreamingModule
-
-_FACTORY_PREFIX = "nchw_nat_"
-
-
-def _factory_name(variant: str) -> str:
-    """Return the conventional NCHW factory name for a public variant name."""
-
-    if not isinstance(variant, str) or not variant:
-        raise ValueError("NAT variant must be a non-empty string")
-    name = variant if variant.startswith("nat_") else f"nat_{variant}"
-    suffix = name.removeprefix("nat_")
-    if not suffix or not suffix.isidentifier():
-        raise ValueError(
-            f"Invalid NAT variant {variant!r}; expected 'nat_<name>' or '<name>'"
-        )
-    return f"nchw_{name}"
-
-
-def _resolve_factory(variant: str):
-    """Resolve and validate an exported ``nchw_nat_*`` model factory."""
-
-    factory_name = _factory_name(variant)
-    exported = getattr(nchw, "__all__", ())
-    factory = getattr(nchw, factory_name, None)
-    if (
-        not factory_name.startswith(_FACTORY_PREFIX)
-        or factory_name not in exported
-        or not callable(factory)
-    ):
-        choices = ", ".join(StreamingNAT.get_model_names())
-        raise ValueError(f"Invalid NAT variant {variant!r}. Choose one of: {choices}")
-    return factory
 
 
 class StreamingNAT(StreamingModule):
-    """Stream a deterministic NAT backbone and return its normalized NCHW map.
-
-    ``variant`` accepts either the public name (for example ``"nat_mini"``)
-    or its short form (``"mini"``).  Checkpoint selection and conversion are
-    delegated to the corresponding NCHW factory.
-    """
+    """Stream a deterministic NCHW NAT backbone."""
 
     def __init__(
         self,
-        variant: str,
+        encoder: str,
         tile_size: int,
         *,
-        pretrained: Any = True,
+        pretrained: bool = True,
         tile_cache_path: str | Path | None = None,
         tile_cache: dict[str, Any] | None = None,
         tile_cache_state: dict[str, Any] | None = None,
@@ -76,19 +45,22 @@ class StreamingNAT(StreamingModule):
         drop_path_rate: float = 0.0,
         defer_prepare: bool = False,
     ):
-        factory = _resolve_factory(variant)
+        model_choices = self.get_model_choices()
+        if encoder not in model_choices:
+            raise ValueError(
+                f"Invalid model name {encoder!r}. Choose one of: "
+                + ", ".join(model_choices)
+            )
         stochastic = {
             "drop_rate": drop_rate,
             "attn_drop_rate": attn_drop_rate,
             "drop_path_rate": drop_path_rate,
         }
-        invalid = [
-            f"{name}={value!r}" for name, value in stochastic.items() if value != 0
-        ]
+        invalid = [f"{key}={value!r}" for key, value in stochastic.items() if value]
         if invalid:
             raise ValueError(
-                "StreamingNAT requires drop_rate=0, attn_drop_rate=0, and "
-                "drop_path_rate=0; unsupported setting(s): " + ", ".join(invalid)
+                "StreamingNAT requires all stochastic rates to be zero; "
+                + ", ".join(invalid)
             )
         if tile_cache is not None and tile_cache_state is not None:
             raise ValueError("pass only one of `tile_cache` and `tile_cache_state`")
@@ -99,15 +71,13 @@ class StreamingNAT(StreamingModule):
                 "tile-cache state and `tile_cache_path` are mutually exclusive"
             )
         if tile_cache is None and tile_cache_path is None:
-            model_name = factory.__name__.removeprefix("nchw_")
-            tile_cache_path = Path.cwd() / (
-                f"{model_name}_tile_cache_1_3_{tile_size}_{tile_size}"
+            tile_cache_path = (
+                Path.cwd() / f"{encoder}_tile_cache_1_3_{tile_size}_{tile_size}"
             )
 
-        network = factory(pretrained=pretrained)
+        network = model_choices[encoder](pretrained=pretrained)
         if device is not None:
             network.to(device)
-
         self._provided_tile_cache = tile_cache
         if mean is None:
             mean = [0.485, 0.456, 0.406]
@@ -131,14 +101,19 @@ class StreamingNAT(StreamingModule):
         )
 
     @staticmethod
-    def get_model_names() -> list[str]:
-        """Discover public variants from exported NCHW factory callables."""
+    def get_model_choices() -> dict[str, Callable[..., nn.Module]]:
+        return {
+            "nat_mini": nchw_nat_mini,
+            "nat_tiny": nchw_nat_tiny,
+            "nat_small": nchw_nat_small,
+            "nat_base": nchw_nat_base,
+            "nat_nano": nchw_nat_nano,
+            "nat_pico": nchw_nat_pico,
+        }
 
-        return sorted(
-            name.removeprefix("nchw_")
-            for name in getattr(nchw, "__all__", ())
-            if name.startswith(_FACTORY_PREFIX) and callable(getattr(nchw, name, None))
-        )
+    @classmethod
+    def get_model_names(cls) -> list[str]:
+        return list(cls.get_model_choices())
 
     def load_tile_cache_if_needed(self, use_tile_cache: bool = True):
         if self._provided_tile_cache is not None:
