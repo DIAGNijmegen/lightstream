@@ -245,7 +245,10 @@ def main() -> None:
     full_state = full.state_dict()
     streamed_state = streamed_model.state_dict()
     if full_state.keys() != streamed_state.keys() or any(
-        not torch.equal(value, streamed_state[name])
+        not torch.equal(
+            value.detach().cpu(),
+            streamed_state[name].detach().cpu(),
+        )
         for name, value in full_state.items()
     ):
         raise RuntimeError("full and streamed NCHW checkpoints are not identical")
