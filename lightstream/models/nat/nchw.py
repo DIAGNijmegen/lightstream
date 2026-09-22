@@ -489,6 +489,30 @@ class NCHWNAT(nn.Module):
         return self.forward_features(x)
 
 
+def NCHWNatMini(**kwargs) -> NCHWNAT:
+    """Build the deterministic NCHW counterpart of :func:`nat_mini`.
+
+    The original factory's stochastic-depth default is intentionally replaced
+    with zero: stochastic regularizers are not invariant to Lightstream's tile
+    replay.  Keeping the complete production configuration in one public
+    factory also prevents checkpoint conversion tests and applications from
+    silently drifting apart.
+    """
+
+    return NCHWNAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[2, 4, 8, 16],
+        embed_dim=64,
+        mlp_ratio=3,
+        kernel_size=7,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+        **kwargs,
+    )
+
+
 def copy_nhwc_nat_to_nchw(reference: nn.Module, target: NCHWNATLayer) -> NCHWNATLayer:
     """Copy an original-layout NAT layer into an NCHW production layer."""
 
@@ -557,6 +581,7 @@ __all__ = [
     "NCHWConvDownsampler",
     "NCHWConvTokenizer",
     "NCHWNAT",
+    "NCHWNatMini",
     "NCHWNATBlock",
     "NCHWNATLayer",
     "PointwiseConvMlp",

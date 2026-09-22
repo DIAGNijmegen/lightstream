@@ -20,6 +20,7 @@ from lightstream.models.nat import (
     ConvDownsampler,
     NCHWConvTokenizer,
     NCHWNAT,
+    NCHWNatMini,
     NCHWNATBlock,
     NCHWNATLayer,
     convert_nchw_nat_state_dict,
@@ -1662,6 +1663,71 @@ def test_complete_nat_block_matches_reference_streaming_and_reset(
                 optimizer.zero_grad(set_to_none=True)
 
 
+def test_nat_mini_factory_strict_checkpoint_and_full_frame_feature_parity(
+    natten_backend,
+):
+    """The production mini checkpoint has a complete, value-preserving map."""
+
+    from lightstream.models.nat.nat import NAT
+
+    torch.manual_seed(41999)
+    reference = NAT(
+        depths=[3, 4, 6, 5],
+        num_heads=[2, 4, 8, 16],
+        embed_dim=64,
+        mlp_ratio=3,
+        kernel_size=7,
+        num_classes=0,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        layer_scale=None,
+    ).eval()
+    nchw = NCHWNatMini().eval()
+    converted = convert_nhwc_nat_state_dict(reference.state_dict())
+
+    # Strict loading is part of the checkpoint compatibility contract; the
+    # explicit assertions make failures useful on PyTorch versions that return
+    # the incompatible-keys tuple even for a successful strict load.
+    incompatible = nchw.load_state_dict(converted, strict=True)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+    assert set(converted) == set(nchw.state_dict())
+
+    reference_parameters = dict(reference.named_parameters())
+    nchw_parameters = dict(nchw.named_parameters())
+    mapped_names = {
+        next(iter(convert_nhwc_nat_state_dict({name: parameter}))): name
+        for name, parameter in reference_parameters.items()
+    }
+    assert set(mapped_names) == set(nchw_parameters)
+    for nchw_name, reference_name in mapped_names.items():
+        torch.testing.assert_close(
+            _linear_shaped(
+                nchw_parameters[nchw_name], reference_parameters[reference_name]
+            ),
+            reference_parameters[reference_name],
+            rtol=0,
+            atol=0,
+            msg=f"converted nat_mini parameter {nchw_name}",
+        )
+
+    # This deliberately small full frame keeps the production-depth test
+    # practical while still traversing every stage and every mapped parameter.
+    image = torch.randn(1, 3, 64, 68)
+    with torch.no_grad():
+        expected = reference.forward_feature_map(image).permute(0, 3, 1, 2)
+        actual = nchw(image)
+    _assert_close_with_diagnostics(
+        actual,
+        expected,
+        rtol=_CROSS_LAYOUT_OUTPUT_RTOL,
+        atol=_CROSS_LAYOUT_OUTPUT_ATOL,
+        quantity="nat_mini full-frame feature map",
+    )
+    assert actual.shape == (1, 512, 2, 3)
+
+
 def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     natten_backend,
 ):
@@ -1690,7 +1756,7 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     }
     full_nchw = NCHWNAT(**nchw_configuration).float()
     converted_state = convert_nhwc_nat_state_dict(reference.state_dict())
-    load_result = full_nchw.load_state_dict(converted_state, strict=False)
+    load_result = full_nchw.load_state_dict(converted_state, strict=True)
     assert load_result.missing_keys == []
     assert load_result.unexpected_keys == []
     assert set(converted_state) == set(full_nchw.state_dict())
@@ -1847,7 +1913,9 @@ def test_complete_four_stage_nat_matches_nhwc_full_and_cached_streaming(
     [None, 1e-5],
     ids=["without-layer-scale", "with-layer-scale"],
 )
-def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend, layer_scale):
+def test_complete_four_stage_nat_multi_tile_cuda_parity(
+    natten_backend, layer_scale, tmp_path
+):
     """A complete reduced NAT is exact across shifted, multi-tile streaming."""
 
     from lightstream.models.nat.nat import NAT
@@ -1895,6 +1963,9 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend, layer_sc
     image_shape = (481, 485)
     streaming = StreamingCNN(copy.deepcopy(full_nchw), tile_shape=tile_shape)
     tile_cache = streaming.get_tile_cache()
+    cache_path = tmp_path / "complete_nat_tile_cache.pt"
+    torch.save(tile_cache, cache_path)
+    restored_tile_cache = torch.load(cache_path, weights_only=False)
 
     def assert_streaming_layer_scales(item):
         streamed_gamma_modules = {
@@ -2075,6 +2146,8 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend, layer_sc
             final_stride_y, final_stride_x = (
                 int(value) for value in boundary_stats["norm"]["output_stride"][-2:]
             )
+            assert (final_stride_y, final_stride_x) == (32, 32)
+            assert tuple(output.shape) == (1, 64, 16, 16)
             assert (shifted_row - regular_rows[-1]) // final_stride_y >= 1
             assert (shifted_column - regular_columns[-1]) // final_stride_x >= 1
 
@@ -2212,7 +2285,7 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend, layer_sc
 
     streaming.stream_module.load_state_dict(full_nchw.state_dict())
     cached_streaming = StreamingCNN(
-        copy.deepcopy(full_nchw), tile_shape=tile_shape, state_dict=tile_cache
+        copy.deepcopy(full_nchw), tile_shape=tile_shape, state_dict=restored_tile_cache
     )
     assert_streaming_layer_scales(cached_streaming)
     cached_streaming.stream_module.load_state_dict(full_nchw.state_dict())
