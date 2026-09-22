@@ -487,7 +487,7 @@ class _LinearNHWCBackend(nn.Module):
 
 @pytest.mark.cuda_integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_streaming_attention_backward_restores_cuda_autocast_state():
+def test_streaming_attention_supports_explicit_cuda_bfloat16_autocast():
     backend = _LinearNHWCBackend().cuda()
     reference = copy.deepcopy(backend)
     attention = StreamingNeighborhoodAttention2D(attention=backend)
@@ -505,9 +505,10 @@ def test_streaming_attention_backward_restores_cuda_autocast_state():
         output = attention(input)
         assert output.dtype == torch.bfloat16
 
-    # Backward deliberately starts after the user autocast context has ended.
-    # The custom autograd boundary must restore the forward BF16 autocast state
-    # so its nested replay can consume NATTEN's Float32 parameters correctly.
+    # Backward deliberately starts after the explicit user autocast context.
+    # The supported contract is a BF16 forward result with gradients returned
+    # in the FP32 input and parameter dtypes; complete-model FP32 parity is
+    # covered independently below.
     output.sum().backward()
 
     torch.testing.assert_close(input.grad, reference_input.grad, rtol=1e-5, atol=1e-6)
@@ -2045,8 +2046,28 @@ def test_complete_four_stage_nat_multi_tile_cuda_parity(natten_backend):
         upstream = torch.randn(full_features.shape, generator=generator, device="cuda")
         reference_features.backward(upstream.permute(0, 2, 3, 1).contiguous())
         full_features.backward(upstream)
+
+        replay_activation_dtypes = {
+            streamer_name: [] for streamer_name, _ in streamers
+        }
+        replay_dtype_hooks = []
+        for streamer_name, item in streamers:
+            def record_replay_dtype(module, args, *, name=streamer_name):
+                replay_activation_dtypes[name].append(args[0].dtype)
+
+            replay_dtype_hooks.append(
+                item.stream_module.register_forward_pre_hook(record_replay_dtype)
+            )
         for (_, item), value in zip(streamers, stream_inputs):
             item.backward(value, upstream)
+        for hook in replay_dtype_hooks:
+            hook.remove()
+        for streamer_name, dtypes in replay_activation_dtypes.items():
+            assert dtypes, f"no backward replay activations captured for {streamer_name}"
+            assert set(dtypes) == {torch.float32}, (
+                streamer_name,
+                dtypes,
+            )
 
         assert reference_input.grad is not None
         assert full_input.grad is not None

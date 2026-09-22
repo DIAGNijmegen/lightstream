@@ -1719,7 +1719,7 @@ class StreamingCNN(torch.nn.Module):
         use_cuda_autocast = (
             self.device.type == "cuda"
             and torch.cuda.is_available()
-            and self.dtype in {torch.float16, torch.bfloat16}
+            and self.dtype in (torch.float16, torch.bfloat16)
         )
         if use_cuda_autocast:
             with torch.autocast(device_type="cuda", dtype=self.dtype):
