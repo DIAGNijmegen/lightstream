@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+from types import MappingProxyType
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,72 @@ from lightstream.core.layers import (
     StreamingUpsample2d,
 )
 from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
+
+
+def _metadata_only_scnn(module):
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    nn.Module.__init__(scnn)
+    scnn.stream_module = module
+    scnn._module_stats = {}
+    return scnn
+
+
+def test_internal_alignment_combines_input_stride_with_local_pool_stride():
+    encoder = nn.Conv2d(3, 3, kernel_size=1, stride=8)
+    pool = nn.AvgPool2d(kernel_size=64, stride=64)
+    scnn = _metadata_only_scnn(nn.Sequential(encoder, pool))
+    scnn._module_stats[encoder] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 8, 8]),
+    }
+    scnn._module_stats[pool] = {
+        "output_stride": torch.tensor([1, 8, 8]),
+        "stride": torch.tensor([1, 64, 64]),
+    }
+
+    assert scnn._compute_internal_alignment() == (512, 512)
+
+
+def test_internal_alignment_uses_lcm_not_numerical_maximum():
+    conv4 = nn.Conv2d(3, 3, kernel_size=1, stride=4)
+    conv6 = nn.Conv2d(3, 3, kernel_size=1, stride=6)
+    scnn = _metadata_only_scnn(nn.ModuleList([conv4, conv6]))
+    scnn._module_stats[conv4] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 4, 4]),
+    }
+    scnn._module_stats[conv6] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 6, 6]),
+    }
+
+    assert scnn._compute_internal_alignment() == (12, 12)
+
+
+def test_flatten_output_paths_preserve_nested_order_and_names():
+    scnn = _metadata_only_scnn(nn.Identity())
+    output = {
+        "p_fused": torch.zeros(1),
+        "loss_components": ((torch.ones(1), torch.ones(2)),),
+    }
+
+    flat, _, paths = scnn._flatten_output_structure(output, include_paths=True)
+
+    assert paths == ["loss_components[0][0]", "loss_components[0][1]", "p_fused"]
+    assert [tensor.numel() for tensor in flat] == [1, 2, 1]
+
+
+def test_named_output_strides_provides_immutable_path_lookup():
+    scnn = _metadata_only_scnn(nn.Identity())
+    scnn._output_metadata = (
+        MappingProxyType({"path": "loss_components[0][0]", "stride": (8, 8)}),
+        MappingProxyType({"path": "p_fused", "stride": (1, 1)}),
+    )
+
+    assert scnn.named_output_strides["loss_components[0][0]"] == (8, 8)
+    assert scnn.named_output_strides["p_fused"] == (1, 1)
+    with pytest.raises(TypeError):
+        scnn.named_output_strides["p_fused"] = (4, 4)
 
 
 class _BackwardReplayPrecisionProbe(StreamingConv2d):
