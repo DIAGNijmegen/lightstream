@@ -6,6 +6,7 @@ import math
 import copy
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import List
 
 import numpy as np
@@ -237,6 +238,8 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = None
         self._tile_output_lost = None
         self._output_stride_per_output = None
+        self._output_metadata = ()
+        self._required_input_alignment = (1, 1)
         self._output_size_transforms_per_output = None
         self._output_spec = None
         self._module_stats = {}
@@ -427,6 +430,7 @@ class StreamingCNN(torch.nn.Module):
         self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
+        self._required_input_alignment = self._compute_internal_alignment()
         self._add_hooks_for_streaming()
 
         # Remove temporary data
@@ -468,7 +472,9 @@ class StreamingCNN(torch.nn.Module):
         # Forward pass with grads enabled
         torch.set_grad_enabled(True)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec, output_paths = self._flatten_output_structure(
+            output, include_paths=True
+        )
         self._output_spec = output_spec
 
         # Gather backward statistics
@@ -499,6 +505,19 @@ class StreamingCNN(torch.nn.Module):
             self._output_stride_per_output.append(output_stride)
             self._output_size_transforms_per_output.append(output_size_transforms)
 
+        self._output_metadata = tuple(
+            MappingProxyType(
+                {
+                    "path": path,
+                    "stride": tuple(int(value) for value in stride[-2:]),
+                    "shape": tuple(int(value) for value in tensor.shape),
+                }
+            )
+            for path, stride, tensor in zip(
+                output_paths, self._output_stride_per_output, output_tensors
+            )
+        )
+
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
         for stride in self._output_stride_per_output[1:]:
@@ -515,40 +534,90 @@ class StreamingCNN(torch.nn.Module):
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec, _ = self._flatten_output_structure(output, include_paths=True)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
         self._print_verbose("\n", "Output lost", self._tile_output_lost)
 
-    def _flatten_output_structure(self, output):
+    def _flatten_output_structure(self, output, include_paths=False, _path=""):
+        """Flatten tensors while optionally retaining stable structure paths.
+
+        Dictionary keys are kept in the existing sorted order and sequence indices
+        use bracket notation, so enabling paths never changes flattening order.
+        """
         if isinstance(output, torch.Tensor):
-            return [output], ("tensor", None)
+            result = ([output], ("tensor", None))
+            return (*result, [_path or "output"]) if include_paths else result
         if isinstance(output, tuple):
             flat = []
             children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
+            paths = []
+            for index, x in enumerate(output):
+                child = self._flatten_output_structure(
+                    x, include_paths=include_paths, _path=f"{_path}[{index}]"
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append(child_spec)
-            return flat, ("tuple", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("tuple", children))
+            return (*result, paths) if include_paths else result
         if isinstance(output, list):
             flat = []
             children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
+            paths = []
+            for index, x in enumerate(output):
+                child = self._flatten_output_structure(
+                    x, include_paths=include_paths, _path=f"{_path}[{index}]"
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append(child_spec)
-            return flat, ("list", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("list", children))
+            return (*result, paths) if include_paths else result
         if isinstance(output, dict):
             flat = []
             children = []
+            paths = []
             for key in sorted(output.keys()):
-                child_flat, child_spec = self._flatten_output_structure(output[key])
+                child_path = str(key) if not _path else f"{_path}.{key}"
+                child = self._flatten_output_structure(
+                    output[key], include_paths=include_paths, _path=child_path
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append((key, child_spec))
-            return flat, ("dict", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("dict", children))
+            return (*result, paths) if include_paths else result
         raise TypeError(f"Unsupported output type for streaming: {type(output)}")
+
+    @property
+    def output_strides(self):
+        """Immutable spatial strides in the same order as flattened outputs."""
+        return tuple(tuple(int(value) for value in stride[-2:]) for stride in self._output_stride_per_output)
+
+    @property
+    def required_input_alignment(self):
+        """Spatial input lattice required by all internal downsampling layers."""
+        return self._required_input_alignment
+
+    @property
+    def output_metadata(self):
+        """Immutable diagnostic metadata for every flattened statistics output."""
+        return self._output_metadata
+
+    @property
+    def named_output_strides(self):
+        """Immutable mapping from stable output paths to spatial strides."""
+        return MappingProxyType(
+            {metadata["path"]: metadata["stride"] for metadata in self._output_metadata}
+        )
 
     def _unflatten_output_structure(self, flat, spec, index=0):
         kind, payload = spec
@@ -1755,8 +1824,23 @@ class StreamingCNN(torch.nn.Module):
         del trimmed_grads
         del trimmed_outputs
 
-    def forward(self, image, result_on_cpu=False, mask=None):
+    def validate_input_alignment(self, image):
+        """Raise early when an input is not on the required internal lattice."""
+        height, width = int(image.shape[H_DIM]), int(image.shape[W_DIM])
+        align_h, align_w = self.required_input_alignment
+        next_height = math.ceil(height / align_h) * align_h
+        next_width = math.ceil(width / align_w) * align_w
+        if (height, width) != (next_height, next_width):
+            raise ValueError(
+                "Input spatial shape is not aligned: "
+                f"received=({height}, {width}), required_alignment=({align_h}, {align_w}), "
+                f"next_valid_padded_shape=({next_height}, {next_width})"
+            )
+
+    def forward(self, image, result_on_cpu=False, mask=None, validate_input_alignment=False):
         """Perform forward pass with lightstream."""
+        if validate_input_alignment:
+            self.validate_input_alignment(image)
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
         self._active_reducer_mask = mask
@@ -2956,6 +3040,8 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
+        named_stats["required_input_alignment"] = self.required_input_alignment
+        named_stats["output_metadata"] = [dict(entry) for entry in self._output_metadata]
         named_stats["output_size_transforms_per_output"] = getattr(
             self, "_output_size_transforms_per_output", None
         )
@@ -2982,6 +3068,24 @@ class StreamingCNN(torch.nn.Module):
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
                 self._module_stats[module] = state["net_stats"][name]
+
+        cached_alignment = state.get("required_input_alignment")
+        self._required_input_alignment = (
+            tuple(int(value) for value in cached_alignment)
+            if cached_alignment is not None
+            else self._compute_internal_alignment()
+        )
+        cached_metadata = state.get("output_metadata")
+        if cached_metadata is None:
+            cached_metadata = [
+                {
+                    "path": "output" if len(self._output_stride_per_output) == 1 else f"[{index}]",
+                    "stride": tuple(int(value) for value in stride[-2:]),
+                    "shape": tuple(int(value) for value in self._tile_output_shapes[index]),
+                }
+                for index, stride in enumerate(self._output_stride_per_output)
+            ]
+        self._output_metadata = tuple(MappingProxyType(dict(entry)) for entry in cached_metadata)
 
         self.enable()
 
