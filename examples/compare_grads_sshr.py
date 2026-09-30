@@ -400,6 +400,8 @@ def main() -> None:
     dtype = _parse_dtype(args.dtype)
 
     img = torch.rand((1, 3, args.input_size, args.input_size), device=device, dtype=dtype)
+    img = torch.rand((1, 3, 3888, 9720), device=device, dtype=dtype)
+
     mask = _build_dummy_mask(args.input_size, device=device)
 
     print(f"device={device}, dtype={dtype}, tile_size={args.tile_size}, input_size={args.input_size}")
