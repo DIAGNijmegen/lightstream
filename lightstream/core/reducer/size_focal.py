@@ -29,7 +29,10 @@ def _validate_parameters(p: float, lambda_: float) -> tuple[float, float]:
 
 
 class SizeFocalReducer(BaseReducer):
-    """Compute size-focal scores from one activation/probability map."""
+    """Return ``(1-mean_valid(m_ci))**p * log(lambda_+mean_valid(m_ci))``.
+
+    A fully masked sample returns zero.
+    """
 
     def __init__(self, p: float = 3.0, lambda_: float = 0.01, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):

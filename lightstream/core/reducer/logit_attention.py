@@ -11,7 +11,10 @@ from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class LogitAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
-    """Pool one ``[N,C,H,W]`` logit tensor with its spatial softmax."""
+    """Return ``sum_i softmax(z_ci/tau)_i*z_ci`` per class channel.
+
+    Attention may be detached; ``tau`` may be fixed or learned.
+    """
 
     def __init__(
         self,

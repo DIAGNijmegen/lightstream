@@ -31,6 +31,9 @@ class AttentionKLDivergenceReducer(BaseReducer):
     Each ``[N,C]`` plane is normalized independently over all valid ``H*W``
     positions. The result has shape ``[N,C,1,1]``: spatial KL terms are summed,
     while averaging over samples/classes is deliberately left to the caller.
+    With ``q_i = sigmoid(teacher_i/T)/sum_j sigmoid(teacher_j/T)`` and
+    ``p_i = softmax(student)_i``, returns ``sum_i q_i*log(q_i/p_i)``.
+    The teacher branch is detached.
     """
 
     def __init__(

@@ -6,6 +6,7 @@ from .fused_attention_gem import (
 )
 from .gem import GeMReducer, StreamingGeMReducer
 from .mean import MeanReducer, StreamingMeanReducer
+from .mse import MSEReducer, StreamingMSEReducer
 from .logit_attention import (
     LogitAttentionPoolingReducer,
     StreamingLogitAttentionPoolingReducer,
@@ -32,6 +33,8 @@ __all__ = [
     "BaseStreamingGlobalReducer",
     "StreamingReducer",
     "StreamingMeanReducer",
+    "MSEReducer",
+    "StreamingMSEReducer",
     "StreamingSumReducer",
     "GeMReducer",
     "StreamingGeMReducer",

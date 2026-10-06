@@ -14,15 +14,18 @@ class SoftmaxAttentionReducer(BaseReducer):
     """Average opaque ``values`` using a spatial softmax of attention logits.
 
     Inputs are positional ``(values, attention_logits)``.  Channel-wise attention
-    logits are averaged to one channel before the spatial softmax.
+    logits are averaged to one channel before the spatial softmax. For each
+    value channel, ``y_c = sum_i softmax(attention_logits)_i * values_ci``.
+    ``stopgrad_attention`` removes only the attention-branch derivative.
     """
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None, mask_resize: bool = False,
-                 mask_resize_mode: str = "nearest"):
+                 mask_resize_mode: str = "nearest", stopgrad_attention: bool = False):
         super().__init__()
         self.accumulator_dtype = accumulator_dtype
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
+        self.stopgrad_attention = bool(stopgrad_attention)
 
     def forward(self, *inputs: torch.Tensor, mask: torch.Tensor | None = None):
         if len(inputs) != 2:
@@ -37,7 +40,8 @@ class SoftmaxAttentionReducer(BaseReducer):
             return passthrough
 
         dtype = resolve_accumulator_dtype(self.accumulator_dtype, values.dtype)
-        values_acc, logits_acc = values.to(dtype=dtype), logits.to(dtype=dtype)
+        values_acc = values.to(dtype=dtype)
+        logits_acc = (logits.detach() if self.stopgrad_attention else logits).to(dtype=dtype)
         if mask is None:
             valid = torch.ones((values.shape[0], 1, *values.shape[-2:]), device=values.device, dtype=torch.bool)
         else:
@@ -53,17 +57,21 @@ class SoftmaxAttentionReducer(BaseReducer):
         return output.to(dtype=values.dtype)
 
     def to_streaming(self) -> "StreamingSoftmaxAttentionReducer":
-        return StreamingSoftmaxAttentionReducer(self.accumulator_dtype, self.mask_resize, self.mask_resize_mode)
+        return StreamingSoftmaxAttentionReducer(self.accumulator_dtype, self.mask_resize,
+                                                self.mask_resize_mode, self.stopgrad_attention)
 
 
 class StreamingSoftmaxAttentionReducer(BaseStreamingGlobalReducer):
-    """Stable global spatial softmax-attention accumulated across tiles."""
+    """Accumulate global softmax ``Z`` and weighted ``S``; replay
+    ``a_i*(values_ci-S_c/Z)`` for attention and ``a_i`` for values.
+    """
 
     def __init__(self, accumulator_dtype: torch.dtype | None = None, mask_resize: bool = False,
-                 mask_resize_mode: str = "nearest"):
+                 mask_resize_mode: str = "nearest", stopgrad_attention: bool = False):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
+        self.stopgrad_attention = bool(stopgrad_attention)
         self.register_buffer("running_max", torch.zeros(0), persistent=False)
         self.register_buffer("softmax_denominator", torch.zeros(0), persistent=False)
         self.register_buffer("weighted_numerator", torch.zeros(0), persistent=False)
@@ -73,9 +81,12 @@ class StreamingSoftmaxAttentionReducer(BaseStreamingGlobalReducer):
         if len(inputs) != 2:
             raise ValueError(f"StreamingSoftmaxAttentionReducer expects exactly two inputs (values, attention_logits), got {len(inputs)}.")
         values, logits = inputs
-        _normalize_logits(logits, values)
-        self._last_inputs, self._last_output = (values, logits), values
-        return values, logits
+        normalized_logits = _normalize_logits(logits, values)
+        # Give this reducer distinct identities even when another head pools
+        # the same value and attention maps.
+        payload = (values.view_as(values), normalized_logits.view_as(normalized_logits))
+        self._last_inputs, self._last_output = payload, payload[0]
+        return payload
 
     # Multi-input tile orchestration and replay bookkeeping are identical to
     # AttentionGeM; only the reduction math below differs.
@@ -95,7 +106,7 @@ class StreamingSoftmaxAttentionReducer(BaseStreamingGlobalReducer):
             self.reset_stream_state(values.shape[0], values.shape[1], values.device, values.dtype)
         dtype = resolve_accumulator_dtype(self.accumulator_dtype, values.dtype)
         values_acc = values.to(dtype=dtype)
-        logits_acc = _normalize_logits(logits, values).to(dtype=dtype)
+        logits_acc = _normalize_logits(logits.detach(), values).to(dtype=dtype)
         valid = valid_mask[None, None].to(device=values.device, dtype=torch.bool)
         masked = torch.where(valid, logits_acc, torch.full_like(logits_acc, torch.finfo(dtype).min))
         tile_max = masked.amax(dim=(-2, -1), keepdim=True)
@@ -129,7 +140,8 @@ class StreamingSoftmaxAttentionReducer(BaseStreamingGlobalReducer):
             valid_mask = torch.ones(values.shape[-2:], device=values.device, dtype=torch.bool)
         dtype = resolve_accumulator_dtype(self.accumulator_dtype, values.dtype)
         values_acc = values.to(dtype=dtype)
-        logits_acc = _normalize_logits(logits, values).to(dtype=dtype)
+        attention_logits = logits.detach() if self.stopgrad_attention else logits
+        logits_acc = _normalize_logits(attention_logits, values).to(dtype=dtype)
         valid = valid_mask[None, None].to(device=values.device, dtype=torch.bool)
         weights = torch.where(valid, torch.exp(logits_acc - global_context["max"].to(values.device)),
                               torch.zeros_like(logits_acc))
@@ -138,4 +150,5 @@ class StreamingSoftmaxAttentionReducer(BaseStreamingGlobalReducer):
                                      global_context["denominator"].to(values.device)).to(values.dtype)
 
     def to_reducer(self) -> SoftmaxAttentionReducer:
-        return SoftmaxAttentionReducer(self.accumulator_dtype, self.mask_resize, self.mask_resize_mode)
+        return SoftmaxAttentionReducer(self.accumulator_dtype, self.mask_resize,
+                                       self.mask_resize_mode, self.stopgrad_attention)

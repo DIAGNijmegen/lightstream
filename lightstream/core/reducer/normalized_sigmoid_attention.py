@@ -16,6 +16,8 @@ class NormalizedSigmoidAttentionReducer(BaseReducer):
     Channel-shaped attention logits are averaged to one channel, matching
     :class:`AttentionGeMReducer`, and that shared attention field is broadcast
     over all value channels.
+    ``y_c = sum_i sigmoid(attention_logits_i)*values_ci /
+    sum_i sigmoid(attention_logits_i)`` over valid positions.
     """
 
     def __init__(self, accumulator_dtype=None, mask_resize=False, mask_resize_mode="nearest"):

@@ -42,7 +42,14 @@ def _normalize_logits(logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 
 class AttentionGeMReducer(BaseReducer):
-    """Apply attention-weighted global GeM reduction on NCHW tensors."""
+    """Pool ``(x, attn_logits)`` with global softmax-weighted GeM.
+
+    For valid positions ``i``, ``a_i = softmax(attn_logits)_i`` and
+    ``b_i = (1-uniform_attention_eps)*a_i + uniform_attention_eps/N_valid``.
+    Each channel returns ``(max(sum_i b_i*max(x_ci, eps)**r, eps))**(1/r)``.
+    ``stopgrad_attention`` freezes only the attention branch's gradients;
+    the values remain differentiable above their input clamp.
+    """
 
     def __init__(
         self,
@@ -52,6 +59,7 @@ class AttentionGeMReducer(BaseReducer):
         uniform_attention_eps: float = 0.0,
         mask_resize: bool = False,
         mask_resize_mode: str = "nearest",
+        stopgrad_attention: bool = False,
     ):
         super().__init__()
         self.eps = float(eps)
@@ -59,6 +67,7 @@ class AttentionGeMReducer(BaseReducer):
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
+        self.stopgrad_attention = bool(stopgrad_attention)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
 
     @property
@@ -81,7 +90,9 @@ class AttentionGeMReducer(BaseReducer):
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x.dtype)
         x_acc = x.to(dtype=acc_dtype)
         x_pow = x_acc.clamp_min(self.eps).pow(self.current_r.to(device=x.device, dtype=acc_dtype))
-        logits_acc = logits.to(dtype=acc_dtype)
+        # Passthrough above must retain both producer branches for SCNN's tile
+        # statistics probe; detach only the actual reduction's attention path.
+        logits_acc = (logits.detach() if self.stopgrad_attention else logits).to(dtype=acc_dtype)
 
         if mask is not None:
             mask_nchw = prepare_spatial_mask(mask, x, mask_resize=self.mask_resize, mask_resize_mode=self.mask_resize_mode).to(device=x.device)
@@ -123,13 +134,16 @@ class AttentionGeMReducer(BaseReducer):
             uniform_attention_eps=self.uniform_attention_eps,
             mask_resize=self.mask_resize,
             mask_resize_mode=self.mask_resize_mode,
+            stopgrad_attention=self.stopgrad_attention,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer
 
 
 class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
-    """Streaming attention-weighted global GeM reducer with stable softmax accumulation."""
+    """Accumulate global ``max``, ``sum(exp(logits-max))`` and
+    ``sum(exp(logits-max)*max(x,eps)**r)``; replay global GeM derivatives.
+    """
 
     def __init__(
         self,
@@ -139,12 +153,14 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         uniform_attention_eps: float = 0.0,
         mask_resize: bool = False,
         mask_resize_mode: str = "nearest",
+        stopgrad_attention: bool = False,
     ):
         super().__init__(mode="mean", accumulator_dtype=accumulator_dtype)
         self.eps = float(eps)
         self.uniform_attention_eps = _validate_uniform_attention_eps(uniform_attention_eps)
         self.mask_resize = bool(mask_resize)
         self.mask_resize_mode = mask_resize_mode
+        self.stopgrad_attention = bool(stopgrad_attention)
         self.register_buffer("r", torch.tensor(float(r_init), dtype=torch.float32))
         self.register_buffer("running_m", torch.zeros(0), persistent=False)
         self.register_buffer("running_zhat", torch.zeros(0), persistent=False)
@@ -163,9 +179,13 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         if len(inputs) != 2:
             raise ValueError(f"StreamingAttentionGeMReducer expects exactly two inputs (x_tile, logits_tile), got {len(inputs)}.")
         x_tile, logits_tile = inputs
-        self._last_inputs = (x_tile, logits_tile)
-        self._last_output = x_tile
-        return x_tile, logits_tile
+        normalized_logits = _normalize_logits(logits_tile, x_tile)
+        # SCNN maps heads by flattened tensor identity. Distinct views keep
+        # independent reducers identifiable when they share producer tensors.
+        payload = (x_tile.view_as(x_tile), normalized_logits.view_as(normalized_logits))
+        self._last_inputs = payload
+        self._last_output = payload[0]
+        return payload
 
     def accumulate_stream_tile(self, trimmed_output, tile_y: int, tile_x: int, sides, dst_box, user_mask: torch.Tensor | None = None):
         payload = self._parse_multi_input_payload(trimmed_output)
@@ -241,7 +261,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
 
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x_tile.dtype)
         x = x_tile.to(dtype=acc_dtype).clamp_min(self.eps)
-        logits = _normalize_logits(logits_tile, x_tile).to(dtype=acc_dtype)
+        logits = _normalize_logits(logits_tile.detach(), x_tile).to(dtype=acc_dtype)
         r = self.current_r.to(device=x_tile.device, dtype=acc_dtype)
         x_pow = x.pow(r)
 
@@ -311,7 +331,8 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
             valid_mask = torch.ones(x_tile.shape[-2:], device=x_tile.device, dtype=torch.bool)
         acc_dtype = resolve_accumulator_dtype(self.accumulator_dtype, x_tile.dtype)
         x = x_tile.to(dtype=acc_dtype).clamp_min(self.eps)
-        logits = _normalize_logits(logits_tile, x_tile).to(dtype=acc_dtype)
+        attention_tile = logits_tile.detach() if self.stopgrad_attention else logits_tile
+        logits = _normalize_logits(attention_tile, x_tile).to(dtype=acc_dtype)
         r = global_context["r"].to(device=x_tile.device, dtype=acc_dtype)
         m = global_context["m"].to(device=x_tile.device, dtype=acc_dtype)
         zhat = global_context["zhat"].to(device=x_tile.device, dtype=acc_dtype).clamp_min(self.eps)
@@ -341,7 +362,10 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
         # finalized global reducer output y = (global_S / global_Z) ** (1/r).
         # Do not finalize each tile independently; the summed tile gradients must
         # match the gradient of that single global expression.
-        scale = (1.0 / r) * final_mixed_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
+        # clamp_min has derivative 1 at equality in PyTorch. The replay
+        # surrogate otherwise leaks gradients through the output floor.
+        gate = (final_mixed_mean >= self.eps).to(dtype=acc_dtype)
+        scale = gate * (1.0 / r) * final_mixed_mean.clamp_min(self.eps).pow(1.0 / r - 1.0)
         surrogate = scale.detach() * replay_term
         return surrogate.to(dtype=x_tile.dtype)
 
@@ -353,6 +377,7 @@ class StreamingAttentionGeMReducer(BaseStreamingGlobalReducer):
             uniform_attention_eps=self.uniform_attention_eps,
             mask_resize=self.mask_resize,
             mask_resize_mode=self.mask_resize_mode,
+            stopgrad_attention=self.stopgrad_attention,
         )
         reducer.r.data.copy_(self.current_r.detach().to(device=reducer.r.device, dtype=reducer.r.dtype))
         return reducer

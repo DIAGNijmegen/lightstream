@@ -1,12 +1,58 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 
 from lightstream.core.reducer import AttentionGeMReducer, FusedAttentionGeMReducer
+from lightstream.core.scnn.scnn import StreamingCNN
+
+
+class _IndependentAttentionGeMHead(nn.Module):
+    def __init__(self, stopgrad: bool):
+        super().__init__()
+        self.values = nn.Conv2d(3, 2, 1, dtype=torch.float64)
+        self.attention = nn.Conv2d(3, 1, 1, dtype=torch.float64)
+        with torch.no_grad():
+            self.values.bias.fill_(1.0)
+        self.reducer = AttentionGeMReducer(
+            r_init=1.8, eps=1e-9, accumulator_dtype=torch.float64,
+            uniform_attention_eps=0.2, stopgrad_attention=stopgrad,
+        )
+
+    def forward(self, features):
+        return self.reducer(self.values(features), self.attention(features))
+
+
+@pytest.mark.parametrize("stopgrad", [False, True])
+def test_attention_gem_streamed_stopgrad_matches_full_model(stopgrad):
+    torch.manual_seed(223)
+    features = torch.randn(1, 3, 5, 7, dtype=torch.float64) * 0.05
+    upstream = torch.randn(1, 2, 1, 1, dtype=torch.float64)
+    reference = _IndependentAttentionGeMHead(stopgrad)
+    streamed_model = copy.deepcopy(reference)
+    full_features = features.clone().requires_grad_()
+    torch.autograd.backward(reference(full_features), upstream)
+
+    streamed = StreamingCNN(
+        streamed_model, tile_shape=(1, 3, 4, 4), deterministic=True,
+        saliency=False, copy_to_gpu=False, statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    streamed_features = features.clone().requires_grad_()
+    torch.testing.assert_close(streamed(streamed_features), reference(features))
+    streamed.backward(streamed_features, upstream)
+    torch.testing.assert_close(streamed_features.grad, full_features.grad, rtol=1e-9, atol=1e-11)
+    for name, parameter in reference.named_parameters():
+        actual = dict(streamed_model.named_parameters())[name].grad
+        if stopgrad and name.startswith("attention."):
+            assert actual is None and parameter.grad is None
+        else:
+            torch.testing.assert_close(actual, parameter.grad, rtol=1e-9, atol=1e-11)
 
 
 def _attention_formula(x, logits, *, r, eps, uniform_attention_eps, mask=None):
@@ -25,6 +71,72 @@ def _attention_formula(x, logits, *, r, eps, uniform_attention_eps, mask=None):
     mixed = (1.0 - uniform_attention_eps) * att
     mixed[..., valid_flat] = mixed[..., valid_flat] + uniform_attention_eps / n_valid
     return (mixed.reshape_as(logits) * x_pow).sum(dim=(-2, -1), keepdim=True).clamp_min(eps).pow(1.0 / r)
+
+
+@pytest.mark.parametrize("stopgrad", [False, True])
+@pytest.mark.parametrize("uniform_mix", [0.0, 0.25, 1.0])
+def test_attention_gem_stopgrad_keeps_values_and_controls_attention(stopgrad, uniform_mix):
+    torch.manual_seed(221)
+    x = (torch.rand(1, 2, 3, 4, dtype=torch.float64) + 0.2).requires_grad_()
+    logits = torch.randn(1, 1, 3, 4, dtype=torch.float64, requires_grad=True)
+    reducer = AttentionGeMReducer(r_init=1.7, eps=1e-9, accumulator_dtype=torch.float64,
+                                  uniform_attention_eps=uniform_mix, stopgrad_attention=stopgrad)
+    output = reducer(x, logits)
+    expected = _attention_formula(x.detach(), logits.detach(), r=reducer.current_r,
+                                  eps=reducer.eps, uniform_attention_eps=uniform_mix)
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    assert torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
+    if stopgrad or uniform_mix == 1.0:
+        assert logits.grad is None or torch.count_nonzero(logits.grad) == 0
+    else:
+        assert logits.grad is not None and logits.grad.abs().sum() > 0
+
+    streaming = reducer.to_streaming()
+    assert streaming.stopgrad_attention is stopgrad
+    assert streaming.to_reducer().stopgrad_attention is stopgrad
+
+
+@pytest.mark.parametrize("stopgrad", [False, True])
+@pytest.mark.parametrize("constant", [0.001, 0.125, 0.5])
+def test_attention_gem_replay_respects_output_clamp(stopgrad, constant):
+    eps = 0.015625
+    x = torch.full((1, 1, 2, 3), constant, dtype=torch.float64, requires_grad=True)
+    logits = torch.zeros(1, 1, 2, 3, dtype=torch.float64, requires_grad=True)
+    reducer = AttentionGeMReducer(r_init=2.0, eps=eps, accumulator_dtype=torch.float64,
+                                  stopgrad_attention=stopgrad)
+    # With six normalized weights, two valid reduction orders can round to
+    # opposite sides of the exact clamp threshold. A single valid location
+    # makes the equality case exact in both full-frame and streaming math.
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    if constant == 0.125:
+        valid[0, 1:] = False
+        valid[1] = False
+    reducer(x, logits, mask=valid).sum().backward()
+    streaming = reducer.to_streaming()
+    streaming.accumulate_valid_tile((x.detach(), logits.detach()), valid)
+    replay_x = x.detach().clone().requires_grad_()
+    replay_logits = logits.detach().clone().requires_grad_()
+    replay = streaming.reduce_tile_for_backward(
+        (replay_x, replay_logits), valid, streaming.extra_state_for_backward()
+    )
+    replay.sum().backward()
+    torch.testing.assert_close(replay_x.grad, x.grad, rtol=1e-9, atol=1e-12)
+    if stopgrad:
+        assert logits.grad is None and replay_logits.grad is None
+    elif logits.grad is not None:
+        torch.testing.assert_close(replay_logits.grad, logits.grad, rtol=1e-9, atol=1e-12)
+
+
+def test_attention_gem_same_tensor_as_values_and_attention_retains_value_gradient():
+    x = torch.tensor([[[[0.5, 1.0], [1.5, 2.0]]]], dtype=torch.float64, requires_grad=True)
+    reducer = AttentionGeMReducer(r_init=2.0, eps=1e-9, accumulator_dtype=torch.float64,
+                                  stopgrad_attention=True)
+    reducer(x, x).sum().backward()
+    weights = torch.softmax(x.detach().flatten(2), dim=-1).view_as(x)
+    mean_power = (weights * x.detach().square()).sum()
+    expected = weights * x.detach() / mean_power.sqrt()
+    torch.testing.assert_close(x.grad, expected, rtol=1e-10, atol=1e-12)
 
 
 def _fused_formula(y1, y2, y3, logits, *, r, eps, value_weights, attention_weights, uniform_attention_eps, mask=None):
@@ -128,16 +240,18 @@ def test_fused_attention_gem_uniform_mix_matches_direct_formula_after_branch_fus
 
 
 @pytest.mark.parametrize("mask", [None, torch.tensor([[True, True, False, True], [False, True, True, True], [True, False, True, True]])])
-def test_attention_gem_streaming_backward_replay_matches_nonstreaming_value_and_logits(mask):
+@pytest.mark.parametrize("stopgrad", [False, True])
+def test_attention_gem_streaming_backward_replay_matches_nonstreaming_value_and_logits(mask, stopgrad):
     torch.manual_seed(205)
     x = (torch.rand(2, 3, 3, 4, dtype=torch.float64) + 0.1).requires_grad_(True)
     logits = torch.randn(2, 1, 3, 4, dtype=torch.float64, requires_grad=True)
-    reducer = AttentionGeMReducer(r_init=1.6, eps=1e-9, uniform_attention_eps=0.2)
+    reducer = AttentionGeMReducer(r_init=1.6, eps=1e-9, uniform_attention_eps=0.2,
+                                  stopgrad_attention=stopgrad)
     upstream = torch.randn(2, 3, 1, 1, dtype=torch.float64)
 
     torch.autograd.backward(reducer(x, logits, mask=mask), upstream)
     expected_x_grad = x.grad.detach().clone()
-    expected_logits_grad = logits.grad.detach().clone()
+    expected_logits_grad = None if stopgrad else logits.grad.detach().clone()
 
     state_streaming = reducer.to_streaming()
     valid_mask = torch.ones(x.shape[-2:], dtype=torch.bool) if mask is None else mask
@@ -153,7 +267,10 @@ def test_attention_gem_streaming_backward_replay_matches_nonstreaming_value_and_
     torch.autograd.backward(replay, upstream)
 
     assert torch.allclose(replay_x.grad, expected_x_grad, atol=1e-9, rtol=1e-8)
-    assert torch.allclose(replay_logits.grad, expected_logits_grad, atol=1e-9, rtol=1e-8)
+    if stopgrad:
+        assert replay_logits.grad is None
+    else:
+        assert torch.allclose(replay_logits.grad, expected_logits_grad, atol=1e-9, rtol=1e-8)
 
 
 @pytest.mark.parametrize("mask", [None, torch.tensor([[True, True, False, True], [False, True, True, True], [True, False, True, True]])])

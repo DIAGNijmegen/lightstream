@@ -8,7 +8,7 @@ from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class SumReducer(BaseReducer):
-    """Apply global spatial sum reduction on NCHW tensors."""
+    """Return ``sum_{i in valid} x_ci`` for each sample and channel."""
 
     def __init__(
         self,

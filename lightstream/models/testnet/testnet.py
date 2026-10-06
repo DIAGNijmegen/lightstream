@@ -3,12 +3,11 @@ from pathlib import Path
 import torch
 from torch import Tensor
 import torch.nn as nn
-from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
 from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
-from lightstream.core.layers.streaminglayerscale import LayerScale
-from lightstream.core.reducer import SoftmaxAttentionReducer
+
+from lightstream.core.reducer import SoftmaxAttentionReducer,
 
 
 class GatedAttention(nn.Module):
@@ -41,7 +40,7 @@ class Head(nn.Module):
         super().__init__()
         self.att_net = GatedAttention(16,16,1)
         self.classifier = nn.Conv2d(16, 1, kernel_size=1)
-        self.reducer = SoftmaxAttentionReducer(accumulator_dtype=None, mask_resize=True)
+        self.reducer = SoftmaxAttentionReducer(accumulator_dtype=None, mask_resize=True, stopgrad_attention=True)
     def forward(self, x):
         att = self.att_net(x)
         logits = self.classifier(x)

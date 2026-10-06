@@ -15,6 +15,7 @@ nav:
       ConvNext: models/convnext.md
       NAT: models/nat.md
   - Modules:
+      Reducers: modules/reducers.md
       streaming: modules/streamingmodule.md
       imagenet: modules/imagenettemplate.md
       constructor: modules/constructor.md
@@ -71,5 +72,11 @@ plugins:
 
 markdown_extensions:
   - admonition
+  - pymdownx.arithmatex:
+      generic: true
   - pymdownx.details
   - pymdownx.superfences
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js

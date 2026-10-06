@@ -35,6 +35,8 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 ### Reducer-specific expected input ordering
 
 - `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
+- `MSEReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`. It returns the per-sample, per-channel mean squared deviation from the spatial mean. Set `use_softmax=True` to compute that deviation after a spatial softmax.
+
 - `AttentionGeMReducer`: `inputs == (x, att_logits)`, where `att_logits` is `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`.
 - `NormalizedSigmoidAttentionReducer`: `inputs == (values, attention_logits)`, with values `[N,C,H,W]` and attention logits `[N,H,W]`, `[N,1,H,W]`, or `[N,C,H,W]`.
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
@@ -43,6 +45,8 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `SigmoidAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor. It preserves every channel and returns `[N, C, 1, 1]`; attention is the spatial `softmax(sigmoid(logits) / tau)` per class.
 - `LogitAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor used as both values and attention logits. It returns `[N, C, 1, 1]`.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
+
+For consistency loss, use `MSEReducer(use_softmax=True)(instance_logits).mean()` to average its `[N,C,1,1]` output across batch and channels. Softmax normalization is over valid spatial positions independently for each class channel; for nonempty masks its spatial mean is exactly `1/N_valid`.
 
 ## Package structure
 
@@ -72,6 +76,10 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `gem.py`
   - `GeMReducer`: non-streaming GeM API entry point.
   - `StreamingGeMReducer`: streaming GeM execution implementation.
+
+- `mse.py`
+  - `MSEReducer`: spatial mean squared deviation from the spatial mean, optionally after softmax.
+  - `StreamingMSEReducer`: global-moment accumulation and backward replay implementation.
 
 ## `use_streaming=True` passthrough behavior
 
@@ -211,6 +219,25 @@ logits, normalize spatially per batch/class, share masking and temperature
 configuration, and expose streaming classes only as execution implementations.
 
 ## AttentionGeM
+
+For a consolidated formula reference covering every public reducer, see
+[`docs/modules/reducers.md`](../../../docs/modules/reducers.md).
+
+Both `AttentionGeMReducer` and `SoftmaxAttentionReducer` accept externally
+produced attention logits. Set `stopgrad_attention=True` to keep their global
+softmax weights but stop gradients into the attention branch. The value branch
+still receives gradients; `False` is the compatibility default. During SCNN
+statistics probing, both inputs remain connected so tile geometry includes
+both producer branches. Detachment happens only in reduction and replay.
+Streaming passthrough returns separate tensor views for each reducer instance;
+SCNN uses those identities to resolve independent heads that share producers.
+
+```python
+gem = AttentionGeMReducer(r_init=3.0, stopgrad_attention=True)
+softmax = SoftmaxAttentionReducer(stopgrad_attention=True)
+pooled_gem = gem(positive_values, attention_logits)
+pooled_logits = softmax(instance_logits, attention_logits)
+```
 
 ## Normalized sigmoid attention
 
