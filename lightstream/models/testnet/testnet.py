@@ -7,7 +7,7 @@ import torch.nn as nn
 from lightstream.modules.streaming import StreamingModule
 from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
 
-from lightstream.core.reducer import SoftmaxAttentionReducer,
+from lightstream.core.reducer import SoftmaxAttentionReducer
 
 
 class GatedAttention(nn.Module):
