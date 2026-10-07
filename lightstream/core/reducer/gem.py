@@ -8,7 +8,10 @@ from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class GeMReducer(BaseReducer):
-    """Apply global generalized-mean (GeM) reduction on NCHW tensors."""
+    """Return ``max(sum_i max(x_ci,eps)**r/N_valid,eps)**(1/r)``.
+
+    A fully masked sample returns ``eps**(1/r)``. ``r`` may be fixed or learned.
+    """
 
     def __init__(
         self,

@@ -6,6 +6,7 @@ import math
 import copy
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import List
 
 import numpy as np
@@ -25,19 +26,27 @@ from lightstream.core.scnn.utils import (
     H_DIM,
     W_DIM,
 )
-from lightstream.core.scnn.streamingconv import StreamingConv2d
-from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
-from lightstream.core.scnn.streaminglayernorm import (
+from lightstream.core.layers.streamingconv import StreamingConv2d
+from lightstream.core.layers.streamingupsample import StreamingUpsample2d
+from lightstream.core.layers.streaminglayernorm import (
     ChannelLayerNorm,
     StreamingChannelLayerNorm,
 )
-from lightstream.core.scnn.streaminglayerscale import LayerScale, StreamingLayerScale
-from lightstream.core.scnn.statisticsprobe import StatisticsProbe
-from lightstream.core.scnn.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayerscale import LayerScale, StreamingLayerScale
+from lightstream.core.layers.statisticsprobe import StatisticsProbe
+from lightstream.core.layers.streamingmerge import StreamingMerge
+from lightstream.core.layers.streamingneighborhoodattention import (
+    NeighborhoodAttention2D,
+    StreamingNeighborhoodAttention2D,
+)
 from lightstream.core.reducer import BaseReducer, BaseStreamingGlobalReducer
 
 
 logger = logging.getLogger(__name__)
+
+# Keep each temporary indexing result reasonably small while still amortizing
+# the cost of launching an indexing operation (especially on accelerators).
+_MASK_RESIZE_ROWS_PER_CHUNK = 4096
 
 _triple = _ntuple(3)
 
@@ -47,7 +56,49 @@ BACKWARD_STREAMING_MODULE_TYPES = (
     StreamingUpsample2d,
     StreamingChannelLayerNorm,
     StreamingLayerScale,
+    StreamingNeighborhoodAttention2D,
 )
+
+
+def _resize_nearest_bool_mask(
+    mask: torch.Tensor,
+    output_height: int,
+    output_width: int,
+    rows_per_chunk: int = _MASK_RESIZE_ROWS_PER_CHUNK,
+) -> torch.Tensor:
+    """Resize a normalized 2D bool mask using PyTorch's legacy nearest mapping.
+
+    ``interpolate(mode="nearest")`` selects source coordinate
+    ``floor(target_coordinate * source_size / target_size)``.  Coordinates are
+    always calculated in the complete output domain; chunking only limits the
+    number of output rows materialized by each advanced-indexing operation.
+    """
+    if mask.ndim != 2 or mask.dtype != torch.bool:
+        raise ValueError("mask must be a normalized 2D boolean tensor")
+    output_height, output_width = int(output_height), int(output_width)
+    rows_per_chunk = int(rows_per_chunk)
+    if output_height <= 0 or output_width <= 0:
+        raise ValueError("output_height and output_width must be positive")
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+
+    source_height, source_width = mask.shape
+    if source_height == 0 or source_width == 0:
+        raise ValueError("source mask dimensions must be positive")
+    if (source_height, source_width) == (output_height, output_width):
+        return mask
+
+    # Integer arithmetic is both exact and identical to interpolate's legacy
+    # nearest-neighbour coordinate transformation (not ``nearest-exact``).
+    target_columns = torch.arange(output_width, device=mask.device)
+    source_columns = torch.div(target_columns * source_width, output_width, rounding_mode="floor")
+    resized = torch.empty((output_height, output_width), dtype=torch.bool, device=mask.device)
+    for start in range(0, output_height, rows_per_chunk):
+        end = min(start + rows_per_chunk, output_height)
+        target_rows = torch.arange(start, end, device=mask.device)
+        source_rows = torch.div(target_rows * source_height, output_height, rounding_mode="floor")
+        resized[start:end] = mask[source_rows[:, None], source_columns[None, :]]
+    return resized
 
 
 def _is_spatial_preserving_pointwise_module(module):
@@ -133,6 +184,7 @@ class StreamingCNN(torch.nn.Module):
         verbose=False,
         deterministic=False,
         saliency=False,
+        diagnose_saliency_assembly=False,
         eps=1e-5,
         copy_to_gpu=True,
         dtype=None,
@@ -151,6 +203,8 @@ class StreamingCNN(torch.nn.Module):
                 module's logger at DEBUG level (default is False).
             deterministic (bool): whether to use the deterministic algorithms for cudnn
             saliency (bool): will gather the gradients of the input image (saliency map)
+            diagnose_saliency_assembly (bool): additionally retain per-tile saliency
+                transformation metadata and counterfactual candidate maps when saliency is enabled.
             eps (float): epsilon error to compare floating values
         """
         super().__init__()
@@ -164,7 +218,8 @@ class StreamingCNN(torch.nn.Module):
         if dtype is not None:
             self.dtype = dtype
         self.tile_shape = tile_shape
-        self.gather_input_gradient = saliency
+        self.diagnose_saliency_assembly = bool(diagnose_saliency_assembly)
+        self.gather_input_gradient = bool(saliency)
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
 
@@ -183,6 +238,9 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shapes = None
         self._tile_output_lost = None
         self._output_stride_per_output = None
+        self._output_metadata = ()
+        self._required_input_alignment = (1, 1)
+        self._output_size_transforms_per_output = None
         self._output_spec = None
         self._module_stats = {}
         self._saved_tensors = {}
@@ -199,7 +257,6 @@ class StreamingCNN(torch.nn.Module):
         self._prepared_reducer_domain_masks = {}
         self._current_output_heights = None
         self._current_output_widths = None
-
         if state_dict is None:
             self._configure()
         else:
@@ -223,21 +280,21 @@ class StreamingCNN(torch.nn.Module):
         if mask is None:
             return None
         if mask.ndim == 2:
-            return mask.to(device=self.device, dtype=torch.bool)
+            return mask.to(dtype=torch.bool)
         if mask.ndim == 3:
             if mask.shape[0] != image.shape[0]:
                 raise ValueError(
                     f"3D mask shape {tuple(mask.shape)} must be [N,H,W] with N={image.shape[0]}; "
                     "H/W must align with the reducer/reduced feature spatial domain."
                 )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=0)
+            return torch.any(mask.to(dtype=torch.bool), dim=0)
         if mask.ndim == 4:
             if mask.shape[0] != image.shape[0]:
                 raise ValueError(
                     f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
                     "H/W must align with the reducer/reduced feature spatial domain."
                 )
-            return torch.any(mask.to(device=self.device, dtype=torch.bool), dim=(0, 1))
+            return torch.any(mask.to(dtype=torch.bool), dim=(0, 1))
         raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
 
     def _prepare_reducer_domain_mask(
@@ -261,7 +318,7 @@ class StreamingCNN(torch.nn.Module):
         expected_shape = (int(output_height), int(output_width))
         actual_shape = (int(normalized.shape[-2]), int(normalized.shape[-1]))
         if actual_shape == expected_shape:
-            return normalized
+            return normalized.to(device=self.device)
 
         if not getattr(reducer, "mask_resize", False):
             raise ValueError(
@@ -276,12 +333,8 @@ class StreamingCNN(torch.nn.Module):
                 "Only 'nearest' is supported for streaming reducer mask resizing."
             )
 
-        resized = torch.nn.functional.interpolate(
-            normalized[None, None].to(dtype=torch.float32),
-            size=expected_shape,
-            mode=mask_resize_mode,
-        )[0, 0]
-        return resized.to(device=self.device, dtype=torch.bool)
+        resized = _resize_nearest_bool_mask(normalized, output_height, output_width)
+        return resized.to(device=self.device)
 
     def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
         reducer = self._reducer_head_map[head_idx]
@@ -354,9 +407,13 @@ class StreamingCNN(torch.nn.Module):
         # Create all-ones tile
         tile = torch.ones(self.tile_shape, dtype=self.dtype, requires_grad=True, device=self.device)
 
-        self._gather_forward_statistics(tile)
-        self._print_verbose("")
-        self._gather_backward_statistics(tile)
+        self._set_streaming_merge_statistics_mode(True)
+        try:
+            self._gather_forward_statistics(tile)
+            self._print_verbose("")
+            self._gather_backward_statistics(tile)
+        finally:
+            self._set_streaming_merge_statistics_mode(False)
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
@@ -373,6 +430,7 @@ class StreamingCNN(torch.nn.Module):
         self._capture_public_output_spec()
         self._streaming_reducers = []
         self.stream_module = self._convert_modules_for_streaming(self.stream_module)
+        self._required_input_alignment = self._compute_internal_alignment()
         self._add_hooks_for_streaming()
 
         # Remove temporary data
@@ -400,6 +458,11 @@ class StreamingCNN(torch.nn.Module):
             if isinstance(mod, BaseReducer):
                 mod._streaming_passthrough = enabled
 
+    def _set_streaming_merge_statistics_mode(self, enabled: bool):
+        for mod in self.stream_module.modules():
+            if isinstance(mod, StreamingMerge):
+                mod._streaming_statistics_mode = enabled
+
     def _set_channel_layer_norm_statistics_passthrough(self, enabled: bool):
         for mod in self.stream_module.modules():
             if isinstance(mod, ChannelLayerNorm):
@@ -409,13 +472,16 @@ class StreamingCNN(torch.nn.Module):
         # Forward pass with grads enabled
         torch.set_grad_enabled(True)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec, output_paths = self._flatten_output_structure(
+            output, include_paths=True
+        )
         self._output_spec = output_spec
 
         # Gather backward statistics
         self._tile_output_shapes = [out.shape for out in output_tensors]
         self._tile_output_shape = self._tile_output_shapes[0]
         self._output_stride_per_output = []
+        self._output_size_transforms_per_output = []
         gradients = []
         for idx, out in enumerate(output_tensors):
             lost = self._tile_output_lost[idx]
@@ -431,10 +497,26 @@ class StreamingCNN(torch.nn.Module):
             p_stats = self._prev_stats(out)
             if p_stats:
                 output_stride = p_stats["output_stride"] * torch.tensor(p_stats["stride"])
+                output_size_transforms = p_stats.get("output_size_transforms")
             else:
                 output_stride = torch.tensor([1, 1, 1])
+                output_size_transforms = []
 
             self._output_stride_per_output.append(output_stride)
+            self._output_size_transforms_per_output.append(output_size_transforms)
+
+        self._output_metadata = tuple(
+            MappingProxyType(
+                {
+                    "path": path,
+                    "stride": tuple(int(value) for value in stride[-2:]),
+                    "shape": tuple(int(value) for value in tensor.shape),
+                }
+            )
+            for path, stride, tensor in zip(
+                output_paths, self._output_stride_per_output, output_tensors
+            )
+        )
 
         self.output_stride = self._output_stride_per_output[0]
         self._base_output_stride = self._output_stride_per_output[0].clone()
@@ -452,40 +534,90 @@ class StreamingCNN(torch.nn.Module):
     def _gather_forward_statistics(self, tile):
         torch.set_grad_enabled(False)
         output = self.stream_module(tile)
-        output_tensors, output_spec = self._flatten_output_structure(output)
+        output_tensors, output_spec, _ = self._flatten_output_structure(output, include_paths=True)
         self._output_spec = output_spec
         self._tile_output_lost = [self._non_max_border_amount(out) for out in output_tensors]
         self.tile_output_lost = self._tile_output_lost[0]
         self._print_verbose("\n", "Output lost", self._tile_output_lost)
 
-    def _flatten_output_structure(self, output):
+    def _flatten_output_structure(self, output, include_paths=False, _path=""):
+        """Flatten tensors while optionally retaining stable structure paths.
+
+        Dictionary keys are kept in the existing sorted order and sequence indices
+        use bracket notation, so enabling paths never changes flattening order.
+        """
         if isinstance(output, torch.Tensor):
-            return [output], ("tensor", None)
+            result = ([output], ("tensor", None))
+            return (*result, [_path or "output"]) if include_paths else result
         if isinstance(output, tuple):
             flat = []
             children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
+            paths = []
+            for index, x in enumerate(output):
+                child = self._flatten_output_structure(
+                    x, include_paths=include_paths, _path=f"{_path}[{index}]"
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append(child_spec)
-            return flat, ("tuple", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("tuple", children))
+            return (*result, paths) if include_paths else result
         if isinstance(output, list):
             flat = []
             children = []
-            for x in output:
-                child_flat, child_spec = self._flatten_output_structure(x)
+            paths = []
+            for index, x in enumerate(output):
+                child = self._flatten_output_structure(
+                    x, include_paths=include_paths, _path=f"{_path}[{index}]"
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append(child_spec)
-            return flat, ("list", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("list", children))
+            return (*result, paths) if include_paths else result
         if isinstance(output, dict):
             flat = []
             children = []
+            paths = []
             for key in sorted(output.keys()):
-                child_flat, child_spec = self._flatten_output_structure(output[key])
+                child_path = str(key) if not _path else f"{_path}.{key}"
+                child = self._flatten_output_structure(
+                    output[key], include_paths=include_paths, _path=child_path
+                )
+                child_flat, child_spec = child[:2]
                 flat.extend(child_flat)
                 children.append((key, child_spec))
-            return flat, ("dict", children)
+                if include_paths:
+                    paths.extend(child[2])
+            result = (flat, ("dict", children))
+            return (*result, paths) if include_paths else result
         raise TypeError(f"Unsupported output type for streaming: {type(output)}")
+
+    @property
+    def output_strides(self):
+        """Immutable spatial strides in the same order as flattened outputs."""
+        return tuple(tuple(int(value) for value in stride[-2:]) for stride in self._output_stride_per_output)
+
+    @property
+    def required_input_alignment(self):
+        """Spatial input lattice required by all internal downsampling layers."""
+        return self._required_input_alignment
+
+    @property
+    def output_metadata(self):
+        """Immutable diagnostic metadata for every flattened statistics output."""
+        return self._output_metadata
+
+    @property
+    def named_output_strides(self):
+        """Immutable mapping from stable output paths to spatial strides."""
+        return MappingProxyType(
+            {metadata["path"]: metadata["stride"] for metadata in self._output_metadata}
+        )
 
     def _unflatten_output_structure(self, flat, spec, index=0):
         kind, payload = spec
@@ -737,6 +869,17 @@ class StreamingCNN(torch.nn.Module):
                 mod.output_stride = self._module_stats[module]["output_stride"]
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, NeighborhoodAttention2D) and not isinstance(
+            module, StreamingNeighborhoodAttention2D
+        ):
+            mod = StreamingNeighborhoodAttention2D.from_reference(module)
+            if module in self._module_stats:
+                stats = self._module_stats[module]
+                mod.grad_lost = stats.get("grad_lost", module.directional_spatial_support)
+                mod.output_stride = stats.get("output_stride", torch.tensor([1, 1, 1]))
+                self._module_stats[mod] = stats
+                del self._module_stats[module]
+            return mod
         elif isinstance(module, torch.nn.Upsample):
             mod = StreamingUpsample2d.from_torch_upsample(module)
             if module in self._module_stats:
@@ -825,6 +968,18 @@ class StreamingCNN(torch.nn.Module):
             else:
                 self._module_stats[mod] = self._module_stats[module]
                 del self._module_stats[module]
+        elif isinstance(module, StreamingNeighborhoodAttention2D):
+            mod = module.to_reference()
+            stats = self._module_stats.pop(module, None)
+            if stats is None:
+                stats = {
+                    "grad_lost": module.grad_lost,
+                    "output_stride": module.output_stride,
+                    "stride": torch.tensor([1, 1, 1]),
+                    "directional_spatial_support": module.directional_spatial_support,
+                }
+            self._module_stats[mod] = stats
+            return mod
         elif isinstance(module, StreamingUpsample2d):
             mod = module.to_torch_upsample()
             if module not in self._module_stats:
@@ -953,8 +1108,14 @@ class StreamingCNN(torch.nn.Module):
         # constant setup tensors from producing zero LayerNorm input gradients.
         for m in self.stream_module.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+                if m.weight is not None:
+                    m.weight.data.fill_(1)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+                if m.running_mean is not None:
+                    m.running_mean.data.zero_()
+                if m.running_var is not None:
+                    m.running_var.data.fill_(1)
                 m.eval()
 
     def _set_cudnn_flags(self, deterministic_flag, benchmark_flag):
@@ -1003,17 +1164,45 @@ class StreamingCNN(torch.nn.Module):
         return valid_output_heights, valid_output_widths
 
     def _compute_full_output_sizes(self, image):
-        """Return per-head output sizes for the fully stitched image output."""
-        output_heights = [
-            (image.shape[H_DIM] - self.tile_shape[H_DIM]) // int(self._output_stride_per_output[idx][1])
-            + tile_shape[H_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
-        output_widths = [
-            (image.shape[W_DIM] - self.tile_shape[W_DIM]) // int(self._output_stride_per_output[idx][2])
-            + tile_shape[W_DIM]
-            for idx, tile_shape in enumerate(self._tile_output_shapes)
-        ]
+        """Return per-head output sizes while retaining every strided layer's phase.
+
+        A total stride is not sufficient to infer an output extent: the result also
+        depends on the padding, effective kernel, and phase at *each* layer.  Replay
+        the spatial size transforms captured during setup instead.  Old tile caches
+        without this metadata retain the previous delta-based fallback.
+        """
+        transforms_per_output = getattr(self, "_output_size_transforms_per_output", None)
+        output_heights = []
+        output_widths = []
+        for idx, tile_shape in enumerate(self._tile_output_shapes):
+            transforms = (
+                transforms_per_output[idx]
+                if transforms_per_output is not None and idx < len(transforms_per_output)
+                else None
+            )
+            if transforms is None:
+                output_heights.append(
+                    (image.shape[H_DIM] - self.tile_shape[H_DIM])
+                    // int(self._output_stride_per_output[idx][1])
+                    + tile_shape[H_DIM]
+                )
+                output_widths.append(
+                    (image.shape[W_DIM] - self.tile_shape[W_DIM])
+                    // int(self._output_stride_per_output[idx][2])
+                    + tile_shape[W_DIM]
+                )
+                continue
+
+            height, width = int(image.shape[H_DIM]), int(image.shape[W_DIM])
+            for transform in transforms:
+                kernel_h, kernel_w = transform["kernel_size"]
+                dilation_h, dilation_w = transform["dilation"]
+                padding_h, padding_w = transform["padding"]
+                stride_h, stride_w = transform["stride"]
+                height = (height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
+                width = (width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
+            output_heights.append(height)
+            output_widths.append(width)
         return output_heights, output_widths
 
     def _compute_valid_input_step(self, valid_output_heights, valid_output_widths):
@@ -1074,6 +1263,7 @@ class StreamingCNN(torch.nn.Module):
         tile_width,
     ):
         """Yield input-space tile coordinates with border-aware side markers."""
+        align_h, align_w = self._compute_internal_alignment()
         for row in range(n_rows):
             for col in range(n_cols):
                 input_y = row * valid_input_height
@@ -1086,9 +1276,21 @@ class StreamingCNN(torch.nn.Module):
                 sides = Sides(sides_left, sides_top, sides_right, sides_bottom)
 
                 if sides_bottom:
-                    input_y = max(image.shape[H_DIM] - tile_height, 0)
+                    edge_start = max(image.shape[H_DIM] - tile_height, 0)
+                    # Keep the sampling phase of strided layers at the image
+                    # edge.  The resulting edge tile may be smaller than the
+                    # setup tile, which is preferable to shifting its origin
+                    # off the global stride lattice.
+                    input_y = min(
+                        math.ceil(edge_start / align_h) * align_h,
+                        max(int(image.shape[H_DIM]) - 1, 0),
+                    )
                 if sides_right:
-                    input_x = max(image.shape[W_DIM] - tile_width, 0)
+                    edge_start = max(image.shape[W_DIM] - tile_width, 0)
+                    input_x = min(
+                        math.ceil(edge_start / align_w) * align_w,
+                        max(int(image.shape[W_DIM]) - 1, 0),
+                    )
 
                 input_y = input_y if not sides.top else 0
                 input_x = input_x if not sides.left else 0
@@ -1169,6 +1371,17 @@ class StreamingCNN(torch.nn.Module):
 
         if self.should_normalize:
             tile = self._normalize_on_gpu(tile)
+
+        sides = Sides(
+            input_x == 0,
+            input_y == 0,
+            input_x + tile_width >= image.shape[W_DIM],
+            input_y + tile_height >= image.shape[H_DIM],
+        )
+        input_loc = Box(input_y, tile_height, input_x, tile_width, sides)
+        for mod in self.stream_module.modules():
+            if _is_backward_streaming_module(mod):
+                mod.input_loc = input_loc
 
         tile_output = self.stream_module(tile)
         tile_outputs, _ = self._flatten_output_structure(tile_output)
@@ -1564,10 +1777,19 @@ class StreamingCNN(torch.nn.Module):
             tile = self._normalize_on_gpu(tile)
 
         if self.gather_input_gradient:
-            tile.requires_grad = True
+            # A tile sliced from an input that already requires gradients is a
+            # non-leaf view whose flag cannot be assigned. It already tracks
+            # gradients, so only opt in explicitly for tiles from ordinary
+            # inference inputs.
+            if not tile.requires_grad:
+                tile.requires_grad_(True)
             self.saliency_old_indices = copy.deepcopy(self.saliency_input_module.seen_indices)
 
-        use_cuda_autocast = self.device.type == "cuda" and torch.cuda.is_available()
+        use_cuda_autocast = (
+            self.device.type == "cuda"
+            and torch.cuda.is_available()
+            and self.dtype in (torch.float16, torch.bfloat16)
+        )
         if use_cuda_autocast:
             with torch.autocast(device_type="cuda", dtype=self.dtype):
                 tile_output = self.stream_module(tile)
@@ -1602,8 +1824,23 @@ class StreamingCNN(torch.nn.Module):
         del trimmed_grads
         del trimmed_outputs
 
-    def forward(self, image, result_on_cpu=False, mask=None):
+    def validate_input_alignment(self, image):
+        """Raise early when an input is not on the required internal lattice."""
+        height, width = int(image.shape[H_DIM]), int(image.shape[W_DIM])
+        align_h, align_w = self.required_input_alignment
+        next_height = math.ceil(height / align_h) * align_h
+        next_width = math.ceil(width / align_w) * align_w
+        if (height, width) != (next_height, next_width):
+            raise ValueError(
+                "Input spatial shape is not aligned: "
+                f"received=({height}, {width}), required_alignment=({align_h}, {align_w}), "
+                f"next_valid_padded_shape=({next_height}, {next_width})"
+            )
+
+    def forward(self, image, result_on_cpu=False, mask=None, validate_input_alignment=False):
         """Perform forward pass with lightstream."""
+        if validate_input_alignment:
+            self.validate_input_alignment(image)
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
         self._active_reducer_mask = mask
@@ -1631,6 +1868,48 @@ class StreamingCNN(torch.nn.Module):
 
         if self.gather_input_gradient:
             self.saliency_map = torch.zeros(image.shape, dtype=self.dtype, device="cpu")
+            if getattr(self, "diagnose_saliency_assembly", False):
+                self.saliency_coverage_map = torch.zeros(image.shape, dtype=torch.bool, device="cpu")
+                self.saliency_nonzero_coverage_map = torch.zeros(
+                    image.shape, dtype=torch.bool, device="cpu"
+                )
+                self.saliency_diagnostic_records = []
+                self._saliency_diagnostic_destination_coverage = torch.zeros(
+                    image.shape[-2:], dtype=torch.bool, device="cpu"
+                )
+                self.saliency_diagnostic_maps = {}
+                self.saliency_diagnostic_write_count_maps = {}
+                candidate_names = ["raw", "grad_lost", "ownership", "production"]
+                for name in candidate_names:
+                    try:
+                        self.saliency_diagnostic_maps[name] = torch.zeros(
+                            image.shape, dtype=self.dtype, device="cpu"
+                        )
+                    except (RuntimeError, MemoryError):
+                        logger.warning(
+                            "Unable to allocate saliency diagnostic candidate map %r; "
+                            "continuing with metadata only.",
+                            name,
+                        )
+                        self.saliency_diagnostic_maps[name] = None
+                count_names = ("raw", "grad_lost", "ownership")
+                for name in count_names:
+                    try:
+                        self.saliency_diagnostic_write_count_maps[name] = torch.zeros(
+                            image.shape, dtype=torch.int32, device="cpu"
+                        )
+                    except (RuntimeError, MemoryError):
+                        logger.warning(
+                            "Unable to allocate saliency diagnostic write-count map %r; "
+                            "continuing without write-count diagnostics.",
+                            name,
+                        )
+                        self.saliency_diagnostic_write_count_maps[name] = None
+                # Keep the shorter name as an alias for callers that treat these
+                # alongside ``saliency_diagnostic_maps``.
+                self.saliency_diagnostic_count_maps = (
+                    self.saliency_diagnostic_write_count_maps
+                )
 
         self._last_forward_tiles = []
         internal_alignment = self._compute_internal_alignment()
@@ -1820,6 +2099,14 @@ class StreamingCNN(torch.nn.Module):
             output_heights=output_heights,
             output_widths=output_widths,
         )
+        # Output ownership is assigned once, at the replay head.  Keeping this
+        # separate from layer-level dependency handling is essential for
+        # shifted final tiles: both operands of a residual see the same owned
+        # queries, while spatial operators may still propagate those queries
+        # through halo locations owned as outputs by another tile.
+        self._backward_head_seen_indices = [
+            Box(0, 0, 0, 0, None) for _ in internal_grad_tensors
+        ]
 
         # Reducers can own one-shot backward state even when debug assignment
         # validation is disabled (for example, a single global parameter
@@ -1842,6 +2129,7 @@ class StreamingCNN(torch.nn.Module):
                 reducer.validate_backward_replay_consumed(head_idx=idx)
 
         self._saved_tensors = {}
+        del self._backward_head_seen_indices
 
         for mod in self.stream_module.modules():
             if _is_backward_streaming_module(mod):
@@ -1903,11 +2191,38 @@ class StreamingCNN(torch.nn.Module):
                 output_x=head_output_x + head_lost.left,
             )
 
-        return self._build_non_reducer_backward_pair(
+        paired_output, paired_gradient = self._build_non_reducer_backward_pair(
             trimmed_output=trimmed_output,
             gradient=gradient,
             head_lost=head_lost,
             image=backward_ctx.image,
+        )
+        output_loc = Box(
+            head_output_y + head_lost.top,
+            0,
+            head_output_x + head_lost.left,
+            0,
+            sides,
+        )
+        owned, updated = _new_value_indices(
+            paired_output.shape,
+            output_loc,
+            self._backward_head_seen_indices[head_idx],
+        )
+        self._backward_head_seen_indices[head_idx] = updated
+        return (
+            paired_output[
+                :,
+                :,
+                owned.y : owned.y + owned.height,
+                owned.x : owned.x + owned.width,
+            ],
+            paired_gradient[
+                :,
+                :,
+                owned.y : owned.y + owned.height,
+                owned.x : owned.x + owned.width,
+            ],
         )
 
     def _build_non_reducer_backward_pair(self, trimmed_output, gradient, head_lost, image):
@@ -1976,6 +2291,13 @@ class StreamingCNN(torch.nn.Module):
             context=f"backward reducer head {head_idx}",
             expected_shape=(ref.shape[H_DIM], ref.shape[W_DIM]),
         )
+        # Reducer forward accumulation owns only the first occurrence of each
+        # global position.  Apply that ownership to the backward surrogate as
+        # well, so both the value/classifier and attention-logit branches see
+        # zero gradient for overlap before their per-tile networks run.
+        valid_mask = reducer.claim_backward_region(
+            (dst_y0, dst_y1, dst_x0, dst_x1), valid_mask
+        )
 
         reduced_output, reduced_grad = reducer.build_backward_pair(
             payload,
@@ -2039,6 +2361,8 @@ class StreamingCNN(torch.nn.Module):
                         self.saliency_input_module = mod
                         back_handle = mod.register_full_backward_hook(back_lambda)
                         self._hooks.append(back_handle)
+                        # Saliency describes the model input, not later RGB-like feature maps.
+                        break
 
     def _add_hooks(
         self,
@@ -2049,8 +2373,9 @@ class StreamingCNN(torch.nn.Module):
             torch.nn.MaxPool2d,
             torch.nn.AvgPool2d,
             torch.nn.Upsample,
+            NeighborhoodAttention2D,
         ),
-        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample),
+        back_modules=(torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.Upsample, NeighborhoodAttention2D),
     ):
         for mod in self.stream_module.modules():
             register_forward = isinstance(mod, forward_modules) or _is_spatial_preserving_pointwise_module(mod)
@@ -2086,6 +2411,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _forward_gather_statistics_hook(self, module, inpt, output):
         is_upsample = isinstance(module, torch.nn.Upsample)
+        is_neighborhood_attention = isinstance(module, NeighborhoodAttention2D)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
         is_merge = isinstance(module, StreamingMerge)
         if is_pointwise_module:
@@ -2137,12 +2463,45 @@ class StreamingCNN(torch.nn.Module):
             # constant setup tensors can make the actual output all zeros, so
             # derive validity from the input.
 
-            # A merge's valid support is the intersection encoded by its actual
-            # numerical result.  Other pointwise boundaries remain value
-            # independent and inherit support from their sole input.
-            validity_source = output if is_merge or not is_pointwise_module else inpt[0]
-            lost = self._non_max_border_amount(validity_source)
-
+            # Neighborhood attention has known spatial support, so its output
+            # values are neither necessary nor reliable as a validity mask.
+            # A merge is different: its result encodes the intersection of its
+            # branch masks and must still be inspected.  Other pointwise
+            # boundaries inherit validity from their sole input.
+            if is_neighborhood_attention:
+                input_lost = self._non_max_border_amount(inpt[0])
+                support = module.directional_spatial_support
+                lost = Lost(
+                    input_lost.top + support.top,
+                    input_lost.left + support.left,
+                    input_lost.bottom + support.bottom,
+                    input_lost.right + support.right,
+                )
+            elif is_merge or not is_pointwise_module:
+                lost = self._non_max_border_amount(output)
+            else:
+                lost = self._non_max_border_amount(inpt[0])
+            if (
+                is_upsample
+                and module.mode == "bilinear"
+                and getattr(module, "align_corners", None) in (None, False)
+            ):
+                scale_h, scale_w = self._resolve_upsample_scale(module, inpt, output)
+                # With align_corners=False, the first and last high-resolution
+                # samples use PyTorch's edge padding.  That padding is valid at
+                # an image boundary but not at an interior tile seam, where the
+                # neighbouring low-resolution sample lives in another tile.
+                # Keep these samples out of the forward-valid region.  This is
+                # independent of the low-resolution dependency mask collected
+                # for bilinear backward replay below.
+                border_h = math.ceil((scale_h - 1.0) / 2.0)
+                border_w = math.ceil((scale_w - 1.0) / 2.0)
+                lost = Lost(
+                    lost.top + border_h,
+                    lost.left + border_w,
+                    lost.bottom + border_h,
+                    lost.right + border_w,
+                )
             # Make output between 0-1 again, so the values do not explode
             output.fill_(0)
             output[
@@ -2154,12 +2513,15 @@ class StreamingCNN(torch.nn.Module):
 
             module_stats = {
                 "lost": lost,
+                "output_shape": tuple(output.shape),
                 "stride": stride if not is_upsample else torch.tensor([1, 1, 1]),
                 "kernel_size": kernel_size,
                 "padding": padding,
                 "dilation": dilation,
                 "module": module,
             }
+            if is_neighborhood_attention:
+                module_stats["directional_spatial_support"] = module.directional_spatial_support
             if is_upsample:
                 module_stats["backward_valid_lost"] = Lost(0, 0, 0, 0)
                 module_stats["upsample_forward_output_lost"] = module_stats["lost"]
@@ -2220,6 +2582,27 @@ class StreamingCNN(torch.nn.Module):
             else:
                 output_stride = prev_output_stride
 
+            previous_transforms = p_stats.get("output_size_transforms") if p_stats else []
+            if previous_transforms is None or is_upsample:
+                # The legacy delta calculation remains the safe fallback for
+                # paths containing transforms that cannot be represented by a
+                # convolution size formula.
+                module_stats["output_size_transforms"] = None
+            elif isinstance(module, torch.nn.Conv2d):
+                module_stats["output_size_transforms"] = [
+                    *previous_transforms,
+                    {
+                        "kernel_size": tuple(int(v) for v in module.kernel_size),
+                        "dilation": tuple(int(v) for v in module.dilation),
+                        "padding": tuple(int(v) for v in module.padding),
+                        "stride": tuple(int(v) for v in module.stride),
+                    },
+                ]
+            elif is_pointwise_module or is_neighborhood_attention:
+                module_stats["output_size_transforms"] = list(previous_transforms)
+            else:
+                module_stats["output_size_transforms"] = None
+
             output_stride = output_stride.clone().detach()
             output_stride[0] = 1
             module_stats["output_stride"] = output_stride
@@ -2270,6 +2653,7 @@ class StreamingCNN(torch.nn.Module):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         is_upsample = isinstance(module, torch.nn.Upsample)
+        is_neighborhood_attention = isinstance(module, NeighborhoodAttention2D)
         is_pointwise_module = _is_spatial_preserving_pointwise_module(module)
         if is_pointwise_module:
             stride = torch.tensor([1, 1, 1])
@@ -2364,6 +2748,14 @@ class StreamingCNN(torch.nn.Module):
 
             valid_grad = f_grad > (1 - self.eps) * f_grad.max()
 
+            if is_neighborhood_attention:
+                # A retained query contributes through every key/value in its
+                # halo.  Overlapping replay tiles therefore carry additive,
+                # partial input gradients rather than duplicate gradients to
+                # discard.  Keep the complete tile input active and let tensor
+                # view accumulation assemble those contributions globally.
+                valid_grad.fill_(True)
+
             # When the effective kernel is larger than the stride we have some
             # _overlap_ of gradients, this overlap makes extra positions in the
             # input gradient invalid. Dilation increases the effective receptive
@@ -2382,7 +2774,14 @@ class StreamingCNN(torch.nn.Module):
                     valid_lost.left + overlap_cols : valid_grad.shape[1] - valid_lost.right - overlap_cols,
                 ] = 1
 
-            new_grad_in = valid_grad[None].expand(grad_in[0].shape[1], *valid_grad.shape)[None]
+            # Statistics tiles may contain more than one sample.  Every sample
+            # has the same synthetic spatial validity mask, but a backward hook
+            # must preserve the complete NCHW shape of its input gradient.
+            new_grad_in = valid_grad[None, None].expand(
+                grad_in[0].shape[B_DIM],
+                grad_in[0].shape[C_DIM],
+                *valid_grad.shape,
+            )
             new_grad_in = new_grad_in.type(self.dtype) * 10 - 1
             new_grad_in_lost = self._non_max_border_amount(new_grad_in)
             self._module_stats[module]["backward_valid_lost"] = new_grad_in_lost
@@ -2405,6 +2804,7 @@ class StreamingCNN(torch.nn.Module):
         change_grad=True,
     ):
         stride: List[int] = _triple(module.stride)  # type:ignore
+        raw_input_grad = grad_in[0]
 
         # Trim gradient of invalid values
         sides = module.input_loc.sides
@@ -2440,7 +2840,7 @@ class StreamingCNN(torch.nn.Module):
         new_output_box, updated_total_indices = _new_value_indices(valid_grad.shape, data_loc, old_value_indices)
 
         if module.in_channels == 3:
-            valid_grad_in = grad_in[0][
+            valid_grad_in = raw_input_grad[
                 :,
                 :,
                 lost.top * stride[1] : grad_in[0].shape[2] - lost.bottom * stride[1],
@@ -2454,13 +2854,147 @@ class StreamingCNN(torch.nn.Module):
                 new_output_box.x * stride[2] : new_output_box.x * stride[2] + new_output_box.width * stride[2],
             ]
 
-            self.saliency_map[
-                :,
-                :,
-                updated_total_indices.y * stride[1] : updated_total_indices.height * stride[1],
-                updated_total_indices.x * stride[2]
-                - relevant_input_grad.shape[3] : updated_total_indices.x * stride[2],
-            ] = relevant_input_grad.detach().cpu()
+            destination = (
+                slice(None),
+                slice(None),
+                slice(
+                    updated_total_indices.y * stride[1],
+                    updated_total_indices.height * stride[1],
+                ),
+                slice(
+                    updated_total_indices.x * stride[2] - relevant_input_grad.shape[3],
+                    updated_total_indices.x * stride[2],
+                ),
+            )
+
+            diagnose_saliency_assembly = getattr(
+                self, "diagnose_saliency_assembly", False
+            )
+            if diagnose_saliency_assembly:
+                destination_bounds = (
+                    destination[2].start,
+                    destination[2].stop,
+                    destination[3].start,
+                    destination[3].stop,
+                )
+                destination_2d = self._saliency_diagnostic_destination_coverage[
+                    destination[2], destination[3]
+                ]
+                overlaps_previous = bool(destination_2d.any().item())
+                destination_2d.fill_(True)
+                self.saliency_diagnostic_records.append(
+                    {
+                        "input_loc": {"y": int(input_loc.y), "x": int(input_loc.x)},
+                        "sides": {
+                            "top": bool(sides.top), "left": bool(sides.left),
+                            "bottom": bool(sides.bottom), "right": bool(sides.right),
+                        },
+                        "stride": tuple(int(value) for value in stride),
+                        "output_stride": tuple(int(value) for value in module.output_stride),
+                        "grad_lost": {
+                            "top": int(grad_lost.top), "left": int(grad_lost.left),
+                            "bottom": int(grad_lost.bottom), "right": int(grad_lost.right),
+                        },
+                        "raw_shape": tuple(raw_input_grad.shape),
+                        "post_grad_lost_shape": tuple(valid_grad_in.shape),
+                        "post_ownership_shape": tuple(relevant_input_grad.shape),
+                        "raw_nonzero": int(raw_input_grad.count_nonzero().item()),
+                        "post_grad_lost_nonzero": int(valid_grad_in.count_nonzero().item()),
+                        "post_ownership_nonzero": int(relevant_input_grad.count_nonzero().item()),
+                        "new_output_box": {
+                            "y": int(new_output_box.y), "height": int(new_output_box.height),
+                            "x": int(new_output_box.x), "width": int(new_output_box.width),
+                        },
+                        "updated_total_indices": {
+                            "y": int(updated_total_indices.y),
+                            "height": int(updated_total_indices.height),
+                            "x": int(updated_total_indices.x),
+                            "width": int(updated_total_indices.width),
+                        },
+                        "destination_slices": destination_bounds,
+                        "candidate_destination_slices": {
+                            "raw": (
+                                int(input_loc.y), int(input_loc.x),
+                                int(input_loc.y) + raw_input_grad.shape[2],
+                                int(input_loc.x) + raw_input_grad.shape[3],
+                            ),
+                            "grad_lost": (
+                                int(input_loc.y) + lost.top * stride[1],
+                                int(input_loc.x) + lost.left * stride[2],
+                                int(input_loc.y) + lost.top * stride[1] + valid_grad_in.shape[2],
+                                int(input_loc.x) + lost.left * stride[2] + valid_grad_in.shape[3],
+                            ),
+                            "ownership": (
+                                destination[2].start, destination[3].start,
+                                destination[2].stop, destination[3].stop,
+                            ),
+                        },
+                        "destination_overlaps_previous": overlaps_previous,
+                    }
+                )
+                raw_cpu = raw_input_grad.detach().cpu()
+                valid_cpu = valid_grad_in.detach().cpu()
+                relevant_cpu = relevant_input_grad.detach().cpu()
+                raw_destination = (
+                    slice(None), slice(None),
+                    slice(int(input_loc.y), int(input_loc.y) + raw_cpu.shape[2]),
+                    slice(int(input_loc.x), int(input_loc.x) + raw_cpu.shape[3]),
+                )
+                valid_y = int(input_loc.y) + lost.top * stride[1]
+                valid_x = int(input_loc.x) + lost.left * stride[2]
+                valid_destination = (
+                    slice(None), slice(None), slice(valid_y, valid_y + valid_cpu.shape[2]),
+                    slice(valid_x, valid_x + valid_cpu.shape[3]),
+                )
+                for name, target, source, additive in (
+                    ("raw", raw_destination, raw_cpu, True),
+                    ("grad_lost", valid_destination, valid_cpu, True),
+                    ("ownership", destination, relevant_cpu, True),
+                    ("production", raw_destination, raw_cpu, True),
+                ):
+                    candidate = self.saliency_diagnostic_maps.get(name)
+                    if candidate is not None:
+                        if additive:
+                            candidate[target] += source
+                        else:
+                            candidate[target] = source
+                    if name != "production":
+                        count_maps = getattr(
+                            self, "saliency_diagnostic_write_count_maps", None
+                        )
+                        if count_maps is None:
+                            # Support diagnostic hooks invoked directly by tests
+                            # and downstream tooling, without a forward setup.
+                            count_maps = {
+                                key: torch.zeros_like(value, dtype=torch.int32)
+                                if value is not None else None
+                                for key, value in self.saliency_diagnostic_maps.items()
+                                if key != "production"
+                            }
+                            self.saliency_diagnostic_write_count_maps = count_maps
+                            self.saliency_diagnostic_count_maps = count_maps
+                        count_map = count_maps.get(name)
+                        if count_map is not None:
+                            # Count each contribution before accumulation.  The
+                            # accumulated value cannot reveal writes that cancel.
+                            count_map[target] += source.ne(0).to(count_map.dtype)
+
+            # Input-tile gradients are dependency contributions, not mutually
+            # exclusive output ownership regions.  Accumulate the complete
+            # gradient at the input tile's true image location.  In particular,
+            # ``input_loc`` is already in input pixels and must not be scaled by
+            # the first convolution's stride.
+            raw_input_grad = raw_input_grad.detach().cpu()
+            raw_destination = (
+                slice(None),
+                slice(None),
+                slice(int(input_loc.y), int(input_loc.y) + raw_input_grad.shape[2]),
+                slice(int(input_loc.x), int(input_loc.x) + raw_input_grad.shape[3]),
+            )
+            self.saliency_map[raw_destination] += raw_input_grad
+            if diagnose_saliency_assembly or hasattr(self, "saliency_coverage_map"):
+                self.saliency_coverage_map[raw_destination] = True
+                self.saliency_nonzero_coverage_map[raw_destination] |= raw_input_grad.ne(0)
 
             del relevant_input_grad
             del valid_grad_in
@@ -2506,6 +3040,11 @@ class StreamingCNN(torch.nn.Module):
         named_stats["tile_output_shape"] = self._tile_output_shape  # type:ignore
         named_stats["tile_output_shapes"] = self._tile_output_shapes  # type:ignore
         named_stats["output_stride_per_output"] = self._output_stride_per_output  # type:ignore
+        named_stats["required_input_alignment"] = self.required_input_alignment
+        named_stats["output_metadata"] = [dict(entry) for entry in self._output_metadata]
+        named_stats["output_size_transforms_per_output"] = getattr(
+            self, "_output_size_transforms_per_output", None
+        )
         named_stats["output_spec"] = self._output_spec
         return named_stats
 
@@ -2519,6 +3058,7 @@ class StreamingCNN(torch.nn.Module):
         self._tile_output_shape = state["tile_output_shape"]
         self._tile_output_shapes = state.get("tile_output_shapes", [self._tile_output_shape])
         self._output_stride_per_output = state.get("output_stride_per_output", [self.output_stride])
+        self._output_size_transforms_per_output = state.get("output_size_transforms_per_output")
         self._base_output_stride = self._output_stride_per_output[0].clone()
         for stride in self._output_stride_per_output[1:]:
             self._base_output_stride[1] = min(int(self._base_output_stride[1]), int(stride[1]))
@@ -2528,6 +3068,24 @@ class StreamingCNN(torch.nn.Module):
         for name, module in self.stream_module.named_modules():
             if name in state["net_stats"]:
                 self._module_stats[module] = state["net_stats"][name]
+
+        cached_alignment = state.get("required_input_alignment")
+        self._required_input_alignment = (
+            tuple(int(value) for value in cached_alignment)
+            if cached_alignment is not None
+            else self._compute_internal_alignment()
+        )
+        cached_metadata = state.get("output_metadata")
+        if cached_metadata is None:
+            cached_metadata = [
+                {
+                    "path": "output" if len(self._output_stride_per_output) == 1 else f"[{index}]",
+                    "stride": tuple(int(value) for value in stride[-2:]),
+                    "shape": tuple(int(value) for value in self._tile_output_shapes[index]),
+                }
+                for index, stride in enumerate(self._output_stride_per_output)
+            ]
+        self._output_metadata = tuple(MappingProxyType(dict(entry)) for entry in cached_metadata)
 
         self.enable()
 

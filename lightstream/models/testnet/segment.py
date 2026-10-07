@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
 
 
 class StreamingTestNet(StreamingModule):
@@ -16,6 +16,7 @@ class StreamingTestNet(StreamingModule):
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
+        diagnose_saliency_assembly: bool = False,
         copy_to_gpu: bool = False,
         statistics_on_cpu: bool = True,
         normalize_on_gpu: bool = True,
@@ -42,6 +43,7 @@ class StreamingTestNet(StreamingModule):
             verbose=verbose,
             deterministic=deterministic,
             saliency=saliency,
+            diagnose_saliency_assembly=diagnose_saliency_assembly,
             copy_to_gpu=copy_to_gpu,
             statistics_on_cpu=statistics_on_cpu,
             normalize_on_gpu=normalize_on_gpu,

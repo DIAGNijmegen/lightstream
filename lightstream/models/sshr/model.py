@@ -5,14 +5,15 @@ https://github.com/Nexuslkl/Swin_MIL/blob/main/models/swin_mil.py
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
 from typing import List
 from torchinfo import summary
 
-from lightstream.core.reducer import NGWPReducer
+from lightstream.core.reducer import MeanReducer
 from lightstream.models.segment.resnet import make_resnet_backbone
-from lightstream.core.scnn.streamingmerge import StreamingMerge
-from lightstream.core.scnn.streaminglayerscale import LayerScale
-
+from lightstream.core.layers.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayerscale import LayerScale
 
 class LocalRectification(nn.Module):
     """
@@ -27,7 +28,7 @@ class LocalRectification(nn.Module):
         shallow_channels: int,
         deep_channels: int,
         scale_factor: int,
-        kernel_size: int = 16,
+        kernel_size: int = 8,
     ):
         super(LocalRectification, self).__init__()
 
@@ -43,9 +44,32 @@ class LocalRectification(nn.Module):
             ),
         )
 
-        self.multiply = StreamingMerge("multiply")
-        self.add = StreamingMerge("add")
-        self.gamma = LayerScale(shape=1, init_value=1.0)
+        context_kernel = 7
+        padding = context_kernel // 2
+        self.context_conv = nn.Conv2d(
+            shallow_channels,
+            shallow_channels,
+            kernel_size=context_kernel,
+            padding=padding,
+            groups=shallow_channels,
+            bias=False,
+        )
+
+        nn.init.constant_(self.context_conv.weight, 1.0 / (context_kernel**2))
+
+        self.gamma_rect = LayerScale(shape=1, init_value=0.0)
+        self.multiply_merge_rect = StreamingMerge("multiply")
+        self.add_merge_rect = StreamingMerge("add")
+
+        self.gamma_context = LayerScale(shape=1, init_value=0.0)
+        self.add_merge_context = StreamingMerge("add")
+
+    @torch.no_grad()
+    def initialize_context(self):
+        nn.init.constant_(
+            self.context_conv.weight,
+            1.0 / (self.context_conv.kernel_size[0] ** 2),
+        )
 
     def forward(self, feature_shallow: Tensor, feature_deep: Tensor) -> Tensor:
         """
@@ -61,9 +85,16 @@ class LocalRectification(nn.Module):
         """
 
         weights = self.rec_block(feature_deep)
-        weighted_features = self.multiply(feature_shallow, weights)
-        scaled_features = self.gamma(weighted_features)
-        return self.add(feature_shallow, scaled_features)
+        weighted_features = self.multiply_merge_rect(feature_shallow, weights)
+        scaled_rect = self.gamma_rect(weighted_features)
+
+        context_features = self.context_conv(feature_shallow)
+        scaled_context = self.gamma_context(context_features)
+
+        result = self.add_merge_rect(feature_shallow, scaled_rect)
+        result = self.add_merge_context(result, scaled_context)
+
+        return result
 
 
 class SSHRDecoder(nn.Module):
@@ -86,7 +117,7 @@ class SSHRDecoder(nn.Module):
         encoder_channels: List[int],
         encoder_strides: List[int],
         n_classes: int = 1,
-        kernel_size: int = 16,
+        kernel_size: int = 8,
     ):
         super().__init__()
 
@@ -106,14 +137,9 @@ class SSHRDecoder(nn.Module):
             )
             self.blocks.append(block)
 
-        self.convs = nn.ModuleList(
-            nn.Conv2d(in_channel, n_classes, kernel_size=1)
-            for in_channel in encoder_channels
-        )
+        self.convs = nn.ModuleList(nn.Conv2d(in_channel, n_classes, kernel_size=1) for in_channel in encoder_channels)
 
-    def forward(
-        self, features: List[torch.Tensor]
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, features: List[torch.Tensor]) -> tuple[tuple[Tensor,...], ...]:
         c2, c3, c4, c5 = features[-4:]
 
         c2_rect = self.blocks[0](c2, c5)
@@ -124,18 +150,20 @@ class SSHRDecoder(nn.Module):
         z3 = self.convs[1](c3_rect)
         z4 = self.convs[2](c4_rect)
         z5 = self.convs[3](c5)
+        instance_logits = (z2, z3, z4, z5)
 
-        return z2, z3, z4, z5
+        return instance_logits
+
 
 class FuseHead(nn.Module):
     """Fuses logit/sigmoid branches from WSSS branches"""
+
     def __init__(self, apply_sigmoid=True):
         super().__init__()
         self.sigmoid = nn.Sigmoid()
         self.apply_sigmoid = apply_sigmoid
 
     def forward(self, *args, fuse_weights: list[float]):
-
         if len(fuse_weights) != len(args):
             raise ValueError(f"fuse_weights and args must have same length, found {len(fuse_weights), len(args)}")
 
@@ -143,6 +171,12 @@ class FuseHead(nn.Module):
             args = [x.sigmoid() for x in args]
 
         return sum(w * x for w, x in zip(fuse_weights, args))
+
+class Logit(nn.Module):
+    """Streaming requires ops like this to be bounded for correct tile statistics calculations"""
+
+    def forward(self, x):
+        return x.logit(eps=1e-6)
 
 class SSHR(nn.Module):
     "Streaming application of SWIN MIL: https://github.com/Nexuslkl/Swin_MIL"
@@ -160,19 +194,18 @@ class SSHR(nn.Module):
         self.register_buffer("fuse_weights", torch.tensor(fuse_weights_list, dtype=torch.float32))
         self.loss_weights = tuple(loss_weights_list)
         self.sigmoid = torch.nn.Sigmoid()
+        self.logit = Logit()
 
-        self.encoder, self.channels = make_resnet_backbone( encoder, weights=weights, include_layer4=True)
 
+        self.encoder, self.channels = make_resnet_backbone(encoder, weights=weights, include_layer4=True)
 
-        self.feature_strides = [4, 8, 16, 32]  # Computed dynamically in weiss, static here for testing
+        # Computed dynamically in weiss, static here for testing
+        self.feature_strides = [4, 8, 16, 32]
 
-        channels = [y for x,y in self.channels.items()]
+        channels = [y for x, y in self.channels.items()]
 
         self.decoder = SSHRDecoder(
-            encoder_channels=channels,
-            encoder_strides=self.feature_strides,
-            n_classes=1,
-            kernel_size=8,
+            encoder_channels=channels, encoder_strides=self.feature_strides, n_classes=1, kernel_size=8
         )
 
         self.segmentation_head = FuseHead(apply_sigmoid=False)
@@ -187,15 +220,15 @@ class SSHR(nn.Module):
             blocks.append(block)
         return blocks
 
-    def _init_reducers(self, reducer_accumulator_dtype: torch.dtype | None):
+    def _init_reducers(self, reducer: str = "ngwp"):
         self.reducers = nn.ModuleList()
 
         for i in range(len(self.loss_weights)):
-            block = NGWPReducer(eps=1, mask_resize=True, accumulator_dtype=reducer_accumulator_dtype)
+            block = MeanReducer(mask_resize=True, accumulator_dtype=torch.float64)
             self.reducers.append(block)
 
-
     def forward(self, x, mask=None):
+        print(x.shape)
         features = self.encoder(x)
         logits = self.decoder(features)
 
@@ -203,15 +236,14 @@ class SSHR(nn.Module):
         probs = [self.sigmoid(z) for z in logits]
 
         # Reduce branches at native resolution
-        reduced_outputs = tuple(self.reducers[i](z, p, mask=mask) for i, (z, p) in enumerate(zip(logits, probs)))
+        reduced_outputs = tuple(self.reducers[i](z, mask=mask) for i, z in enumerate(logits))
 
         # Only enlarge what is needed for spatial fusion
         probs_up = [self.upsample_blocks[i](p) for i, p in enumerate(probs)]
 
         p_fused = self.segmentation_head(*probs_up, fuse_weights=self.fuse_weights)
-        logit_fused = p_fused.logit(eps=1e-6)
-
-        reduced_outputs += (self.reducers[-1](logit_fused, p_fused, mask=mask),)
+        logit_fused = self.logit(p_fused)
+        reduced_outputs += (self.reducers[-1](logit_fused, mask=mask),)
 
         return reduced_outputs
 

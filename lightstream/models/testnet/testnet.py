@@ -3,19 +3,48 @@ from pathlib import Path
 import torch
 from torch import Tensor
 import torch.nn as nn
-from torch.nn import Sequential
 
 from lightstream.modules.streaming import StreamingModule
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
-from lightstream.core.scnn.streaminglayerscale import LayerScale
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
+
+from lightstream.core.reducer import SoftmaxAttentionReducer
+
+
+class GatedAttention(nn.Module):
+    """Convolutional implementation of Gated Attention compatible with streaming."""
+
+    def __init__(self, in_channels: int, hidden_channels: int, n_classes: int, scale_factor: int=1):
+        super(GatedAttention, self).__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = n_classes
+        self.sigmoid = nn.Sigmoid()
+
+        self.sigmoid_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Sigmoid()])
+        self.tanh_branch = nn.Sequential(*[nn.Conv2d(in_channels, hidden_channels, kernel_size=1), nn.Tanh()])
+
+        self.att_logits = nn.Conv2d(hidden_channels, n_classes, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        sigmoid_att = self.sigmoid_branch(x)
+        tanh_att = self.tanh_branch(x)
+
+        dot_product = sigmoid_att * tanh_att
+
+        att_logits = self.att_logits(dot_product)
+        return att_logits
+
 
 class Head(nn.Module):
     def __init__(self):
         super().__init__()
-        self.scale = LayerScale(1, init_value=3.0)
-
+        self.att_net = GatedAttention(16,16,1)
+        self.classifier = nn.Conv2d(16, 1, kernel_size=1)
+        self.reducer = SoftmaxAttentionReducer(accumulator_dtype=None, mask_resize=True, stopgrad_attention=True)
     def forward(self, x):
-        return self.scale(x)
+        att = self.att_net(x)
+        logits = self.classifier(x)
+        return self.reducer(logits, att)
 
 
 class StreamingTestNet(StreamingModule):
@@ -25,6 +54,7 @@ class StreamingTestNet(StreamingModule):
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
+        diagnose_saliency_assembly: bool = False,
         copy_to_gpu: bool = False,
         statistics_on_cpu: bool = True,
         normalize_on_gpu: bool = True,
@@ -50,6 +80,7 @@ class StreamingTestNet(StreamingModule):
             verbose=verbose,
             deterministic=deterministic,
             saliency=saliency,
+            diagnose_saliency_assembly=diagnose_saliency_assembly,
             copy_to_gpu=copy_to_gpu,
             statistics_on_cpu=statistics_on_cpu,
             normalize_on_gpu=normalize_on_gpu,
@@ -67,16 +98,13 @@ class StreamingTestNet(StreamingModule):
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),
-            Head(),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
-            Head(),
             torch.nn.MaxPool2d(2),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
-            Head(),
             torch.nn.Conv2d(16, 16, kernel_size=3, padding=padding), torch.nn.ReLU(),
             ChannelLayerNorm(16),
             torch.nn.MaxPool2d(2),

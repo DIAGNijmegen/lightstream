@@ -35,13 +35,18 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 ### Reducer-specific expected input ordering
 
 - `MeanReducer` / `GeMReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`.
+- `MSEReducer`: `inputs == (x,)`, where `x` is `[N, C, H, W]`. It returns the per-sample, per-channel mean squared deviation from the spatial mean. Set `use_softmax=True` to compute that deviation after a spatial softmax.
+
 - `AttentionGeMReducer`: `inputs == (x, att_logits)`, where `att_logits` is `[N, H, W]`, `[N, 1, H, W]`, or `[N, C, H, W]`.
+- `NormalizedSigmoidAttentionReducer`: `inputs == (values, attention_logits)`, with values `[N,C,H,W]` and attention logits `[N,H,W]`, `[N,1,H,W]`, or `[N,C,H,W]`.
 - `FusedAttentionGeMReducer`: `inputs == (y1, y2, y3, att_logits1, att_logits2, att_logits3)`, where all value maps are spatially aligned `[N, C, H, W]` tensors and each attention-logit map follows the `AttentionGeMReducer` logit shape contract.
 - `NGWPReducer`: `inputs == (scores, activation_masks)`, with both tensors aligned as `[N, C, H, W]`. It returns `sum(scores * activation_masks) / (eps + sum(activation_masks))` per batch/channel.
 - `SizeFocalReducer`: `inputs == (m,)`, where `m` is an activation/probability tensor `[N, C, H, W]`. It returns `(1 - mean_m)^p * log(lambda_ + mean_m)` per batch/channel.
 - `SigmoidAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor. It preserves every channel and returns `[N, C, 1, 1]`; attention is the spatial `softmax(sigmoid(logits) / tau)` per class.
 - `LogitAttentionPoolingReducer`: `inputs == (logits,)`, one `[N, C, H, W]` class-logit tensor used as both values and attention logits. It returns `[N, C, 1, 1]`.
 - Custom reducers: explicitly document ordering (for example `(x, weights)` or `(x, guidance, confidence)`) and enforce with runtime checks.
+
+For consistency loss, use `MSEReducer(use_softmax=True)(instance_logits).mean()` to average its `[N,C,1,1]` output across batch and channels. Softmax normalization is over valid spatial positions independently for each class channel; for nonempty masks its spatial mean is exactly `1/N_valid`.
 
 ## Package structure
 
@@ -71,6 +76,10 @@ For SCNN streaming support, reducers must preserve non-streaming semantics:
 - `gem.py`
   - `GeMReducer`: non-streaming GeM API entry point.
   - `StreamingGeMReducer`: streaming GeM execution implementation.
+
+- `mse.py`
+  - `MSEReducer`: spatial mean squared deviation from the spatial mean, optionally after softmax.
+  - `StreamingMSEReducer`: global-moment accumulation and backward replay implementation.
 
 ## `use_streaming=True` passthrough behavior
 
@@ -107,6 +116,11 @@ their sums and denominators/counts. Masks follow the package's 2D/3D/4D spatial
 mask contract. By default they must already align with the reducer output; set
 `mask_resize=True` to resize a reduced-resolution tissue mask using nearest-neighbor
 interpolation. Empty tissue masks return zero for every affected output channel.
+Mask resizing uses one global nearest-neighbor coordinate system for each reducer
+output domain. Output-row chunking bounds temporary indexing memory only and does
+not restart coordinates at chunk boundaries. When a streamed model has multiple
+reducer heads, each head receives a separately resized mask matching its own spatial
+resolution.
 
 `StreamingNGWPReducer` retains separate weighted-score and activation-mask sums,
 then divides only during `finalize_from_state`. `StreamingSizeFocalReducer` retains
@@ -206,6 +220,42 @@ configuration, and expose streaming classes only as execution implementations.
 
 ## AttentionGeM
 
+For a consolidated formula reference covering every public reducer, see
+[`docs/modules/reducers.md`](../../../docs/modules/reducers.md).
+
+Both `AttentionGeMReducer` and `SoftmaxAttentionReducer` accept externally
+produced attention logits. Set `stopgrad_attention=True` to keep their global
+softmax weights but stop gradients into the attention branch. The value branch
+still receives gradients; `False` is the compatibility default. During SCNN
+statistics probing, both inputs remain connected so tile geometry includes
+both producer branches. Detachment happens only in reduction and replay.
+Streaming passthrough returns separate tensor views for each reducer instance;
+SCNN uses those identities to resolve independent heads that share producers.
+
+```python
+gem = AttentionGeMReducer(r_init=3.0, stopgrad_attention=True)
+softmax = SoftmaxAttentionReducer(stopgrad_attention=True)
+pooled_gem = gem(positive_values, attention_logits)
+pooled_logits = softmax(instance_logits, attention_logits)
+```
+
+## Normalized sigmoid attention
+
+`NormalizedSigmoidAttentionReducer` preserves `values` exactly and uses the ratio
+
+```text
+output_c = sum_i(sigmoid(attention_logits_i) * values_i,c)
+           / sum_i(sigmoid(attention_logits_i))
+```
+
+over valid spatial positions. It does not apply a sigmoid, clamp, power, or any
+other transformation to instance values. One-channel attention broadcasts across
+value channels. As in `AttentionGeMReducer`, `[N,C,H,W]` attention logits are
+averaged across channels to a single attention field before sigmoid and spatial
+normalization. Masks exclude pixels from both sums, and fully masked samples yield
+zero. `StreamingNormalizedSigmoidAttentionReducer` accumulates the same numerator
+and denominator across tiles and uses global statistics during backward replay.
+
 `AttentionGeMReducer` reduces a value tensor `x` with attention logits over the same spatial domain. Its exact input ordering is:
 
 ```python
@@ -278,6 +328,29 @@ Again, masks define `N_valid`; without a mask, `N_valid = H * W`. This post-fusi
 Both `value_weights` and `attention_weights` are registered as non-trainable buffers, alongside the non-trainable GeM exponent `r`. They are included in module state and copied by `to_streaming()`, but they are not optimized during training.
 
 SCNN conversion uses `StreamingFusedAttentionGeMReducer`, which keeps the public six-input reducer API but exposes a compact two-tensor internal payload `(fused_y, att_logits_stacked)`, where the stacked logits use shape `[N, 3, H, W]` for tiled accumulation and backward replay. The streaming implementation tracks per-branch softmax state plus one fused valid uniform sum/count, preserving the post-branch-fusion uniform-mix semantics in forward and backward replay.
+
+## Spatial softmax attention
+
+`SoftmaxAttentionReducer` takes positional inputs `(values, attention_logits)`,
+where `values` is `[N,C,H,W]` and attention logits may be `[N,H,W]`,
+`[N,1,H,W]`, or `[N,C,H,W]`. In the last form, channels are averaged before
+softmax to produce one shared attention field. Values are opaque scores: they are
+never sigmoid-transformed, clamped, or otherwise altered. The output is
+`[N,C,1,1]` and is defined, independently for each sample, by
+
+```text
+m = max(valid attention_logits)
+w_i = exp(attention_logits_i - m) / sum_j exp(attention_logits_j - m)
+output_c = sum_i w_i * values_c,i
+```
+
+Softmax normalization covers only valid spatial positions. Optional masks follow
+the common reducer conventions (including nearest-neighbor resizing with
+`mask_resize=True`); invalid positions receive zero weight, and fully masked
+samples return zero. `StreamingSoftmaxAttentionReducer` preserves the same
+global softmax across all tiles by retaining and rescaling a running maximum,
+denominator, and weighted numerator. Use `to_streaming()` and `to_reducer()` to
+convert between implementations.
 
 ## Extension guide: custom reducers
 

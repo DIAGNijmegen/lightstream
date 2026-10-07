@@ -16,6 +16,7 @@ class StreamingMerge(torch.nn.Module):
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
         self.mode = mode
+        self._streaming_statistics_mode = False
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if a.shape[-2:] != b.shape[-2:]:
@@ -25,4 +26,10 @@ class StreamingMerge(torch.nn.Module):
             )
         if self.mode == "add":
             return a + b
+        if self._streaming_statistics_mode:
+            if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+                raise ValueError("StreamingMerge statistics require finite operands")
+            a_scale = a.detach().abs().amax().clamp_min(1.0)
+            b_scale = b.detach().abs().amax().clamp_min(1.0)
+            return (a / a_scale) * (b / b_scale)
         return a * b

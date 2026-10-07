@@ -6,18 +6,25 @@ from .fused_attention_gem import (
 )
 from .gem import GeMReducer, StreamingGeMReducer
 from .mean import MeanReducer, StreamingMeanReducer
+from .mse import MSEReducer, StreamingMSEReducer
 from .logit_attention import (
     LogitAttentionPoolingReducer,
     StreamingLogitAttentionPoolingReducer,
 )
 from .ngwp import NGWPReducer, StreamingNGWPReducer
+from .normalized_sigmoid_attention import (
+    NormalizedSigmoidAttentionReducer,
+    StreamingNormalizedSigmoidAttentionReducer,
+)
 from .reducer_base import BaseReducer
 from .size_focal import SizeFocalReducer, StreamingSizeFocalReducer
 from .sigmoid_attention import (
     SigmoidAttentionPoolingReducer,
     StreamingSigmoidAttentionPoolingReducer,
 )
+from .kl import AttentionKLDivergenceReducer, StreamingAttentionKLDivergenceReducer
 from .sum import StreamingSumReducer, SumReducer
+from .softmax_attention import SoftmaxAttentionReducer, StreamingSoftmaxAttentionReducer
 
 __all__ = [
     "MeanReducer",
@@ -26,6 +33,8 @@ __all__ = [
     "BaseStreamingGlobalReducer",
     "StreamingReducer",
     "StreamingMeanReducer",
+    "MSEReducer",
+    "StreamingMSEReducer",
     "StreamingSumReducer",
     "GeMReducer",
     "StreamingGeMReducer",
@@ -35,10 +44,16 @@ __all__ = [
     "StreamingFusedAttentionGeMReducer",
     "NGWPReducer",
     "StreamingNGWPReducer",
+    "NormalizedSigmoidAttentionReducer",
+    "StreamingNormalizedSigmoidAttentionReducer",
     "SizeFocalReducer",
     "StreamingSizeFocalReducer",
     "SigmoidAttentionPoolingReducer",
     "StreamingSigmoidAttentionPoolingReducer",
     "LogitAttentionPoolingReducer",
     "StreamingLogitAttentionPoolingReducer",
+    "SoftmaxAttentionReducer",
+    "StreamingSoftmaxAttentionReducer",
+    "AttentionKLDivergenceReducer",
+    "StreamingAttentionKLDivergenceReducer"
 ]

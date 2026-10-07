@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from time import time
 from lightstream.models.testnet.testnet import StreamingTestNet
+from saliency_diagnostics import compare_saliency_candidates
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -145,6 +146,7 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         std=[1, 1, 1],
         normalize_on_gpu=False,
         saliency=args.input_grad,
+        diagnose_saliency_assembly=args.diagnose_saliency_assembly,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
@@ -228,6 +230,14 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
                 f"mean abs diff={input_grad_diff.mean().item():.6e}, "
                 f"max abs diff={input_grad_diff.max().item():.6e}"
             )
+            compare_saliency_candidates(
+                network.stream_network,
+                img_normal.grad,
+                rtol=args.input_grad_rtol,
+                atol=args.input_grad_atol,
+                verbose=args.verbose_saliency_coordinates,
+                diagnose_assembly=args.diagnose_saliency_assembly,
+            )
 
     _compare_selected_grads(
         network.stream_network.stream_module,
@@ -251,11 +261,26 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=960)
     parser.add_argument("--input-size", type=int, default=3520)
+    parser.add_argument("--input-grad-rtol", type=float, default=1e-7)
+    parser.add_argument("--input-grad-atol", type=float, default=1e-9)
+    parser.add_argument(
+        "--diagnose-saliency-assembly",
+        action="store_true",
+        help=(
+            "Enable expensive raw/grad_lost/ownership saliency assembly "
+            "counterfactual diagnostics (off by default)."
+        ),
+    )
+    parser.add_argument(
+        "--verbose-saliency-coordinates",
+        action="store_true",
+        help="Print complete saliency coordinate and mismatch-count diagnostics.",
+    )
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
         action="store_false",
-        help="Disable streaming saliency/input-gradient gathering and skip input-gradient comparison.",
+        help="Disable input saliency entirely: do not gather or compare input gradients.",
     )
     parser.set_defaults(input_grad=True)
 

@@ -40,11 +40,13 @@ class StreamingResNet(StreamingModule):
         encoder: str,
         tile_size: int,
         additional_modules: nn.Module | None = None,
+        weights: str | None = "DEFAULT",
         remove_last_block=False,
         replace_stride_with_dilation: Optional[list[bool]] = None,
         verbose: bool = True,
         deterministic: bool = True,
         saliency: bool = False,
+        diagnose_saliency_assembly: bool = False,
         copy_to_gpu: bool = False,
         statistics_on_cpu: bool = True,
         normalize_on_gpu: bool = True,
@@ -61,7 +63,7 @@ class StreamingResNet(StreamingModule):
         if encoder not in model_choices:
             raise ValueError(f"Invalid model name '{encoder}'. " f"Choose one of: {', '.join(model_choices.keys())}")
 
-        resnet = model_choices[encoder](weights="DEFAULT", replace_stride_with_dilation=replace_stride_with_dilation)
+        resnet = model_choices[encoder](weights=weights, replace_stride_with_dilation=replace_stride_with_dilation)
 
         if additional_modules is not None:
             stream_network = Sequential(
@@ -86,6 +88,7 @@ class StreamingResNet(StreamingModule):
             verbose=verbose,
             deterministic=deterministic,
             saliency=saliency,
+            diagnose_saliency_assembly=diagnose_saliency_assembly,
             copy_to_gpu=copy_to_gpu,
             statistics_on_cpu=statistics_on_cpu,
             normalize_on_gpu=normalize_on_gpu,

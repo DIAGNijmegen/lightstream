@@ -19,8 +19,12 @@ dependencies = [
 "Homepage" = "https://github.com/DIAGNijmegen/lightstream"
 "Bug Tracker" = "https://github.com/DIAGNijmegen/lightstream/issues"
 
-
 [project.optional-dependencies]
+nat = [
+    "torch==2.13.0",
+    "natten @ git+https://github.com/SHI-Labs/NATTEN.git@0a6a3df544fe478e97bdd77e92fd3ec14cf43cff",
+]
+
 docs = [
     "mkdocs",
     "mkdocstrings",
@@ -32,6 +36,9 @@ docs = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["lightstream"]

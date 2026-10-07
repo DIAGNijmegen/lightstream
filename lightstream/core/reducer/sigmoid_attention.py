@@ -37,6 +37,7 @@ class SigmoidAttentionPoolingReducer(_TemperatureMixin, BaseReducer):
     The sole positional input supplies both the raw values being pooled and the
     logits from which attention is computed. ``mask`` is optional keyword-only
     spatial metadata; no separate value or attention tensor is required.
+    ``y_c = sum_i softmax(sigmoid(z_ci)/tau)_i*z_ci`` over valid positions.
     """
 
     def __init__(

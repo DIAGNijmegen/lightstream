@@ -24,7 +24,10 @@ def _validate_inputs(scores: torch.Tensor, activation_masks: torch.Tensor) -> No
 
 
 class NGWPReducer(BaseReducer):
-    """Reduce ``(scores, activation_masks)`` by normalized global weighting."""
+    """Reduce ``(scores, activation_masks)`` to
+    ``sum_i(scores_ci*activation_masks_ci)/(eps+sum_i activation_masks_ci)``.
+    Only valid spatial positions enter either sum.
+    """
 
     def __init__(self, eps: float = 1, accumulator_dtype: torch.dtype | None = None,
                  mask_resize: bool = False, mask_resize_mode: str = "nearest"):

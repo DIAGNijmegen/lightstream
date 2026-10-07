@@ -1,13 +1,192 @@
+import copy
 import logging
+import math
+from types import MappingProxyType
 
 import torch
 import torch.nn as nn
 import pytest
 
 from lightstream.core.constructor import StreamingConstructor
-from lightstream.core.scnn.scnn import StreamingCNN
-from lightstream.core.scnn.utils import Lost
+from lightstream.core.layers import (
+    ChannelLayerNorm,
+    LayerScale,
+    StatisticsProbe,
+    StreamingChannelLayerNorm,
+    StreamingConv2d,
+    StreamingLayerScale,
+    StreamingMerge,
+    StreamingUpsample2d,
+)
+from lightstream.core.scnn.scnn import StreamingCNN, _resize_nearest_bool_mask
+
+
+def _metadata_only_scnn(module):
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    nn.Module.__init__(scnn)
+    scnn.stream_module = module
+    scnn._module_stats = {}
+    return scnn
+
+
+def test_internal_alignment_combines_input_stride_with_local_pool_stride():
+    encoder = nn.Conv2d(3, 3, kernel_size=1, stride=8)
+    pool = nn.AvgPool2d(kernel_size=64, stride=64)
+    scnn = _metadata_only_scnn(nn.Sequential(encoder, pool))
+    scnn._module_stats[encoder] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 8, 8]),
+    }
+    scnn._module_stats[pool] = {
+        "output_stride": torch.tensor([1, 8, 8]),
+        "stride": torch.tensor([1, 64, 64]),
+    }
+
+    assert scnn._compute_internal_alignment() == (512, 512)
+
+
+def test_internal_alignment_uses_lcm_not_numerical_maximum():
+    conv4 = nn.Conv2d(3, 3, kernel_size=1, stride=4)
+    conv6 = nn.Conv2d(3, 3, kernel_size=1, stride=6)
+    scnn = _metadata_only_scnn(nn.ModuleList([conv4, conv6]))
+    scnn._module_stats[conv4] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 4, 4]),
+    }
+    scnn._module_stats[conv6] = {
+        "output_stride": torch.tensor([1, 1, 1]),
+        "stride": torch.tensor([1, 6, 6]),
+    }
+
+    assert scnn._compute_internal_alignment() == (12, 12)
+
+
+def test_flatten_output_paths_preserve_nested_order_and_names():
+    scnn = _metadata_only_scnn(nn.Identity())
+    output = {
+        "p_fused": torch.zeros(1),
+        "loss_components": ((torch.ones(1), torch.ones(2)),),
+    }
+
+    flat, _, paths = scnn._flatten_output_structure(output, include_paths=True)
+
+    assert paths == ["loss_components[0][0]", "loss_components[0][1]", "p_fused"]
+    assert [tensor.numel() for tensor in flat] == [1, 2, 1]
+
+
+def test_named_output_strides_provides_immutable_path_lookup():
+    scnn = _metadata_only_scnn(nn.Identity())
+    scnn._output_metadata = (
+        MappingProxyType({"path": "loss_components[0][0]", "stride": (8, 8)}),
+        MappingProxyType({"path": "p_fused", "stride": (1, 1)}),
+    )
+
+    assert scnn.named_output_strides["loss_components[0][0]"] == (8, 8)
+    assert scnn.named_output_strides["p_fused"] == (1, 1)
+    with pytest.raises(TypeError):
+        scnn.named_output_strides["p_fused"] = (4, 4)
+
+
+class _BackwardReplayPrecisionProbe(StreamingConv2d):
+    """Record the precision selected for the activation entering replay."""
+
+    def __init__(self, channels):
+        super().__init__(channels, channels, kernel_size=1)
+        self.record_replay = False
+        self.replay_states = []
+
+    def forward(self, input):
+        if self.record_replay:
+            self.replay_states.append(
+                (torch.is_autocast_enabled("cuda"), input.dtype)
+            )
+        return super().forward(input)
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("streaming_dtype", "expected_autocast", "expected_activation_dtype"),
+    [
+        (torch.float32, False, torch.float32),
+        (torch.bfloat16, True, torch.bfloat16),
+    ],
+)
+def test_backward_replay_uses_autocast_only_for_low_precision(
+    streaming_dtype, expected_autocast, expected_activation_dtype
+):
+    if streaming_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA bfloat16 is required")
+
+    module = nn.Sequential(
+        StreamingConv2d(3, 4, kernel_size=1),
+        _BackwardReplayPrecisionProbe(4),
+    ).to(device="cuda", dtype=streaming_dtype)
+    streaming = StreamingCNN(
+        module,
+        tile_shape=(1, 3, 4, 4),
+        dtype=streaming_dtype,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    assert all(parameter.dtype == streaming_dtype for parameter in module.parameters())
+
+    image = torch.randn(1, 3, 4, 4, device="cuda", dtype=streaming_dtype)
+    output = streaming(image)
+    probe = next(
+        child
+        for child in streaming.stream_module.modules()
+        if isinstance(child, _BackwardReplayPrecisionProbe)
+    )
+    probe.replay_states.clear()
+    probe.record_replay = True
+
+    streaming.backward(image, torch.ones_like(output))
+
+    assert probe.replay_states
+    assert all(
+        state == (expected_autocast, expected_activation_dtype)
+        for state in probe.replay_states
+    )
+
+
+@pytest.mark.parametrize(
+    ("saliency", "diagnose_saliency_assembly", "expect_saliency", "expect_diagnostics"),
+    [
+        (False, False, False, False),
+        (True, False, True, False),
+        (True, True, True, True),
+        (False, True, False, False),
+    ],
+)
+def test_saliency_diagnostic_state_is_opt_in(
+    saliency, diagnose_saliency_assembly, expect_saliency, expect_diagnostics
+):
+    scnn = StreamingCNN(
+        torch.nn.Sequential(torch.nn.Conv2d(3, 2, kernel_size=3, padding=1)),
+        tile_shape=(1, 3, 4, 4),
+        saliency=saliency,
+        diagnose_saliency_assembly=diagnose_saliency_assembly,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+    )
+
+    scnn(torch.rand(1, 3, 4, 4))
+
+    assert hasattr(scnn, "saliency_map") is expect_saliency
+    for name in (
+        "saliency_coverage_map",
+        "saliency_nonzero_coverage_map",
+        "saliency_diagnostic_maps",
+        "saliency_diagnostic_write_count_maps",
+        "saliency_diagnostic_records",
+        "_saliency_diagnostic_destination_coverage",
+    ):
+        assert hasattr(scnn, name) is expect_diagnostics
+from lightstream.core.scnn.utils import Box, Lost, Sides
 from lightstream.models.testnet.segment import StreamingTestNet
+from lightstream.models.testnet.testnet import StreamingTestNet as SaliencyTestNet
 
 from lightstream.core.reducer import (
     BaseReducer,
@@ -25,6 +204,423 @@ from lightstream.core.reducer import (
     StreamingSumReducer,
     SumReducer,
 )
+
+
+@pytest.mark.parametrize(
+    ("tile_hw", "image_hw"),
+    [
+        ((8, 8), (17, 17)),  # even setup tile, odd full image
+        ((9, 9), (17, 17)),  # odd setup tile, odd full image
+        ((8, 9), (17, 19)),  # independent height/width phases
+    ],
+)
+def test_strided_conv_full_output_shape_and_tile_placement_preserve_phase(tile_hw, image_hw):
+    torch.manual_seed(91)
+    reference = nn.Conv2d(2, 3, kernel_size=3, stride=2, padding=1).eval()
+    streaming_module = nn.Conv2d(2, 3, kernel_size=3, stride=2, padding=1).eval()
+    streaming_module.load_state_dict(reference.state_dict())
+    streaming = StreamingCNN(
+        streaming_module,
+        tile_shape=(1, 2, *tile_hw),
+        deterministic=True,
+        copy_to_gpu=False,
+    )
+    image = torch.randn(1, 2, *image_hw)
+
+    expected = reference(image)
+    actual = streaming(image)
+
+    assert actual.shape == expected.shape == (1, 3, math.ceil(image_hw[0] / 2), math.ceil(image_hw[1] / 2))
+    torch.testing.assert_close(actual, expected)
+    # More than one tile ensures the assertion covers allocation and placement,
+    # rather than only setup-time shape propagation.
+    assert len(streaming._last_forward_tiles) > 1
+
+
+def test_multiple_strided_convs_propagate_full_output_size_layer_by_layer():
+    torch.manual_seed(92)
+    reference = nn.Sequential(
+        nn.Conv2d(1, 2, kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1),
+    ).eval()
+    streaming_module = nn.Sequential(
+        nn.Conv2d(1, 2, kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1),
+    ).eval()
+    streaming_module.load_state_dict(reference.state_dict())
+    streaming = StreamingCNN(
+        streaming_module,
+        tile_shape=(1, 1, 16, 16),
+        deterministic=True,
+        copy_to_gpu=False,
+    )
+    image = torch.randn(1, 1, 33, 35)
+
+    expected = reference(image)
+    actual = streaming(image)
+
+    assert actual.shape == expected.shape == (1, 2, 9, 9)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_saliency_backward_matches_reference_for_shifted_boundary_tiles():
+    """Production replay preserves input and parameter gradients at shifted edges."""
+    torch.manual_seed(94)
+    dtype = torch.float64
+    rtol, atol = 1e-7, 1e-9
+    tile_height, tile_width = 8, 8
+    image_height, image_width = 11, 13
+
+    model = nn.Sequential(
+        nn.Conv2d(3, 4, kernel_size=3, padding=1),
+        nn.Softplus(),
+        nn.Conv2d(4, 2, kernel_size=3, padding=1),
+    ).to(dtype=dtype).eval()
+    reference = copy.deepcopy(model)
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, 3, tile_height, tile_width),
+        deterministic=True,
+        saliency=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    image = torch.randn(1, 3, image_height, image_width, dtype=dtype)
+
+    streamed_output = scnn(image)
+    safe_height, safe_width = scnn._compute_internal_safe_input_step()
+    assert image_height % safe_height
+    assert image_width % safe_width
+
+    tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
+    final_row_start = image_height - tile_height
+    final_column_start = image_width - tile_width
+    assert final_row_start % safe_height
+    assert final_column_start % safe_width
+    assert any(y == final_row_start for y, _ in tile_starts)
+    assert any(x == final_column_start for _, x in tile_starts)
+
+    output_gradient = torch.randn_like(streamed_output)
+    scnn.backward(image, output_gradient)
+
+    reference_input = image.detach().clone().requires_grad_(True)
+    reference_output = reference(reference_input)
+    torch.autograd.backward(reference_output, output_gradient)
+    reference_saliency = reference_input.grad
+
+    tolerance = atol + rtol * reference_saliency.abs()
+    reference_support = reference_saliency.abs() > tolerance
+    production_support = scnn.saliency_map.abs() > tolerance
+
+    # Keep these checks ordered from missing support, through excess support and
+    # complete numeric parity, to the independent parameter-gradient contract.
+    assert not (reference_support & ~production_support).any()
+    assert not (production_support & ~reference_support).any()
+    torch.testing.assert_close(scnn.saliency_map, reference_saliency, rtol=rtol, atol=atol)
+
+    streaming_parameters = dict(scnn.stream_module.named_parameters())
+    reference_parameters = dict(reference.named_parameters())
+    assert streaming_parameters.keys() == reference_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        assert streaming_parameters[name].grad is not None, name
+        assert reference_parameter.grad is not None, name
+        torch.testing.assert_close(
+            streaming_parameters[name].grad,
+            reference_parameter.grad,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
+
+
+def test_saliency_hook_adds_overlapping_input_gradient_contributions():
+    """The hook-level fixture specifically covers additive overlap arithmetic."""
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 4, 7, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    expected = torch.zeros_like(scnn.saliency_map)
+
+    contributions = (
+        (1.0, (0, 0), Box(0, 0, 0, 0, None)),
+        (2.0, (0, 3), Box(0, 4, 4, 0, None)),
+    )
+    for value, (input_y, input_x), previously_seen in contributions:
+        input_conv.input_loc = Box(input_y, 4, input_x, 4, Sides(False, False, False, False))
+        scnn.saliency_old_indices = previously_seen
+        tile_gradient = torch.full((1, 3, 4, 4), value, dtype=torch.double)
+        scnn._backward_saliency_hook(
+            input_conv,
+            (tile_gradient,),
+            (torch.ones(1, 2, 4, 4, dtype=torch.double),),
+        )
+        expected[
+            :, :, input_y : input_y + tile_gradient.shape[-2],
+            input_x : input_x + tile_gradient.shape[-1],
+        ] += tile_gradient
+
+    assert scnn.saliency_map[0, 0, 0, 3].item() == 3
+    torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
+
+
+def test_saliency_coverage_distinguishes_zero_write_from_unvisited_coordinate():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 4, 5, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1).double()
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(0, 4, 0, 4, Sides(True, True, False, True))
+    scnn.saliency_old_indices = Box(0, 0, 0, 0, None)
+    tile_gradient = torch.zeros(1, 3, 4, 4, dtype=torch.double)
+    tile_gradient[..., 1, 2] = 1
+
+    scnn._backward_saliency_hook(
+        input_conv,
+        (tile_gradient,),
+        (torch.ones(1, 2, 4, 4, dtype=torch.double),),
+    )
+
+    assert scnn.saliency_coverage_map[..., :4].all()
+    assert not scnn.saliency_coverage_map[..., 4].any()
+    torch.testing.assert_close(scnn.saliency_nonzero_coverage_map, scnn.saliency_map.ne(0))
+
+
+def test_saliency_raw_placement_uses_input_coordinates_for_strided_first_conv():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.saliency_map = torch.zeros(1, 3, 12, 13, dtype=torch.double)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=3, stride=2, padding=1).double()
+    input_conv.grad_lost = Lost(0, 0, 0, 0)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(3, 4, 5, 6, Sides(False, False, True, True))
+    # The legacy ownership calculation still runs for the diagnostic candidates.
+    scnn.saliency_old_indices = Box(1, 0, 2, 0, None)
+    raw = torch.arange(72, dtype=torch.double).reshape(1, 3, 4, 6)
+
+    scnn._backward_saliency_hook(
+        input_conv,
+        (raw,),
+        (torch.ones(1, 2, 2, 3, dtype=torch.double),),
+    )
+
+    expected = torch.zeros_like(scnn.saliency_map)
+    expected[:, :, 3:7, 5:11] = raw
+    torch.testing.assert_close(scnn.saliency_map, expected, rtol=0, atol=0)
+    assert scnn.saliency_coverage_map[:, :, 3:7, 5:11].all()
+
+
+def test_saliency_diagnostics_capture_stages_without_changing_production_map():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn.diagnose_saliency_assembly = True
+    scnn.saliency_map = torch.zeros(1, 3, 6, 6)
+    scnn.saliency_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_nonzero_coverage_map = torch.zeros_like(scnn.saliency_map, dtype=torch.bool)
+    scnn.saliency_diagnostic_records = []
+    scnn.saliency_diagnostic_maps = {
+        name: torch.zeros_like(scnn.saliency_map)
+        for name in ("raw", "grad_lost", "ownership", "production")
+    }
+    scnn.saliency_diagnostic_write_count_maps = {
+        name: torch.zeros_like(scnn.saliency_map, dtype=torch.int32)
+        for name in ("raw", "grad_lost", "ownership")
+    }
+    scnn._saliency_diagnostic_destination_coverage = torch.zeros(6, 6, dtype=torch.bool)
+
+    input_conv = StreamingConv2d(3, 2, kernel_size=1)
+    input_conv.grad_lost = Lost(1, 1, 1, 1)
+    input_conv.output_stride = torch.tensor([1, 1, 1])
+    input_conv.input_loc = Box(0, 6, 0, 6, Sides(True, True, False, False))
+    scnn.saliency_old_indices = Box(0, 0, 0, 0, None)
+    raw = torch.ones(1, 3, 6, 6)
+
+    scnn._backward_saliency_hook(input_conv, (raw,), (torch.ones(1, 2, 6, 6),))
+
+    record = scnn.saliency_diagnostic_records[0]
+    assert record["raw_shape"] == (1, 3, 6, 6)
+    assert record["post_grad_lost_shape"] == (1, 3, 5, 5)
+    assert record["post_ownership_shape"] == (1, 3, 5, 5)
+    assert record["raw_nonzero"] == 108
+    assert record["destination_overlaps_previous"] is False
+    torch.testing.assert_close(scnn.saliency_diagnostic_maps["production"], scnn.saliency_map)
+    assert scnn.saliency_diagnostic_write_count_maps["raw"].eq(1).all()
+    assert scnn.saliency_diagnostic_write_count_maps["grad_lost"][..., :5, :5].eq(1).all()
+    assert scnn.saliency_diagnostic_write_count_maps["grad_lost"][..., 5, :].eq(0).all()
+    assert scnn.saliency_diagnostic_write_count_maps["ownership"][..., :5, :5].eq(1).all()
+
+
+@pytest.mark.cuda_integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_testnet_raw_saliency_candidate_characterizes_later_stage_regressions(tmp_path):
+    """Characterize the TestNet result before extending this to ResNet and SSHR."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float64
+    rtol, atol = 1e-7, 1e-9
+
+    # These are deliberately the dimensions used by grad_compare_testnet.py,
+    # rather than a reduced unit-test proxy: shifted final tiles are part of
+    # the diagnostic result being locked down here.
+    tile_size = 960
+    input_size = 3520
+    image = torch.rand((1, 3, input_size, input_size), device=device, dtype=dtype)
+    network = SaliencyTestNet(
+        tile_size,
+        verbose=False,
+        mean=[0, 0, 0],
+        std=[1, 1, 1],
+        normalize_on_gpu=False,
+        saliency=True,
+        tile_cache_path=tmp_path / "testnet_saliency_tile_cache",
+    ).to(device=device, dtype=dtype)
+    scnn = network.stream_network
+    scnn.device = device
+    scnn.dtype = dtype
+    scnn.mean = scnn.mean.to(device=device, dtype=dtype)
+    scnn.std = scnn.std.to(device=device, dtype=dtype)
+    scnn.diagnose_saliency_assembly = True
+    for module in scnn.stream_module.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+
+    streamed_output = network(image)
+    if not isinstance(streamed_output, torch.Tensor):
+        assert len(streamed_output) == 1
+        streamed_output = streamed_output[0]
+    target = torch.tensor(50.0, device=device, dtype=dtype)
+    loss = nn.MSELoss()(torch.sigmoid(streamed_output.mean()), target)
+    (output_gradient,) = torch.autograd.grad(loss, streamed_output)
+    scnn.backward(image, output_gradient.detach())
+
+    candidates = scnn.saliency_diagnostic_maps
+    scnn.disable()
+    reference_input = image.detach().clone().requires_grad_(True)
+    reference_output = scnn.stream_module(reference_input)
+    torch.autograd.backward(reference_output, output_gradient.detach())
+    reference = reference_input.grad.detach().cpu()
+
+    raw = candidates["raw"].to(dtype=dtype)
+    cropped = candidates["grad_lost"].to(dtype=dtype)
+    owned = candidates["ownership"].to(dtype=dtype)
+    reference_support = reference.ne(0)
+
+    raw_support = raw.ne(0)
+    assert not (reference_support & ~raw_support).any()
+    assert not (raw_support & ~reference_support).any()
+    torch.testing.assert_close(raw, reference, rtol=rtol, atol=atol)
+
+    # Cropping itself changes values beyond the float64 parity tolerance.
+    cropped_error = (cropped - reference).abs()
+    cropped_tolerance = atol + rtol * reference.abs()
+    assert (cropped_error > cropped_tolerance).any()
+
+    # Ownership selection is a separate, later diagnostic: it removes support
+    # that was still present after the side-aware grad_lost crop. Avoid locking
+    # down its current count, which can vary with supported PyTorch versions.
+    cropped_support = cropped.ne(0)
+    owned_support = owned.ne(0)
+    additional_missing_support = reference_support & cropped_support & ~owned_support
+    assert additional_missing_support.any()
+
+
+def test_strided_conv_backward_accepts_gap_before_shifted_final_replay_row():
+    """A diagnostic cursor gap must not discard any dependency gradients."""
+    torch.manual_seed(93)
+    streaming = StreamingConv2d(1, 2, kernel_size=3, stride=2, padding=1).double()
+    reference = streaming.to_torch_conv2d()
+    streaming.output_stride = torch.tensor([1, 1, 1])
+
+    replay_tiles = (
+        (torch.randn(1, 1, 9, 7, dtype=torch.double), 0),
+        (torch.randn(1, 1, 3, 7, dtype=torch.double), 12),
+    )
+    expected_input_gradients = []
+    actual_input_gradients = []
+
+    for index, (tile, input_y) in enumerate(replay_tiles):
+        reference_input = tile.detach().clone().requires_grad_(True)
+        streaming_input = tile.detach().clone().requires_grad_(True)
+        streaming.input_loc = Box(
+            input_y,
+            tile.shape[2],
+            0,
+            tile.shape[3],
+            Sides(True, index == 0, True, index == len(replay_tiles) - 1),
+        )
+
+        reference_output = reference(reference_input)
+        streaming_output = streaming(streaming_input)
+        output_gradient = torch.randn_like(reference_output)
+        reference_output.backward(output_gradient)
+        streaming_output.backward(output_gradient)
+
+        expected_input_gradients.append(reference_input.grad)
+        actual_input_gradients.append(streaming_input.grad)
+        if index == 0:
+            assert streaming.seen_indices.height == 5
+        else:
+            projected_data_y = input_y // streaming.stride[0]
+            assert projected_data_y == 6
+
+    assert streaming.seen_indices.y == 6
+    assert streaming.seen_indices.height == 8
+    for actual, expected in zip(actual_input_gradients, expected_input_gradients):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(streaming.weight.grad, reference.weight.grad)
+    torch.testing.assert_close(streaming.bias.grad, reference.bias.grad)
+
+
+def test_convert_and_reset_every_supported_layer_type():
+    scnn = StreamingCNN.__new__(StreamingCNN)
+    scnn._streaming_reducers = []
+
+    conv = nn.Conv2d(3, 3, kernel_size=1)
+    norm = ChannelLayerNorm(3)
+    scale = LayerScale((1, 3, 1, 1))
+    upsample = nn.Upsample(scale_factor=2, mode="nearest")
+    probe = StatisticsProbe()
+    merge = StreamingMerge("add")
+    model = nn.ModuleList([conv, norm, scale, upsample, probe, merge])
+
+    stats = {
+        "grad_lost": Lost(0, 0, 0, 0),
+        "output_stride": torch.tensor([1, 1, 1]),
+    }
+    scnn._module_stats = {
+        conv: dict(stats),
+        norm: dict(stats),
+        scale: dict(stats),
+        upsample: dict(stats),
+    }
+
+    converted = scnn._convert_modules_for_streaming(model)
+
+    assert isinstance(converted[0], StreamingConv2d)
+    assert isinstance(converted[1], StreamingChannelLayerNorm)
+    assert isinstance(converted[2], StreamingLayerScale)
+    assert isinstance(converted[3], StreamingUpsample2d)
+    assert converted[4] is probe
+    assert converted[5] is merge
+
+    restored = scnn._reset_converted_modules(converted)
+
+    assert type(restored[0]) is nn.Conv2d
+    assert type(restored[1]) is ChannelLayerNorm
+    assert type(restored[2]) is LayerScale
+    assert type(restored[3]) is nn.Upsample
+    assert restored[4] is probe
+    assert restored[5] is merge
 
 
 def test_forward_statistics_store_and_preserve_dilated_conv2d_dilation():
@@ -97,6 +693,70 @@ def test_backward_statistics_use_dilated_effective_kernel_for_overlap():
     assert dilation_2_lost.left > dilation_1_lost.left
     assert dilation_2_lost.bottom > dilation_1_lost.bottom
     assert dilation_2_lost.right > dilation_1_lost.right
+
+
+def test_batch_norm_checkpoint_state_is_restored_and_does_not_affect_tile_cache():
+    def configure(running_mean, running_var):
+        model = nn.Sequential(
+            nn.Conv2d(3, 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.Conv2d(4, 2, kernel_size=3, padding=1),
+        ).eval()
+        with torch.no_grad():
+            model[1].weight.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5]))
+            model[1].bias.copy_(torch.tensor([-1.0, -0.5, 0.5, 1.0]))
+            model[1].running_mean.copy_(torch.tensor(running_mean))
+            model[1].running_var.copy_(torch.tensor(running_var))
+            model[1].num_batches_tracked.fill_(17)
+        checkpoint_state = {name: value.clone() for name, value in model.state_dict().items()}
+
+        scnn = StreamingCNN(
+            model,
+            tile_shape=(1, 3, 8, 8),
+            deterministic=True,
+            copy_to_gpu=False,
+            statistics_on_cpu=False,
+            normalize_on_gpu=False,
+        )
+
+        restored_state = scnn.stream_module.state_dict()
+        assert restored_state.keys() == checkpoint_state.keys()
+        for name, expected in checkpoint_state.items():
+            torch.testing.assert_close(restored_state[name], expected, rtol=0, atol=0)
+        return scnn.get_tile_cache()
+
+    first_cache = configure(
+        running_mean=[-100.0, -2.0, 5.0, 80.0],
+        running_var=[0.01, 0.5, 10.0, 250.0],
+    )
+    second_cache = configure(
+        running_mean=[90.0, 7.0, -4.0, -120.0],
+        running_var=[300.0, 20.0, 0.25, 0.02],
+    )
+
+    def assert_identical_finite(first, second):
+        assert type(first) is type(second)
+        if isinstance(first, torch.Tensor):
+            assert torch.isfinite(first).all()
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        elif isinstance(first, dict):
+            assert first.keys() == second.keys()
+            for key in first:
+                assert_identical_finite(first[key], second[key])
+        elif isinstance(first, (tuple, list)):
+            assert len(first) == len(second)
+            for first_value, second_value in zip(first, second):
+                assert_identical_finite(first_value, second_value)
+        elif isinstance(first, nn.Module):
+            assert repr(first) == repr(second)
+        elif isinstance(first, float):
+            assert math.isfinite(first)
+            assert first == second
+        else:
+            assert first == second
+
+    assert_identical_finite(first_cache, second_cache)
 
 
 @pytest.mark.parametrize(
@@ -241,6 +901,18 @@ class DownsampledReducerNet(nn.Module):
     def forward(self, x, mask: torch.Tensor | None = None):
         feat = self.down(x)
         return self.reducer(feat, mask=mask)
+
+
+class MultiResolutionReducerNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.half = nn.Conv2d(3, 4, kernel_size=3, stride=2, padding=1, bias=False)
+        self.quarter = nn.Conv2d(3, 5, kernel_size=3, stride=4, padding=1, bias=False)
+        self.half_reducer = MeanReducer(mask_resize=True)
+        self.quarter_reducer = MeanReducer(mask_resize=True)
+
+    def forward(self, x):
+        return self.half_reducer(self.half(x)), self.quarter_reducer(self.quarter(x))
 
 
 class MixedHeadsNet(nn.Module):
@@ -437,6 +1109,103 @@ def _make_streaming(model: nn.Module, tile_size: int = 4):
         normalize_on_gpu=False,
     )
     return constructor.prepare_streaming_model()
+
+
+def _seen_indices_by_module(scnn: StreamingCNN):
+    return {
+        name: (
+            module.seen_indices.y,
+            module.seen_indices.height,
+            module.seen_indices.x,
+            module.seen_indices.width,
+            module.seen_indices.sides,
+        )
+        for name, module in scnn.stream_module.named_modules()
+        if hasattr(module, "seen_indices")
+    }
+
+
+def test_scnn_repeated_forward_backward_cycles_and_cached_statistics_reset_state():
+    torch.manual_seed(5)
+
+    def make_model():
+        return nn.Sequential(
+            nn.Conv2d(3, 5, kernel_size=1, bias=True),
+            nn.Softplus(),
+            nn.Conv2d(5, 2, kernel_size=1, bias=True),
+        ).eval()
+
+    source = make_model()
+    source_state = {name: value.detach().clone() for name, value in source.state_dict().items()}
+
+    scnn = StreamingCNN(
+        source,
+        tile_shape=(1, 3, 4, 4),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    scnn.gather_input_gradient = True
+    scnn._remove_hooks()
+    scnn._add_hooks_for_streaming()
+
+    cached_source = make_model()
+    cached_source.load_state_dict(source_state)
+    cached_scnn = StreamingCNN(
+        cached_source,
+        tile_shape=(1, 3, 4, 4),
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+        state_dict=scnn.get_tile_cache(),
+    )
+    cached_scnn.gather_input_gradient = True
+    cached_scnn._remove_hooks()
+    cached_scnn._add_hooks_for_streaming()
+
+    def run_cycle(streaming_model: StreamingCNN, cycle: int):
+        streaming_model.zero_grad(set_to_none=True)
+        stream_input = (torch.rand(1, 3, 9, 11) + 0.05).requires_grad_(True)
+
+        reference = make_model()
+        reference.load_state_dict(source_state)
+        reference.zero_grad(set_to_none=True)
+        reference_input = stream_input.detach().clone().requires_grad_(True)
+        reference_output = reference(reference_input)
+        output_gradient = torch.full_like(reference_output, 0.19 + cycle * 0.11)
+        torch.autograd.backward(reference_output, output_gradient)
+
+        streaming_output = streaming_model.forward(stream_input)
+        streaming_model.backward(stream_input, output_gradient.detach().clone())
+
+        torch.testing.assert_close(streaming_output, reference_output.detach(), rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(streaming_model.saliency_map, reference_input.grad, rtol=1e-4, atol=1e-5)
+
+        streaming_parameters = dict(streaming_model.stream_module.named_parameters())
+        reference_parameters = dict(reference.named_parameters())
+        assert streaming_parameters.keys() == reference_parameters.keys()
+        for name, reference_parameter in reference_parameters.items():
+            assert reference_parameter.grad is not None, name
+            assert streaming_parameters[name].grad is not None, name
+            torch.testing.assert_close(
+                streaming_parameters[name].grad,
+                reference_parameter.grad,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
+
+        return _seen_indices_by_module(streaming_model)
+
+    first_reset_state = run_cycle(scnn, cycle=0)
+    second_reset_state = run_cycle(scnn, cycle=1)
+    cached_reset_state = run_cycle(cached_scnn, cycle=2)
+
+    assert first_reset_state
+    assert second_reset_state == first_reset_state
+    assert cached_reset_state == first_reset_state
 
 
 def test_scnn_forward_all_reducer_heads_parity():
@@ -995,6 +1764,67 @@ def test_scnn_downsampled_reducer_resizes_input_domain_mask():
         streamed = scnn.forward(image, mask=mask)
 
     assert torch.allclose(streamed, expected, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "target_shape"),
+    [
+        ((9, 13), (4, 6)),       # downsample, non-integer ratio
+        ((3, 5), (8, 12)),       # upsample, non-integer ratio
+        ((8, 12), (4, 3)),       # exact integer ratios
+        ((7, 11), (13, 17)),     # odd dimensions
+        ((1, 9), (7, 1)),        # one-pixel source/target dimensions
+        ((9, 1), (1, 8)),
+    ],
+)
+def test_resize_nearest_bool_mask_matches_interpolate_for_all_chunk_sizes(source_shape, target_shape):
+    source = (torch.arange(source_shape[0] * source_shape[1]).reshape(source_shape) % 3 == 0)
+    expected = torch.nn.functional.interpolate(
+        source[None, None].float(), size=target_shape, mode="nearest"
+    )[0, 0].bool()
+
+    results = [
+        _resize_nearest_bool_mask(source, *target_shape, rows_per_chunk=chunk_size)
+        for chunk_size in (1, 4, target_shape[0] + 3)
+    ]
+    assert all(torch.equal(result, expected) for result in results)
+    assert all(torch.equal(result, results[0]) for result in results[1:])
+
+
+def test_resize_nearest_bool_mask_chunked_path_never_uses_float_interpolation(monkeypatch):
+    source = torch.rand(17, 19) > 0.5
+
+    def forbidden_interpolate(*args, **kwargs):
+        raise AssertionError("boolean mask resize must not call float interpolation")
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", forbidden_interpolate)
+    resized = _resize_nearest_bool_mask(source, 31, 37, rows_per_chunk=3)
+    assert resized.shape == (31, 37)
+    assert resized.dtype == torch.bool
+
+
+def test_scnn_multi_head_masks_are_resized_in_each_reducer_output_domain():
+    torch.manual_seed(120)
+    model = MultiResolutionReducerNet().eval()
+    image = torch.randn(1, 3, 17, 19)
+    mask = (torch.arange(17)[:, None] + 2 * torch.arange(19)[None, :]) % 5 != 0
+    scnn = _make_streaming(model, tile_size=9)
+
+    with torch.no_grad():
+        scnn.forward(image, mask=mask)
+
+    assert len(scnn._prepared_reducer_domain_masks) == 2
+    for head_idx, reducer in scnn._reducer_head_map.items():
+        prepared = scnn._prepared_reducer_domain_masks[(id(reducer), head_idx)]
+        target_shape = (
+            scnn._current_output_heights[head_idx],
+            scnn._current_output_widths[head_idx],
+        )
+        expected = torch.nn.functional.interpolate(
+            mask[None, None].float(), size=target_shape, mode="nearest"
+        )[0, 0].bool()
+        assert prepared.shape == target_shape
+        assert torch.equal(prepared.cpu(), expected)
 
 
 def test_scnn_too_small_reducer_mask_fails_at_reducer_slice_site():

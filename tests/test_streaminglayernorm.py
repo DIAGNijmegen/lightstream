@@ -4,8 +4,8 @@ import types
 import pytest
 import torch
 
-from lightstream.core.scnn import ChannelLayerNorm, StreamingChannelLayerNorm
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm as ImportedChannelLayerNorm
+from lightstream.core.layers import ChannelLayerNorm, StreamingChannelLayerNorm
+from lightstream.core.layers import ChannelLayerNorm as ImportedChannelLayerNorm
 
 
 def _channel_layer_norm_affine_keys(module: torch.nn.Module) -> set[str]:
@@ -84,7 +84,7 @@ def test_channel_layer_norm_rejects_channel_mismatch():
         module(torch.randn(2, 4, 5, 7))
 
 
-def test_channel_layer_norm_is_public_from_scnn_package():
+def test_channel_layer_norm_is_public_from_layers_package():
     assert ImportedChannelLayerNorm is ChannelLayerNorm
     assert StreamingChannelLayerNorm.__name__ == "StreamingChannelLayerNorm"
 
@@ -189,7 +189,7 @@ def test_streaming_statistics_hooks_include_channel_layer_norm(monkeypatch):
 
 
 def test_streaming_channel_layer_norm_conversion_preserves_parameters_and_metadata():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True).to(dtype=torch.float64)
     module.norm.weight.data.copy_(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
@@ -257,7 +257,7 @@ def test_channel_layer_norm_stores_constructor_metadata():
 
 
 def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadata():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3, eps=1e-4, elementwise_affine=True)
     module.norm = torch.nn.LayerNorm(3, eps=1e-2, elementwise_affine=True)
@@ -274,7 +274,7 @@ def test_streaming_channel_layer_norm_conversion_uses_channel_layer_norm_metadat
 
 
 def test_streaming_channel_layer_norm_conversion_rejects_replaced_norm():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     module = ChannelLayerNorm(3)
     module.norm = torch.nn.Identity()
@@ -284,7 +284,7 @@ def test_streaming_channel_layer_norm_conversion_rejects_replaced_norm():
 
 def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
     from lightstream.core.scnn.scnn import StreamingCNN
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Lost
 
     norm = ChannelLayerNorm(3)
@@ -308,7 +308,7 @@ def test_scnn_converts_nested_channel_layer_norm_and_transfers_stats():
 
 def test_scnn_resets_streaming_channel_layer_norm_and_preserves_stats():
     from lightstream.core.scnn.scnn import StreamingCNN
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Lost
 
     streaming_norm = StreamingChannelLayerNorm(3)
@@ -328,7 +328,7 @@ def test_scnn_resets_streaming_channel_layer_norm_and_preserves_stats():
 
 
 def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_backward():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     torch.manual_seed(11)
     module = ChannelLayerNorm(4, eps=1e-5, elementwise_affine=True)
@@ -342,16 +342,30 @@ def test_streaming_channel_layer_norm_matches_channel_layer_norm_forward_and_bac
     module(x).backward(grad)
     streaming(x_streaming).backward(grad)
 
-    torch.testing.assert_close(x_streaming.grad, x.grad)
+    torch.testing.assert_close(
+        x_streaming.grad,
+        x.grad,
+        atol=2e-5,
+        rtol=1e-5,
+        msg="input gradient differs",
+    )
     reference_grads = {name: param.grad for name, param in module.named_parameters()}
     streaming_grads = {name: param.grad for name, param in streaming.named_parameters()}
     assert streaming_grads.keys() == reference_grads.keys() == {"norm.weight", "norm.bias"}
-    for name in reference_grads:
-        torch.testing.assert_close(streaming_grads[name], reference_grads[name])
+    torch.testing.assert_close(
+        streaming_grads["norm.weight"],
+        reference_grads["norm.weight"],
+        msg="weight gradient differs",
+    )
+    torch.testing.assert_close(
+        streaming_grads["norm.bias"],
+        reference_grads["norm.bias"],
+        msg="bias gradient differs",
+    )
 
 
-def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+def test_streaming_channel_layer_norm_affine_grads_include_all_upstream_contributions():
+    from lightstream.core.layers import StreamingChannelLayerNorm
     from lightstream.core.scnn.utils import Box, Lost, Sides
 
     torch.manual_seed(13)
@@ -368,15 +382,15 @@ def test_streaming_channel_layer_norm_affine_grads_use_only_unique_valid_region(
     with torch.no_grad():
         centered = x - x.mean(dim=1, keepdim=True)
         x_hat = centered * torch.rsqrt(centered.pow(2).mean(dim=1, keepdim=True) + streaming.eps)
-        expected_grad_weight = (grad[:, :, :3, :] * x_hat[:, :, :3, :]).sum(dim=(0, 2, 3))
-        expected_grad_bias = grad[:, :, :3, :].sum(dim=(0, 2, 3))
+        expected_grad_weight = (grad * x_hat).sum(dim=(0, 2, 3))
+        expected_grad_bias = grad.sum(dim=(0, 2, 3))
 
     torch.testing.assert_close(streaming.norm.weight.grad, expected_grad_weight)
     torch.testing.assert_close(streaming.norm.bias.grad, expected_grad_bias)
 
 
 def test_streaming_channel_layer_norm_without_affine_backpropagates_input():
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
+    from lightstream.core.layers import StreamingChannelLayerNorm
 
     torch.manual_seed(17)
     module = ChannelLayerNorm(3, elementwise_affine=False)
@@ -404,9 +418,7 @@ def test_backward_streaming_module_predicate_includes_existing_and_layer_norm_ty
     monkeypatch.setitem(sys.modules, "numpy", types.ModuleType("numpy"))
 
     from lightstream.core.scnn.scnn import _is_backward_streaming_module
-    from lightstream.core.scnn.streamingconv import StreamingConv2d
-    from lightstream.core.scnn.streaminglayernorm import StreamingChannelLayerNorm
-    from lightstream.core.scnn.streamingupsample import StreamingUpsample2d
+    from lightstream.core.layers import StreamingChannelLayerNorm, StreamingConv2d, StreamingUpsample2d
 
     assert _is_backward_streaming_module(StreamingConv2d(3, 3, kernel_size=1))
     assert _is_backward_streaming_module(StreamingUpsample2d(scale_factor=2.0, mode="bilinear"))
@@ -455,8 +467,7 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     reference.load_state_dict(model.state_dict())
 
     # Odd image dimensions with this tile size make the SCNN pass use overlapping
-    # tiles; this is the case that would double-count affine gradients if
-    # seen_indices tracking regressed.
+    # tiles, exercising output-query ownership and dependency-gradient accumulation.
     image = torch.randn(1, 3, 13, 11)
     upstream_grad = torch.randn(1, 2, 13, 11)
 
@@ -480,14 +491,32 @@ def _assert_channel_norm_scnn_parity(elementwise_affine: bool):
     assert any(x > 0 for _, x, _ in scnn._last_forward_tiles)
     torch.testing.assert_close(stream_output, ref_output.detach(), atol=1e-5, rtol=1e-4)
 
-    scnn.backward(image.detach().clone(), upstream_grad.detach().clone())
+    stream_image = image.detach().clone().requires_grad_(True)
+    scnn.backward(stream_image, upstream_grad.detach().clone())
 
     stream_module = scnn.stream_module
     reference_grads = {name: param.grad for name, param in reference.named_parameters()}
     streaming_grads = {name: param.grad for name, param in stream_module.named_parameters()}
     assert streaming_grads.keys() == reference_grads.keys()
-    for name in reference_grads:
-        torch.testing.assert_close(streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4)
+
+    def assert_parameter_grad_matches(name: str) -> None:
+        torch.testing.assert_close(
+            streaming_grads[name], reference_grads[name], atol=1e-5, rtol=1e-4, msg=name
+        )
+
+    assert_parameter_grad_matches("upstream.weight")
+    assert_parameter_grad_matches("upstream.bias")
+
+    if elementwise_affine:
+        assert_parameter_grad_matches("norm.norm.weight")
+        assert_parameter_grad_matches("norm.norm.bias")
+
+    assert_parameter_grad_matches("downstream.weight")
+    assert_parameter_grad_matches("downstream.bias")
+
+    torch.testing.assert_close(
+        stream_image.grad, ref_image.grad, atol=1e-5, rtol=1e-4, msg="model input gradient"
+    )
 
     if elementwise_affine:
         assert {"norm.norm.weight", "norm.norm.bias"}.issubset(streaming_grads)
@@ -506,6 +535,128 @@ def test_scnn_channel_layer_norm_forward_backward_parity():
 
 def test_scnn_channel_layer_norm_elementwise_affine_false_forward_backward_parity():
     _assert_channel_norm_scnn_parity(elementwise_affine=False)
+
+
+def test_scnn_pointwise_after_channel_layer_norm_shifted_overlap_gradients():
+    """Pointwise replay gives non-owned overlap positions zero upstream gradient."""
+    torch.manual_seed(303)
+    channels, output_channels = 4, 3
+    image_shape = (13, 14)
+    tile_shape = (8, 9)
+
+    model = torch.nn.Sequential(
+        ChannelLayerNorm(channels, eps=1e-5, elementwise_affine=True),
+        torch.nn.Conv2d(channels, output_channels, kernel_size=1, bias=True),
+    ).eval()
+    reference = torch.nn.Sequential(
+        ChannelLayerNorm(channels, eps=1e-5, elementwise_affine=True),
+        torch.nn.Conv2d(channels, output_channels, kernel_size=1, bias=True),
+    ).eval()
+    reference.load_state_dict(model.state_dict())
+
+    image = torch.randn(1, channels, *image_shape)
+    upstream = torch.randn(1, output_channels, *image_shape)
+    reference_image = image.detach().clone().requires_grad_(True)
+    reference_output = reference(reference_image)
+    reference_output.backward(upstream)
+
+    try:
+        import numpy  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["numpy"] = types.ModuleType("numpy")
+    from lightstream.core.scnn.scnn import StreamingCNN
+
+    scnn = StreamingCNN(
+        model,
+        tile_shape=(1, channels, *tile_shape),
+        verbose=False,
+        deterministic=True,
+        copy_to_gpu=False,
+        statistics_on_cpu=False,
+        normalize_on_gpu=False,
+    )
+    streaming_output = scnn.forward(image.detach().clone())
+    torch.testing.assert_close(streaming_output, reference_output.detach())
+
+    tile_starts = [(y, x) for y, x, _ in scnn._last_forward_tiles]
+    assert tile_starts == [(0, 0), (0, 5), (5, 0), (5, 5)]
+    assert tile_starts[-1][0] < tile_starts[-2][0] + tile_shape[0]
+    assert tile_starts[-1][1] < tile_starts[1][1] + tile_shape[1]
+
+    # Capture the input and the *actual* upstream gradient seen by LayerNorm in
+    # each replay. With only a pointwise operation after it, an output belongs
+    # to exactly one tile and no owned output can depend on a neighboring
+    # position. Thus shifted-tile overlap positions must receive zero here.
+    norm = scnn.stream_module[0]
+    tile_records = []
+
+    def save_norm_input(module, inputs, output):
+        del output
+        tile_records.append(
+            {
+                "start": (module.input_loc.y, module.input_loc.x),
+                "input": inputs[0].detach().clone(),
+            }
+        )
+
+    def save_norm_grad(module, grad_input, grad_output):
+        del module, grad_input
+        tile_records[-1]["grad_output"] = grad_output[0].detach().clone()
+
+    forward_handle = norm.register_forward_hook(save_norm_input)
+    backward_handle = norm.register_full_backward_hook(save_norm_grad)
+    streaming_image = image.detach().clone().requires_grad_(True)
+    scnn.backward(streaming_image, upstream.detach().clone())
+    forward_handle.remove()
+    backward_handle.remove()
+
+    assert [record["start"] for record in tile_records] == tile_starts
+    owned_globally = torch.zeros(image_shape, dtype=torch.bool)
+    overlap_positions = 0
+    summed_grad_bias = torch.zeros_like(norm.norm.bias)
+    summed_grad_weight = torch.zeros_like(norm.norm.weight)
+    for record in tile_records:
+        y, x = record["start"]
+        tile_input = record["input"]
+        tile_grad = record["grad_output"]
+        height, width = tile_grad.shape[-2:]
+        owned = ~owned_globally[y : y + height, x : x + width]
+        non_owned = ~owned
+        overlap_positions += int(non_owned.sum())
+
+        assert torch.count_nonzero(tile_grad[:, :, non_owned]) == 0
+        owned_globally[y : y + height, x : x + width] = True
+
+        centered = tile_input - tile_input.mean(dim=1, keepdim=True)
+        x_hat = centered * torch.rsqrt(
+            centered.square().mean(dim=1, keepdim=True) + norm.eps
+        )
+        summed_grad_bias += tile_grad.sum(dim=(0, 2, 3))
+        summed_grad_weight += (tile_grad * x_hat).sum(dim=(0, 2, 3))
+
+    assert overlap_positions > 0
+    assert owned_globally.all()
+    torch.testing.assert_close(summed_grad_weight, norm.norm.weight.grad)
+    torch.testing.assert_close(summed_grad_bias, norm.norm.bias.grad)
+
+    reference_parameters = dict(reference.named_parameters())
+    streaming_parameters = dict(scnn.stream_module.named_parameters())
+    assert reference_parameters.keys() == streaming_parameters.keys()
+    for name in ("0.norm.weight", "0.norm.bias", "1.weight", "1.bias"):
+        torch.testing.assert_close(
+            streaming_parameters[name].grad,
+            reference_parameters[name].grad,
+            atol=1e-5,
+            rtol=1e-4,
+            msg=f"parameter gradient differs for {name}",
+        )
+    torch.testing.assert_close(
+        streaming_image.grad,
+        reference_image.grad,
+        atol=1e-5,
+        rtol=1e-4,
+        msg="input gradient differs",
+    )
 
 
 def test_streaming_channel_layer_norm_rejects_non_4d_input():

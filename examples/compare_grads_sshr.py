@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from time import time
 from lightstream.models.sshr.streamingsshr import StreamingSSHR
+from saliency_diagnostics import compare_saliency_candidates
 
 
 def _gather_param_grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -129,6 +130,75 @@ def _base_output_grads(
     return tuple(grad.detach().clone() for grad in grads)
 
 
+def _assert_input_gradient_parity(
+    stream_input_grad: torch.Tensor,
+    reference_input_grad: torch.Tensor,
+    write_coverage_map: torch.Tensor,
+    nonzero_coverage_map: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Diagnose saliency coverage and values without failing normal example runs."""
+    if stream_input_grad.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Streaming and reference input-gradient shapes differ: "
+            f"{tuple(stream_input_grad.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+    if write_coverage_map.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Saliency coverage and reference input-gradient shapes differ: "
+            f"{tuple(write_coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+    if nonzero_coverage_map.shape != reference_input_grad.shape:
+        raise AssertionError(
+            "Saliency nonzero coverage and reference input-gradient shapes differ: "
+            f"{tuple(nonzero_coverage_map.shape)} vs {tuple(reference_input_grad.shape)}"
+        )
+
+    reference_support = reference_input_grad.ne(0)
+    missing_nonzero_support = reference_support & ~nonzero_coverage_map
+    print(
+        "Input gradient spatial coverage: "
+        f"reference-supported={reference_support.count_nonzero().item()}, "
+        f"stream-written={write_coverage_map.count_nonzero().item()}, "
+        f"stream-nonzero-written={nonzero_coverage_map.count_nonzero().item()}, "
+        f"reference-supported without nonzero stream write="
+        f"{missing_nonzero_support.count_nonzero().item()}"
+    )
+    coverage_matches = not missing_nonzero_support.any().item()
+    try:
+        assert coverage_matches, (
+            "Streaming saliency replay did not make a nonzero write at every "
+            "reference-supported input coordinate; "
+            f"missing indices={missing_nonzero_support.nonzero().tolist()[:20]}"
+        )
+        print("Input gradient nonzero streamed-write coverage: PASS")
+    except AssertionError as error:
+        print(f"Input gradient nonzero streamed-write coverage: DIAGNOSTIC FAILURE: {error}")
+
+    values_match = True
+    try:
+        torch.testing.assert_close(
+            stream_input_grad[reference_support],
+            reference_input_grad[reference_support],
+            rtol=rtol,
+            atol=atol,
+            msg="streamed saliency values differ over reference-supported coordinates",
+        )
+        print("Input gradient values over reference support: PASS")
+    except AssertionError as error:
+        values_match = False
+        outside_reference_support = stream_input_grad.ne(0) & ~reference_support
+        print(
+            f"Input gradient values over reference support: DIAGNOSTIC FAILURE: {error}\n"
+            "Streamed nonzero values outside reference support: "
+            f"count={outside_reference_support.count_nonzero().item()}, "
+            f"indices={outside_reference_support.nonzero().tolist()[:20]}"
+        )
+    return coverage_matches and values_match
+
+
 def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor) -> None:
     device = img.device
     dtype = img.dtype
@@ -140,18 +210,34 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
     print("=" * 80)
 
     network = StreamingSSHR(
-        "resnet34",
+        "resnet18",
         args.tile_size,
+        weights=None,
         additional_modules=None,
         mean=[0, 0, 0],
         std=[1, 1, 1],
         normalize_on_gpu=False,
+        copy_to_gpu=device.type == "cuda",
+        statistics_on_cpu=device.type == "cuda",
         saliency=args.input_grad,
+        diagnose_saliency_assembly=args.diagnose_saliency_assembly,
     ).to(device=device, dtype=dtype)
     network.stream_network.device = device
     network.stream_network.dtype = dtype
     network.stream_network.mean = network.stream_network.mean.to(device=device, dtype=dtype)
     network.stream_network.std = network.stream_network.std.to(device=device, dtype=dtype)
+
+    valid_output_heights, valid_output_widths = network.stream_network._compute_valid_output_sizes()
+    safe_step = network.stream_network._compute_valid_input_step(
+        valid_output_heights, valid_output_widths
+    )
+    shifted_boundaries = tuple(
+        size % step != 0 for size, step in zip(img.shape[-2:], safe_step)
+    )
+    print(
+        f"computed safe tile step={safe_step} "
+        f"(shifted boundary tiles by axis={shifted_boundaries})"
+    )
 
     # Valid StreamingCNN debug information
     print("output_spec:", network.stream_network._output_spec)
@@ -173,6 +259,9 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         output if output.requires_grad else output.detach().requires_grad_()
         for output in stream_outputs
     )
+    print("")
+    print("Stream output for grads", stream_outputs_for_grads)
+    print("")
 
     output_grads = _base_output_grads(stream_outputs_for_grads, target, criterion)
     print(
@@ -222,14 +311,36 @@ def _run_compare(args: argparse.Namespace, img: torch.Tensor, mask: torch.Tensor
         elif not hasattr(network.stream_network, "saliency_map") or network.stream_network.saliency_map is None:
             print("Input gradient comparison skipped: streaming saliency map is missing.")
         else:
-            stream_input_grad = network.stream_network.saliency_map[0].to(device=img_normal.grad.device)
-            input_grad_diff = (img_normal.grad.detach() - stream_input_grad).abs()
+            stream_input_grad = network.stream_network.saliency_map.to(device=img_normal.grad.device)
+            reference_input_grad = img_normal.grad.detach()
+            if args.diagnose_saliency_assembly:
+                _assert_input_gradient_parity(
+                    stream_input_grad,
+                    reference_input_grad,
+                    network.stream_network.saliency_coverage_map.to(
+                        device=img_normal.grad.device
+                    ),
+                    network.stream_network.saliency_nonzero_coverage_map.to(
+                        device=img_normal.grad.device
+                    ),
+                    rtol=args.input_grad_rtol,
+                    atol=args.input_grad_atol,
+                )
+            input_grad_diff = (reference_input_grad - stream_input_grad).abs()
             print(
-                "Input gradient stats: "
+                "Input gradient full-tensor stats: "
                 f"stream mean abs={stream_input_grad.abs().mean().item():.6e}, "
-                f"normal mean abs={img_normal.grad.detach().abs().mean().item():.6e}, "
+                f"normal mean abs={reference_input_grad.abs().mean().item():.6e}, "
                 f"mean abs diff={input_grad_diff.mean().item():.6e}, "
                 f"max abs diff={input_grad_diff.max().item():.6e}"
+            )
+            compare_saliency_candidates(
+                network.stream_network,
+                reference_input_grad,
+                rtol=args.input_grad_rtol,
+                atol=args.input_grad_atol,
+                verbose=args.verbose_saliency_coordinates,
+                diagnose_assembly=args.diagnose_saliency_assembly,
             )
 
     _compare_selected_grads(
@@ -254,11 +365,27 @@ def main() -> None:
     parser.add_argument("--dtype", default="float64", help="float16, float32, or float64")
     parser.add_argument("--tile-size", type=int, default=3072)
     parser.add_argument("--input-size", type=int, default=4608)
+    parser.add_argument("--input-grad-rtol", type=float, default=1e-4)
+    parser.add_argument("--input-grad-atol", type=float, default=1e-6)
+    parser.add_argument(
+        "--diagnose-saliency-assembly",
+        action="store_true",
+        help=(
+            "Enable expensive raw/grad_lost/ownership saliency assembly "
+            "counterfactual diagnostics (off by default)."
+        ),
+    )
+    parser.add_argument(
+        "--verbose-saliency-coordinates",
+        action="store_true",
+        help="Print complete saliency coordinate and mismatch-count diagnostics.",
+    )
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument(
         "--no-input-grad",
         dest="input_grad",
         action="store_false",
-        help="Disable streaming saliency/input-gradient gathering and skip input-gradient comparison.",
+        help="Disable input saliency entirely: do not gather or compare input gradients.",
     )
     parser.set_defaults(input_grad=True)
 
@@ -266,10 +393,15 @@ def main() -> None:
 
     torch.manual_seed(0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available() else
+        "cpu" if args.device == "auto" else args.device
+    )
     dtype = _parse_dtype(args.dtype)
 
     img = torch.rand((1, 3, args.input_size, args.input_size), device=device, dtype=dtype)
+    img = torch.rand((1, 3, 3888, 9720), device=device, dtype=dtype)
+
     mask = _build_dummy_mask(args.input_size, device=device)
 
     print(f"device={device}, dtype={dtype}, tile_size={args.tile_size}, input_size={args.input_size}")

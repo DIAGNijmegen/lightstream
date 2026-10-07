@@ -63,7 +63,13 @@ def _validate_stacked_logits(logits_stacked: torch.Tensor, reference: torch.Tens
 
 
 class FusedAttentionGeMReducer(BaseReducer):
-    """Fuse three value maps, then apply three globally normalized attention-GeM branches."""
+    """Fuse three value maps, then apply three globally normalized attention-GeM branches.
+
+    ``v=sum_j value_weights[j]*y_j`` and
+    ``a_i=sum_j attention_weights[j]*softmax(att_logits_j)_i``.
+    With ``b_i=(1-uniform_attention_eps)*a_i+uniform_attention_eps/N_valid``,
+    return ``max(sum_i b_i*max(v_ci,eps)**r,eps)**(1/r)``.
+    """
 
     def __init__(
         self,

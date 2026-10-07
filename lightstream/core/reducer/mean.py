@@ -9,7 +9,10 @@ from .utils import prepare_spatial_mask, resolve_accumulator_dtype
 
 
 class MeanReducer(BaseReducer):
-    """Apply global spatial mean reduction on NCHW tensors."""
+    """Return ``sum_i x_ci / N_valid`` for each sample and channel.
+
+    A fully masked sample returns zero.
+    """
 
     def __init__(
         self,

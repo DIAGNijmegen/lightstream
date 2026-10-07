@@ -18,10 +18,10 @@ import torch.nn as nn
 from copy import deepcopy
 from lightstream.core.scnn.scnn import StreamingCNN
 from lightstream.core.reducer import BaseReducer
-from lightstream.core.scnn.streaminglayernorm import ChannelLayerNorm
-from lightstream.core.scnn.streaminglayerscale import LayerScale
-from lightstream.core.scnn.statisticsprobe import StatisticsProbe
-from lightstream.core.scnn.streamingmerge import StreamingMerge
+from lightstream.core.layers.streaminglayernorm import ChannelLayerNorm
+from lightstream.core.layers.streaminglayerscale import LayerScale
+from lightstream.core.layers.statisticsprobe import StatisticsProbe
+from lightstream.core.layers.streamingmerge import StreamingMerge
 from typing import Any, Callable, Optional
 
 
@@ -33,6 +33,7 @@ class StreamingConstructor:
         verbose: bool = True,
         deterministic: bool = False,
         saliency: bool = False,
+        diagnose_saliency_assembly: bool = False,
         copy_to_gpu: bool = False,
         statistics_on_cpu: bool = True,
         normalize_on_gpu: bool = True,
@@ -68,6 +69,7 @@ class StreamingConstructor:
         self.verbose = verbose
         self.deterministic = deterministic
         self.saliency = saliency
+        self.diagnose_saliency_assembly = diagnose_saliency_assembly
         self.copy_to_gpu = copy_to_gpu
         self.statistics_on_cpu = statistics_on_cpu
         self.normalize_on_gpu = normalize_on_gpu
@@ -171,6 +173,7 @@ class StreamingConstructor:
             tile_shape=(1, 3, self.tile_size, self.tile_size),
             deterministic=self.deterministic,
             saliency=self.saliency,
+            diagnose_saliency_assembly=self.diagnose_saliency_assembly,
             copy_to_gpu=self.copy_to_gpu,
             verbose=self.verbose,
             statistics_on_cpu=self.statistics_on_cpu,

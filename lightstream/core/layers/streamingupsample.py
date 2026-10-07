@@ -78,13 +78,14 @@ class StreamingUpsample2dF(torch.autograd.Function):
         else:
             grad_in = None
 
-        if grad_in is not None:
-            # Upsample backward maps a high-resolution gradient tile onto the
-            # low-resolution input lattice.  Statistics gathering computes how
-            # much of that low-resolution lattice lacks complete support for
-            # each border, so crop/zero in low-resolution coordinates here.
-            # Do not reuse the high-resolution grad_output loss directly: its
-            # units differ from grad_in after interpolation backward.
+        if grad_in is not None and ctx.mode != "bilinear":
+            # Nearest-neighbour interpolation has a one-to-one ownership map
+            # (modulo replication), so its incomplete low-resolution border
+            # can be removed directly. Bilinear interpolation is deliberately
+            # excluded: distinct, head-owned output queries in adjacent replay
+            # tiles can contribute to the same low-resolution input cell. Such
+            # dependency gradients must accumulate rather than be filtered by
+            # low-resolution coordinate ownership or completeness.
             input_lost_top = upsample_backward_input_lost.top if not sides.top else 0
             input_lost_bottom = upsample_backward_input_lost.bottom if not sides.bottom else 0
             input_lost_left = upsample_backward_input_lost.left if not sides.left else 0
