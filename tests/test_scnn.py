@@ -1815,7 +1815,7 @@ def test_scnn_multi_head_masks_are_resized_in_each_reducer_output_domain():
 
     assert len(scnn._prepared_reducer_domain_masks) == 2
     for head_idx, reducer in scnn._reducer_head_map.items():
-        prepared = scnn._prepared_reducer_domain_masks[(id(reducer), head_idx)]
+        prepared = scnn._get_prepared_reducer_domain_mask(head_idx)
         target_shape = (
             scnn._current_output_heights[head_idx],
             scnn._current_output_widths[head_idx],
@@ -1825,6 +1825,69 @@ def test_scnn_multi_head_masks_are_resized_in_each_reducer_output_domain():
         )[0, 0].bool()
         assert prepared.shape == target_shape
         assert torch.equal(prepared.cpu(), expected)
+
+
+def test_scnn_shares_prepared_mask_across_matching_reducer_heads():
+    model = SharedRGeMNet().eval()
+    scnn = _make_streaming(model, tile_size=4)
+    image = torch.rand(1, 3, 9, 11) + 0.1
+    mask = torch.rand(1, 1, 9, 11) > 0.2
+
+    with torch.no_grad():
+        scnn.forward(image, mask=mask)
+
+    assert len(scnn._prepared_reducer_domain_masks) == 1
+
+
+def test_scnn_releases_slide_references_after_backward():
+    scnn = _make_streaming(AllReducerHeadsNet().eval(), tile_size=4)
+    image = torch.randn(1, 3, 9, 11)
+    mask = torch.ones(9, 11, dtype=torch.bool)
+
+    with torch.no_grad():
+        output = scnn.forward(image, mask=mask)
+    scnn.backward(image, tuple(torch.ones_like(head) for head in output), mask=mask)
+
+    assert scnn._active_reducer_mask is None
+    assert scnn._active_reducer_mask_image is None
+    assert scnn._active_source_image is None
+    assert not scnn._prepared_reducer_domain_masks
+    assert all(reducer._output_size is None for reducer in scnn._reducer_head_map.values())
+
+
+def test_scnn_releases_slide_references_after_inference_forward():
+    scnn = _make_streaming(AllReducerHeadsNet().eval(), tile_size=4)
+    image = torch.randn(1, 3, 9, 11)
+    mask = torch.ones(9, 11, dtype=torch.bool)
+
+    with torch.inference_mode():
+        scnn.forward(image, mask=mask)
+
+    assert scnn._active_reducer_mask is None
+    assert scnn._active_reducer_mask_image is None
+    assert scnn._active_source_image is None
+    assert not scnn._prepared_reducer_domain_masks
+    assert all(reducer._output_size is None for reducer in scnn._reducer_head_map.values())
+
+
+def test_scnn_reuses_unchanged_input_transfer_for_backward(monkeypatch):
+    scnn = _make_streaming(AllReducerHeadsNet().eval(), tile_size=4)
+    scnn.copy_to_gpu = True
+    image = torch.randn(1, 3, 9, 11)
+    original_to = torch.Tensor.to
+    transfers = []
+
+    def tracked_to(tensor, *args, **kwargs):
+        if tensor is image:
+            transfers.append(1)
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", tracked_to)
+    with torch.no_grad():
+        output = scnn.forward(image)
+    scnn.backward(image, tuple(torch.ones_like(head) for head in output))
+
+    assert len(transfers) == 1
 
 
 def test_scnn_too_small_reducer_mask_fails_at_reducer_slice_site():

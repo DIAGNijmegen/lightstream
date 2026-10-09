@@ -274,7 +274,8 @@ def test_fixed_input_parity_across_single_nonoverlapping_and_overlapping_tiles()
     sides = SimpleNamespace(top=False, left=False, right=False, bottom=False)
     for name, boxes in configurations.items():
         streaming = dense_reducer.to_streaming()
-        streaming.start_stream(4, 6, 1, 3, logits.device, logits.dtype)
+        # The full-slide coverage bitmap is now an explicit diagnostic surface.
+        streaming.start_stream(4, 6, 1, 3, logits.device, logits.dtype, debug_replay=True)
         assembled_logits = torch.empty_like(logits)
         assigned = torch.zeros_like(mask)
         replay_tiles = []

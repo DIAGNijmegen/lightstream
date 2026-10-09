@@ -103,12 +103,12 @@ class StreamingNGWPReducer(BaseStreamingGlobalReducer):
     def _accumulate_payload(self, payload, tile_y, tile_x, sides, dst_box, user_mask):
         scores, _ = payload
         y0, y1, x0, x1 = dst_box
-        seen = self._stream_seen_mask[y0:y1, x0:x1]
-        new, effective = ~seen, ~seen if user_mask is None else (~seen & user_mask.to(device=seen.device, dtype=torch.bool))
+        effective = self._claim_region(
+            (y0, y1, x0, x1), user_mask, self._forward_claimed_boxes, scores.device,
+        )
         if self._debug_replay_enabled:
             self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), scores.shape[-2], scores.shape[-1], y0, y1, x0, x1, 2))
         if torch.any(effective): self.accumulate_valid_tile(payload, effective)
-        seen |= new
 
     def build_backward_pair(self, trimmed_output, gradient, *, input_y, input_x, sides, valid_mask=None):
         payload = self._payload(trimmed_output)

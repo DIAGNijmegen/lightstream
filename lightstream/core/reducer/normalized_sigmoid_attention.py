@@ -93,14 +93,13 @@ class StreamingNormalizedSigmoidAttentionReducer(BaseStreamingGlobalReducer):
             raise ValueError(f"StreamingNormalizedSigmoidAttentionReducer expects payload arity=2, got {len(payload)}")
         values = payload[0]
         y0, y1, x0, x1 = dst_box
-        seen = self._stream_seen_mask[y0:y1, x0:x1]
-        new = ~seen
-        effective = new if user_mask is None else new & user_mask.to(device=new.device, dtype=torch.bool)
+        effective = self._claim_region(
+            (y0, y1, x0, x1), user_mask, self._forward_claimed_boxes, values.device,
+        )
         if self._debug_replay_enabled:
             self._replay_assignments.append((int(tile_y), int(tile_x), bool(sides.top), bool(sides.left), bool(sides.right), bool(sides.bottom), int(values.shape[-2]), int(values.shape[-1]), int(y0), int(y1), int(x0), int(x1), 2))
         if torch.any(effective):
             self.accumulate_valid_tile(payload, effective)
-        seen |= new
 
     def build_backward_pair(self, trimmed_output, gradient, *, input_y, input_x, sides, valid_mask=None):
         payload = self._parse_multi_input_payload(trimmed_output)

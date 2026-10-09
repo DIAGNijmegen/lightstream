@@ -45,11 +45,11 @@ class StreamingReducerTileF(torch.autograd.Function):
                 raise ValueError(f"valid_mask must be 2D (H,W), got shape={tuple(valid_mask.shape)}")
             mask_4d = valid_mask.to(dtype=tile_output.dtype, device=tile_output.device)[None, None]
             masked = tile_output * mask_4d
-            ctx.save_for_backward(mask_4d)
+            ctx.save_for_backward(valid_mask.to(device=tile_output.device, dtype=torch.bool))
             ctx.has_mask = True
         else:
             masked = tile_output
-            ctx.save_for_backward(torch.zeros(0, device=tile_output.device, dtype=tile_output.dtype))
+            ctx.save_for_backward(torch.zeros(0, device=tile_output.device, dtype=torch.bool))
             ctx.has_mask = False
 
         ctx.input_height = tile_output.shape[-2]
@@ -85,7 +85,7 @@ class StreamingReducerTileF(torch.autograd.Function):
         tuple[torch.Tensor, None, None]
             Gradient for tile input and ``None`` for non-differentiable inputs.
         """
-        (mask_4d,) = ctx.saved_tensors
+        (saved_mask,) = ctx.saved_tensors
 
         grad_input = grad_output
         if ctx.has_normalization:
@@ -94,7 +94,7 @@ class StreamingReducerTileF(torch.autograd.Function):
         grad_input = grad_input.expand(-1, -1, ctx.input_height, ctx.input_width)
 
         if ctx.has_mask:
-            grad_input = grad_input * mask_4d.to(dtype=grad_input.dtype, device=grad_input.device)
+            grad_input = grad_input * saved_mask[None, None].to(dtype=grad_input.dtype)
 
         return grad_input, None, None
 
@@ -182,6 +182,10 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         self.register_buffer("running_sum", torch.zeros(0), persistent=False)
         self.register_buffer("running_count", torch.zeros(0), persistent=False)
         self.register_buffer("_stream_seen_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
+        self._output_size: tuple[int, int] | None = None
+        self._forward_claimed_boxes: list[tuple[int, int, int, int]] = []
+        self._backward_claimed_boxes: list[tuple[int, int, int, int]] = []
+        self._backward_replay_active = False
         self._last_output = None
         self._debug_replay_enabled = False
         self._replay_assignments: list[tuple] | None = None
@@ -229,7 +233,12 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
     ):
         """Initialize reducer state before tile traversal."""
         self.reset_stream_state(batch_size=batch_size, channels=channels, device=device, dtype=dtype)
-        self._stream_seen_mask = torch.zeros((output_height, output_width), dtype=torch.bool, device=device)
+        self._output_size = (output_height, output_width)
+        self._forward_claimed_boxes = []
+        self._backward_replay_active = False
+        # Preserve the old dense inspection surface only for explicit diagnostics.
+        self._stream_seen_mask = (torch.zeros((output_height, output_width), dtype=torch.bool, device=device)
+                                  if debug_replay else torch.zeros(0, dtype=torch.bool, device=device))
         self._debug_replay_enabled = debug_replay
         self._replay_assignments = [] if debug_replay else None
         self._replay_cursor = None
@@ -245,9 +254,10 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         """
         tile_payload = self._parse_single_input_payload(trimmed_output)
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
-        seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
-        new_mask = ~seen_slice
-        effective_mask = new_mask if user_mask is None else (new_mask & user_mask.to(dtype=torch.bool, device=new_mask.device))
+        effective_mask = self._claim_region(
+            (dst_y0, dst_y1, dst_x0, dst_x1), user_mask,
+            self._forward_claimed_boxes, tile_payload.device,
+        )
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
@@ -270,7 +280,28 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
             )
         if torch.any(effective_mask):
             self.accumulate_valid_tile(tile_payload, valid_mask=effective_mask)
-        seen_slice |= new_mask
+
+    def _claim_region(self, dst_box, user_mask, claimed_boxes, device):
+        """Claim first-visited pixels using output rectangles instead of a full-slide bitmap."""
+        y0, y1, x0, x1 = (int(value) for value in dst_box)
+        if self._output_size is None or not (0 <= y0 <= y1 <= self._output_size[0] and 0 <= x0 <= x1 <= self._output_size[1]):
+            raise ValueError(f"Reducer region {dst_box} is outside output size {self._output_size}")
+        shape = (y1 - y0, x1 - x0)
+        if user_mask is None:
+            effective = torch.ones(shape, dtype=torch.bool, device=device)
+        else:
+            if tuple(user_mask.shape) != shape:
+                raise ValueError(f"Reducer mask shape {tuple(user_mask.shape)} does not match tile region {shape}")
+            effective = user_mask.to(device=device, dtype=torch.bool).clone()
+        for old_y0, old_y1, old_x0, old_x1 in claimed_boxes:
+            overlap_y0, overlap_y1 = max(y0, old_y0), min(y1, old_y1)
+            overlap_x0, overlap_x1 = max(x0, old_x0), min(x1, old_x1)
+            if overlap_y0 < overlap_y1 and overlap_x0 < overlap_x1:
+                effective[overlap_y0-y0:overlap_y1-y0, overlap_x0-x0:overlap_x1-x0] = False
+        claimed_boxes.append((y0, y1, x0, x1))
+        if claimed_boxes is self._forward_claimed_boxes and self._stream_seen_mask.numel():
+            self._stream_seen_mask[y0:y1, x0:x1] = True
+        return effective
 
     def finish_stream(self) -> torch.Tensor:
         """Return finalized reduced output for current stream."""
@@ -282,7 +313,9 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         # first tile that visits it.  Backward must make the identical choice:
         # shifted final tiles otherwise replay part of the preceding tile and
         # duplicate gradients in modules which produced the reducer inputs.
-        self._backward_seen_mask = torch.zeros_like(self._stream_seen_mask)
+        self._backward_claimed_boxes = []
+        self._backward_replay_active = True
+        self._backward_seen_mask = None
         self._backward_replay_regions = []
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
@@ -302,26 +335,28 @@ class BaseStreamingGlobalReducer(nn.Module, ABC):
         before autograd reaches either producer branch.  Global coordinates
         are retained for diagnostics and regression tests.
         """
-        if self._backward_seen_mask is None:
+        if self._output_size is None or not self._backward_replay_active:
             raise RuntimeError("Reducer backward ownership is not initialized. Call start_backward_replay() first.")
         y0, y1, x0, x1 = (int(value) for value in dst_box)
-        seen = self._backward_seen_mask[y0:y1, x0:x1]
-        unique = ~seen
-        if valid_mask is not None:
-            if tuple(valid_mask.shape) != tuple(unique.shape):
-                raise ValueError(
-                    f"Reducer backward mask shape {tuple(valid_mask.shape)} does not match "
-                    f"tile region {tuple(unique.shape)}."
-                )
-            effective = unique & valid_mask.to(device=unique.device, dtype=torch.bool)
-        else:
-            effective = unique
-        seen |= unique
-        coordinates = effective.nonzero(as_tuple=False)
-        if coordinates.numel():
-            coordinates = coordinates + coordinates.new_tensor((y0, x0))
-        self._backward_replay_regions.append(coordinates.detach().cpu())
+        device = valid_mask.device if valid_mask is not None else self.running_sum.device
+        effective = self._claim_region((y0, y1, x0, x1), valid_mask, self._backward_claimed_boxes, device)
+        if self._debug_replay_enabled:
+            coordinates = effective.nonzero(as_tuple=False)
+            if coordinates.numel():
+                coordinates = coordinates + coordinates.new_tensor((y0, x0))
+            self._backward_replay_regions.append(coordinates.detach().cpu())
         return effective
+
+    def release_slide_state(self):
+        """Drop spatial state after the paired backward or inference forward."""
+        self._stream_seen_mask = torch.zeros(0, dtype=torch.bool, device=self.running_sum.device)
+        self._output_size = None
+        self._forward_claimed_boxes = []
+        self._backward_claimed_boxes = []
+        self._backward_replay_active = False
+        self._backward_seen_mask = None
+        if not self._debug_replay_enabled:
+            self._backward_replay_regions = []
 
     def validate_backward_replay_consumed(self, *, head_idx: int):
         """Validate that backward replay consumed all recorded assignments."""

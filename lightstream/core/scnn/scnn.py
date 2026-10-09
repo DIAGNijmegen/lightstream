@@ -254,6 +254,9 @@ class StreamingCNN(torch.nn.Module):
         self._reducer_input_indices = {}
         self._active_reducer_mask = None
         self._active_reducer_mask_image = None
+        self._active_source_image = None
+        self._active_source_image_version = None
+        self._normalized_reducer_mask = None
         self._prepared_reducer_domain_masks = {}
         self._current_output_heights = None
         self._current_output_widths = None
@@ -294,7 +297,7 @@ class StreamingCNN(torch.nn.Module):
                     f"4D mask shape {tuple(mask.shape)} must be [N,C,H,W] with N={image.shape[0]}; "
                     "H/W must align with the reducer/reduced feature spatial domain."
                 )
-            return torch.any(mask.to(dtype=torch.bool), dim=(0, 1))
+            return mask.to(dtype=torch.bool).any(dim=0).any(dim=0)
         raise ValueError(f"mask must be 2D [H,W], 3D [N,H,W], or 4D [N,C,H,W], got shape={tuple(mask.shape)}")
 
     def _prepare_reducer_domain_mask(
@@ -311,7 +314,9 @@ class StreamingCNN(torch.nn.Module):
         if self._active_reducer_mask_image is None:
             raise RuntimeError("Reducer mask preparation requires the active forward/backward image context.")
 
-        normalized = self._normalize_reducer_mask(mask, self._active_reducer_mask_image)
+        if self._normalized_reducer_mask is None:
+            self._normalized_reducer_mask = self._normalize_reducer_mask(mask, self._active_reducer_mask_image)
+        normalized = self._normalized_reducer_mask
         if normalized is None:
             return None
 
@@ -338,7 +343,12 @@ class StreamingCNN(torch.nn.Module):
 
     def _get_prepared_reducer_domain_mask(self, head_idx: int) -> torch.Tensor | None:
         reducer = self._reducer_head_map[head_idx]
-        cache_key = (id(reducer), int(head_idx))
+        cache_key = (
+            int(self._current_output_heights[head_idx]),
+            int(self._current_output_widths[head_idx]),
+            bool(getattr(reducer, "mask_resize", False)),
+            getattr(reducer, "mask_resize_mode", "nearest"),
+        )
         if cache_key not in self._prepared_reducer_domain_masks:
             self._prepared_reducer_domain_masks[cache_key] = self._prepare_reducer_domain_mask(
                 self._active_reducer_mask,
@@ -400,6 +410,7 @@ class StreamingCNN(torch.nn.Module):
 
         # TODO; temp hack for tile sizes too big on gpu,
         # we need float32 precision
+        original_device = self.device
         if self.statistics_on_cpu:
             self.stream_module = self.stream_module.cpu()
             self.device = torch.device("cpu")  # type:ignore
@@ -417,8 +428,8 @@ class StreamingCNN(torch.nn.Module):
 
         # TODO; temp hack for tile sizes too big on gpu,
         if self.statistics_on_cpu:
-            self.stream_module = self.stream_module.cuda()
-            self.device = torch.device("cuda")  # type:ignore
+            self.stream_module = self.stream_module.to(original_device)
+            self.device = original_device
 
         # Remove all hooks and add hooks for correcting gradients
         # during lightstream
@@ -1841,10 +1852,15 @@ class StreamingCNN(torch.nn.Module):
         """Perform forward pass with lightstream."""
         if validate_input_alignment:
             self.validate_input_alignment(image)
+        self._active_source_image = image
+        self._active_source_image_version = (
+            None if torch.is_inference_mode_enabled() else image._version
+        )
         if self.copy_to_gpu:
             image = image.to(self.device, non_blocking=True)
         self._active_reducer_mask = mask
         self._active_reducer_mask_image = image
+        self._normalized_reducer_mask = None
         self._prepared_reducer_domain_masks = {}
 
         tile_height = self.tile_shape[H_DIM]
@@ -2022,16 +2038,37 @@ class StreamingCNN(torch.nn.Module):
 
         output, final_idx = self._unflatten_output_structure(materialized_outputs, self._output_spec)
         assert final_idx == len(materialized_outputs)
+        if torch.is_inference_mode_enabled():
+            self.release_slide_state()
         return output
+
+    def release_slide_state(self):
+        """Release spatial tensors after a completed backward or inference forward."""
+        self._active_reducer_mask = None
+        self._active_reducer_mask_image = None
+        self._active_source_image = None
+        self._active_source_image_version = None
+        self._normalized_reducer_mask = None
+        self._prepared_reducer_domain_masks = {}
+        for reducer in self._reducer_head_map.values():
+            reducer.release_slide_state()
+            reducer._last_inputs = None
+            reducer._last_output = None
 
     def backward(self, image, grad, mask=None):
         """Perform backward pass with lightstream."""
         if self.copy_to_gpu:
-            image = image.to(self.device, non_blocking=True)
+            image = (self._active_reducer_mask_image
+                     if image is self._active_source_image
+                     and image._version == self._active_source_image_version
+                     and self._active_reducer_mask_image is not None
+                     else image.to(self.device, non_blocking=True))
         if mask is not None:
-            self._active_reducer_mask = mask
-            self._active_reducer_mask_image = image
-            self._prepared_reducer_domain_masks = {}
+            if mask is not self._active_reducer_mask or self._active_reducer_mask_image is not image:
+                self._active_reducer_mask = mask
+                self._active_reducer_mask_image = image
+                self._normalized_reducer_mask = None
+                self._prepared_reducer_domain_masks = {}
         elif self._active_reducer_mask_image is None:
             self._active_reducer_mask_image = image
 
@@ -2139,6 +2176,7 @@ class StreamingCNN(torch.nn.Module):
         assert (
             last_sides is not None and last_sides.right and last_sides.bottom
         ), "It seems like we could not reconstruct all output"
+        self.release_slide_state()
 
     def _build_head_backward_pair(
         self,

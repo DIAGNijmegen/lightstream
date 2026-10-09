@@ -243,9 +243,10 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             raise ValueError(f"fused_y must be an NCHW tensor, got shape={tuple(fused_y.shape)}")
         _validate_stacked_logits(logits_stacked, fused_y)
         dst_y0, dst_y1, dst_x0, dst_x1 = dst_box
-        seen_slice = self._stream_seen_mask[dst_y0:dst_y1, dst_x0:dst_x1]
-        new_mask = ~seen_slice
-        effective_mask = new_mask if user_mask is None else (new_mask & user_mask.to(dtype=torch.bool, device=new_mask.device))
+        effective_mask = self._claim_region(
+            (dst_y0, dst_y1, dst_x0, dst_x1), user_mask,
+            self._forward_claimed_boxes, fused_y.device,
+        )
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
@@ -268,7 +269,6 @@ class StreamingFusedAttentionGeMReducer(BaseStreamingGlobalReducer):
             )
         if torch.any(effective_mask):
             self.accumulate_valid_tile(payload, valid_mask=effective_mask)
-        seen_slice |= new_mask
 
     def build_backward_pair(self, trimmed_output, gradient: torch.Tensor, *, input_y: int, input_x: int, sides, valid_mask: torch.Tensor | None = None):
         """Build a replay tile pair using the mask prepared by ``StreamingCNN``.

@@ -171,20 +171,14 @@ class _StreamingNeighborhoodAttentionFunction(torch.autograd.Function):
             )
             replay = replay.permute(0, 3, 1, 2).contiguous()
             trainable_indices = [index for index, parameter in enumerate(parameters) if parameter.requires_grad]
-            input_gradient = torch.autograd.grad(
+            requested = (replay_input, *(parameters[index] for index in trainable_indices))
+            gradients = torch.autograd.grad(
                 replay,
-                replay_input,
+                requested,
                 grad_output,
-                retain_graph=bool(trainable_indices),
-            )[0]
-            parameter_gradients = ()
-            if trainable_indices:
-                parameter_gradients = torch.autograd.grad(
-                    replay,
-                    tuple(parameters[index] for index in trainable_indices),
-                    grad_output,
-                    allow_unused=True,
-                )
+                allow_unused=True,
+            )
+            input_gradient, *parameter_gradients = gradients
         parameter_grads = [None] * len(parameters)
         for index, gradient in zip(trainable_indices, parameter_gradients):
             parameter_grads[index] = gradient

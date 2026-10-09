@@ -158,9 +158,9 @@ class StreamingAttentionKLDivergenceReducer(BaseStreamingGlobalReducer):
         student, teacher = payload
         _validate_logits(student, teacher)
         y0, y1, x0, x1 = dst_box
-        seen = self._stream_seen_mask[y0:y1, x0:x1]
-        new = ~seen
-        effective = new if user_mask is None else new & user_mask.to(device=new.device, dtype=torch.bool)
+        effective = self._claim_region(
+            (y0, y1, x0, x1), user_mask, self._forward_claimed_boxes, student.device,
+        )
         if self._debug_replay_enabled:
             if self._replay_assignments is None:
                 raise RuntimeError("Reducer replay assignments are not initialized.")
@@ -171,7 +171,6 @@ class StreamingAttentionKLDivergenceReducer(BaseStreamingGlobalReducer):
             )
         if torch.any(effective):
             self.accumulate_valid_tile(payload, effective)
-        seen |= new
 
     def build_backward_pair(self, trimmed_output, gradient, *, input_y, input_x, sides, valid_mask=None):
         payload = self._parse_multi_input_payload(trimmed_output)
